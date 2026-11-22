@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.zip binary
+# Preserve the bytes of upstream notices, including their original line endings.
+/packaging/windows/licenses/* -text

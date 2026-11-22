@@ -1,5 +1,45 @@
 # agent-router
 
-WFC 的独立终端执行内核。上层通过标准输入输出请求内核启动终端、发送输入和读取画面。任务派发、消息回执和总控唤醒由 workflow-core 负责。
+WFC 的独立终端执行内核。上层通过私有标准输入输出协议启动终端、写入按键、调整大小、读取当前画面并关闭进程。编译需要本仓、Rust 1.96.1、Zig 0.16.0、Python 3.12 和平台链接器。首次构建会取回 Cargo 和 Zig 的固定依赖。
 
-初始 Rust 入口及 Cargo 清单来自 xmxxc/workflow-core 提交 3c06c0905faaf9e61de49404c33e70720409607f 的 experiments/herdr-kernel-prototype，保留原项目 MIT 许可（LICENSE-WFC）。上游终端组件以 herdrdev/herdr 的 0.9.5 提交 ee5bfb5041bb3e4a49d591c72308aae3c81ecdde 为基线。独立构建所需的组件、各自许可证及跨平台验证正在迁入。
+## Linux x64
+
+在带 C 链接器的 GNU/Linux 上，从仓库根目录运行下列命令。先将 Zig 0.16.0 放入 PATH，或用 ZIG 指定可执行文件的绝对路径。
+
+```sh
+rustup toolchain install 1.96.1 --profile minimal
+python3 tools/prepare.py
+cargo build --release --locked --target x86_64-unknown-linux-gnu
+cargo test --workspace --release --locked --target x86_64-unknown-linux-gnu
+python3 tools/smoke.py target/x86_64-unknown-linux-gnu/release/herdr-kernel-prototype
+python3 tools/collect_notices.py x86_64-unknown-linux-gnu target/bundled-notices
+```
+
+## Windows x64
+
+在带 Visual Studio 2022 C++ Build Tools 和 Windows SDK 的 x64 Developer PowerShell 中运行。使用 MSVC 版 Rust，PATH 中应有 Python 3.12 和 Zig 0.16.0。原生 CI 在 windows-2022 上从本仓构建，复制产物到含空格的目录，再运行相同的终端往返测试。通过后另行检出固定的 WFC 测试树，执行六项原生生命周期验证。[Windows 验证工作流](.github/workflows/kernel.yml)
+
+```powershell
+rustup toolchain install 1.96.1-x86_64-pc-windows-msvc --profile minimal
+python tools/prepare.py
+cargo +1.96.1-x86_64-pc-windows-msvc build --release --locked --target x86_64-pc-windows-msvc
+cargo +1.96.1-x86_64-pc-windows-msvc test --workspace --release --locked --target x86_64-pc-windows-msvc
+python tools/smoke.py target/x86_64-pc-windows-msvc/release/herdr-kernel-prototype.exe
+python tools/collect_notices.py x86_64-pc-windows-msvc target/bundled-notices
+```
+
+prepare 校验并解出仓内的 Ghostty 源码包，校验 zlib 下载字节和 Zig 包哈希。已有原始 zlib 源包时可传入 `--zlib-archive <文件>`。其他 Zig 依赖按 Ghostty 的 .zon 清单校验内容，Rust 依赖按 Cargo.lock 校验。许可证输出目录须为新目录。
+
+## 运行和接入 WFC
+
+直接启动产物会收到一行 JSON 握手，其中含协议版本 1 和本次启动的 generation。保持标准输入打开，每行发送一个 JSON 请求。spawn 返回 nonce，后续 read、input、resize 和 close 使用同一个 unit、generation 和 nonce。关闭标准输入会结束内核。smoke 启动真实子进程，等待它就绪，调整窗口，输入随机文本并核对它回写的反转文本。
+
+WFC 的 `build.py --bundled-kernel <内核文件> --kernel-notices <许可证目录>` 接收以上两项输出，将内核放在 WFC 旁边，命名为 `wfc-kernel` 或 `wfc-kernel.exe`。运行时也可由 WFC 显式指定 `WFC_BUNDLED_KERNEL`。Windows 默认使用系统 ConPTY（Windows 的伪终端接口）。向可执行文件旁边放置可选 Microsoft 组件时，使用 Herdr 固定的目录布局、哈希和许可。[Microsoft 包清单](packaging/windows/conpty.json)
+
+Unix 内核关闭仍存活的子进程时检查并终止其进程组。Windows 内核关闭直接子进程。WFC 负责整棵执行树，包括根进程先退出、后代另建会话、运行时意外退出，Linux 使用委派的 cgroup v2，Windows 使用 Job Object。普通终端往返可单独运行。验证整棵树时，另备 WFC 提交 `3c06c0905faaf9e61de49404c33e70720409607f` 的干净测试树。Linux 先将 `WFC_BUNDLED_CGROUP_ROOT` 指向测试专属且可写的委派目录，再运行下列命令。Windows 在原生 PowerShell 中用 python 运行同一脚本，传入 .exe。
+
+```sh
+timeout 240s python3 tools/check_wfc.py /path/to/workflow-core target/x86_64-unknown-linux-gnu/release/herdr-kernel-prototype
+```
+
+脚本运行 WFC 已有的六个真实进程用例，并检查每个用例都实际执行。首次候选的 Linux x64 独立编译、终端测试和 stdio 往返已实测。Windows 原生和 Linux 委派进程树的验收由总控在冻结候选上执行。[来源、补丁与复建方法](SOURCES.md)
