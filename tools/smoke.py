@@ -16,7 +16,8 @@ def run(binary):
         deadline.start()
         try:
             hello = json.loads(kernel.stdout.readline())
-            assert hello["protocol"] == 1 and hello["transport"] == "private-stdio-ndjson", hello
+            if hello["protocol"] != 1 or hello["transport"] != "private-stdio-ndjson":
+                raise RuntimeError(f"Unexpected kernel hello: {hello}")
             generation = hello["generation"]
             unit = dict(unit="native", generation=generation)
             sequence = 0
@@ -28,7 +29,8 @@ def run(binary):
                 kernel.stdin.write(json.dumps(request) + "\n")
                 kernel.stdin.flush()
                 reply = json.loads(kernel.stdout.readline())
-                assert reply["id"] == sequence and reply["ok"], reply
+                if reply["id"] != sequence or not reply["ok"]:
+                    raise RuntimeError(f"Unexpected {operation} reply: {reply}")
                 return reply["result"]
 
             script = "print('READY', flush=True); print(input()[::-1], flush=True); input()"
@@ -45,16 +47,23 @@ def run(binary):
                 raise RuntimeError(view)
 
             observe("READY")
-            assert call("resize", cols=80, rows=20) == {"cols": 80, "rows": 20}
+            resized = call("resize", cols=80, rows=20)
+            if resized != {"cols": 80, "rows": 20}:
+                raise RuntimeError(f"Unexpected resize result: {resized}")
             view = call("read")
-            assert (view["cols"], view["rows"]) == (80, 20), view
+            if (view["cols"], view["rows"]) != (80, 20):
+                raise RuntimeError(f"Unexpected viewport after resize: {view}")
             marker = uuid.uuid4().hex
             call("input", text=marker + "\r")
             observe(marker[::-1])
-            assert call("close")["closed"]
+            closed = call("close")
+            if closed["closed"] is not True:
+                raise RuntimeError(f"Unexpected close result: {closed}")
             kernel.stdin.close()
-            assert kernel.wait(timeout=10) == 0
-            print("Native PTY create, submit, observe child response, close passed")
+            status = kernel.wait(timeout=10)
+            if status != 0:
+                raise RuntimeError(f"Kernel exited with status {status}")
+            print("Native PTY create, resize, submit, observe child response, close passed")
         finally:
             deadline.cancel()
             if kernel.poll() is None:

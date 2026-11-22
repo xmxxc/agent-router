@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 
 NOTICE = re.compile(r'^(licen[cs]e|unlicense|copying|copyright|notices?)(?:$|[-. _])', re.I)
+UUCODE = 'uucode-0.2.0-ZZjBPlK5VADj7fdoq7G8LIHzD5o6FSkcBXXrRWr4jnrA'
 
 
 def notices(directory):
@@ -62,11 +63,17 @@ def collect(prepared, target, out):
     shutil.copyfile(prepared / 'Cargo.lock', out / 'Cargo.lock')
     vendor = prepared / 'vendor/libghostty-vt'
     cache = vendor / 'zig-pkg'
-    if not cache.is_dir():
-        raise ValueError('Expected materialized Zig packages at ' + str(cache))
+    if not (cache / UUCODE).is_dir():
+        raise ValueError(f'Expected pinned uucode package at {cache / UUCODE}')
     zig = []
     for package in sorted(p for p in cache.iterdir() if p.is_dir()):
-        files = copy_files(notices(package), package, out / 'zig' / package.name)
+        destination = out / 'zig' / package.name
+        files = copy_files(notices(package), package, destination)
+        if package.name == UUCODE:
+            # Zig omits the two licenses referenced by uucode's LICENSE.md.
+            source = prepared / 'licenses/uucode'
+            files.extend(copy_files([source / 'licenses/LICENSE_Bjoern_Hoehrmann',
+                                     source / 'licenses/LICENSE_unicode'], source, destination))
         zig.append(dict(package_hash=package.name, notices=files))
     shutil.copyfile(vendor / 'LICENSE', out / 'LICENSE-Ghostty')
     shutil.copyfile(prepared / 'licenses/LICENSE-Herdr', out / 'LICENSE-Herdr')
@@ -79,7 +86,11 @@ def collect(prepared, target, out):
         source = prepared / path
         paths = [p for p in source.rglob('*') if p.is_file()] if source.is_dir() else [source]
         copy_files(paths, prepared, provenance)
+    licenses = prepared / 'licenses'
+    rgb_notices = copy_files([licenses / 'xorg-rgb/COPYING'], licenses, out)
     index = dict(target=target, cargo=records, zig_materialized=zig,
+                 embedded_data=[dict(name='X.Org rgb', version='1.1.0', notices=rgb_notices,
+                                     source='https://www.x.org/releases/individual/app/rgb-1.1.0.tar.xz')],
                  cargo_lock_sha256=hashlib.sha256((prepared / 'Cargo.lock').read_bytes()).hexdigest(),
                  scope='Cargo target metadata including build dependencies. Zig package directories describe fetched inputs, not a link map.')
     (out / 'sources.json').write_text(json.dumps(index, indent=2) + '\n', encoding='utf-8')

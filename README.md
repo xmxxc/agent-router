@@ -34,7 +34,24 @@ prepare 校验并解出仓内的 Ghostty 源码包，校验 zlib 下载字节和
 
 直接启动产物会收到一行 JSON 握手，其中含协议版本 1 和本次启动的 generation。保持标准输入打开，每行发送一个 JSON 请求。spawn 返回 nonce，后续 read、input、resize 和 close 使用同一个 unit、generation 和 nonce。关闭标准输入会结束内核。smoke 启动真实子进程，等待它就绪，调整窗口，输入随机文本并核对它回写的反转文本。
 
-WFC 的 `build.py --bundled-kernel <内核文件> --kernel-notices <许可证目录>` 接收以上两项输出，将内核放在 WFC 旁边，命名为 `wfc-kernel` 或 `wfc-kernel.exe`。运行时也可由 WFC 显式指定 `WFC_BUNDLED_KERNEL`。Windows 默认使用系统 ConPTY（Windows 的伪终端接口）。向可执行文件旁边放置可选 Microsoft 组件时，使用 Herdr 固定的目录布局、哈希和许可。[Microsoft 包清单](packaging/windows/conpty.json)
+WFC 的 `build.py --bundled-kernel <内核文件> --kernel-notices <许可证目录>` 接收以上两项输出，将内核放在 WFC 旁边，命名为 `wfc-kernel` 或 `wfc-kernel.exe`。运行时也可由 WFC 显式指定 `WFC_BUNDLED_KERNEL`。Windows 默认使用系统 ConPTY（Windows 的伪终端接口）。
+
+**可选的 Microsoft ConPTY 包**需要四个运行时文件。先按清单校验 nupkg 和三个二进制文件的 SHA-256，再按各自的 destination 放到内核可执行文件旁的 `conpty/` 目录内。按 notices 中的 destination 把两份署名放到同级 `THIRD-PARTY-NOTICES/`。第四个运行时文件是 `conpty/herdr-conpty.json`，与 `conpty.dll` 同目录。[Microsoft 包清单](packaging/windows/conpty.json)
+
+从本仓根目录运行下面的命令，将最后一个参数换成内核可执行文件所在目录。它从同一份包清单生成标记文件，字节格式与 Herdr 的 `marker_data` 一致。[固定版本的生成逻辑](https://github.com/herdrdev/herdr/blob/ee5bfb5041bb3e4a49d591c72308aae3c81ecdde/scripts/package_windows_conpty.py#L237-L248)
+
+```powershell
+@'
+import json, sys
+from pathlib import Path
+m = json.loads(Path("packaging/windows/conpty.json").read_bytes())
+files = m["bundles"]["x86_64"]["files"]
+marker = dict(schema_version=1, package=m["package"]["id"], version=m["package"]["version"],
+              architecture="x86_64", files={f["destination"]: f["sha256"] for f in files})
+(Path(sys.argv[1]) / "conpty/herdr-conpty.json").write_bytes(
+    (json.dumps(marker, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+'@ | python - "C:\path\to\kernel-directory"
+```
 
 Unix 内核关闭仍存活的子进程时检查并终止其进程组。Windows 内核关闭直接子进程。WFC 负责整棵执行树，包括根进程先退出、后代另建会话、运行时意外退出，Linux 使用委派的 cgroup v2，Windows 使用 Job Object。普通终端往返可单独运行。验证整棵树时，另备 WFC 提交 `3c06c0905faaf9e61de49404c33e70720409607f` 的干净测试树。Linux 先将 `WFC_BUNDLED_CGROUP_ROOT` 指向测试专属且可写的委派目录，再运行下列命令。Windows 在原生 PowerShell 中用 python 运行同一脚本，传入 .exe。
 
