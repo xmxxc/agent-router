@@ -1,0 +1,8 @@
+[package]
+name = "ghostty-vt"
+version = "0.0.0"
+edition = "2021"
+description = "Terminal operations extracted from Herdr for the WFC kernel"
+license = "Apache-2.0"
+repository = "https://github.com/xmxxc/agent-router"
+publish = false

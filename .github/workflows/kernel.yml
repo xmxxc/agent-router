@@ -1,0 +1,59 @@
+name: Standalone kernel
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      PYTHONUTF8: '1'
+      CARGO_BUILD_JOBS: '2'
+      TRIPLE: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        with:
+          version: '0.16.0'
+      - run: rustup toolchain install 1.96.1 --profile minimal
+      - run: python tools/prepare.py
+      - run: cargo build --release --locked --target $env:TRIPLE
+      - run: cargo test --workspace --release --locked --target $env:TRIPLE
+      - name: Stage and exercise the WFC companion
+        run: |
+          New-Item -ItemType Directory "target/standalone kernel" | Out-Null
+          Copy-Item "target/$env:TRIPLE/release/herdr-kernel-prototype.exe" "target/standalone kernel/wfc-kernel.exe"
+          python tools/smoke.py "target/standalone kernel/wfc-kernel.exe"
+      - run: python tools/collect_notices.py $env:TRIPLE "target/standalone kernel/bundled-notices"
+      - name: Fetch the WFC lifecycle test suite after standalone validation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: xmxxc/workflow-core
+          ref: 3c06c0905faaf9e61de49404c33e70720409607f
+          path: integration-workflow-core
+          persist-credentials: false
+      - name: Verify the six native WFC contracts including Job Object cleanup
+        timeout-minutes: 8
+        run: python tools/check_wfc.py integration-workflow-core "target/standalone kernel/wfc-kernel.exe"
+      - name: Record candidate and binary digest
+        run: |
+          git rev-parse HEAD | Set-Content -Encoding ascii "target/standalone kernel/COMMIT.txt"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ((Get-FileHash "target/standalone kernel/wfc-kernel.exe").Hash.ToLowerInvariant() + '  wfc-kernel.exe') |
+            Tee-Object -FilePath "target/standalone kernel/SHA256SUMS"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kernel-windows-x64-${{ github.event.pull_request.head.sha || github.sha }}
+          path: target/standalone kernel/
+          if-no-files-found: error
+          retention-days: 5
