@@ -166,7 +166,6 @@ struct HistoryExtent {
 struct InputScreen<'a> {
     scrollback: Vec<&'a str>,
     visible: Vec<&'a str>,
-    entry_breaks: Vec<bool>,
     draft: &'a str,
     extent: HistoryExtent,
 }
@@ -174,7 +173,7 @@ struct InputScreen<'a> {
 struct InputDelta<'a, 'row> {
     rows: &'a [&'row str],
     retained_history: &'a [&'row str],
-    separated_entry: bool,
+    archived_visible_head: bool,
 }
 
 struct InputCapture {
@@ -200,21 +199,9 @@ impl InputCapture {
             return None;
         }
         let visible = full.split_off(cut);
-        let (prompt, _) = strict_composer(&self.viewport)?;
-        let mut entry_breaks = Vec::with_capacity(visible.len());
-        for line in self.viewport.lines().take(prompt) {
-            if line.trim_end().is_empty() {
-                if let Some(last) = entry_breaks.last_mut() {
-                    *last = true;
-                }
-            } else {
-                entry_breaks.push(false);
-            }
-        }
         Some(InputScreen {
             scrollback: full,
             visible,
-            entry_breaks,
             draft,
             extent: self.extent,
         })
@@ -263,31 +250,42 @@ impl InputScreen<'_> {
             }
             added
         };
+        let removed = self.visible.len() - added;
         Some(InputDelta {
             rows: &after.visible[added..],
             retained_history,
-            separated_entry: after.entry_breaks.get(added).copied().unwrap_or(false),
+            archived_visible_head: !scrolled.is_empty() && scrolled == &self.visible[..removed],
         })
     }
 
-    fn attributable(&self, delta: &InputDelta<'_, '_>, matches: impl Fn(&str) -> bool) -> bool {
+    fn attributable(
+        &self,
+        previous: &InputScreen<'_>,
+        after: &InputScreen<'_>,
+        matches: impl Fn(&str) -> bool,
+    ) -> bool {
         let hidden = self.scrollback.iter().any(|line| matches(line))
             && !self.visible.iter().any(|line| matches(line));
-        // Require both versions when the only earlier lookalike was hidden:
-        // the old row still anchored in history and an independently delimited
-        // entry at the live append boundary. A raster with no boundary is ambiguous.
+        // A repaint can repeat the hidden row and its blank lines. Require the
+        // old copy to remain anchored and the native history to advance by
+        // exactly the rows that left the viewport since the last verified
+        // screen. Scrolling during drafting cannot prove a later append.
         !hidden
-            || (delta.separated_entry && delta.retained_history.iter().any(|line| matches(line)))
+            || previous.added(after).is_some_and(|delta| {
+                delta.archived_visible_head
+                    && delta.retained_history.iter().any(|line| matches(line))
+                    && delta.rows.first().is_some_and(|line| matches(line))
+            })
     }
 
-    fn refused(&self, after: &InputScreen<'_>) -> Option<Value> {
+    fn refused(&self, previous: &InputScreen<'_>, after: &InputScreen<'_>) -> Option<Value> {
         let delta = self.added(after)?;
         let [notice] = delta.rows else {
             return None;
         };
         if after.draft.is_empty()
             && refusal_entry(notice)
-            && self.attributable(&delta, refusal_entry)
+            && self.attributable(previous, after, refusal_entry)
         {
             let mut result = refused(REFUSAL);
             result["inputEvidence"] = json!("new-host-refusal");
@@ -303,13 +301,14 @@ fn user_entry(line: &str, text: &str) -> bool {
 
 fn appended_result(
     before: &InputScreen<'_>,
+    previous: &InputScreen<'_>,
     after: &InputScreen<'_>,
     text: &str,
 ) -> Reply<Option<Value>> {
     if !after.draft.is_empty() {
         return Ok(None);
     }
-    if let Some(refusal) = before.refused(after) {
+    if let Some(refusal) = before.refused(previous, after) {
         return Err(refusal);
     }
     let delta = before
@@ -320,7 +319,7 @@ fn appended_result(
         return Ok(None);
     };
     if user_entry(first, text)
-        && before.attributable(&delta, |line| user_entry(line, text))
+        && before.attributable(previous, after, |line| user_entry(line, text))
         && added.iter().filter(|line| user_entry(line, text)).count() == 1
         && !added.iter().any(|line| refusal_entry(line))
     {
@@ -686,16 +685,12 @@ impl Tmux<'_> {
         check_input: &mut dyn FnMut(InputBoundary) -> Reply<()>,
     ) -> Reply<Value> {
         let after_text = |_| uncertain("input was attempted but submission could not be confirmed");
-        for final_check in [false, true] {
-            if final_check {
-                sleep(Duration::from_millis(300));
-                check_input(InputBoundary::PrepareEnter)?;
-            }
+        let draft_mismatch =
+            || uncertain("Codex draft does not match the complete input; Enter was not sent");
+        let capture_draft = |previous: &InputScreen<'_>| -> Reply<InputCapture> {
             let capture = self.input_capture(t).map_err(after_text)?;
-            let draft_mismatch =
-                || uncertain("Codex draft does not match the complete input; Enter was not sent");
             let screen = capture.parse().ok_or_else(draft_mismatch)?;
-            if let Some(refusal) = before.refused(&screen) {
+            if let Some(refusal) = before.refused(previous, &screen) {
                 return Err(refusal);
             }
             if notices(&capture.viewport).state.is_some()
@@ -711,7 +706,14 @@ impl Tmux<'_> {
                     "Codex visible transcript changed; Enter was not sent",
                 ));
             }
-        }
+            Ok(capture)
+        };
+        let first = capture_draft(before)?;
+        sleep(Duration::from_millis(300));
+        check_input(InputBoundary::PrepareEnter)?;
+        let first = first.parse().ok_or_else(draft_mismatch)?;
+        let ready = capture_draft(&first)?;
+        let ready = ready.parse().ok_or_else(draft_mismatch)?;
         check_input(InputBoundary::Enter)?;
         self.worker_command_if(
             t,
@@ -733,7 +735,7 @@ impl Tmux<'_> {
                 ));
             }
             if let Some(after) = capture.parse() {
-                if let Some(result) = appended_result(before, &after, text)? {
+                if let Some(result) = appended_result(before, &ready, &after, text)? {
                     return Ok(result);
                 }
             }

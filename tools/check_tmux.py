@@ -3684,13 +3684,27 @@ draft = b""
 local_draft = False
 assignment = None
 transcript = "Previous assistant output\r\n\r\n"
-old_text = "› [router] Message from the controller: historical\r\n"
-old_refusal = "This conversation is read-only or unavailable; no operation was sent.\r\n"
+old_text = "› [router] Message from the controller: historical"
+old_refusal = "This conversation is read-only or unavailable; no operation was sent."
+history_row = None
 
 def write_json(name, value):
     tmp = Path(name + ".tmp")
     tmp.write_text(json.dumps(value))
     tmp.replace(name)
+
+def archive_history_head():
+    global history_row
+    # Archive the two head anchors with real native scroll, retaining the rest of the viewport.
+    bottom = os.get_terminal_size(0).lines
+    print(f"\x1b[{bottom};1H\r\n\r\n", end="")
+    history_row -= 2
+
+def append_entry(entry, *, replay=False):
+    global transcript
+    if history_row is not None and not replay:
+        archive_history_head()
+    transcript += entry + "\r\n\r\n"
 
 def draw():
     shown = "Ask Codex to do anything" if local_draft else draft.decode(errors="replace")
@@ -3709,7 +3723,8 @@ def draw():
         prompt = "\x1b[1m›\x1b[0m"
         if not shown:
             shown = "\x1b[2mAsk Codex to do anything\x1b[0m"
-    print(f"\x1b[2J\x1b[H{visible}{prompt} {shown}\r\n\r\n  model · cwd", end="", flush=True)
+    start = "\x1b[2J\x1b[H" if history_row is None else f"\x1b[{history_row};1H\x1b[J"
+    print(f"{start}{visible}{prompt} {shown}\r\n\r\n  model · cwd", end="", flush=True)
     display = "draft" if local_draft else "partial" if draft and Path("change-draft").exists() else "ready"
     Path("screen").write_text(display)
 
@@ -3740,7 +3755,10 @@ while time.monotonic() < deadline:
         mode = Path("seed-history").read_text()
         Path("seed-history").unlink()
         old = old_refusal if mode == "refusal" else old_text
-        print("\x1b[2J\x1b[H" + old + "".join(f"history {i}\r\n" for i in range(35)), end="", flush=True)
+        print("\x1b[2J\x1b[H" + old + "\r\n\r\n"
+              + "".join(f"history {i}\r\n" for i in range(35)), end="")
+        print("\x1b[2J\x1b[Hhistory head 0\r\nhistory head 1", end="")
+        history_row = 6
         draw()
         Path("history-ready").touch()
     if Path("fill-transcript").exists():
@@ -3807,17 +3825,17 @@ while time.monotonic() < deadline:
             continue
         draft = b""
         if Path("refuse-input").exists():
-            transcript += old_refusal + "\r\n"
+            append_entry(old_refusal)
             draw()
             continue
         if Path("expose-history").exists():
-            transcript += old_refusal if Path("expose-history").read_text() == "refusal" else old_text
+            append_entry(old_text, replay=True)
             draw()
             continue
         with open("formal-input", "a") as log:
             print(json.dumps(line), file=log)
         if not Path("omit-transcript").exists():
-            transcript += f"› {line}\r\n\r\n"
+            append_entry(f"› {line}")
         draw()
         if line == "[router] Message from the controller: finish first":
             Path(report).write_text("first report")
@@ -3835,9 +3853,13 @@ while time.monotonic() < deadline:
                 result = done(target, attempt, "--callback-ref", reference)
                 write_json("r2-done", json.loads(result.stdout))
     if draft:
-        if Path("refuse-draft").exists() and draft.endswith(b"and end your turn."):
+        if history_row is not None and Path("scroll-draft").exists():
+            Path("scroll-draft").unlink()
+            archive_history_head()
+        replay_refusal = Path("expose-history").exists() and Path("expose-history").read_text() == "refusal"
+        if (Path("refuse-draft").exists() or replay_refusal) and draft.endswith(b"and end your turn."):
             draft = b""
-            transcript += old_refusal + "\r\n"
+            append_entry(old_refusal, replay=replay_refusal)
         draw()
 """)
         config = self.work / "launch.json"
@@ -4722,33 +4744,92 @@ int fsync(int fd) {
                 self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
         self.work = original
 
-    def test_public_nudge_does_not_attribute_reappearing_history(self):
+    def seed_public_input_history(self, dispatch, mode):
+        pane = self.active_pane(dispatch)
+        capture = self.tmux + ["capture-pane", "-p", "-J", "-t", pane]
+        hidden = ("› [router] Message from the controller: historical" if mode == "same-text"
+                  else "This conversation is read-only or unavailable; no operation was sent.")
+
+        def screen(*args):
+            text = subprocess.check_output(capture + list(args), text=True, timeout=2)
+            return "\n".join(line.rstrip() for line in text.splitlines()) + "\n"
+
+        def ready():
+            if not (self.work / "history-ready").exists():
+                return False
+            snapshot = screen()
+            return "history head 1" in snapshot and "model · cwd" in snapshot
+
+        seed = self.work / "prepare-history"
+        seed.write_text(mode)
+        seed.replace(self.work / "seed-history")
+        self.await_input_value(ready)
+        self.assertNotIn(hidden, screen())
+        self.assertIn(hidden, screen("-S", "-"))
+        return hidden, screen
+
+    def test_public_input_does_not_attribute_reappearing_history(self):
         original = self.work
-        for mode in ("same-text", "refusal"):
-            with self.subTest(mode=mode):
-                self.work = original / mode
+        for mode, scroll_draft in (("same-text", False), ("same-text", True), ("refusal", False)):
+            with self.subTest(mode=mode, scroll_draft=scroll_draft):
+                scope = "scrolled-draft" if scroll_draft else mode
+                self.work = original / scope
                 self.work.mkdir()
-                cli, first, token, _ = self.public_input_worker(scope=mode)
+                cli, first, token, _ = self.public_input_worker(scope=scope)
                 dispatch = first["dispatch"]
-                (self.work / "seed-history").write_text(mode)
-                self.await_input_value(lambda: (self.work / "history-ready").exists())
-                pane = self.active_pane(dispatch)
-                hidden = "historical" if mode == "same-text" else "no operation was sent"
-                capture = self.tmux + ["capture-pane", "-p", "-J", "-t", pane]
-                self.assertNotIn(hidden, subprocess.check_output(capture, text=True))
-                self.assertIn(hidden, subprocess.check_output(capture + ["-S", "-"], text=True))
+                if mode == "refusal":
+                    (self.work / "finish-first-externally").touch()
+                    done_path = self.work / "first-done"
+                    self.await_input_value(done_path.exists)
+                    done = json.loads(done_path.read_text())
+                hidden, screen = self.seed_public_input_history(dispatch, mode)
+                previous = screen()
+                if scroll_draft:
+                    (self.work / "scroll-draft").touch()
                 (self.work / "expose-history").write_text(mode)
-                args = ("nudge", dispatch, "--text", "historical")
+                args = (("nudge", dispatch, "--text", "historical") if mode == "same-text" else
+                        ("continue", dispatch, "--task", "next-task", "--report", "report2"))
                 result = cli(*args, token=token, expected=1)
-                self.assertIn("nudge uncertain", result)
-                self.assertIn("no entry attributable", result)
+                self.assertIn(f"{args[0]} uncertain", result)
+                diagnostic = "no entry attributable" if mode == "same-text" else "Enter was not sent"
+                self.assertIn(diagnostic, result)
+                current = screen()
+                self.assertIn(f"{hidden}\n\n", current)
+                if scroll_draft:
+                    self.assertNotIn("history head", current)
+                    self.assertIn("history head 0\nhistory head 1", screen("-S", "-"))
+                else:
+                    head = previous.split("Previous assistant output", 1)[0]
+                    self.assertTrue(current.startswith(head + "Previous assistant output"))
+                self.assertEqual(screen("-S", "-").count(hidden), 2)
                 row = cli("status", "--dispatch", dispatch)["dispatches"][0]
-                self.assertEqual(row["audit"][-1]["result"], "uncertain")
+                audit = row["audit"][-1]
+                self.assertEqual((audit["fromRound"], audit["fromAttempt"], audit["result"]),
+                                 (1, first["attempt"], "uncertain"))
+                self.assertNotIn("inputEvidence", audit)
                 self.assertTrue(all(m["to"] != "worker" for m in row["messages"]))
+                received = (self.work / "input-bytes").read_bytes()
                 self.assertIn("pending or uncertain", cli(*args, token=token, expected=1))
-                self.assertEqual(len((self.work / "typed").read_text().splitlines()), 1)
+                self.assertEqual((self.work / "input-bytes").read_bytes(), received)
+                if mode == "same-text":
+                    self.assertEqual((row["round"], row["attempt"]), (1, first["attempt"]))
+                    self.assertEqual(received, hidden.removeprefix("› ").encode() + b"\r")
+                    self.assertEqual(len((self.work / "typed").read_text().splitlines()), 1)
+                else:
+                    self.assertEqual((row["round"], row["attempt"]), (2, audit["attempt"]))
+                    self.assertNotEqual(row["attempt"], first["attempt"])
+                    completed, = [m for m in row["messages"] if m["type"] == "done"]
+                    self.assertEqual((completed["id"], completed["attempt"]),
+                                     (done["message"], first["attempt"]))
+                    self.assertTrue(received.startswith(b"[router] New task for you"))
+                    self.assertNotIn(b"\r", received)
+                    self.assertFalse((self.work / "typed").exists())
                 self.assertFalse((self.work / "formal-input").exists())
                 self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
+                print("R23 redraw " + json.dumps({
+                    "mode": mode, "draft_scroll": scroll_draft, "result": audit["result"],
+                    "round": row["round"], "enter_count": received.count(b"\r"), "formal_count": 0,
+                }), flush=True)
         self.work = original
 
     def test_public_input_confirms_new_entry_when_lookalike_is_only_in_history(self):
@@ -4761,17 +4842,17 @@ int fsync(int fd) {
                 dispatch = first["dispatch"]
                 if mode == "refusal":
                     (self.work / "finish-first-externally").touch()
-                    self.await_input_value(lambda: (self.work / "first-done").exists())
-                (self.work / "seed-history").write_text(mode)
-                self.await_input_value(lambda: (self.work / "history-ready").exists())
-                pane = self.active_pane(dispatch)
-                hidden = "historical" if mode == "same-text" else "no operation was sent"
-                capture = self.tmux + ["capture-pane", "-p", "-J", "-t", pane]
-                self.assertNotIn(hidden, subprocess.check_output(capture, text=True))
-                self.assertIn(hidden, subprocess.check_output(capture + ["-S", "-"], text=True))
+                    done_path = self.work / "first-done"
+                    self.await_input_value(done_path.exists)
+                    done = json.loads(done_path.read_text())
+                hidden, screen = self.seed_public_input_history(dispatch, mode)
+                self.assertIn("history head 0\nhistory head 1", screen())
                 if mode == "same-text":
-                    receipt = cli("nudge", dispatch, "--text", "historical", token=token)
+                    args = ("nudge", dispatch, "--text", "historical", "--message-id", "new-intent")
+                    receipt = cli(*args, token=token)
+                    self.assertEqual(cli(*args, token=token), {**receipt, "duplicate": True})
                     row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+                    self.assertEqual((row["round"], row["attempt"]), (1, first["attempt"]))
                     self.assertEqual(row["audit"][-1]["inputEvidence"], "appended-user-entry")
                     self.assertEqual([m["id"] for m in row["messages"] if m["to"] == "worker"],
                                      [receipt["message"]])
@@ -4785,12 +4866,23 @@ int fsync(int fd) {
                     self.assertIn("continue refused", rejected)
                     row = cli("status", "--dispatch", dispatch)["dispatches"][0]
                     self.assertEqual((row["round"], row["attempt"]), (1, first["attempt"]))
+                    completed, = [m for m in row["messages"] if m["type"] == "done"]
+                    self.assertEqual((completed["id"], completed["attempt"]),
+                                     (done["message"], first["attempt"]))
                     self.assertEqual(row["audit"][-1]["inputEvidence"], "new-host-refusal")
                     self.assertFalse(any(m["to"] == "worker" for m in row["messages"]))
                     self.assertNotIn(b"\r", (self.work / "input-bytes").read_bytes())
                     self.assertFalse((self.work / "typed").exists())
                     self.assertFalse((self.work / "formal-input").exists())
+                self.assertIn(f"{hidden}\n\n", screen())
+                self.assertNotIn("history head", screen())
+                self.assertIn("history head 0\nhistory head 1", screen("-S", "-"))
+                self.assertEqual(screen("-S", "-").count(hidden), 2)
                 self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
+                print("R23 new entry " + json.dumps({
+                    "mode": mode, "evidence": row["audit"][-1]["inputEvidence"],
+                    "round": row["round"], "enter_count": (self.work / "input-bytes").read_bytes().count(b"\r"),
+                }), flush=True)
         self.work = original
 
     def test_public_nudge_reads_confirmed_key_while_other_input_is_unresolved(self):
