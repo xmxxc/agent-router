@@ -72,3 +72,31 @@ fn original_kernel_filename_starts_protocol_without_arguments() {
     assert_eq!(hello["event"], "hello");
     assert_eq!(hello["protocol"], 1);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn herdr_reconcile_help_and_missing_evidence() {
+    let wfc = env!("CARGO_BIN_EXE_wfc");
+    let help = Command::new(wfc)
+        .args(["herdr-reconcile", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8(help.stdout)
+        .unwrap()
+        .contains("--old-writer-evidence"));
+    let invalid = Command::new(wfc)
+        .args([
+            "herdr-reconcile",
+            "d-12345678",
+            "--pane",
+            "p1",
+            "--terminal",
+            "t1",
+            "--actor",
+            "operator",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(invalid.status.code(), Some(2));
+}

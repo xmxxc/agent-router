@@ -1,4 +1,4 @@
-//! Public lifecycle client for the tmux create/inspect/close protocol (#31).
+//! Public lifecycle clients for tmux and Herdr.
 use super::{host::Launch, valid_identity, write_json};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
@@ -286,7 +286,7 @@ fn closed_path(state: &Path, row: &Value) -> Result<PathBuf> {
     )))
 }
 
-fn archive(state: &Path, row: &Value) -> Result<Option<Value>> {
+pub(super) fn archive(state: &Path, row: &Value) -> Result<Option<Value>> {
     match File::open(closed_path(state, row)?) {
         Ok(f) => {
             let saved: Value = serde_json::from_reader(f)?;
@@ -447,7 +447,127 @@ fn closed_worker(state: &Path, row: &Value, saved: &Value) -> Result<Value> {
     Ok(worker.clone())
 }
 
-pub fn observe(state: &Path, row: &Value) -> Result<(Value, Value)> {
+#[cfg(target_os = "linux")]
+pub(super) fn herdr_receipt(state: &Path, create: &Value) -> Result<Value> {
+    let Some(name) = create["receipt"].as_str() else {
+        return Ok(Value::Null);
+    };
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .context("invalid launch receipt")?;
+    ensure!(
+        stem.len() == 32
+            && stem.bytes().all(|b| b.is_ascii_hexdigit())
+            && path.extension() == Some("json".as_ref()),
+        "invalid launch receipt"
+    );
+    private_receipt(state, Some(stem))
+}
+
+pub(super) fn herdr_closes(row: &Value) -> impl DoubleEndedIterator<Item = &Value> {
+    row["audit"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|event| event["operation"] == "close")
+}
+
+fn close_is_pending(event: &Value) -> bool {
+    matches!(event["result"].as_str(), Some("pending" | "uncertain"))
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn pending_herdr_close(row: &Value) -> Option<&Value> {
+    herdr_closes(row)
+        .next_back()
+        .filter(|event| close_is_pending(event))
+}
+
+fn same_execution(row: &Value, event: &Value) -> bool {
+    ["dispatch", "round", "attempt"]
+        .iter()
+        .all(|&k| event[k] == row[k])
+}
+
+pub(super) fn herdr_close_blocks_done(state: &Path, row: &Value) -> Result<bool> {
+    let latest = herdr_closes(row).rfind(|event| same_execution(row, event));
+    Ok(
+        latest.is_some_and(|e| close_is_pending(e) || e["result"] == "completed")
+            || archive(state, row)?.is_some(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn verify_herdr_close_target(row: &Value, event: &Value) -> Result<()> {
+    let current = &row["backendHandle"];
+    let target = &event["target"];
+    ensure!(
+        [
+            "dispatch",
+            "round",
+            "attempt",
+            "endpoint",
+            "service",
+            "workspace",
+            "pane",
+            "terminal",
+            "nonce"
+        ]
+        .iter()
+        .all(|&k| target[k] == current[k])
+            && same_execution(row, event)
+            && same_execution(row, current)
+            && current["endpoint"] == row["endpoint"]
+            && current["receipt"] == row["create"]["receipt"],
+        "close intent target changed"
+    );
+    let (archived, known) = target["writerProcesses"]
+        .as_array()
+        .zip(current["writerProcesses"].as_array())
+        .context("close intent target changed: missing Herdr writer list")?;
+    ensure!(
+        archived.first() == known.first(),
+        "close intent target changed: Herdr root writer identity differs or is missing"
+    );
+    ensure!(
+        archived.iter().all(|writer| known.contains(writer)),
+        "close intent target changed: unrecognized Herdr writer"
+    );
+    let verify_stop = |binding: &Value| -> Result<bool> {
+        let handle: wfc_herdr::Handle = serde_json::from_value(binding.clone())?;
+        Ok(handle.verified_stopped()?)
+    };
+    let current_stopped = verify_stop(current).context("close intent target changed")?;
+    let archived_stopped = verify_stop(target).context("close intent target changed")?;
+    ensure!(
+        current_stopped == archived_stopped
+            && (!known.is_empty() || current_stopped)
+            && target["writerStoppedEvidence"] == current["writerStoppedEvidence"],
+        "close intent target changed: missing or changed Herdr writer stop evidence"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn herdr_worker(evidence: &Value, inspection: &Value) -> Value {
+    match evidence["category"].as_str() {
+        Some("process_exited") => {
+            json!({"state":"exited","exit_code":evidence["exitCode"],"signal":null})
+        }
+        Some("started") | None if inspection["alive"] == true && inspection["owned"] == true => {
+            json!({"state":"running"})
+        }
+        _ => json!({"state":"unknown"}),
+    }
+}
+
+pub fn observe(state: &Path, row: &mut Value) -> Result<(Value, Value)> {
+    #[cfg(target_os = "linux")]
+    if row["backend"] == "herdr" {
+        return super::herdr::observe(state, row);
+    }
     let saved = archive(state, row)?.unwrap_or(Value::Null);
     if confirmed(row, &saved) {
         let mut observation = json!({"result":"completed","alive":false});
@@ -523,6 +643,10 @@ fn inspect_worker(state: &Path, row: &Value, saved: &Value) -> Result<(Value, Va
 }
 
 pub fn close(state: &Path, row: &Value) -> Result<Value> {
+    #[cfg(target_os = "linux")]
+    if row["backend"] == "herdr" {
+        return super::herdr::close(state, row);
+    }
     let id = row["dispatch"].as_str().context("missing dispatch")?;
     // Archived replay works on read-only state. A first close serializes on a
     // stable per-attempt file regardless of which publication the reader saw.
