@@ -1,6 +1,7 @@
-//! Persist the claim before crossing the Codex queue boundary. Only the exact
-//! still-outstanding claim can be settled when the external command returns.
+//! Persist the claim before crossing the transport boundary. Only the exact
+//! still-outstanding claim can be settled when the transport returns.
 mod codex;
+mod opencode;
 pub(crate) mod queue_owner;
 mod registration;
 pub use registration::waiters;
@@ -8,7 +9,6 @@ pub use registration::waiters;
 use super::{state_dir, Inbox, State};
 use crate::workflow::{read_record, valid_id, worker_owner};
 use anyhow::{bail, ensure, Context, Result};
-use codex::Outcome;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -22,13 +22,35 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const USAGE: &str = "wfc relay (--codex | --codex-thread UUID) [--scope NAME] [--for SECONDS] [--detach] [--stall-after SECONDS] [--owner-token TOKEN]";
+pub const USAGE: &str = "wfc relay (--codex | --codex-thread UUID | --opencode-url URL --opencode-session ID) [--scope NAME] [--for SECONDS] [--detach] [--stall-after SECONDS] [--owner-token TOKEN]";
 
 pub struct Relay<'a> {
     scope: Option<&'a str>,
-    thread: Option<&'a str>,
+    target: Target<'a, Option<&'a str>>,
     detach: bool,
     lifetime: Option<Duration>,
+}
+
+enum Target<'a, Thread> {
+    Codex(Thread),
+    OpenCode(opencode::Target<'a>),
+}
+
+impl<'a> Target<'a, Option<&'a str>> {
+    fn resolve(self) -> Result<Target<'a, String>> {
+        Ok(match self {
+            Target::Codex(thread) => {
+                let current = env::var("CODEX_THREAD_ID").ok();
+                Target::Codex(codex::controller(
+                    thread
+                        .or(current.as_deref())
+                        .filter(|s| !s.is_empty())
+                        .context("--codex needs CODEX_THREAD_ID")?,
+                )?)
+            }
+            Target::OpenCode(target) => Target::OpenCode(target),
+        })
+    }
 }
 
 fn seconds(value: &str) -> Result<Duration> {
@@ -54,7 +76,8 @@ impl<'a> Relay<'a> {
             match flag {
                 "--codex" if !codex => codex = true,
                 "--detach" if !detach => detach = true,
-                "--codex-thread" | "--scope" | "--for" | "--stall-after" | "--owner-token" => {
+                "--codex-thread" | "--opencode-url" | "--opencode-session" | "--scope"
+                | "--for" | "--stall-after" | "--owner-token" => {
                     let v = args
                         .next()
                         .and_then(|v| v.to_str())
@@ -66,13 +89,19 @@ impl<'a> Relay<'a> {
             }
         }
         let thread = opts.get("--codex-thread").copied();
-        ensure!(codex != thread.is_some(), "give --codex or --codex-thread");
+        let url = opts.get("--opencode-url").copied();
+        let session = opts.get("--opencode-session").copied();
+        let target = match (codex, thread, url, session) {
+            (true, None, None, None) | (false, Some(_), None, None) => Target::Codex(thread),
+            (false, None, Some(url), Some(session)) => Target::OpenCode(opencode::Target::parse(url, session)?),
+            _ => bail!("give exactly one controller: --codex, --codex-thread, or --opencode-url with --opencode-session"),
+        };
         if let Some(value) = opts.get("--stall-after") {
             seconds(value)?;
         }
         Ok(Self {
             scope: opts.get("--scope").copied(),
-            thread,
+            target,
             detach,
             lifetime: opts
                 .get("--for")
@@ -89,13 +118,7 @@ impl<'a> Relay<'a> {
         );
         let state = state_dir()?;
         scope_assignments(&state, self.scope)?;
-        let current = env::var("CODEX_THREAD_ID").ok();
-        let thread = codex::controller(
-            self.thread
-                .or(current.as_deref())
-                .filter(|s| !s.is_empty())
-                .context("--codex needs CODEX_THREAD_ID")?,
-        )?;
+        let target = self.target.resolve()?;
         let timeout = seconds(&env::var("WFC_QUEUE_TIMEOUT").unwrap_or_else(|_| "60".into()))?;
         if self.detach {
             fs::create_dir_all(&state)?;
@@ -108,7 +131,16 @@ impl<'a> Relay<'a> {
                 .open(&log)?;
             ensure!(out.metadata()?.is_file(), "invalid relay log");
             let mut cmd = Command::new(env::current_exe()?);
-            cmd.args(["relay", "--codex-thread", &thread]);
+            cmd.arg("relay");
+            match &target {
+                Target::Codex(thread) => cmd.args(["--codex-thread", thread]),
+                Target::OpenCode(target) => cmd.args([
+                    "--opencode-url",
+                    target.url,
+                    "--opencode-session",
+                    target.session,
+                ]),
+            };
             if let Some(scope) = self.scope {
                 cmd.args(["--scope", scope]);
             }
@@ -124,16 +156,25 @@ impl<'a> Relay<'a> {
             println!("{}", json!({"pid":child.id(),"log":log}));
             return Ok(());
         }
-        let _entry = registration::Registration::create(&state, self.scope, &thread)?;
+        let destination = match &target {
+            Target::Codex(thread) => ("thread", thread.as_str()),
+            Target::OpenCode(target) => ("session", target.session),
+        };
+        let _entry = registration::Registration::create(&state, self.scope, destination)?;
         let start = Instant::now();
         let remaining = || {
             self.lifetime
                 .map_or(Duration::MAX, |d| d.saturating_sub(start.elapsed()))
         };
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        ensure!(page_size > 0, "cannot determine queue argument limit");
-        // Linux MAX_ARG_STRLEN counts the terminating NUL.
-        let mut budget = page_size as usize * 32;
+        let mut budget = match &target {
+            Target::Codex(_) => {
+                let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                ensure!(page_size > 0, "cannot determine queue argument limit");
+                // Linux MAX_ARG_STRLEN counts the terminating NUL.
+                page_size as usize * 32
+            }
+            Target::OpenCode(_) => usize::MAX, // The batch is an HTTP body, not an argument.
+        };
         let mut diagnosed = HashSet::new();
         while !remaining().is_zero() {
             let order = transport_lock(&state, self.scope)?;
@@ -154,7 +195,11 @@ impl<'a> Relay<'a> {
                 None => None,
             };
             if let Some((batch, text)) = batch {
-                let outcome = codex::queue(&thread, &batch, &text, remaining().min(timeout))?;
+                let limit = remaining().min(timeout);
+                let outcome = match &target {
+                    Target::Codex(thread) => codex::queue(thread, &batch, &text, limit)?,
+                    Target::OpenCode(target) => target.deliver(&text, limit),
+                };
                 if outcome != Outcome::Uncertain {
                     loop {
                         if let Some(mut inbox) = Inbox::try_open(&state)? {
@@ -168,10 +213,12 @@ impl<'a> Relay<'a> {
                         std::thread::sleep(remaining().min(Duration::from_millis(10)));
                     }
                 }
-                ensure!(
-                    outcome != Outcome::Missing,
-                    "no rollout found for thread {thread}; messages stay waiting"
-                );
+                if let Target::Codex(thread) = &target {
+                    ensure!(
+                        outcome != Outcome::Missing,
+                        "no rollout found for thread {thread}; messages stay waiting"
+                    );
+                }
                 if outcome == Outcome::TooLong {
                     // exec rejected this exact argument before submission. Its byte
                     // length excludes the NUL, so the next claim must be smaller.
@@ -212,6 +259,52 @@ fn transport_lock(state: &Path, scope: Option<&str>) -> Result<Option<Vec<File>>
     Ok(Some(locks))
 }
 
+// Match the Python queue text, including UTF-8, JSON separators and field order.
+const PREFIX: &str = "[router] Messages for the controller: {\"messages\": [";
+const SUFFIX: &str = "]}";
+
+fn envelope(m: &Value) -> String {
+    let header = [
+        "id",
+        "messageId",
+        "dispatch",
+        "type",
+        "state",
+        "statusVersion",
+    ];
+    let mut fields = Vec::new();
+    let mut field = |k: &str, v: &Value| fields.push(format!("{}: {v}", json!(k)));
+    for k in header {
+        field(k, &m[k]);
+    }
+    for (k, v) in m.as_object().expect("controller message").iter() {
+        if !header.contains(&k.as_str()) {
+            field(k, v);
+        }
+    }
+    field("delivery", &json!("pending"));
+    field(
+        "deliveryAttempt",
+        &json!(format!(
+            "relay:{}:{}",
+            m["messageId"].as_str().unwrap(),
+            m["statusVersion"]
+        )),
+    );
+    format!("{{{}}}", fields.join(", "))
+}
+
+// Discriminants also serve as private exit codes for the Codex queue supervisor.
+#[derive(PartialEq, Eq)]
+#[repr(u8)]
+pub(super) enum Outcome {
+    Delivered = 0,
+    Failed = 20,
+    Missing = 21,
+    Uncertain = 22,
+    TooLong = 23,
+}
+
 fn claim_batch(
     inbox: &mut Inbox,
     scope: Option<&str>,
@@ -220,7 +313,7 @@ fn claim_batch(
     diagnosed: &mut HashSet<u64>,
 ) -> Result<Option<(Vec<Value>, String)>> {
     let mut messages = Vec::new();
-    let mut text = String::from(codex::PREFIX);
+    let mut text = String::from(PREFIX);
     for m in &mut inbox.messages {
         if m.delivery.state != State::Unsent || scope.is_some_and(|s| s != m.worker.scope()) {
             continue;
@@ -235,8 +328,8 @@ fn claim_batch(
             continue;
         }
         let view = m.view_at(State::Unknown, m.delivery.next_version()?);
-        let envelope = codex::envelope(&view);
-        let size = codex::PREFIX.len() + envelope.len() + codex::SUFFIX.len() + 1;
+        let envelope = envelope(&view);
+        let size = PREFIX.len() + envelope.len() + SUFFIX.len() + 1;
         if size > budget {
             if diagnosed.insert(m.id) {
                 println!("router relay: message {} ({}) needs {size} queue argument bytes, limit {budget}; available to wait", m.id, m.message_id);
@@ -244,7 +337,7 @@ fn claim_batch(
             continue;
         }
         if !messages.is_empty() {
-            if text.len() + 2 + envelope.len() + codex::SUFFIX.len() + 1 > budget {
+            if text.len() + 2 + envelope.len() + SUFFIX.len() + 1 > budget {
                 break;
             }
             text.push_str(", ");
@@ -256,7 +349,7 @@ fn claim_batch(
     if messages.is_empty() {
         return Ok(None);
     }
-    text.push_str(codex::SUFFIX);
+    text.push_str(SUFFIX);
     inbox
         .save()
         .context("claim controller messages for relay")?;

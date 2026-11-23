@@ -1,5 +1,6 @@
+use super::Outcome;
 use anyhow::{bail, ensure, Context, Result};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::{
     env,
     ffi::OsStr,
@@ -87,53 +88,6 @@ pub(super) fn controller(thread: &str) -> Result<String> {
         "no rollout for Codex thread {thread} under {}",
         root.display()
     )
-}
-
-// Match the Python queue text, including UTF-8, JSON separators and field order.
-pub(super) const PREFIX: &str = "[router] Messages for the controller: {\"messages\": [";
-pub(super) const SUFFIX: &str = "]}";
-
-pub(super) fn envelope(m: &Value) -> String {
-    let header = [
-        "id",
-        "messageId",
-        "dispatch",
-        "type",
-        "state",
-        "statusVersion",
-    ];
-    let mut fields = Vec::new();
-    let mut field = |k: &str, v: &Value| fields.push(format!("{}: {v}", json!(k)));
-    for k in header {
-        field(k, &m[k]);
-    }
-    for (k, v) in m.as_object().expect("controller message").iter() {
-        if !header.contains(&k.as_str()) {
-            field(k, v);
-        }
-    }
-    field("delivery", &json!("pending"));
-    field(
-        "deliveryAttempt",
-        &json!(format!(
-            "relay:{}:{}",
-            m["messageId"].as_str().unwrap(),
-            m["statusVersion"]
-        )),
-    );
-    format!("{{{}}}", fields.join(", "))
-}
-
-// Exit codes used only between wfc relay and its queue supervisor. An unexpected
-// status after launch (including a signal or an internal error) stays uncertain.
-#[derive(PartialEq, Eq)]
-#[repr(u8)]
-pub(super) enum Outcome {
-    Delivered = 0,
-    Failed = 20,
-    Missing = 21,
-    Uncertain = 22,
-    TooLong = 23,
 }
 
 pub(super) fn missing_rollout(output: &mut fs::File, thread: &OsStr) -> io::Result<bool> {

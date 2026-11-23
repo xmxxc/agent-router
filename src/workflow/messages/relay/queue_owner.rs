@@ -1,7 +1,8 @@
 //! A separate wfc survives loss of the relay long enough to stop this queue
 //! invocation's process group. A persistent host owns a separate group.
 use super::super::private_file;
-use super::codex::{codex_home, missing_rollout, Outcome};
+use super::codex::{codex_home, missing_rollout};
+use super::Outcome;
 use anyhow::{ensure, Result};
 use std::{
     env,

@@ -4,7 +4,7 @@ Rust 版 `wfc` 在同一个可执行文件中提供命令行和终端内核。�
 
 ## Linux x64
 
-在带 C 链接器的 GNU/Linux 上，从仓库根目录运行下列命令。先将 Zig 0.16.0 放入 PATH，或用 ZIG 指定可执行文件的绝对路径。
+在装有 C 链接器、pkg-config、zlib 和 OpenSSL 开发包的 GNU/Linux 上，从仓库根目录运行下列命令。先将 Zig 0.16.0 放入 PATH，或用 ZIG 指定可执行文件的绝对路径。
 
 ```sh
 rustup toolchain install 1.96.1 --profile minimal
@@ -181,7 +181,7 @@ timeout 240s python3 tools/check_wfc.py /path/to/workflow-core target/wfc-kernel
 
 脚本运行 WFC 已有的六个真实进程用例，并检查每个用例都实际执行。首次候选的 Linux x64 独立编译、终端测试和 stdio 往返已实测。Windows 原生和 Linux 委派进程树的验收由总控在冻结候选上执行。[来源、补丁与复建方法](SOURCES.md)
 
-## 在 Linux 将完成回执送回 Codex 聊天
+## 在 Linux 将完成回执送回控制端聊天
 
 在发起派发的 Codex 会话内，使用同一份 `WFC_STATE` 和派发回执中的 scope 注册 relay。例如，下面的转发进程独立运行 90 秒，启动命令返回它的 PID 和日志路径。
 
@@ -195,3 +195,11 @@ wfc status
 同一批完成回执会随一次 `codex queue --thread … --message … --resume` 发送。聊天收到后按原 `messageId` 执行 `wfc ack MESSAGE`。队列返回成功后回执为 `received`。程序启动失败会恢复为 `unsent`，下次轮询可重试。队列明确报告找不到目标时恢复为 `unsent` 并退出。超时或其他非零退出保留 `unknown`；重启 relay 后仍可查询原消息，核对聊天后使用上述 `resolve` 和 `ack`。队列确认和聊天处理结果分别记录为 `received` 和 `processed`。
 
 每次队列调用都有独立的进程组。队列程序和继承该组的临时辅助进程由同一监督进程清理；队列返回、调用超时、relay 意外退出都会触发清理。已有 Desktop 服务保有自己的进程组。需要在调用结束后继续运行的宿主，应在独立会话或进程组中启动。
+
+OpenCode 控制端使用正在监听的 OpenCode TUI 或 `opencode serve` 的 HTTP(S) 地址和原会话 ID。
+
+```sh
+wfc relay --opencode-url http://127.0.0.1:4096 --opencode-session ses_example --scope review --for 90 --detach
+```
+
+两个 OpenCode 参数必须成对提供，与 Codex 目标互斥。`status.waiters` 显示 OpenCode 的目标 `session`。relay 向该地址的 `/session/<id>/prompt_async` POST 一批原回执；聊天仍用原 `messageId` 确认。HTTP 2xx 确认为 `received`，明确拒连则恢复为 `unsent`。重定向、其他 HTTP 状态、超时和连接中断均保留 `unknown`。relay 直连显式目标，使用系统 TLS 信任库，按 `WFC_QUEUE_TIMEOUT`（默认 60 秒）或剩余寿命中较短者设置请求超时。Linux 可执行文件链接系统 OpenSSL，HTTPS 验证使用系统信任库。
