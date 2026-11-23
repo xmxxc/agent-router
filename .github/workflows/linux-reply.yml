@@ -1,8 +1,7 @@
-name: Linux reply, reclaim and controller receipts
+name: Jammy reply, reclaim, resume and controller receipts
 on:
   push:
-    branches: [rust-router/11-reply-r11-tmux-composer]
-  workflow_dispatch:
+    branches: [rust-router/11-reply-r13-tmux-post-send-jammy-ci]
 
 permissions:
   contents: read
@@ -13,10 +12,12 @@ defaults:
 
 jobs:
   worker-replies:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 35
     env:
-      WFC_BUILD_ID: ${{ github.sha }}
+      PRODUCT_SHA: beacb150e76330413596c5acfaf385e6110ed12f
+      PRODUCT_TREE: 1685b84056d9fe4766e26d401e2516f6975d63cb
+      PRODUCT_PARENTS: a9e99529cfbc540d2ad1ddcbfba97e07f1ee01a9
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       HERDR_SOURCE_SHA: 2ecf19a92fc3a7fff75b6ce3655ef04f4625ec01
       CODEX_SOURCE_SHA: 086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a
@@ -27,13 +28,22 @@ jobs:
       - name: Record run identity
         run: |
           mkdir -p "$EVIDENCE"
-          printf 'Workflow %s\nRun %s attempt %s\nExpected product %s\n' \
-            "$GITHUB_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$WFC_BUILD_ID" | tee "$EVIDENCE/run.log"
-          printf 'Codex screen fixture source %s\n' "$CODEX_SOURCE_SHA" | tee -a "$EVIDENCE/run.log"
-          uname -a | tee -a "$EVIDENCE/run.log"
+          {
+            printf 'Workflow %s\nHead %s\nRef %s\nRun %s attempt %s\nExpected product %s\n' \
+              "$GITHUB_WORKFLOW_SHA" "$GITHUB_SHA" "$GITHUB_REF" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PRODUCT_SHA"
+            printf 'Codex screen fixture source %s\n' "$CODEX_SOURCE_SHA"
+            cat /etc/os-release
+            getconf GNU_LIBC_VERSION
+            uname -a
+          } | tee "$EVIDENCE/run.log"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ env.WFC_BUILD_ID }}
+          ref: ${{ github.workflow_sha }}
+          path: ci
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PRODUCT_SHA }}
           path: product
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -52,11 +62,28 @@ jobs:
       - name: Verify sources and prepare the native build
         working-directory: product
         run: |
-          git log -1 --format='Rust HEAD %H tree %T' | tee "$EVIDENCE/sources.log"
-          test "$(git rev-parse HEAD)" = "$WFC_BUILD_ID"
-          test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
-          sha256sum vendor/INPUTS.sha256 tests/herdr_public.py tools/check_tmux.py crates/herdr/tests/live.py crates/herdr/tests/composer.py tests/relay.py tests/opencode_relay.py | tee "$EVIDENCE/inputs.log"
-          sha256sum -c vendor/INPUTS.sha256 2>&1 | tee -a "$EVIDENCE/inputs.log"
+          {
+            test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
+            test "$(git -C ../ci rev-parse HEAD)" = "$GITHUB_SHA"
+            ci_parent=$(git -C ../ci cat-file -p HEAD | sed -n '/^$/q; s/^parent //p' | paste -sd' ' -)
+            test "$ci_parent" = "$PRODUCT_SHA"
+            test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+            test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+            parents=$(git cat-file -p HEAD | sed -n '/^$/q; s/^parent //p' | paste -sd' ' -)
+            test "$parents" = "$PRODUCT_PARENTS"
+            test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
+            printf 'CI %s tree %s parent %s\n' "$GITHUB_SHA" "$(git -C ../ci rev-parse 'HEAD^{tree}')" "$ci_parent"
+            printf 'Product %s tree %s parents %s\n' "$PRODUCT_SHA" "$PRODUCT_TREE" "$parents"
+            git -C ../native-input show -s --format='Native input %H tree %T'
+          } | tee "$EVIDENCE/sources.log"
+          sha256sum vendor/INPUTS.sha256 tests/herdr_public.py tools/check_tmux.py \
+            crates/herdr/tests/live.py crates/herdr/tests/composer.py tests/relay.py tests/opencode_relay.py \
+            ../ci/.github/workflows/linux-reply.yml ../native-input/vendor/zlib-1.3.1.tar.gz | tee "$EVIDENCE/inputs.log"
+          printf '%s\n' 'Resume fixture from 7441bf7c38eeb6aba6d2c7ad71cd6c9640d8ac42 (patch SHA-256 3352bcc9d9784cb99adb975f0c04d7a5a21bd6d9570cf8f9f3e8f706771af6d8)' \
+            | tee -a "$EVIDENCE/inputs.log"
+          printf '%s\n' '35ac6fce7f3fe7305f4cca85ac6c232deaee8c89f11b574d0dafb4fb4614266d  ../ci/tools/check_tmux.py' \
+            | tee -a "$EVIDENCE/inputs.log" | sha256sum --check --strict | tee -a "$EVIDENCE/inputs.log"
+          sha256sum --check --strict vendor/INPUTS.sha256 2>&1 | tee -a "$EVIDENCE/inputs.log"
           rustup toolchain install 1.96.1 --profile minimal 2>&1 | tee "$EVIDENCE/toolchain.log"
           { rustc -vV; cargo --version; zig version; python --version; pkg-config --modversion openssl zlib; } | tee -a "$EVIDENCE/toolchain.log"
           python tools/prepare.py --zlib-archive ../native-input/vendor/zlib-1.3.1.tar.gz 2>&1 | tee -a "$EVIDENCE/inputs.log"
@@ -64,11 +91,11 @@ jobs:
         id: build
         working-directory: product
         run: |
-          cargo build --release --locked --bin wfc 2>&1 | tee "$EVIDENCE/build.log"
-          sha256sum target/release/wfc | tee "$EVIDENCE/binary.log"
+          WFC_BUILD_ID="$PRODUCT_SHA" cargo build --release --locked --bin wfc 2>&1 | tee "$EVIDENCE/build.log"
+          sha256sum target/release/wfc | tee "$EVIDENCE/elf.sha256"
           version=$(target/release/wfc --version)
-          printf '%s\n' "$version" | tee -a "$EVIDENCE/binary.log"
-          [[ "$version" == *"(Rust, x86_64-unknown-linux-gnu, release, build $WFC_BUILD_ID)" ]]
+          printf '%s\n' "$version" | tee "$EVIDENCE/binary.log"
+          [[ "$version" == *"(Rust, x86_64-unknown-linux-gnu, release, build $PRODUCT_SHA)" ]]
       - name: Verify the Herdr screen parser
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: product
@@ -97,6 +124,7 @@ jobs:
             printf '%s\n' "$version"
             test "$version" = 'herdr 0.9.5'
           } 2>&1 | tee "$EVIDENCE/herdr-input.log"
+          sha256sum --check --strict "$EVIDENCE/elf.sha256" | tee -a "$EVIDENCE/elf-check.log"
           python -Bu tests/herdr_public.py "$herdr" target/release/wfc -v \
             PublicLifecycle.test_public_reply_accepts_styled_compact_herdr_empty_composer \
             PublicLifecycle.test_public_reply_protects_compact_herdr_drafts_without_footer_proof \
@@ -113,7 +141,7 @@ jobs:
             PublicLifecycle.test_question_replays_after_herdr_close_intent \
             PublicLifecycle.test_reclaim_uses_verified_herdr_close_and_keeps_sibling \
             2>&1 | tee "$EVIDENCE/herdr-public.log"
-      - name: Verify tmux reply text and controller takeover
+      - name: Verify tmux reply, controller takeover and resume callbacks
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: product
         run: |
@@ -122,35 +150,64 @@ jobs:
             sudo apt-get install -y --no-install-recommends tmux 2>&1 | tee -a "$EVIDENCE/tmux-install.log"
           fi
           tmux -V | tee "$EVIDENCE/tmux.log"
-          python -Bu tools/check_tmux.py target/release/wfc -v \
+          sha256sum --check --strict "$EVIDENCE/elf.sha256" | tee -a "$EVIDENCE/elf-check.log"
+          python -Bu ../ci/tools/check_tmux.py target/release/wfc -v \
             Backend.test_public_reply_once_and_original_done \
             Backend.test_public_reply_preserves_tmux_draft_with_changed_whitespace \
+            Backend.test_public_reply_keeps_claim_when_tmux_draft_reappears \
             Backend.test_public_reply_requires_confirmed_tmux_chat_composer \
             Backend.test_managed_tmux_reply_rechecks_owner_while_waiting \
             Backend.test_public_reply_and_reclaim_preserve_controller_receipts \
             Backend.test_public_reclaim_preview_mixed_results_and_history \
             Backend.test_public_reclaim_stops_on_scope_authority_loss \
+            Backend.test_public_resume_after_reclaim_preserves_history \
+            Backend.test_public_resume_preserves_conversation_rounds_and_callback_fences \
             2>&1 | tee -a "$EVIDENCE/tmux.log"
       - name: Verify controller delivery receipts for both routes
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: product
         run: |
+          sha256sum --check --strict "$EVIDENCE/elf.sha256" | tee -a "$EVIDENCE/elf-check.log"
           python -Bu tests/relay.py target/release/wfc -v \
             Relay.test_question_envelope_matches_python_json_separators \
             2>&1 | tee "$EVIDENCE/codex-relay.log"
           python -Bu tests/opencode_relay.py target/release/wfc -v \
             OpenCodeRelay.test_204_detached_preserves_batch_order_scope_and_session \
             2>&1 | tee "$EVIDENCE/opencode-relay.log"
+      - name: Verify the release ELF and selected results
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: |
+          sha256sum --check --strict "$EVIDENCE/elf.sha256" | tee -a "$EVIDENCE/elf-check.log"
+          {
+            grep -E '^test result: ok\. 6 passed; 0 failed; 0 ignored;' "$EVIDENCE/herdr-screen.log"
+            for entry in herdr-public:14 tmux:10 codex-relay:1 opencode-relay:1; do
+              log="$EVIDENCE/${entry%:*}.log"
+              count="${entry#*:}"
+              printf '%s\n' "${entry%:*}"
+              grep -E "^Ran $count tests? in " "$log"
+              grep -x 'OK' "$log"
+            done
+          } | tee "$EVIDENCE/results.log"
       - name: Checksum evidence
         if: always()
         run: |
           cd "$EVIDENCE"
-          sha256sum -- *.log > SHA256SUMS
-          sha256sum -c SHA256SUMS
+          find . -maxdepth 1 -type f \( -name '*.log' -o -name '*.sha256' \) -print0 \
+            | sort -z | xargs -0 sha256sum -- > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        id: evidence
         if: always()
         with:
           name: linux-reply-${{ github.sha }}-attempt-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14
+      - name: Record the evidence artifact identity
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
+        env:
+          ARTIFACT_ID: ${{ steps.evidence.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.evidence.outputs.artifact-digest }}
+        run: |
+          printf 'Evidence artifact %s, SHA-256 %s\n' "$ARTIFACT_ID" "$ARTIFACT_DIGEST" | tee -a "$GITHUB_STEP_SUMMARY"
