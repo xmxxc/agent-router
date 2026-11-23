@@ -10,6 +10,9 @@ use std::{
     process::{Command, Stdio},
 };
 
+// Public assignments published with the session-aware tmux protocol.
+pub(super) const LAUNCH_PROTOCOL: u64 = 8;
+
 #[cfg(target_os = "linux")]
 pub fn tmux_socket() -> Result<PathBuf> {
     let socket = env::var_os("WFC_TMUX_SOCKET")
@@ -317,9 +320,15 @@ fn matches_revocation(row: &Value, fact: &Value) -> bool {
         && fact["category"] == "not_started"
 }
 
+fn revocation_reply(state: &Path, row: &Value, answer: &Value) -> Result<Option<Value>> {
+    (answer["category"] == "not_started")
+        .then(|| revocation(state, row, answer))
+        .transpose()
+}
+
 fn revocation(state: &Path, row: &Value, answer: &Value) -> Result<Value> {
     ensure!(
-        matches_revocation(row, answer) && answer["closeEffect"] == "already_absent",
+        matches_revocation(row, answer),
         "close uncertain: cancellation does not identify this reservation"
     );
     let stem = answer["launchId"].as_str().context("missing launchId")?;
@@ -341,19 +350,44 @@ fn revocation(state: &Path, row: &Value, answer: &Value) -> Result<Value> {
     Ok(fact)
 }
 
+fn saved_revocation<'a>(row: &Value, saved: &'a Value) -> Option<&'a Value> {
+    let fact = &saved["revocation"];
+    (saved["worker"] == json!({"state":"not_started"})
+        && matches_revocation(row, fact)
+        && saved["closeOperationId"] == fact["closeOperationId"]
+        && saved["launchId"] == fact["launchId"]
+        && saved["executionId"] == row["attempt"]
+        && receipt_id(row).is_ok_and(|known| known.is_none_or(|id| fact["launchId"] == id)))
+    .then_some(fact)
+}
+
+fn supports_session_confirmation(row: &Value) -> bool {
+    row["tmuxLaunchProtocol"] == LAUNCH_PROTOCOL
+}
+
+fn revocation_close_effect(receipt: &Value) -> bool {
+    matches!(
+        receipt["closeEffect"].as_str(),
+        Some("already_absent" | "unstarted_session_closed")
+    )
+}
+
+fn unverified_absence(saved: &Value) -> bool {
+    saved["closeEffect"] == "already_absent" && saved["resourceCleanup"] != "confirmed"
+}
+
 fn confirmed(row: &Value, saved: &Value) -> bool {
-    if saved["worker"]["state"] == "not_started" {
-        return saved["worker"] == json!({"state":"not_started"})
-            && saved["closeEffect"] == "already_absent"
-            && matches_revocation(row, &saved["revocation"])
-            && saved["closeOperationId"] == saved["revocation"]["closeOperationId"]
-            && saved["launchId"] == saved["revocation"]["launchId"]
-            && saved["executionId"] == row["attempt"];
+    if saved["resourceCleanup"] == "uncertain" {
+        return false;
     }
-    // R2 could archive cancellation while a server was lost. An old process
-    // exit code is still evidence about the worker, not proof of session cleanup.
+    if saved["worker"]["state"] == "not_started" {
+        return saved["resourceCleanup"] == "confirmed"
+            && revocation_close_effect(saved)
+            && saved_revocation(row, saved).is_some();
+    }
     match saved["closeEffect"].as_str() {
-        Some("already_absent" | "worker_exited") => archived_exit(saved),
+        Some("already_absent") => !unverified_absence(saved) && archived_exit(saved),
+        Some("worker_exited") => archived_exit(saved),
         Some("session_closed") => archived_exit(saved) || saved["worker"]["state"] == "cancelled",
         _ => false,
     }
@@ -416,13 +450,52 @@ fn closed_worker(state: &Path, row: &Value, saved: &Value) -> Result<Value> {
 pub fn observe(state: &Path, row: &Value) -> Result<(Value, Value)> {
     let saved = archive(state, row)?.unwrap_or(Value::Null);
     if confirmed(row, &saved) {
-        let mut observation =
-            json!({"result":"completed","alive":false,"closeEffect":saved["closeEffect"]});
-        if let Some(revocation) = saved.get("revocation") {
-            observation["revocation"] = revocation.clone();
-        }
+        let mut observation = json!({"result":"completed","alive":false});
+        copy_close_fields(&saved, &mut observation);
         return Ok((closed_worker(state, row, &saved)?, observation));
     }
+
+    let (worker, mut inspection) = inspect_worker(state, row, &saved)?;
+    let revoked = saved_revocation(row, &saved).filter(|_| worker["state"] == "not_started");
+    // A legacy release can replay an old absence from the backend's history,
+    // even if the public archive never made it to disk.
+    let legacy_absence = !supports_session_confirmation(row) && inspection["alive"] == false;
+    if revoked.is_some()
+        || unverified_absence(&saved)
+        || legacy_absence
+        || saved["resourceCleanup"] == "uncertain"
+    {
+        inspection["result"] = json!("uncertain");
+        if inspection["alive"] != true || inspection["owned"] != true {
+            inspection["alive"] = Value::Null;
+        }
+        inspection["resourceCleanup"] = json!("uncertain");
+        if let Some(fact) = revoked {
+            inspection["revocation"] = fact.clone();
+            inspection["closeOperationId"] = fact["closeOperationId"].clone();
+        } else if archived_exit(&saved)
+            && close_operation(row).is_ok_and(|op| saved["closeOperationId"] == op)
+        {
+            inspection["closeOperationId"] = saved["closeOperationId"].clone();
+        }
+    }
+    Ok((worker, inspection))
+}
+
+pub(super) fn copy_close_fields(saved: &Value, output: &mut Value) {
+    for field in [
+        "closeOperationId",
+        "closeEffect",
+        "revocation",
+        "resourceCleanup",
+    ] {
+        if let Some(value) = saved.get(field) {
+            output[field] = value.clone();
+        }
+    }
+}
+
+fn inspect_worker(state: &Path, row: &Value, saved: &Value) -> Result<(Value, Value)> {
     let mut inspection = existing(state, row, "inspect")
         .unwrap_or_else(|e| json!({"result":"uncertain","diagnostic":e.to_string()}));
     let evidence = match inspect_launch(state, row, &inspection) {
@@ -434,7 +507,7 @@ pub fn observe(state: &Path, row: &Value) -> Result<(Value, Value)> {
     };
     let worker = if let Some(exit) = exited(&evidence) {
         exit
-    } else if archived_exit(&saved) {
+    } else if archived_exit(saved) || saved_revocation(row, saved).is_some() {
         saved["worker"].clone()
     } else if matches!(evidence["category"].as_str(), Some("started") | None)
         && inspection["result"] == "accepted"
@@ -453,33 +526,30 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
     let id = row["dispatch"].as_str().context("missing dispatch")?;
     // Archived replay works on read-only state. A first close serializes on a
     // stable per-attempt file regardless of which publication the reader saw.
-    let saved = archive(state, row)?.filter(|saved| confirmed(row, saved));
+    let saved = archive(state, row)?.unwrap_or(Value::Null);
     let _lock;
-    let saved = if saved.is_some() {
+    let saved = if confirmed(row, &saved) {
         saved
     } else {
         _lock = super::assignment::close_lock(state, row)?;
-        archive(state, row)?.filter(|saved| confirmed(row, saved))
+        archive(state, row)?.unwrap_or(Value::Null)
     };
     let mut receipt = json!({"dispatch":id,"operation":"close","result":"completed","round":row["round"],"attempt":row["attempt"]});
-    if let Some(saved) = saved {
+    if confirmed(row, &saved) {
         receipt["worker"] = closed_worker(state, row, &saved)?;
-        for field in ["closeOperationId", "closeEffect", "revocation"] {
-            if let Some(value) = saved.get(field) {
-                receipt[field] = value.clone();
-            }
-        }
+        copy_close_fields(&saved, &mut receipt);
         receipt["diagnostic"] = json!("session was already gone");
         return Ok(receipt);
     }
-    let (before, observed) = observe(state, row)?;
-    // After a publisher dies before startup, inspect may have no process
-    // to identify. The keyed backend close can still revoke that reservation.
+
+    let (before, observed) = inspect_worker(state, row, &saved)?;
+    let previous_revocation = saved_revocation(row, &saved);
     let pending_native = (row["createPending"] == true || row["create"]["result"] == "uncertain")
         && row["executionId"].is_string()
         && row["executionId"] == row["attempt"]
         && receipt_id(row)?.is_none();
-    let recovery = pending_native && observed["result"] == "uncertain";
+    let recovery =
+        previous_revocation.is_some() || (pending_native && observed["result"] == "uncertain");
     ensure!(
         observed["result"] == "accepted" || recovery,
         "backend inspection {}: {}",
@@ -492,34 +562,72 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
             "tmux session is not owned by this dispatch"
         );
     }
+
     let launch = inspect_launch(state, row, &observed)?;
-    // An older backend must reject this verb instead of falling through to
-    // a normal close if the worker starts or the original socket returns.
-    let answer = existing(state, row, if recovery { "revoke" } else { "close" })?;
+    let mut answer = existing(state, row, if recovery { "revoke" } else { "close" })?;
+    let mut cancellation = revocation_reply(state, row, &answer)?;
+    if let Some(previous) = previous_revocation {
+        // A legacy archive can preserve the worker fact across disconnection.
+        // A fresh keyed proof is required before retrying session cleanup.
+        ensure!(
+            cancellation.as_ref() == Some(previous) && before["state"] == "not_started",
+            "close uncertain: conflicting worker evidence"
+        );
+        if answer["result"] == "uncertain" {
+            answer = existing(state, row, "close")?;
+            cancellation = revocation_reply(state, row, &answer)?;
+        }
+    }
+
+    if let Some(fact) = cancellation {
+        ensure!(
+            matches!(before["state"].as_str(), Some("unknown" | "not_started"))
+                && previous_revocation.is_none_or(|previous| previous == &fact)
+                && launch.is_none_or(|id| fact["launchId"] == id),
+            "close uncertain: conflicting worker evidence"
+        );
+        let cleanup_confirmed = answer["result"] == "completed" && revocation_close_effect(&answer);
+        let mut snapshot = json!({
+            "dispatch":id, "round":row["round"], "attempt":row["attempt"],
+            "executionId":fact["executionId"], "launchId":fact["launchId"],
+            "closeOperationId":fact["closeOperationId"], "revocation":fact,
+            "worker":{"state":"not_started"},
+            "resourceCleanup":if cleanup_confirmed { "confirmed" } else { "uncertain" }
+        });
+        if cleanup_confirmed {
+            snapshot["closeEffect"] = answer["closeEffect"].clone();
+        }
+        write_json(&closed_path(state, row)?, &snapshot, None)?;
+        ensure!(
+            cleanup_confirmed,
+            "close uncertain: worker launch was revoked; tmux cleanup is unconfirmed ({})",
+            answer["diagnostic"]
+        );
+        receipt["worker"] = snapshot["worker"].clone();
+        copy_close_fields(&snapshot, &mut receipt);
+        return Ok(receipt);
+    }
+
     ensure!(
         answer["result"] == "completed",
         "close {}: {}",
         answer["result"],
         answer["diagnostic"]
     );
-    // Only the service performing the guarded close knows whether it killed
-    // a live session. Its observation can be later than our last inspection.
-    let cancellation = if answer["category"] == "not_started" {
-        let fact = revocation(state, row, &answer)?;
-        ensure!(
-            before["state"] == "unknown" && launch.is_none_or(|id| fact["launchId"] == id),
-            "close uncertain: conflicting worker evidence"
-        );
-        Some(fact)
-    } else {
-        ensure!(
-            !recovery,
-            "close uncertain: missing verified reservation cancellation"
-        );
-        None
-    };
+    ensure!(
+        !recovery,
+        "close uncertain: missing verified reservation cancellation"
+    );
+    ensure!(
+        answer["closeOperationId"] == close_operation(row)?,
+        "close uncertain: backend did not confirm the close operation"
+    );
     let worker = match answer["closeEffect"].as_str() {
-        Some("already_absent") if cancellation.is_some() => json!({"state":"not_started"}),
+        Some("already_absent")
+            if !supports_session_confirmation(row) || unverified_absence(&saved) =>
+        {
+            bail!("close uncertain: old absence has no independently verified cleanup")
+        }
         Some("already_absent" | "worker_exited") => {
             if before["state"] == "exited" {
                 before
@@ -532,25 +640,14 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
         Some("session_closed") => json!({"state":"cancelled","exit_code":null,"signal":null}),
         _ => bail!("close uncertain: backend did not confirm the close effect"),
     };
-    ensure!(
-        answer["closeOperationId"] == close_operation(row)?,
-        "close uncertain: backend did not confirm the close operation"
-    );
-    receipt["closeOperationId"] = answer["closeOperationId"].clone();
     if answer["closeEffect"] == "already_absent" {
         receipt["diagnostic"] = json!("session was already gone");
     }
-    receipt["closeEffect"] = answer["closeEffect"].clone();
-    receipt["worker"] = worker.clone();
-    let mut snapshot = json!({"launchId":launch, "executionId":row["executionId"], "legacyExecutionId":observed["legacyExecutionId"], "closeOperationId":answer["closeOperationId"], "dispatch":id,"round":row["round"],"attempt":row["attempt"],
-        "worker":worker,"closeEffect":answer["closeEffect"]});
-    if let Some(fact) = cancellation {
-        snapshot["launchId"] = fact["launchId"].clone();
-        snapshot["revocation"] = fact.clone();
-        receipt["revocation"] = fact;
-    }
-    let path = closed_path(state, row)?;
-    write_json(&path, &snapshot, None)?;
+    let snapshot = json!({"launchId":launch, "executionId":row["executionId"], "legacyExecutionId":observed["legacyExecutionId"], "closeOperationId":answer["closeOperationId"], "dispatch":id,"round":row["round"],"attempt":row["attempt"],
+        "worker":worker,"closeEffect":answer["closeEffect"],"resourceCleanup":"confirmed"});
+    write_json(&closed_path(state, row)?, &snapshot, None)?;
+    receipt["worker"] = worker;
+    copy_close_fields(&snapshot, &mut receipt);
     Ok(receipt)
 }
 
@@ -570,6 +667,12 @@ mod tests {
             "closeOperationId":fact["closeOperationId"],"launchId":launch,"worker":{"state":"not_started"}});
         assert!(!confirmed(&row, &saved));
         saved["revocation"] = fact;
+        assert!(!confirmed(&row, &saved)); // R5 stored only the worker fact.
+        saved["resourceCleanup"] = json!("uncertain");
+        assert!(!confirmed(&row, &saved));
+        saved["resourceCleanup"] = json!("confirmed");
+        assert!(confirmed(&row, &saved));
+        saved["closeEffect"] = json!("unstarted_session_closed");
         assert!(confirmed(&row, &saved));
         for name in [
             "executionId",
@@ -585,6 +688,16 @@ mod tests {
         saved["worker"]["exit_code"] = json!(0);
         assert!(!confirmed(&row, &saved));
         Ok(())
+    }
+
+    #[test]
+    fn old_absence_does_not_discard_exit_or_confirm_cleanup() {
+        let mut old =
+            json!({"closeEffect":"already_absent","worker":{"state":"exited","exit_code":37}});
+        assert!(archived_exit(&old));
+        assert!(!confirmed(&Value::Null, &old));
+        old["resourceCleanup"] = json!("confirmed");
+        assert!(confirmed(&Value::Null, &old));
     }
 
     #[test]
