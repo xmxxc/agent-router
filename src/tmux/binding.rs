@@ -283,12 +283,7 @@ pub(super) fn host_launch_id(
         .filter(|s| valid_launch_id(s))?;
     let receipt = super::launch::read_receipt(&state.join("launches").join(format!("{id}.json")))?;
     let child = u32::try_from(receipt["pid"].as_u64()?).ok()?;
-    let stat = fs::read_to_string(format!("/proc/{child}/stat")).ok()?;
-    let mut fields = stat.rsplit_once(") ")?.1.split_whitespace();
-    if matches!(fields.next()?, "Z" | "X") {
-        return None;
-    }
-    let parent: u32 = fields.next()?.parse().ok()?;
+    let (parent, _) = live_process_at(&format!("/proc/{child}/stat")).ok()??;
     (receipt["category"] == "started" && parent == pid).then(|| id.to_owned())
 }
 
@@ -304,25 +299,31 @@ fn boot_id() -> std::io::Result<String> {
 }
 
 fn process_start(pid: u32) -> Result<Option<u64>> {
-    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+    Ok(live_process_at(&format!("/proc/{pid}/stat"))?.map(|(_, start)| start))
+}
+
+fn live_process_at(path: &str) -> Result<Option<(u32, u64)>> {
+    let stat = match fs::read(path) {
+        Err(e) if e.kind() == ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH) => {
+            return Ok(None);
+        }
         result => result?,
     };
-    let mut fields = stat
-        .rsplit_once(") ")
-        .context("invalid process stat")?
-        .1
-        .split_whitespace();
+    let end = stat
+        .iter()
+        .rposition(|b| *b == b')')
+        .context("invalid process stat")?;
+    let mut fields = std::str::from_utf8(&stat[end + 1..])?.split_whitespace();
     let state = fields.next().context("missing process state")?;
-    if matches!(state, "Z" | "X") {
+    if matches!(state, "Z" | "X" | "x") {
         return Ok(None);
     }
-    Ok(Some(
-        fields
-            .nth(18)
-            .context("missing process start time")?
-            .parse()?,
-    ))
+    let parent = fields.next().context("missing process parent")?.parse()?;
+    let start = fields
+        .nth(17)
+        .context("missing process start time")?
+        .parse()?;
+    Ok(Some((parent, start)))
 }
 
 #[derive(PartialEq)]
@@ -448,6 +449,23 @@ pub(super) fn pin_socket(path: &Path, pid: u32) -> Result<File> {
 
 pub(super) fn fd_path(file: &File) -> String {
     format!("/proc/{}/fd/{}", std::process::id(), file.as_raw_fd())
+}
+
+pub(super) fn signal_worker(target: &File, signal: libc::c_int) -> std::io::Result<()> {
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            target.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0u32,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 pub(super) fn save(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -778,6 +796,40 @@ impl Tmux<'_> {
             _ => return Err(unknown()),
         };
         self.receipt_worker(&id)
+    }
+
+    pub(super) fn close_hangup_target(&self, t: &Target, worker: &Worker) -> Reply<Option<File>> {
+        let (Some((id, supervisor)), Worker::Started(pid)) = (&t.supervisor, worker) else {
+            return Ok(None);
+        };
+        let receipt =
+            super::launch::read_receipt(&self.launch_path(id, "json")).ok_or_else(unknown)?;
+        if receipt["category"] != "started" || receipt["pid"] != *pid {
+            return Err(unknown());
+        }
+        let Some(start) = receipt.get("processStart").filter(|value| !value.is_null()) else {
+            // Launches without a creation identity keep session-only close.
+            return Ok(None);
+        };
+        let start = start.as_str().ok_or_else(unknown)?;
+        let target = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(format!("/proc/{pid}"))
+            .map_err(|_| unknown())?;
+        // Read the identity and relationship through the same descriptor we will signal.
+        let (parent, ticks) = live_process_at(&format!("{}/stat", fd_path(&target)))
+            .map_err(|_| unknown())?
+            .ok_or_else(unknown)?;
+        let boot = boot_id().map_err(|_| unknown())?;
+        if receipt["launchId"] != *id
+            || parent != *supervisor
+            || start != format!("linux:{}:{ticks}", boot.trim())
+        {
+            return Err(unknown());
+        }
+        signal_worker(&target, 0).map_err(|_| unknown())?;
+        Ok(Some(target))
     }
 
     pub(super) fn receipt_worker(&self, id: &str) -> Reply<Worker> {

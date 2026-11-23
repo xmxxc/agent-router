@@ -773,6 +773,7 @@ impl Tmux<'_> {
             } else {
                 worker.check_before_kill()?;
                 t.worker_pane()?;
+                let hangup_target = self.close_hangup_target(&t, &worker)?;
                 // Leave a retained dead pane intact for reconciliation.
                 let action = format!(
                     "if-shell -F -t {} '#{{pane_dead}}' {{ display-message -p dead }} {{ {kill} }}",
@@ -795,6 +796,18 @@ impl Tmux<'_> {
                         "uncertain",
                         "session closed but worker exit order is unconfirmed",
                     ));
+                }
+                // The pane's supervisor survives hangup to write exit and tree-stop
+                // evidence. Deliver the confirmed close's hangup to its verified child.
+                if let Some(target) = hangup_target {
+                    if let Err(error) = binding::signal_worker(&target, libc::SIGHUP) {
+                        if error.raw_os_error() != Some(libc::ESRCH) {
+                            return Err(failure(
+                                "uncertain",
+                                "session closed but original worker hangup is unconfirmed",
+                            ));
+                        }
+                    }
                 }
                 CloseEffect::SessionClosed
             }

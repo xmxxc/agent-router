@@ -722,6 +722,10 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
             return Ok(ExitCode::FAILURE);
         }
     };
+    let process_start = wfc_herdr::Process::observe_unreaped_child(&child)
+        .ok()
+        .flatten()
+        .map(|process| process.creation);
     let watching = startup.as_ref().map(|startup| startup.watch(&child));
     // Ctrl-C addresses the terminal foreground group. Let the worker handle it
     // and keep its receipt writer alive to record the actual exit.
@@ -731,8 +735,8 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
         // Set this after spawn so the worker retains its own HUP behavior.
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
     }
-    let started_receipt =
-        json!({"category":"started","pid":child.id(),"launchId":id,"treeTracked":true});
+    let started_receipt = json!({"category":"started","pid":child.id(),"processStart":process_start,
+        "launchId":id,"treeTracked":true});
     let (status, _, started) = crate::workflow::startup::wait_host(&mut child, || {
         super::binding::save(&receipt, &started_receipt)
     })?;

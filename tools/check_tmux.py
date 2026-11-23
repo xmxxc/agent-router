@@ -665,6 +665,22 @@ os.execv({TMUX!r}, [{TMUX!r}, *args])
             self.assertEqual(result.returncode, 0, result.stderr)
             return json.loads(result.stdout)
 
+        def proc(pid):
+            try:
+                fields = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b")", 1)[1].split()
+            except (FileNotFoundError, ProcessLookupError):
+                return None
+            return (fields[0], int(fields[1]), int(fields[19]))
+
+        def alive(pid, start):
+            row = proc(pid)
+            return row is not None and row[0] not in (b"Z", b"X", b"x") and row[2] == start
+
+        def pane_identity(target):
+            return subprocess.check_output(
+                self.tmux + ["display-message", "-pt", target, "#{pid} #{session_id} #{pane_id} #{pane_pid}"],
+                env=self.env, text=True, timeout=5).split()
+
         (self.work / "task").write_text("controlled worker")
         config = self.work / "launch.json"
         config.write_text(json.dumps({"hosts": {"codex": {"command": [
@@ -672,24 +688,73 @@ os.execv({TMUX!r}, [{TMUX!r}, *args])
         ]}}}))
         worker = data("dispatch", "--scope", scope, "--host", "codex", "--cwd", ".",
                       "--task", "task", "--report", "report", "--launch-config", str(config))
+        launch = Path(worker["create"]["receipt"])
+        started = launch.read_bytes()
+        child = json.loads(started)["pid"]
+        target = "=" + worker["tmux"] + ":"
+        server, _, _, host = pane_identity(target)
+        supervisor = int(host)
+        _, parent, child_start = proc(child)
+        _, _, supervisor_start = proc(supervisor)
+        self.assertEqual(parent, supervisor)
+        sibling = pane_identity("=sibling:")
+        self.assertEqual(sibling[0], server)
+        self.assertNotEqual(sibling[-1], host)
+        sibling_pid = int(sibling[-1])
+        _, _, sibling_start = proc(sibling_pid)
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        print(json.dumps({"archiveCloseTarget": {"dispatch": worker["dispatch"], "attempt": worker["attempt"],
+                          "launchId": launch.stem, "workerPid": child, "workerStartTicks": child_start,
+                          "supervisorPid": supervisor, "supervisorStartTicks": supervisor_start},
+                          "bootId": boot, "sibling": sibling, "siblingStartTicks": sibling_start}), flush=True)
         close = ("close", worker["dispatch"])
         with read_only_tree(self.state):
             first = cli(*close)
             self.assertEqual((first.returncode, first.stdout), (1, ""), first.stderr)
             self.assertIn("Permission denied", first.stderr)
         self.active_pane(worker["dispatch"])
+        self.assertTrue(alive(child, child_start))
+        for altered in ({"processStart": f"linux:{boot}:0"},
+                        {"pid": sibling_pid, "processStart": f"linux:{boot}:{sibling_start}"}):
+            try:
+                launch.write_text(json.dumps({**json.loads(started), **altered}))
+                rejected = cli(*close)
+                self.assertEqual((rejected.returncode, rejected.stdout), (1, ""), rejected.stderr)
+            finally:
+                launch.write_bytes(started)
+            self.active_pane(worker["dispatch"])
+            self.assertTrue(alive(child, child_start))
+            self.assertEqual(pane_identity("=sibling:"), sibling)
+            self.assertTrue(alive(sibling_pid, sibling_start))
         first = data(*close)
         self.assertEqual((first["result"], first["closeEffect"]), ("completed", "session_closed"))
         self.assertTrue(list(self.state.glob("relay-*.lock")))
+        stopped = launch.with_suffix(".stopped")
+        deadline = time.monotonic() + 4
+        while not stopped.is_file() or alive(child, child_start) or alive(supervisor, supervisor_start):
+            self.assertLess(time.monotonic(), deadline, "original close did not stop its worker and supervisor")
+            time.sleep(.025)
+        self.assertEqual(json.loads(stopped.read_bytes()),
+                         {"launchId": launch.stem, "dispatch": worker["dispatch"], "attempt": worker["attempt"],
+                          "round": str(worker["round"]), "writerTreeStopped": True})
+        terminal = json.loads(launch.read_bytes())
+        self.assertEqual((terminal["category"], terminal["startupExit"]["signal"],
+                          terminal["startupExit"]["pid"], terminal["startupExit"]["processStart"]),
+                         ("process_exited", signal.SIGHUP, child, f"linux:{boot}:{child_start}"))
+        self.assertNotEqual(subprocess.run(self.tmux + ["has-session", "-t", "=" + worker["tmux"]],
+                                           env=self.env, capture_output=True, timeout=5).returncode, 0)
+        self.assertEqual(pane_identity("=sibling:"), sibling)
+        self.assertTrue(alive(sibling_pid, sibling_start))
 
         history = self.root / "history"
         (history / "dispatches").mkdir(parents=True)
         (history / "launches").mkdir()
         assignment = f"{worker['dispatch']}.json"
         archive_name = f"{worker['dispatch']}.{worker['attempt']}.closed"
+        original_archive = self.state / "dispatches" / archive_name
+        original_saved = original_archive.read_bytes()
         for name in (assignment, archive_name):
             shutil.copyfile(self.state / "dispatches" / name, history / "dispatches" / name)
-        launch = Path(worker["create"]["receipt"])
         shutil.copyfile(launch, history / "launches" / launch.name)
         self.assertFalse((history / "controller-owners.json").exists())
         archive = history / "dispatches" / archive_name
@@ -721,9 +786,14 @@ os.execv({TMUX!r}, [{TMUX!r}, *args])
             self.assertIn("Permission denied", locked.stderr)
         self.assertEqual(data(*close, "--owner-token", b["token"])["closeOperationId"],
                          replay["closeOperationId"])
+        self.assertEqual(original_archive.read_bytes(), original_saved)
+        self.assertEqual(pane_identity("=sibling:"), sibling)
+        self.assertTrue(alive(sibling_pid, sibling_start))
         print(json.dumps({"readOnlyClose": replay, "unlockedFirstCloseRefused": True,
                           "ambiguousArchiveRefused": True, "managedReplayRequiresLock": True,
-                          "staleTokenRefused": True, "euid": os.geteuid()}), flush=True)
+                          "staleTokenRefused": True, "euid": os.geteuid(), "terminal": terminal,
+                          "originalTreeStopped": True, "sameSiblingAlive": True,
+                          "mismatchedProcessRefused": True}), flush=True)
 
     def test_managed_dispatch_callback_survives_takeover(self):
         env = {**self.env, "WFC_STATE": str(self.state)}
