@@ -36,7 +36,7 @@ prepare 校验并解出仓内的 Ghostty 源码包，校验 zlib 下载字节和
 
 ## 运行和接入 WFC
 
-直接运行 `wfc` 或 `wfc --help` 会列出熟悉的工作流命令名。当前版本支持前台派发和状态查询，预留命令返回退出码 2。`wfc --version` 显示 Rust 标识、包版本、目标平台、构建类型和编译时的 `WFC_BUILD_ID`（未设置、为空或仅含空白时，使用本地构建时间的 Unix 纳秒数）。
+直接运行 `wfc` 或 `wfc --help` 会列出熟悉的工作流命令名。当前版本支持前台派发、状态查询、提交完成报告和等待消息，预留命令返回退出码 2。`wfc --version` 显示 Rust 标识、包版本、目标平台、构建类型和编译时的 `WFC_BUILD_ID`（未设置、为空或仅含空白时，使用本地构建时间的 Unix 纳秒数）。
 
 `dispatch` 接收调用方指定的角色、任务文件和工作目录。`--` 后依次放受控 worker 的程序和参数。下面的 Bash 示例让 worker 在工作目录中写出它实际读到的任务，再由另一个 CLI 查回编号。
 
@@ -52,6 +52,21 @@ wfc status --dispatch ID
 ```
 
 任务文件、工作目录和显式指定的程序路径都可以相对于调用方。程序也可使用 PATH 中的命令名。worker 以指定目录为当前目录，从 `WFC_TASK` 取得任务文件的绝对路径，并从 `WFC_ROLE`、`WFC_DISPATCH`、`WFC_ROUND`、`WFC_ATTEMPT` 和 `WFC_STATE` 取得本次派发上下文。派发在前台等待 worker 退出。worker 的标准输入和标准输出连接到空设备，诊断可写标准错误。worker 成功退出后，CLI 保存记录，标准输出返回一行 JSON，含 `dispatch`、`round`（首次为 1）、`attempt`、`role`、`task` 和 `cwd`。`status` 的 `dispatches` 数组列出已成功派发的记录，可用 `--dispatch` 按编号查询。启动失败、worker 返回非零或查询未知编号时，CLI 返回非零退出码并打印诊断。
+
+派发时用 `--report FILE` 绑定本轮报告路径。相对路径从派发命令所在目录解析，省略时使用 worker 工作目录下的 `report-<dispatch>.md`，每次派发各有一个文件。用 `--scope NAME` 把多项派发分到同一个总控组，省略时会生成独立的组名。worker 从 `WFC_REPORT` 和 `WFC_SCOPE` 读取这两项。报告父目录会在启动前创建。
+
+```sh
+# worker 写好报告后提交，可用同一条命令安全重试
+wfc done --report "$WFC_REPORT" --attempt "$WFC_ATTEMPT"
+# 总控领取派发到 team-a 的消息
+wfc wait --scope team-a --timeout 30
+```
+
+`done` 核对 `WFC_DISPATCH`、已提供的轮次和 attempt，以及已写好的报告文件。提交其他文件会退出 1。首次提交记录派发工作目录的 Git 提交号 `head` 和有无未提交变更的 `dirty`（含未跟踪文件）。目录不在 Git 仓库中、Git 失败或单条命令超过 5 秒时，两项均为 null。
+
+显式传入 `--attempt ID` 时，默认重试键为 `done:<dispatch>:<attempt>`；也可自定 `--message-id KEY`。同一派发、同一键与相同报告重试，返回原数字编号 `message` 和稳定编号 `messageId`，标记 `duplicate: true`，保留该消息首次采集的 Git 快照。不同键分别创建消息。旧式调用可只设置 `WFC_DISPATCH`，新派发同时省略两个选项时，每次调用各产生一条消息。升级前尚无报告绑定和 scope 的 R1 派发，worker 保留原启动环境并重试原命令时，会取回原编号和领取状态。跨轮复用报告路径或轮次历史不全时，应传入本轮的 `--attempt`。
+
+`wait` 默认等待 3600 秒，`--timeout` 接受小数秒，设为 0 可立即查询。它按提交顺序返回 `messages`，包含派发、轮次、attempt、角色、scope、报告路径、Git 快照、数字编号 `id` 和 `messageId`。可按 `--scope NAME`、`--dispatch ID` 或两者共同筛选。首次提交为 `unsent`（版本 1），领取为 `received`（版本 2）。消息在输出前标记为已收取，其他等待者可领取剩余消息。超时返回 `{"messages":[],"timedOut":true}`，退出码为 3。
 
 Rust 默认使用用户主目录下的 `.local/state/agent-router`，可用 `WFC_STATE` 指定独立状态目录。帮助、版本和内核入口都不会读写调度状态。与 Python 版并排使用时，把两份 `wfc` 放在不同目录，分别使用显式路径，并为每次调用指定各自的 `WFC_STATE`。
 
