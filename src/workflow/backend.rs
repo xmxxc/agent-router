@@ -279,6 +279,85 @@ fn private_receipt(state: &Path, launch: Option<&str>) -> Result<Value> {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn publish_unconfirmed_tmux_exit(state: &Path, row: &Value) -> Result<()> {
+    if let Some(receipt) = verified_unconfirmed_tmux_receipt(state, row)? {
+        super::startup::unconfirmed_tmux_exit(
+            state,
+            row,
+            receipt["launchId"].as_str().context("missing launch ID")?,
+            &receipt,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn verified_unconfirmed_tmux_receipt(
+    state: &Path,
+    row: &Value,
+) -> Result<Option<Value>> {
+    let create = &row["create"];
+    if create["result"] != "uncertain" || create["category"] != "process_exited" {
+        return Ok(None);
+    }
+    ensure!(
+        row["backend"] == "tmux" && row["executionId"] == row["attempt"],
+        "early-exit execution identity mismatch"
+    );
+    let id = receipt_id(row)?.context("missing early-exit launch receipt")?;
+    let path = state
+        .canonicalize()?
+        .join("launches")
+        .join(format!("{id}.json"));
+    ensure!(
+        create["receipt"].as_str().map(Path::new) == Some(path.as_path()),
+        "unexpected early-exit receipt path"
+    );
+    let receipt =
+        crate::tmux::launch::read_receipt(&path).context("missing verified early-exit receipt")?;
+    ensure!(
+        receipt["launchId"] == id
+            && receipt["category"] == "process_exited"
+            && receipt["exitCode"] == create["exitCode"]
+            && receipt["exitCode"].as_u64().is_some_and(|code| code <= 255),
+        "early-exit launch identity or outcome mismatch"
+    );
+    Ok(Some(receipt))
+}
+
+fn script_preflight_failed(row: &Value) -> bool {
+    let create = &row["create"];
+    create["result"] == "definitely-not-sent"
+        && matches!(
+            create["category"].as_str(),
+            Some("configured_script_missing" | "configured_script_permission_denied")
+        )
+        && matches!(row["backend"].as_str(), Some("tmux" | "herdr"))
+        && row["dispatch"].as_str().is_some_and(super::valid_id)
+        && super::assignment::identified(row)
+        && row["scope"].as_str().is_some_and(|scope| !scope.is_empty())
+        && same_execution(row, create)
+        // Before scope was repeated in this marker, the bound assignment
+        // was the authoritative scope used for publication and replay.
+        && create.get("scope").is_none_or(|scope| scope == &row["scope"])
+        && (row["backend"] != "tmux" || row["executionId"] == row["attempt"])
+        && row["createPending"] != true
+        && create["receipt"].is_null()
+        && row["backendHandle"].is_null()
+        && row["worker"] == json!({"state":"not_started","exit_code":null,"signal":null})
+}
+
+fn script_preflight_close(row: &Value) -> Option<Value> {
+    script_preflight_failed(row).then(|| {
+        json!({
+            "dispatch":row["dispatch"],"operation":"close","result":"completed",
+            "round":row["round"],"attempt":row["attempt"],"worker":row["worker"],
+            "diagnostic":"session was already gone",
+        })
+    })
+}
+
 fn closed_path(state: &Path, row: &Value) -> Result<PathBuf> {
     let attempt = row["attempt"]
         .as_str()
@@ -585,6 +664,12 @@ pub(super) fn observe_with_mode(
     row: &mut Value,
     read_only: bool,
 ) -> Result<(Value, Value)> {
+    if script_preflight_failed(row) {
+        return Ok((
+            row["worker"].clone(),
+            json!({"result":"definitely-not-sent","alive":false}),
+        ));
+    }
     #[cfg(target_os = "linux")]
     if row["backend"] == "herdr" {
         return super::herdr::observe(state, row, read_only);
@@ -689,6 +774,9 @@ fn replay(state: &Path, row: &Value, saved: &Value, inspect_legacy: bool) -> Res
 }
 
 pub(super) fn read_only_close(state: &Path, row: &Value) -> Result<Option<Value>> {
+    if let Some(receipt) = script_preflight_close(row) {
+        return Ok(Some(receipt));
+    }
     #[cfg(target_os = "linux")]
     if row["backend"] == "herdr" {
         return super::herdr::read_only_close(state, row);
@@ -702,6 +790,9 @@ pub(super) fn read_only_close(state: &Path, row: &Value) -> Result<Option<Value>
 }
 
 pub fn close(state: &Path, row: &Value) -> Result<Value> {
+    if let Some(receipt) = script_preflight_close(row) {
+        return Ok(receipt);
+    }
     #[cfg(target_os = "linux")]
     if row["backend"] == "herdr" {
         return super::herdr::close(state, row);
@@ -834,6 +925,63 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_terminal_notice_requires_the_selected_launch_and_outcome() -> Result<()> {
+        let state = std::env::temp_dir().join(format!("wfc-tmux-startup-{}", uuid::Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let launch = "0123456789abcdef0123456789abcdef";
+            let dispatch = "d-aabbccdd";
+            let attempt = "a-123456789abc";
+            let launches = state.join("launches");
+            let dispatches = state.join("dispatches");
+            std::fs::create_dir_all(&launches)?;
+            std::fs::create_dir_all(&dispatches)?;
+            let receipt = launches.join(format!("{launch}.json"));
+            let evidence = json!({"category":"process_exited","exitCode":143,"launchId":launch,
+                "startupExit":{"exitCode":null,"signal":15,"pid":123,"processStart":null}});
+            write_json(&receipt, &evidence, None)?;
+            let mut row = json!({"dispatch":dispatch,"attempt":attempt,"round":1,"scope":"scope",
+                "role":"test","cwd":state,"report":state.join("report"),"backend":"tmux","host":"codex","executionId":attempt});
+            let answer = json!({"result":"uncertain","dispatch":dispatch,"attempt":attempt,"round":1,
+                "category":"process_exited","exitCode":143,"receipt":receipt});
+            write_json(&dispatches.join(format!("{dispatch}.json")), &row, None)?;
+            for (field, value) in [
+                ("result", json!("accepted")),
+                ("category", Value::Null),
+                ("category", json!("not_started")),
+            ] {
+                row["create"] = answer.clone();
+                row["create"][field] = value;
+                publish_unconfirmed_tmux_exit(&state, &row)?;
+            }
+            for (field, value) in [
+                ("exitCode", json!(17)),
+                ("attempt", json!("a-aaaaaaaaaaaa")),
+                (
+                    "receipt",
+                    json!(state.join("wrong").join(format!("{launch}.json"))),
+                ),
+            ] {
+                row["create"] = answer.clone();
+                row["create"][field] = value;
+                assert!(publish_unconfirmed_tmux_exit(&state, &row).is_err());
+            }
+            assert!(super::super::messages::history(&state, dispatch)?.is_empty());
+            row["create"] = answer;
+            publish_unconfirmed_tmux_exit(&state, &row)?;
+            let history = super::super::messages::history(&state, dispatch)?;
+            assert_eq!(history.len(), 1);
+            assert!(history[0]["fault"]["exitCode"].is_null());
+            assert_eq!(history[0]["fault"]["signal"], 15);
+            assert_eq!(history[0]["fault"]["pid"], 123);
+            assert_eq!(history[0]["fault"]["launchId"], launch);
+            Ok(())
+        })();
+        let _ = std::fs::remove_dir_all(state);
+        result
+    }
 
     #[test]
     fn cancellation_requires_the_original_keyed_receipt() -> Result<()> {

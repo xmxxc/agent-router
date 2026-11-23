@@ -114,7 +114,7 @@ impl<'a> Target<'a> {
         if limit.is_zero() {
             return Outcome::Failed;
         }
-        let mut request = match self.request(text, limit) {
+        let request = match self.request(text, limit) {
             Ok(request) => request,
             Err(error) => {
                 println!(
