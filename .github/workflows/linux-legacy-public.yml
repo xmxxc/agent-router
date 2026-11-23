@@ -1,7 +1,7 @@
-name: Linux legacy ledger combination regression
+name: Linux legacy ledger and ownership combination regression
 on:
   push:
-    branches: [rust-router/linux-ci-legacy-combination]
+    branches: [rust-router/linux-ci-legacy-owner-combination]
 
 permissions:
   contents: read
@@ -12,12 +12,12 @@ defaults:
 
 jobs:
   legacy-public:
-    name: '#30 Legacy ledger and native backend combination'
+    name: '#30 and #16 Legacy ledger and ownership combination'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      WFC_BUILD_ID: 7ebf67dae6bb6c94697312e9967eb27bd320511b
-      PRODUCT_TREE: 1a969a8d8c11e33c2fb277377e7fb476c549d61c
+      WFC_BUILD_ID: a4991653ea41a96df6e39e95da661a1c29bd73fc
+      PRODUCT_TREE: eccd654c8068bd9b07360b6f1bd2fe7c5f66bce4
       LEGACY_TREE: 034a9cad954bc952812b35bec6fef840c6abc3a1
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TMUX_FIXTURE_SHA: 5ced6218637c11d9ca73fa3285a1ff98fadad6fc
@@ -64,7 +64,7 @@ jobs:
           test "$legacy_tree" = "$LEGACY_TREE"
           git -C ../native-input log -1 --format='zlib source checkout HEAD %H tree %T' | tee -a "$EVIDENCE/sources.log"
           test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
-          sha256sum vendor/INPUTS.sha256 tests/{legacy_public,check_codex,herdr_public}.py tools/check_tmux.py | tee "$EVIDENCE/inputs.log"
+          sha256sum vendor/INPUTS.sha256 tests/{legacy_public,check_codex,herdr_public,owner,receipts,relay}.py tools/check_tmux.py | tee "$EVIDENCE/inputs.log"
           sha256sum -c vendor/INPUTS.sha256 2>&1 | tee -a "$EVIDENCE/inputs.log"
           rustup toolchain install 1.96.1 --profile minimal 2>&1 | tee "$EVIDENCE/toolchain.log"
           {
@@ -228,7 +228,56 @@ jobs:
             PublicLifecycle.test_named_status_during_done_then_exit \
             PublicLifecycle.test_done_receipt_and_active_list_through_close \
             PublicLifecycle.test_legacy_authority_or_later_round_is_left_pending \
+            PublicLifecycle.test_close_after_scope_takeover_fences_stale_herdr_controls \
             2>&1 | tee -a "$EVIDENCE/herdr-public.log"
+      - name: Run focused owner takeover and scoped delivery tests
+        if: ${{ !cancelled() && steps.fixture-identity.outcome == 'success' }}
+        working-directory: product
+        run: |
+          head -n 2 "$EVIDENCE/binaries.log" | sha256sum --check --strict | tee "$EVIDENCE/owner.log"
+          reaper="$GITHUB_WORKSPACE/tmux-r11-fixtures/tools/ci/tmux-r11/reap.py"
+          python -B "$reaper" python -Bu - "target/$TRIPLE/release/wfc" \
+            test_takeover_fences_wait_and_ack_but_worker_keeps_its_callback \
+            test_takeover_waits_for_scoped_delivery_and_unregisters_detached_relay \
+            <<'PYTEST' 2>&1 | tee -a "$EVIDENCE/owner.log"
+          import sys
+          import unittest
+          test_names = sys.argv[2:]
+          assert len(test_names) == 2
+          sys.path.insert(0, "tests")
+          from owner import Owner
+          suite = unittest.TestSuite(Owner(test) for test in test_names)
+          sys.exit(not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful())
+          PYTEST
+      - name: Run focused legacy and scoped receipt tests
+        if: ${{ !cancelled() && steps.fixture-identity.outcome == 'success' }}
+        working-directory: product
+        run: |
+          head -n 2 "$EVIDENCE/binaries.log" | sha256sum --check --strict | tee "$EVIDENCE/receipts.log"
+          reaper="$GITHUB_WORKSPACE/tmux-r11-fixtures/tools/ci/tmux-r11/reap.py"
+          python -B "$reaper" python -Bu tests/receipts.py "target/$TRIPLE/release/wfc" -v \
+            Receipts.test_mixed_legacy_inbox Receipts.test_scoped_snapshot_survives_confirmation \
+            2>&1 | tee -a "$EVIDENCE/receipts.log"
+      - name: Run focused relay claim and old assignment tests
+        if: ${{ !cancelled() && steps.fixture-identity.outcome == 'success' }}
+        working-directory: product
+        run: |
+          head -n 2 "$EVIDENCE/binaries.log" | sha256sum --check --strict | tee "$EVIDENCE/relay.log"
+          reaper="$GITHUB_WORKSPACE/tmux-r11-fixtures/tools/ci/tmux-r11/reap.py"
+          python -B "$reaper" python -Bu tests/relay.py "target/$TRIPLE/release/wfc" -v \
+            Relay.test_two_relays_and_wait_claim_once_and_resolution_wins \
+            Relay.test_scoped_delivery_beside_complete_and_truncated_reservations \
+            2>&1 | tee -a "$EVIDENCE/relay.log"
+      - name: Run the managed tmux callback and read-only close archive tests
+        if: ${{ !cancelled() && steps.tmux.outcome == 'success' && steps.fixture-identity.outcome == 'success' }}
+        working-directory: product
+        run: |
+          head -n 2 "$EVIDENCE/binaries.log" | sha256sum --check --strict | tee "$EVIDENCE/tmux-owner.log"
+          reaper="$GITHUB_WORKSPACE/tmux-r11-fixtures/tools/ci/tmux-r11/reap.py"
+          python -B "$reaper" python -Bu tools/check_tmux.py "target/$TRIPLE/release/wfc" -v \
+            Backend.test_managed_dispatch_callback_survives_takeover \
+            Backend.test_read_only_unowned_close_replays_confirmed_archive \
+            2>&1 | tee -a "$EVIDENCE/tmux-owner.log"
       - name: Run the Rust workspace tests
         if: ${{ !cancelled() && steps.tmux.outcome == 'success' }}
         working-directory: product
@@ -242,7 +291,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ always() }}
         with:
-          name: linux-30-combination-${{ env.WFC_BUILD_ID }}-attempt-${{ github.run_attempt }}
+          name: linux-30-owner-combination-${{ env.WFC_BUILD_ID }}-attempt-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14
