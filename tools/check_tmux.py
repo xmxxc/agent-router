@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import pty
 import select
+import signal
 import shutil
 import subprocess
 import sys
@@ -20,7 +21,7 @@ def composer(mode, logfile):
     enters = 0
     banner = "This chat uses A, but Codex now uses B, so this chat is read-only."
     refused = "This conversation is read-only or unavailable; no operation was sent."
-    notice = banner if mode == "readonly" else ""
+    notice = banner if mode == "readonly" else refused if mode == "retry-refusal" else ""
     def draw():
         shown = draft.decode("utf-8", errors="replace") or "Ask Codex to do anything"
         print(f"\x1b[2J\x1b[H{notice}\r\n› {shown}\r\n\r\n  model · cwd", end="", flush=True)
@@ -38,7 +39,11 @@ def composer(mode, logfile):
                 enters += 1
                 if mode == "refusal":
                     notice = refused
-                if mode == "change":
+                if mode == "retry-refusal":
+                    notice = "" if enters == 1 else refused
+                    if enters > 1:
+                        draft = b""
+                elif mode == "change":
                     draft = b"someone else's draft"
                 elif mode != "always-drop" and (mode != "drop" or enters > 1):
                     draft = b""
@@ -94,7 +99,7 @@ class Backend(unittest.TestCase):
         self.assertEqual(Path(result["receipt"]).stat().st_mode & 0o777, 0o600)
         self.assertFalse(list(Path(result["receipt"]).parent.glob("*.spec")))
         deadline = time.monotonic() + 5
-        while "model · cwd" not in self.call("read")["screen"]:
+        while "model · cwd" not in self.call("read", state=data.get("state"))["screen"]:
             self.assertLess(time.monotonic(), deadline, "controlled worker did not draw its prompt")
             time.sleep(0.02)
         return log
@@ -154,6 +159,7 @@ class Backend(unittest.TestCase):
             ("always-drop", "codex", 3, "uncertain"), ("change", "codex", 1, "accepted"),
             ("drop", "claude", 1, "accepted"), ("drop", "opencode", 1, "accepted"),
             ("readonly", "codex", 0, "refused"), ("refusal", "codex", 1, "refused"),
+            ("retry-refusal", "codex", 2, "refused"),
         ]:
             with self.subTest(mode=mode, host=host):
                 log = self.launch_composer(mode)
@@ -180,7 +186,7 @@ class Backend(unittest.TestCase):
         shim.write_text(f"""#!{sys.executable}
 import os, sys
 a = sys.argv[1:]
-if any(x.startswith("send-keys") and " Enter ; " in x for x in a):
+if any("send-keys -t " in x and " Enter ; " in x for x in a):
     sys.exit(1)
 os.execv({TMUX!r}, [{TMUX!r}, *a])
 """)
@@ -216,15 +222,184 @@ os.execv({TMUX!r}, [{TMUX!r}, *a])
         self.assertEqual(self.call("submit", text="foreign visible")["result"], "refused")
         self.assertEqual(self.call("interrupt")["result"], "refused")
         self.assertEqual(self.events(log, 0), [])
+        subprocess.run(self.tmux + ["new-window", "-t", "=wfc-d-abc12345:", "/bin/cat"], env=self.env, check=True)
+        self.assertEqual(self.call("close")["result"], "refused")
+        self.assertEqual(self.call("resume", **self.launch)["result"], "refused")
         subprocess.run(self.tmux + ["unlink-window", "-t", "=sibling:9"], env=self.env, check=True)
         self.assertEqual(self.call("close")["result"], "completed")
+
+    def test_grouped_window_is_shared(self):
+        log = self.launch_composer("grouped")
+        subprocess.run(self.tmux + ["new-session", "-d", "-t", "wfc-d-abc12345", "-s", "group-member"],
+                       env=self.env, check=True)
+        self.attach_detach(self.tmux + ["attach-session", "-t", "=wfc-d-abc12345"])
+        proof = subprocess.check_output(self.tmux + ["display-message", "-p", "-t", "=wfc-d-abc12345:",
+                                        "#{window_linked} #{window_linked_sessions}"], env=self.env, text=True)
+        self.assertEqual(proof.strip(), "0 2")
+        for op in ["read", "submit", "interrupt"]:
+            data = {"text": "shared"} if op == "submit" else {}
+            self.assertEqual(self.call(op, **data)["result"], "refused", op)
+        self.assertEqual(self.events(log, 0), [])
+        self.assertEqual(self.call("close")["result"], "refused")
+        subprocess.run(self.tmux + ["kill-session", "-t", "=wfc-d-abc12345"], env=self.env, check=True)
+        self.assertEqual(self.call("resume", **self.launch)["result"], "uncertain")
+        subprocess.run(self.tmux + ["has-session", "-t", "=sibling"], env=self.env, check=True)
+
+    def test_lost_socket_and_original_server_exit(self):
+        self.launch_composer("original")
+        parked = self.root / "original-socket"
+        os.rename(self.socket, parked)
+        try:
+            for op in ["inspect", "close", "create", "resume"]:
+                data = self.launch if op in ("create", "resume") else {}
+                self.assertEqual(self.call(op, **data)["result"], "uncertain", op)
+                self.assertFalse(Path(self.socket).exists(), op)
+            replacement = self.call("create", state=self.other, dispatch="d-other", **self.launch)
+            self.assertEqual(replacement["result"], "accepted")
+            self.assertEqual(self.call("resume", **self.launch)["result"], "uncertain")
+        finally:
+            if Path(self.socket).is_socket():
+                self.stop_server()
+            os.rename(parked, self.socket)
+        self.assertTrue(self.call("inspect")["owned"])
+        subprocess.run(self.tmux + ["kill-server"], env=self.env, check=True)
+        deadline = time.monotonic() + 3
+        while (inspection := self.call("inspect"))["result"] == "uncertain":
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.03)
+        self.assertFalse(inspection["alive"])
+        self.assertEqual(self.call("resume", **self.launch)["result"], "accepted")
+
+    def test_fresh_adoption_expires_command_saved_before_close(self):
+        self.launch_composer("old")
+        old = self.call("inspect")["attach"]
+        token = subprocess.check_output(self.tmux + ["show-environment", "-t", "=wfc-d-abc12345",
+                                                     "WFC_TMUX_LAUNCH"], env=self.env, text=True).strip()
+        self.assertEqual(self.call("close")["result"], "completed")
+        subprocess.run(self.tmux + ["new-session", "-d", "-s", "wfc-d-abc12345", "-e",
+                                    f"WFC_STATE={self.state}", "-e", token, "/bin/cat"], env=self.env, check=True)
+        new = self.call("inspect")["attach"]
+        self.assertNotEqual(old, new)
+        self.assert_attach_refused(old)
+        self.assertEqual(self.call("submit", text="new")["result"], "accepted")
+        self.assertIn("new", self.call("read")["screen"])
+
+    def test_restored_environment_does_not_replace_the_original_server(self):
+        self.launch_composer("origin")
+        original = self.call("inspect")
+        token = subprocess.check_output(self.tmux + ["show-environment", "-t", "=wfc-d-abc12345",
+                                                     "WFC_TMUX_LAUNCH"], env=self.env, text=True).strip()
+        parked = self.root / "original"
+        os.rename(self.socket, parked)
+        try:
+            for name in ["sibling", "wfc-d-abc12345"]:
+                subprocess.run(self.tmux + ["new-session", "-d", "-s", name, "-e", f"WFC_STATE={self.state}",
+                                            "-e", token, "/bin/cat"], env=self.env, check=True)
+            for op in ["inspect", "close", "resume"]:
+                self.assertEqual(self.call(op, **(self.launch if op == "resume" else {}))["result"], "uncertain")
+            self.assert_attach_refused(original["attach"])
+            subprocess.run(self.tmux + ["has-session", "-t", "=wfc-d-abc12345"], env=self.env, check=True)
+        finally:
+            if Path(self.socket).is_socket():
+                self.stop_server()
+            os.rename(parked, self.socket)
+        self.assertTrue(self.call("inspect")["owned"])
+
+    def test_unlinked_socket_restored_by_original_server(self):
+        log = self.launch_composer("restored")
+        pid = int(subprocess.check_output(self.tmux + ["display-message", "-p", "#{pid}"], env=self.env))
+        os.unlink(self.socket)
+        try:
+            self.assertEqual(self.call("inspect")["result"], "uncertain")
+            self.assertEqual(self.call("resume", **self.launch)["result"], "uncertain")
+            self.assertFalse(Path(self.socket).exists())
+        finally:
+            os.kill(pid, signal.SIGUSR1)
+            deadline = time.monotonic() + 3
+            while not Path(self.socket).exists():
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.02)
+        self.assertTrue(self.call("inspect")["owned"])
+        self.assertEqual(self.call("submit", text="once")["result"], "accepted")
+        self.assertEqual(bytes.fromhex("".join(e[0] for e in self.events(log, 5))), b"once\r")
+
+    def test_legacy_session_is_tracked_on_first_owned_observation(self):
+        self.state.mkdir()
+        subprocess.run(self.tmux + ["new-session", "-d", "-s", "wfc-d-abc12345", "-e",
+                                    f"WFC_STATE={self.state}", "/bin/cat"], env=self.env, check=True)
+        self.assertTrue(self.call("inspect")["owned"])
+        parked = self.root / "legacy-socket"
+        os.rename(self.socket, parked)
+        try:
+            self.assertEqual(self.call("close")["result"], "uncertain")
+        finally:
+            os.rename(parked, self.socket)
+        subprocess.run(self.tmux + ["kill-session", "-t", "=wfc-d-abc12345"], env=self.env, check=True)
+        self.assertFalse(self.call("inspect")["alive"])
+        self.assertEqual(self.call("resume", **self.launch)["result"], "accepted")
+
+    def stop_server(self):
+        pid = int(subprocess.check_output(self.tmux + ["display-message", "-p", "#{pid}"], env=self.env))
+        subprocess.run(self.tmux + ["kill-server"], env=self.env, check=True)
+        deadline = time.monotonic() + 5
+        stat = Path(f"/proc/{pid}/stat")
+        while stat.exists():
+            try:
+                if stat.read_text().rsplit(") ", 1)[1].startswith("Z "):
+                    break
+            except FileNotFoundError:
+                break
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+
+    def test_old_attach_rechecks_ownership(self):
+        self.launch_composer("original")
+        argv = self.call("inspect")["attach"]
+        subprocess.run(self.tmux + ["set-environment", "-t", "=wfc-d-abc12345", "WFC_STATE", str(self.other)],
+                       env=self.env, check=True)
+        self.assert_attach_refused(argv)
+        subprocess.run(self.tmux + ["set-environment", "-g", "WFC_STATE", str(self.state)], env=self.env, check=True)
+        subprocess.run(self.tmux + ["set-environment", "-u", "-t", "=wfc-d-abc12345", "WFC_STATE"],
+                       env=self.env, check=True)
+        self.assert_attach_refused(argv)
+        self.stop_server()
+        subprocess.run(self.tmux + ["new-session", "-d", "-s", "sibling", "/bin/cat"],
+                       env=self.env, check=True)
+        self.launch_composer("replacement", state=self.other)
+        self.assert_attach_refused(argv)
+
+    def assert_attach_refused(self, argv):
+        master, slave = pty.openpty()
+        try:
+            result = subprocess.run(argv, stdin=slave, stdout=slave, stderr=slave, env=self.env, timeout=3)
+            self.assertNotEqual(result.returncode, 0)
+        finally:
+            os.close(slave)
+            os.close(master)
+
+    def test_resume_keeps_started_receipt_when_brief_could_not_be_sent(self):
+        shim = self.work / "tmux"
+        shim.write_text(f"""#!{sys.executable}
+import os, sys
+if "show-environment" in sys.argv:
+    os.unlink(__file__)
+os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
+""")
+        shim.chmod(0o700)
+        reply = self.call("resume", host="opencode", text="brief", environ={"PATH": str(self.work)}, **self.launch)
+        self.assertEqual(json.loads(Path(reply["receipt"]).read_text())["category"], "started")
+        self.assertEqual(reply["result"], "uncertain", reply)
+        self.assertEqual(reply["launchResult"], "accepted")
+        self.assertEqual(reply["inputResult"], "definitely-not-sent")
+        self.assertTrue(self.call("inspect")["owned"])
+        self.assertEqual(self.call("resume", **self.launch)["result"], "refused")
 
     def test_unknown_create_and_literal_response(self):
         shim = self.work / "tmux"
         shim.write_text(f"""#!{sys.executable}
 import os, subprocess, sys, time
 a = sys.argv[1:]
-if "new-session" in a or any(x.startswith("send-keys") and " -l -- " in x for x in a):
+if "new-session" in a or any("send-keys -t " in x and " -l -- " in x for x in a):
     subprocess.run([{TMUX!r}, *a], stdout=subprocess.DEVNULL, check=True)
     time.sleep(0.2)
     sys.exit(1)

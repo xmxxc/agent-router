@@ -56,6 +56,15 @@ fn main() -> anyhow::Result<ExitCode> {
             println!("{}", tmux::execute(&workflow::state_dir()?, request)?);
         }
         #[cfg(target_os = "linux")]
+        Some("--tmux-attach") if args.len() == 4 => {
+            tmux::attach(
+                Path::new(&args[0]),
+                args[1].to_str().unwrap_or_default(),
+                Path::new(&args[2]),
+                args[3].to_str().unwrap_or_default(),
+            )?;
+        }
+        #[cfg(target_os = "linux")]
         Some("--tmux-host") if args.len() == 1 => {
             return tmux::launch::run_host(Path::new(&args[0]));
         }

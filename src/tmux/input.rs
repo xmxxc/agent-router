@@ -119,15 +119,17 @@ fn setting(key: &str, default: f64) -> Duration {
         .unwrap_or_else(|| Duration::from_secs_f64(default))
 }
 
+fn refused(message: &str) -> Value {
+    json!({"result":"refused","category":"permission_required","diagnostic":message,"notice":message})
+}
+
 fn check_notice(screen: &str, before: usize) -> Reply<()> {
     let n = notices(screen);
     if let Some(message) = n
         .state
         .or_else(|| (n.refusals > before).then(|| REFUSAL.to_owned()))
     {
-        return Err(
-            json!({"result":"refused","category":"permission_required","diagnostic":message,"notice":message}),
-        );
+        return Err(refused(&message));
     }
     Ok(())
 }
@@ -156,11 +158,18 @@ impl Tmux<'_> {
         if text.contains('\0') {
             return Err(failure("definitely-not-sent", "tmux input contains NUL"));
         }
-        let before = notices(&self.capture(t)?);
+        let before = notices(&self.capture(t).map_err(|e| {
+            if e["result"] == "refused" {
+                e
+            } else {
+                failure(
+                    "definitely-not-sent",
+                    "could not observe the session before input",
+                )
+            }
+        })?);
         if let Some(message) = before.state {
-            return Err(
-                json!({"result":"refused","category":"permission_required","diagnostic":message,"notice":message}),
-            );
+            return Err(refused(&message));
         }
         // Single-quote for the tmux command parser inside if-shell. No shell is invoked.
         let literal = text.replace('\'', "'\\''");
@@ -173,6 +182,7 @@ impl Tmux<'_> {
             })?;
         sleep(Duration::from_millis(500));
         let window = setting("WFC_TYPED_CHECK_SECONDS", 1.5);
+        let mut earlier_refusals = before.refusals;
         for retry in 0..=2 {
             self.pane_command(t, &format!("send-keys -t {} Enter", t.pane))
                 .map_err(|_| uncertain("text was typed but Enter was not confirmed"))?;
@@ -183,22 +193,23 @@ impl Tmux<'_> {
                     uncertain("could not observe the session after input")
                 }
             };
-            self.observe(t, before.refusals, window)
+            self.observe(t, earlier_refusals, window)
                 .map_err(after_text)?;
             if host != Some("codex") {
                 break;
             }
             let first = self.capture(t).map_err(after_text)?;
-            check_notice(&first, before.refusals)?;
+            check_notice(&first, earlier_refusals)?;
             let Some(draft) = codex_draft(&first).filter(|d| matches_input(d, text)) else {
                 break;
             };
             sleep(Duration::from_millis(300));
             let second = self.capture(t).map_err(after_text)?;
-            check_notice(&second, before.refusals)?;
+            check_notice(&second, earlier_refusals)?;
             if Some(draft) != codex_draft(&second) {
                 break;
             }
+            earlier_refusals = notices(&second).refusals;
             if retry == 2 {
                 return Err(uncertain("typed text remained in the host input box"));
             }
@@ -217,7 +228,12 @@ impl Tmux<'_> {
             let start = Instant::now();
             let mut last = String::new();
             while start.elapsed() < Duration::from_secs(30) {
-                let screen = self.capture(t)?;
+                let screen = self.capture(t).map_err(|_| {
+                    failure(
+                        "definitely-not-sent",
+                        "resumed worker started but its prompt could not be observed",
+                    )
+                })?;
                 if !screen.trim().is_empty() && screen == last {
                     return self.submit(t, text.unwrap_or_default(), host);
                 }
@@ -225,12 +241,19 @@ impl Tmux<'_> {
                 sleep(Duration::from_secs(1));
             }
             return Err(failure(
-                "uncertain",
+                "definitely-not-sent",
                 "resumed worker screen did not become ready",
             ));
         }
         if host == Some("codex") && probe {
-            self.observe(t, 0, setting("WFC_RESUME_CHECK_SECONDS", 5.))?;
+            self.observe(t, 0, setting("WFC_RESUME_CHECK_SECONDS", 5.))
+                .map_err(|e| {
+                    if e["category"] == "permission_required" {
+                        e
+                    } else {
+                        uncertain("could not observe the resumed brief")
+                    }
+                })?;
         }
         Ok(json!({"result":"accepted"}))
     }

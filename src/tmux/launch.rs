@@ -55,12 +55,6 @@ fn read_receipt(path: &Path) -> Option<Value> {
     serde_json::from_reader(File::open(path).ok()?).ok()
 }
 
-fn publish(receipt: &Path, evidence: Value) -> Result<()> {
-    let tmp = receipt.with_extension("tmp");
-    private_file(&tmp, &evidence)?;
-    Ok(fs::rename(tmp, receipt)?)
-}
-
 impl Tmux<'_> {
     pub(super) fn create(&self, launch: Launch) -> Reply<(Target, PathBuf)> {
         if self.target()?.is_some() {
@@ -120,6 +114,7 @@ impl Tmux<'_> {
         let receipt = dir.join(format!("{id}.json"));
         let launcher = env::current_exe().map_err(io_error)?;
         let state_env = format!("WFC_STATE={state}");
+        let launch_env = format!("WFC_TMUX_LAUNCH={id}");
         let dispatch_env = format!("WFC_DISPATCH={}", self.dispatch);
         let mut args = vec![
             "new-session",
@@ -140,6 +135,8 @@ impl Tmux<'_> {
             &state_env,
             "-e",
             &dispatch_env,
+            "-e",
+            &launch_env,
             "--",
             launcher.to_str().ok_or_else(bad)?,
             "--tmux-host",
@@ -155,7 +152,14 @@ impl Tmux<'_> {
                         "could not write private launch files",
                     )
                 })?;
-            let out = self.run(&args)?;
+            self.reserve(&id)?;
+            let out = match self.run(&args) {
+                Err(e) if e["result"] == "definitely-not-sent" => {
+                    self.forget()?;
+                    return Err(e);
+                }
+                result => result?,
+            };
             if !out.status.success() {
                 return Err(unknown());
             }
@@ -171,11 +175,16 @@ impl Tmux<'_> {
                         if evidence["category"] != "started" {
                             return Err(launch_failure(evidence));
                         }
-                        let target = self.owned().map_err(|_| unknown())?;
+                        let started_unverified = || {
+                            let mut e = unknown();
+                            e["launchResult"] = json!("accepted");
+                            e
+                        };
+                        let target = self.owned().map_err(|_| started_unverified())?;
                         if binding.trim_end()
                             != format!("{} {} {}", target.session, target.pane, target.server_pid)
                         {
-                            return Err(unknown());
+                            return Err(started_unverified());
                         }
                         return Ok(target);
                     }
@@ -225,6 +234,7 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
     let receipt = dir.join(format!("{id}.json"));
     let spec: Spec = serde_json::from_reader(File::open(&spec_path)?)?;
     fs::remove_file(spec_path)?;
+    super::binding::record_server(&dir, id)?;
     let mut cmd = Command::new(spec.argv.first().context("empty launch argv")?);
     cmd.args(&spec.argv[1..])
         .current_dir(spec.cwd)
@@ -243,7 +253,7 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
                 ErrorKind::PermissionDenied => "permission_denied",
                 _ => "spawn_failed",
             };
-            publish(&receipt, json!({"category":category}))?;
+            super::binding::save(&receipt, &json!({"category":category}))?;
             return Ok(ExitCode::FAILURE);
         }
     };
@@ -252,14 +262,14 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
     }
-    let started = publish(&receipt, json!({"category":"started","pid":child.id()}));
+    let started = super::binding::save(&receipt, &json!({"category":"started","pid":child.id()}));
     let status = child.wait()?;
     let code = status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
-    publish(
+    super::binding::save(
         &receipt,
-        json!({"category":"process_exited","exitCode":code}),
+        &json!({"category":"process_exited","exitCode":code}),
     )?;
     started?;
     Ok(ExitCode::from(code as u8))
