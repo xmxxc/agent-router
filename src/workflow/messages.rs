@@ -2,6 +2,10 @@
 //! before printing it, so another waiter cannot deliver the same messages.
 mod receipt;
 #[cfg(target_os = "linux")]
+pub(super) mod runtime;
+#[cfg(target_os = "linux")]
+pub(crate) use runtime::{run_runtime_owner, run_runtime_probe};
+#[cfg(target_os = "linux")]
 pub mod relay;
 pub use receipt::{Confirm, ACK_USAGE, RESOLVE_USAGE};
 use receipt::{Delivery, Resolution, State};
@@ -23,6 +27,9 @@ pub const DONE_USAGE: &str =
     "wfc done --report FILE [--attempt ID] [--message-id KEY] [--owner-token TOKEN]";
 pub const ASK_USAGE: &str =
     "wfc ask QUESTION [--options CSV] [--attempt ID] [--callback-ref REF] [--message-id KEY] [--owner-token TOKEN]";
+#[cfg(target_os = "linux")]
+pub const WAIT_USAGE: &str = "wfc wait [--timeout SECONDS] [--dispatch ID] [--scope NAME] [--owner-token TOKEN] [--stall-after SECONDS]";
+#[cfg(not(target_os = "linux"))]
 pub const WAIT_USAGE: &str =
     "wfc wait [--timeout SECONDS] [--scope NAME] [--dispatch ID] [--owner-token TOKEN]";
 
@@ -268,6 +275,7 @@ enum MessageKind {
     Done,
     Question,
     Reclaimed,
+    HostRuntime,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -375,6 +383,12 @@ impl Message {
             .is_some_and(|tag| tag == "reclaimed")
         {
             MessageKind::Reclaimed
+        } else if self
+            .additional_fields
+            .get("kind")
+            .is_some_and(|kind| kind == "host_runtime")
+        {
+            MessageKind::HostRuntime
         } else if self.question_payload.is_some() {
             MessageKind::Question
         } else {
@@ -395,6 +409,18 @@ impl Message {
             MessageKind::Done => self.report.is_some(),
             MessageKind::Question => self.report.is_none(),
             MessageKind::Reclaimed => self.question_payload.is_none() && self.request_key.is_none(),
+            MessageKind::HostRuntime => {
+                self.question_payload.is_none()
+                    && self.request_key.is_none()
+                    && matches!(
+                        self.additional_fields.get("type").and_then(Value::as_str),
+                        Some("blocked" | "unknown" | "stalled" | "exited" | "recovered")
+                    )
+                    && self
+                        .additional_fields
+                        .get("fault")
+                        .is_some_and(Value::is_object)
+            }
         }
     }
 
@@ -411,6 +437,15 @@ impl Message {
             return question.body(&self.worker);
         }
         let mut body = self.original_body();
+        if self.kind() == MessageKind::HostRuntime {
+            body.insert("scope".into(), json!(self.worker.scope()));
+            for key in ["kind", "host", "message", "fault"] {
+                if let Some(value) = self.additional_fields.get(key) {
+                    body.insert(key.into(), value.clone());
+                }
+            }
+            return body;
+        }
         for key in ["head", "dirty"] {
             if let Some(value) = self.additional_fields.get(key) {
                 body.insert(key.into(), value.clone());
@@ -494,7 +529,17 @@ impl Message {
             ("id".into(), json!(self.id)),
             ("messageId".into(), json!(self.message_id)),
             ("dispatch".into(), json!(self.worker.dispatch)),
-            ("type".into(), json!(self.kind())),
+            (
+                "type".into(),
+                if self.kind() == MessageKind::HostRuntime {
+                    self.additional_fields
+                        .get("type")
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                } else {
+                    json!(self.kind())
+                },
+            ),
             ("state".into(), json!(state)),
             ("statusVersion".into(), json!(version)),
         ]);
@@ -1256,10 +1301,25 @@ pub struct Wait<'a> {
     dispatch: Option<&'a str>,
     scope: Option<&'a str>,
     owner_token: Option<&'a str>,
+    #[cfg(target_os = "linux")]
+    stall_after: Duration,
 }
 
 impl<'a> Wait<'a> {
     pub fn parse(args: &'a [OsString]) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        let [timeout, dispatch, scope, owner_token, stall_after] = options(
+            args,
+            [
+                "--timeout",
+                "--dispatch",
+                "--scope",
+                "--owner-token",
+                "--stall-after",
+            ],
+            None,
+        )?;
+        #[cfg(not(target_os = "linux"))]
         let [timeout, dispatch, scope, owner_token] = options(
             args,
             ["--timeout", "--dispatch", "--scope", "--owner-token"],
@@ -1277,6 +1337,8 @@ impl<'a> Wait<'a> {
             dispatch,
             scope,
             owner_token,
+            #[cfg(target_os = "linux")]
+            stall_after: runtime::seconds(stall_after.unwrap_or("300"))?,
         })
     }
 
@@ -1284,6 +1346,8 @@ impl<'a> Wait<'a> {
         let state = state_dir()?;
         let token = controller::token(self.owner_token);
         let start = Instant::now();
+        #[cfg(target_os = "linux")]
+        let mut runtime = runtime::Monitor::new(self.stall_after);
         loop {
             let preflight = || {
                 controller::Owners::read(&state)?.preflight(self.scope, token.as_deref(), "wait")
@@ -1300,7 +1364,20 @@ impl<'a> Wait<'a> {
             if !batch.is_empty() || remaining.is_zero() {
                 return Ok(batch);
             }
-            std::thread::sleep(remaining.min(Duration::from_millis(100)));
+            #[cfg(target_os = "linux")]
+            if runtime.poll(
+                &state,
+                self.dispatch,
+                self.scope,
+                token.as_deref(),
+                remaining,
+            )? {
+                continue;
+            }
+            let delay = Duration::from_millis(100);
+            #[cfg(target_os = "linux")]
+            let delay = runtime.delay(delay);
+            std::thread::sleep(self.timeout.saturating_sub(start.elapsed()).min(delay));
         }
     }
 }

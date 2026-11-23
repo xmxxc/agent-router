@@ -30,6 +30,7 @@ pub struct Relay<'a> {
     detach: bool,
     lifetime: Option<Duration>,
     owner_token: Option<&'a str>,
+    stall_after: Duration,
 }
 
 enum Target<'a, Thread> {
@@ -99,9 +100,7 @@ impl<'a> Relay<'a> {
             (false, None, Some(url), Some(session)) => Target::OpenCode(opencode::Target::parse(url, session)?),
             _ => bail!("give exactly one controller: --codex, --codex-thread, or --opencode-url with --opencode-session"),
         };
-        if let Some(value) = opts.get("--stall-after") {
-            seconds(value)?;
-        }
+        let stall_after = seconds(opts.get("--stall-after").copied().unwrap_or("300"))?;
         Ok(Self {
             scope: opts.get("--scope").copied(),
             target,
@@ -112,6 +111,7 @@ impl<'a> Relay<'a> {
                 .transpose()?
                 .filter(|d| !d.is_zero()),
             owner_token: opts.get("--owner-token").copied(),
+            stall_after,
         })
     }
 
@@ -151,6 +151,7 @@ impl<'a> Relay<'a> {
             if let Some(limit) = self.lifetime {
                 cmd.args(["--for", &limit.as_secs_f64().to_string()]);
             }
+            cmd.args(["--stall-after", &self.stall_after.as_secs_f64().to_string()]);
             if let Some(token) = &token {
                 cmd.env("WFC_CONTROLLER_TOKEN", token)
                     .env_remove("WFC_OWNER_TOKEN");
@@ -184,6 +185,7 @@ impl<'a> Relay<'a> {
             Target::OpenCode(_) => usize::MAX, // The batch is an HTTP body, not an argument.
         };
         let mut diagnosed = HashSet::new();
+        let mut runtime = super::runtime::Monitor::new(self.stall_after);
         while !remaining().is_zero() {
             preflight()?;
             let order = transport_lock(&state, self.scope)?;
@@ -205,6 +207,7 @@ impl<'a> Relay<'a> {
                 None => None,
             };
             if let Some((batch, text)) = batch {
+                runtime.cancel_probe();
                 let limit = remaining().min(timeout);
                 let outcome = match &target {
                     Target::Codex(thread) => {
@@ -244,7 +247,10 @@ impl<'a> Relay<'a> {
                 }
             }
             drop(order);
-            std::thread::sleep(remaining().min(Duration::from_millis(500)));
+            if runtime.poll(&state, None, self.scope, token.as_deref(), remaining())? {
+                continue;
+            }
+            std::thread::sleep(remaining().min(runtime.delay(Duration::from_millis(500))));
         }
         Ok(())
     }

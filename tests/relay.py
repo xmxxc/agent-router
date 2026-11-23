@@ -4,14 +4,18 @@ import hashlib
 import json
 import os
 import select
+import shutil
 import signal
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 import uuid
+
+import runtime_process
 
 WFC = str(Path(sys.argv.pop(1)).resolve())
 PREFIX = "[router] Messages for the controller: "
@@ -98,6 +102,362 @@ subprocess.run([sys.argv[1], 'ask', '选甲,乙？', '--options', '甲,乙',
         self.assertEqual((message["dispatch"], message["attempt"]), (record["dispatch"], record["attempt"]))
         confirmed = self.data("ack", message["messageId"])
         self.assertEqual((confirmed["state"], confirmed["statusVersion"]), ("processed", 4))
+
+    def start_private_tmux(self):
+        socket = self.root / "socket"
+        tmux = [shutil.which("tmux"), "-S", str(socket), "-f", "/dev/null"]
+        self.env.update(PATH=os.pathsep.join((str(self.root), os.environ["PATH"])),
+                        WFC_TMUX_SOCKET=str(socket), TERM="xterm", WFC_MAX_TURN_SECONDS="0")
+        subprocess.run([*tmux, "new-session", "-d", "-s", "sentinel", "/bin/cat"],
+                       env=self.env, check=True, timeout=10)
+        self.addCleanup(subprocess.run, [*tmux, "kill-server"], env=self.env,
+                        capture_output=True, timeout=10)
+
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_runtime_notice_through_the_private_queue(self):
+        self.start_private_tmux()
+        secret = "private-queue-fixture-token"
+        config = self.root / "launch.json"
+        fixture = f"import time; print('Quota exceeded: {secret}', flush=True); time.sleep(20)"
+        config.write_text(json.dumps({"hosts": {"codex": {"command": [sys.executable, "-c", fixture]}}}))
+        job = self.data("dispatch", "--task", "task", "--role", "worker", "--scope", "failure",
+                        "--report", "task", "--cwd", ".", "--host", "codex", "--launch-config", str(config))
+
+        self.cli("relay", "--codex", "--scope", "other", "--for", ".25")
+        self.assertEqual(self.calls(), [])
+        self.cli("relay", "--codex", "--scope", "failure", "--for", "2")
+        [call] = self.calls()
+        self.assertTrue(call[4].startswith(PREFIX))
+        self.assertNotIn(secret, call[4])
+        [notice] = json.loads(call[4][len(PREFIX):])["messages"]
+        self.assertEqual((notice["kind"], notice["type"], notice["fault"]["category"]),
+                         ("host_runtime", "blocked", "quota"))
+        for key in ("dispatch", "round", "attempt", "scope"):
+            self.assertEqual(notice[key], job[key])
+        ack = self.data("ack", notice["messageId"])
+        self.assertEqual((ack["state"], ack["statusVersion"]), ("processed", 4))
+        self.cli("relay", "--codex", "--scope", "failure", "--for", "1.25")
+        self.assertEqual(self.calls(), [call])
+        print(json.dumps({"case": "runtime-private-queue", "scope": notice["scope"],
+                          "dispatch": notice["dispatch"], "attempt": notice["attempt"],
+                          "messageId": notice["messageId"], "fault": notice["fault"],
+                          "queueCalls": 1, "ack": ack}), flush=True)
+
+    def slow_tmux_probe(self):
+        real_tmux = shutil.which("tmux")
+        trace = self.root / "slow-probes"
+        slow = self.root / "slow-probe-gate"
+        shim = self.root / "tmux"
+        shim.write_text(f"#!{sys.executable}\n" + """
+import json, os, subprocess, sys
+from pathlib import Path
+argv = sys.argv[1:]
+if "list-panes" not in argv or not Path(SLOW_GATE).exists():
+    os.execv(REAL_TMUX, [REAL_TMUX, *argv])
+child = subprocess.Popen(["/bin/sleep", "25"])
+with Path(TRACE).open("a") as log:
+    print(json.dumps(dict(shim=os.getpid(), descendant=child.pid, group=os.getpgrp(),
+                          target=argv[argv.index("-t") + 1])), file=log)
+sys.exit(child.wait())
+""".replace("REAL_TMUX", repr(real_tmux)).replace("TRACE", repr(str(trace))).replace("SLOW_GATE", repr(str(slow))))
+        shim.chmod(0o700)
+
+        def probes():
+            return [json.loads(line) for line in trace.read_text().splitlines()] if trace.exists() else []
+
+        return slow, probes
+
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_unverified_tmux_timeout_and_abandoned_relay(self):
+        self.start_private_tmux()
+        config = self.root / "launch.json"
+        fixture = "import time; print('Ready.', flush=True); time.sleep(60)"
+        config.write_text(json.dumps({"hosts": {"codex": {"command": [sys.executable, "-c", fixture]}}}))
+        job = self.data("dispatch", "--task", "task", "--role", "worker", "--scope", "ours",
+                        "--report", "task", "--cwd", ".", "--host", "codex", "--launch-config", str(config))
+        wait = ("wait", "--scope", "ours", "--dispatch", job["dispatch"], "--stall-after", "0")
+        self.assertFalse(self.data(*wait, "--timeout", ".55", code=3)["messages"])
+        watch = self.root / "state" / "dispatches" / f'{job["dispatch"]}.host-watch'
+        self.assertTrue(json.loads(watch.read_text())["execution"])
+        slow, probes = self.slow_tmux_probe()
+        slow.touch()
+        self.assertFalse(self.data(*wait, "--timeout", ".55", code=3)["messages"])
+        self.assertTrue(probes(), "the clipped invocation reached the slow client")
+
+        before = len(probes())
+        self.assertFalse(self.data(*wait, "--timeout", "1.55", code=3)["messages"])
+        self.assertGreater(len(probes()), before, "the complete attempt reached the shim")
+        other = self.publish("ours")
+        [answer] = self.data("wait", "--scope", "ours", "--timeout", "0")["messages"]
+        self.assertEqual(answer["messageId"], other["messageId"])
+
+        runtime_process.subreaper(self)
+        before = len(probes())
+        relay = self.foreground(6)
+        item = self.until(lambda: next(iter(probes()[before:]), None))
+        owned = self.until(lambda: runtime_process.capture(relay))
+        shim = runtime_process.process(item["shim"])
+        descendant = runtime_process.process(item["descendant"])
+        self.assertIsNotNone(shim)
+        self.assertIsNotNone(descendant)
+        self.assertEqual(item["group"], owned[1].pid)
+        backend = runtime_process.process(shim.parent)
+        self.assertIsNotNone(backend)
+        self.assertEqual(backend.parent, owned[1].pid)
+        self.assertEqual(descendant.parent, shim.pid)
+        cleanup = runtime_process.abort_and_reap(self, relay, owned, (backend, shim, descendant))
+        self.assertFalse(self.calls(), "cancellation did not send a new queue message")
+
+        slow.unlink()
+        self.assertFalse(self.data(*wait, "--timeout", ".65", code=3)["messages"])
+        status, = self.data("status", "--dispatch", job["dispatch"])["dispatches"]
+        self.assertFalse(status["messages"])
+        self.assertEqual(self.data("close", job["dispatch"])["result"], "completed")
+        print(json.dumps({"case": "abandoned-relay", "scope": job["scope"], "attempt": job["attempt"],
+                          "unverifiedTimeoutSilent": True,
+                          "otherReceipt": answer["messageId"], "slowClient": shim.pid,
+                          "slowClientStart": shim.started, "descendant": descendant.pid,
+                          "descendantStart": descendant.started, **cleanup}), flush=True)
+
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_tmux_bound_absence_is_reported_and_recovers(self):
+        self.start_private_tmux()
+        cfg = self.root / "launch.json"
+        code = "import time; print('Ready.', flush=True); time.sleep(60)"
+        cfg.write_text(json.dumps({"hosts": {"codex": {"command": [sys.executable, "-c", code]}}}))
+        job = self.data("dispatch", "--task", "task", "--role", "worker", "--scope", "ours",
+                        "--report", "task", "--cwd", ".", "--host", "codex", "--launch-config", str(cfg))
+        dispatch = job["dispatch"]
+        session = f"wfc-{dispatch}"
+        tmux = [shutil.which("tmux"), "-S", self.env["WFC_TMUX_SOCKET"]]
+        run_tmux = lambda *args: subprocess.check_output([*tmux, *args], text=True).strip()
+        pane = run_tmux("display-message", "-p", "-t", session, "#{session_id} #{pane_id}")
+        wait = ("wait", "--scope", "ours", "--dispatch", dispatch, "--stall-after", "0")
+
+        def quiet(timeout="1.25"):
+            self.assertFalse(self.data(*wait, "--timeout", timeout, code=3)["messages"])
+
+        def notice(evidence, read_state):
+            [message] = self.data(*wait, "--timeout", "3")["messages"]
+            self.assertEqual((message["kind"], message["fault"]["evidence"]), ("host_runtime", evidence))
+            for key in ("scope", "round", "attempt", "dispatch"):
+                self.assertEqual(message[key], job[key])
+            row, = self.data("status", "--dispatch", dispatch)["dispatches"]
+            self.assertEqual(row["hostActivity"]["readState"], read_state)
+            self.assertEqual(self.data("ack", message["messageId"])["state"], "processed")
+            self.assertTrue(self.data("ack", message["messageId"])["duplicate"])
+            return message["messageId"]
+
+        quiet()
+        watch = self.root / "state" / "dispatches" / f"{dispatch}.host-watch"
+        execution = json.loads(watch.read_text())["execution"]
+        run_tmux("rename-session", "-t", session, "renamed-original")
+        quiet()  # Same session/pane still appears in the pinned server's roster.
+        run_tmux("rename-session", "-t", "renamed-original", session)
+        launch = run_tmux("show-environment", "-t", session, "WFC_TMUX_LAUNCH").split("=", 1)[1]
+        run_tmux("set-environment", "-t", session, "WFC_TMUX_LAUNCH", "0" * 32)
+        quiet()  # A returned foreign binding does not establish absence.
+        run_tmux("set-environment", "-t", session, "WFC_TMUX_LAUNCH", launch)
+
+        # Isolate a reversible negative roster on the real, pinned private
+        # server. Everything other than these two reported results passes through.
+        gate = self.root / "reported-absence"
+        shim = self.root / "tmux"
+        shim.write_text(f"#!{sys.executable}\n" + f"""
+import os, subprocess, sys
+from pathlib import Path
+args = sys.argv[1:]
+real = {tmux[0]!r}
+if Path({str(gate)!r}).exists() and "list-panes" in args:
+    if {f'={session}:'!r} in args:
+        print({"can't find session: " + session!r}, file=sys.stderr)
+        sys.exit(1)
+    if "-a" in args and "#{{session_id}} #{{pane_id}}" in args:
+        result = subprocess.run([real, *args], capture_output=True, text=True, close_fds=False)
+        if result.returncode:
+            sys.stderr.write(result.stderr)
+            sys.exit(result.returncode)
+        for line in result.stdout.splitlines():
+            if line != {pane!r}:
+                print(line)
+        sys.exit(0)
+os.execv(real, [real, *args])
+""")
+        shim.chmod(0o700)
+
+        gate.touch()
+        wrong, = self.data("status", "--dispatch", dispatch)["dispatches"]
+        self.assertFalse(wrong["backendAlive"])
+        lock = self.root / "state" / "close-locks" / f'{dispatch}.{job["attempt"]}'
+        with lock.open("rb") as close_lock:
+            fcntl.flock(close_lock, fcntl.LOCK_EX)
+            quiet()  # A full negative reply cannot publish while a close owns this execution.
+        first = notice("backend_unavailable", "unavailable")
+        quiet()
+        gate.unlink()
+        recovered = notice("read_restored", "readable")
+        self.assertEqual(json.loads(watch.read_text())["execution"], execution)
+        gate.touch()
+        again = notice("backend_unavailable", "unavailable")
+        self.assertEqual(len({first, recovered, again}), 3)
+        quiet()
+        gate.unlink()
+        self.assertEqual(self.data("close", dispatch)["result"], "completed")
+        gate.touch()
+        quiet()
+        print(json.dumps({"case": "tmux-bound-absence", "scope": job["scope"], "attempt": job["attempt"],
+                          "returnedAbsence": [first, again], "readRestored": recovered,
+                          "renameAndForeignBindingSilent": True, "confirmedCloseSilent": True}), flush=True)
+
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_codex_unicode_appended_activity(self):
+        self.start_private_tmux()
+        commands = self.root / "screen.json"
+        secret = "private-codex-fixture-token"
+        lines = [f"Quota exceeded: {secret}"]
+        commands.write_text(json.dumps(lines))
+        fixture = textwrap.dedent("""
+            import json
+            import time
+            from pathlib import Path
+            count = 0
+            while True:
+                lines = json.loads(Path("screen.json").read_text())
+                for line in lines[count:]:
+                    print(line, flush=True)
+                count = len(lines)
+                time.sleep(.025)
+            """)
+        config = self.root / "launch.json"
+        config.write_text(json.dumps({"hosts": {"codex": {"command": [sys.executable, "-c", fixture]}}}))
+        job = self.data("dispatch", "--task", "task", "--role", "worker", "--scope", "ours",
+                        "--report", "task", "--cwd", ".", "--host", "codex", "--launch-config", str(config))
+        wait = ("wait", "--scope", job["scope"], "--dispatch", job["dispatch"], "--stall-after", "0")
+
+        def append(line):
+            lines.append(line)
+            tmp = commands.with_suffix(".tmp")
+            tmp.write_text(json.dumps(lines))
+            tmp.replace(commands)
+
+        def observe(category, evidence):
+            notice, = self.data(*wait, "--timeout", "3")["messages"]
+            self.assertEqual((notice["fault"]["category"], notice["fault"]["evidence"]),
+                             (category, evidence))
+            self.assertEqual((notice["attempt"], notice["scope"]), (job["attempt"], job["scope"]))
+            self.assertNotIn(secret, json.dumps(notice))
+            self.assertEqual(self.data("ack", notice["messageId"])["state"], "processed")
+            return notice["messageId"]
+
+        def quiet():
+            self.assertFalse(self.data(*wait, "--timeout", "1.3", code=3)["messages"])
+
+        first = observe("quota", "screen_notice")
+        append("Elapsed: 2s")
+        quiet()
+        append("• Time elapsed: 3 seconds")
+        quiet()
+        append("• 4s")
+        quiet()
+        append("• Working (4s • esc to interrupt)")
+        quiet()
+        append("Processing (5s)")
+        quiet()
+        append("普通尾注只是界面文本")
+        quiet()
+        append("• 已拿到结果。")
+        with_punctuation = observe("recovered", "changed_activity")
+        quiet()
+        append("Quota exceeded")
+        second = observe("quota", "screen_notice")
+        self.assertNotEqual(first, second)
+        append("• 已生成下一批结果")
+        without_punctuation = observe("recovered", "changed_activity")
+        quiet()
+        append("Quota exceeded")
+        third = observe("quota", "screen_notice")
+        append("• 2 files changed.")
+        numeric = observe("recovered", "changed_activity")
+        self.assertEqual(len({with_punctuation, without_punctuation, numeric}), 3)
+        self.assertEqual(self.data("close", job["dispatch"])["result"], "completed")
+        print(json.dumps({"case": "codex-unicode-appended-activity", "scope": job["scope"],
+                          "attempt": job["attempt"], "quotaReceipts": [first, second, third],
+                          "recoveryReceipts": [with_punctuation, without_punctuation, numeric],
+                          "ordinaryFootersSilent": True}), flush=True)
+
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_runtime_scope_takeover_fences_the_inflight_read(self):
+        self.start_private_tmux()
+        config = self.root / "launch.json"
+        program = textwrap.dedent("""
+            import time
+            from pathlib import Path
+            print("Ready.", flush=True)
+            while not Path("quota").exists():
+                time.sleep(.025)
+            print("Quota exceeded", flush=True)
+            time.sleep(60)
+            """)
+        config.write_text(json.dumps({"hosts": {"codex": {"command": [sys.executable, "-c", program]}}}))
+        job = self.data("dispatch", "--task", "task", "--role", "worker", "--scope", "ours",
+                        "--report", "task", "--cwd", ".", "--host", "codex", "--launch-config", str(config))
+        first = self.data("owner", "acquire", "--scope", "ours", "--owner", "first")
+        old = {"WFC_CONTROLLER_TOKEN": first["token"]}
+        wait = ("wait", "--scope", "ours", "--dispatch", job["dispatch"], "--stall-after", "0")
+        self.assertFalse(self.data(*wait, "--timeout", ".65", code=3, **old)["messages"])
+        watch = self.root / "state" / "dispatches" / f'{job["dispatch"]}.host-watch'
+        bound = json.loads(watch.read_text())["execution"]
+        sentinel = self.publish("neighbor")
+        slow, probes = self.slow_tmux_probe()
+        slow.touch()
+        waiting = subprocess.Popen([WFC, *wait, "--timeout", "5"], cwd=self.root,
+                                   env=dict(self.env, **old), stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+
+        def cleanup():
+            if waiting.poll() is None:
+                waiting.kill()
+            waiting.communicate(timeout=5)
+
+        self.addCleanup(cleanup)
+        self.until(probes)
+        current = self.data("owner", "takeover", "--scope", "ours", "--owner", "current")
+        new = {"WFC_CONTROLLER_TOKEN": current["token"]}
+        stdout, stderr = waiting.communicate(timeout=5)
+        self.assertEqual((waiting.returncode, stdout, json.loads(stderr)["error"]),
+                         (1, "", "stale_controller_owner"))
+        slow.unlink()
+        self.assertEqual(json.loads(watch.read_text())["execution"], bound)
+        self.assertFalse(self.data(*wait, "--timeout", ".65", code=3, **new)["messages"])
+        [neighbor] = self.data("wait", "--scope", "neighbor", "--timeout", "0")["messages"]
+        self.assertEqual(neighbor["messageId"], sentinel["messageId"])
+
+        tmux = [shutil.which("tmux"), "-S", self.env["WFC_TMUX_SOCKET"]]
+        session = f'wfc-{job["dispatch"]}'
+        subprocess.run([*tmux, "display-message", "-t", session, "-p", "#{pane_id}"],
+                       capture_output=True, check=True, timeout=5)
+        # Deliver an actual host notice to the verified pane via the worker.
+        # A marker file lets the fixture's stdout supply the text.
+        (self.root / "quota").touch()
+        [message] = self.data(*wait, "--timeout", "3", **new)["messages"]
+        self.assertEqual((message["type"], message["kind"], message["fault"]["category"]),
+                         ("blocked", "host_runtime", "quota"))
+        for key in ("dispatch", "round", "attempt", "scope"):
+            self.assertEqual(message[key], job[key])
+        stale = subprocess.run([WFC, "ack", message["messageId"]], cwd=self.root,
+                               env=dict(self.env, **old), capture_output=True, text=True, timeout=5)
+        self.assertEqual((stale.returncode, json.loads(stale.stderr)["error"]),
+                         (1, "stale_controller_owner"))
+        ack = self.data("ack", message["messageId"], **new)
+        self.assertEqual((ack["messageId"], ack["state"]), (message["messageId"], "processed"))
+        self.assertTrue(self.data("ack", message["messageId"], **new)["duplicate"])
+        self.assertEqual(self.data("ack", neighbor["messageId"])["state"], "processed")
+        self.assertEqual(self.data("close", job["dispatch"], **new)["result"], "completed")
+        print(json.dumps({"case": "runtime-scope-takeover", "scope": job["scope"],
+                          "attempt": job["attempt"], "generation": current["generation"],
+                          "receipt": message["messageId"], "neighborReceipt": neighbor["messageId"]}),
+              flush=True)
 
     def test_detached_scope(self):
         other = self.publish("other")

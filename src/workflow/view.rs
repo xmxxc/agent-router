@@ -68,6 +68,20 @@ pub fn merged_history(row: &Value, ledger: Vec<Value>) -> Result<Vec<Value>> {
     Ok(history)
 }
 
+pub(super) fn round_completion<'a>(
+    row: &Value,
+    round: &Value,
+    history: &'a [Value],
+) -> Option<&'a Value> {
+    history.iter().find(|m| {
+        m["type"] == "done"
+            && m["dispatch"] == row["dispatch"]
+            && m["attempt"] == round["attempt"]
+            && m["round"] == round["round"]
+            && (round["report"].is_null() || m["report"] == round["report"])
+    })
+}
+
 pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: bool) -> Result<()> {
     let mut rounds = row
         .get("rounds")
@@ -101,13 +115,7 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
     for round in &mut rounds {
         ensure!(round.is_object(), "invalid stored round");
         let same = round["round"] == row["round"] && round["attempt"] == row["attempt"];
-        let first = history.iter().find(|m| {
-            m["type"] == "done"
-                && m["dispatch"] == row["dispatch"]
-                && m["attempt"] == round["attempt"]
-                && m["round"] == round["round"]
-                && (round["report"].is_null() || m["report"] == round["report"])
-        });
+        let first = round_completion(row, round, history);
         if let Some(m) = first {
             if !matches!(round["state"].as_str(), Some("failed" | "cancelled"))
                 && (round["state"] != "completed" || round["result"].is_null())
@@ -198,6 +206,8 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
         row["tmuxAlive"] = json!(alive);
     }
     row["rounds"] = json!(rounds);
+    #[cfg(target_os = "linux")]
+    super::messages::runtime::project(row, history);
     row["last"] = history.last().cloned().unwrap_or(Value::Null);
     if named {
         row["messages"] = json!(history);
