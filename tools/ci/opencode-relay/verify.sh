@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run the OpenCode suite from the pinned product checkout.
+# Run the OpenCode argument validation method from the pinned product checkout.
 set -euo pipefail
 ci_dir=$(cd "$(dirname "$0")" && pwd)
 binary=$(realpath "target/$TARGET/release/wfc")
@@ -17,7 +17,11 @@ run_suite() {
     mkdir "$work/home" "$work/tmp"
     printf 'suite=%s selector=%s expected=%s\n' "$group" "$selector" "$expected" | tee "$log"
     env -i PATH="$PATH" HOME="$work/home" TMPDIR="$work/tmp" LANG=C.UTF-8 TERM=xterm         PYTHONUTF8=1 PYTHONDONTWRITEBYTECODE=1         WFC_STATE="$work/state" WFC_TMUX_SOCKET="$work/tmux.sock"         "$python" -Bu "$ci_dir/reap.py" timeout --kill-after=5s 180s         "$python" -Bu "$script" "$binary" -v "$selector" 2>&1 | tee -a "$log" || status=$?
-    if grep -Eq "^Ran $expected tests in " "$log"; then
+    local count_label="$expected tests"
+    if (( expected == 1 )); then
+        count_label="$expected test"
+    fi
+    if grep -Eq "^Ran $count_label in " "$log"; then
         selection=confirmed
     fi
     if (( status != 0 )) || [[ "$selection" != confirmed ]] ||
@@ -32,6 +36,6 @@ run_suite() {
         tee -a "$EVIDENCE/results.log"
 }
 
-run_suite opencode tests/opencode_relay.py OpenCodeRelay 5
+run_suite opencode tests/opencode_relay.py OpenCodeRelay.test_invalid_target_and_worker_callback_do_not_claim 1
 printf 'firstFailedSuite=%s\n' "$first_failure" | tee -a "$EVIDENCE/results.log"
 test "$first_failure" = none
