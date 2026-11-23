@@ -290,7 +290,7 @@ impl<'a> Dispatch<'a> {
                             "Herdr dispatch requires an unowned scope"
                         );
                         if host.backend == "herdr" {
-                            herdr::native_state(&state)?;
+                            ensure_state_writable(&state)?;
                         }
                         record["create"] = json!({"result":"definitely-not-sent","category":failure.category(),
                             "dispatch":dispatch,"attempt":attempt,"round":round,"scope":scope});
