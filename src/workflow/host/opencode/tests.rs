@@ -3,7 +3,9 @@ use crate::workflow::host::{Launch, Options};
 use uuid::Uuid;
 
 const ATTEMPT: &str = "a-11111111111111111111111111111111";
+const DISPATCH: &str = "d-33333333333333333333333333333333";
 const NEXT_ATTEMPT: &str = "a-22222222222222222222222222222222";
+const RETRY_ATTEMPT: &str = "a-33333333333333333333333333333333";
 
 struct Fixture {
     root: PathBuf,
@@ -20,31 +22,37 @@ impl Fixture {
         let cwd = root.join("checkout with space");
         fs::create_dir(&cwd).unwrap();
         let config = root.join("launch.json");
-        let store = root.join("worker.db");
+        let store = launch_directory(&root, DISPATCH, ATTEMPT)
+            .unwrap()
+            .join("opencode.db");
         let fixture = Self {
             root,
             cwd,
             config,
             store,
         };
-        fixture.set_store(&fixture.store);
+        fixture.configure(
+            json!({"WFC_OPENCODE_ISOLATED_STORE":"1","OPENCODE_DB":"","WFC_OPENCODE_DB":""}),
+        );
         fixture
     }
 
-    fn set_store(&self, store: &Path) {
+    fn configure(&self, env: Value) {
         fs::write(
             &self.config,
-            json!({"hosts":{"opencode":{
-                "command":["opencode-fixture"],"env":{"OPENCODE_DB":store,"WFC_OPENCODE_DB":store}
-            }}})
-            .to_string(),
+            json!({"hosts":{"opencode":{"command":["opencode-fixture"],"env":env}}}).to_string(),
         )
         .unwrap();
     }
 
-    fn launch(&self) -> (Value, String) {
+    fn set_store(&self, store: &Path) {
+        self.configure(json!({"OPENCODE_DB":store,"WFC_OPENCODE_DB":store,
+                              "WFC_OPENCODE_ISOLATED_STORE":"0"}));
+    }
+
+    fn start(&self) -> Result<(Value, Launch)> {
         let mut record = json!({
-            "dispatch":"d-33333333333333333333333333333333", "attempt": ATTEMPT, "round":1,
+            "dispatch":DISPATCH, "attempt": ATTEMPT, "round":1,
             "cwd":self.cwd, "scope":"fixture", "task":self.root.join("task 合成.md"),
             "role":"fixture", "report":self.root.join("report.md"), "host":"opencode", "backend":"tmux",
             "model":"fixture/provider"
@@ -57,8 +65,12 @@ impl Fixture {
             effort: Some("high"),
             ..Options::default()
         }
-        .prepare(&self.root, &mut record)
-        .unwrap();
+        .prepare(&self.root, &mut record)?;
+        Ok((record, launch))
+    }
+
+    fn launch(&self) -> (Value, String) {
+        let (record, launch) = self.start().unwrap();
         let brief = launch.argv.last().unwrap().to_owned();
         assert!(brief.ends_with(&format!("Current attempt {ATTEMPT}.")));
         assert_eq!(
@@ -78,15 +90,24 @@ impl Fixture {
         assert_eq!(record["opencodeOpening"]["attempt"], ATTEMPT);
         assert!(!record.to_string().contains(&brief));
         assert!(record["hostSession"].is_null());
+        assert!(!self.store.exists());
+        assert_eq!(
+            fs::read_dir(self.store.parent().unwrap()).unwrap().count(),
+            0
+        );
         (record, brief)
     }
 
-    fn resume(&self, original: &Value) -> Result<(Launch, Value)> {
+    fn resume(&self, original: &Value) -> Result<(Launch, String, Value)> {
         let mut next = original.clone();
-        next["attempt"] = json!(NEXT_ATTEMPT);
+        next["attempt"] = json!(if original["attempt"] == NEXT_ATTEMPT {
+            RETRY_ATTEMPT
+        } else {
+            NEXT_ATTEMPT
+        });
         next["round"] = json!(2);
-        let launch = Options::prepare_opencode_resume(&self.root, original, &mut next)?;
-        Ok((launch, next))
+        let (launch, input) = Options::prepare_opencode_resume(&self.root, original, &mut next)?;
+        Ok((launch, input, next))
     }
 
     fn db(&self) -> Connection {
@@ -101,9 +122,34 @@ impl Fixture {
         db
     }
 
+    fn receipt<'a>(&'a self, session: &'a str, first_message: &'a str) -> OpencodeAdoption<'a> {
+        OpencodeAdoption {
+            dispatch: DISPATCH,
+            attempt: ATTEMPT,
+            cwd: &self.cwd,
+            database: &self.store,
+            session,
+            first_message,
+        }
+    }
+
+    fn adopted(&self, original: &Value, id: &str, message: &str) -> Value {
+        let mut record = original.clone();
+        adopt_opencode_session(&self.root, &mut record, self.receipt(id, message)).unwrap();
+        record
+    }
+
     fn assert_resume(&self, original: &Value, id: &str, message: &str) -> Value {
         let before = fs::read(&self.store).unwrap();
-        let (launch, next) = self.resume(original).unwrap();
+        self.assert_rejected(
+            original,
+            "missing verified original OpenCode adoption receipt",
+        );
+        let adopted = self.adopted(original, id, message);
+        let (launch, input, next) = self.resume(&adopted).unwrap();
+        assert!(input.ends_with(&format!("Current attempt {NEXT_ATTEMPT}.")));
+        assert!(!input.contains(ATTEMPT));
+        assert!(!launch.argv.contains(&input));
         assert_eq!(
             launch.argv,
             [
@@ -122,7 +168,7 @@ impl Fixture {
         assert_eq!(next["hostSession"], id);
         assert_eq!(
             next["opencodeSession"],
-            json!({"project":"project","firstMessage":message})
+            json!({"project":"project","firstMessage":message,"adoptedAttempt":ATTEMPT,"currentAttempt":NEXT_ATTEMPT,"session":id})
         );
         assert_eq!(next["opencodeOpening"], original["opencodeOpening"]);
         assert_eq!(fs::read(&self.store).unwrap(), before);
@@ -271,18 +317,19 @@ fn legacy_first_real_user_opening_and_explicit_argv() {
     let saved = fixture.assert_resume(&record, "ses_original", "msg_original");
     let mut recheck = saved.clone();
     recheck["attempt"] = json!("a-44444444444444444444444444444444");
-    let launch = Options::prepare_opencode_resume(&fixture.root, &saved, &mut recheck).unwrap();
+    let (launch, _) =
+        Options::prepare_opencode_resume(&fixture.root, &saved, &mut recheck).unwrap();
     assert_eq!(launch.argv.last().unwrap(), "ses_original");
     db.execute(
         "UPDATE session SET project_id='other' WHERE id='ses_original'",
         [],
     )
     .unwrap();
-    fixture.assert_rejected(&record, "different project");
+    fixture.assert_rejected(&saved, "different project");
 }
 
 #[test]
-fn historical_root_sequence_and_ambiguous_candidates() {
+fn historical_root_sequence_and_adopted_id_ignore_other_roots() {
     let fixture = Fixture::new();
     let (record, brief) = fixture.launch();
     let db = fixture.db();
@@ -323,7 +370,7 @@ fn historical_root_sequence_and_ambiguous_candidates() {
         &brief,
         false,
     );
-    fixture.assert_rejected(&record, "multiple root OpenCode sessions");
+    fixture.assert_resume(&record, "ses_original", "msg_first");
 }
 
 #[test]
@@ -364,28 +411,171 @@ fn unified_sessions_use_recorded_worktree_and_actual_user_sequence() {
     let error = Options::prepare_opencode_resume(&fixture.root, &saved, &mut next)
         .err()
         .unwrap();
-    assert!(error.to_string().contains("session proof changed"));
+    assert!(error
+        .to_string()
+        .contains("invalid OpenCode session identity"));
     modern_message(&db, "ses_original", "msg_same_seq", 2, "user", "other");
-    fixture.assert_rejected(&record, "no root OpenCode session");
+    fixture.assert_rejected(&saved, "does not match the original first user message");
 }
 
 #[test]
 fn missing_conflicting_or_unreadable_launch_evidence_stops_resume() {
     let fixture = Fixture::new();
-    let (mut record, _) = fixture.launch();
-    let mut legacy = record.clone();
-    legacy.as_object_mut().unwrap().remove("opencodeOpening");
-    fixture.assert_rejected(&legacy, "missing recorded OpenCode launch evidence");
-    fixture.assert_rejected(&record, "store is missing or inaccessible");
-    fs::write(&fixture.store, b"not a database").unwrap();
-    fixture.assert_rejected(&record, "not a database");
+    let (mut record, brief) = fixture.launch();
+    for (content, diagnostic) in [
+        (None, "store is missing or inaccessible"),
+        (Some(b"not a database".as_slice()), "not a database"),
+    ] {
+        if let Some(content) = content {
+            fs::write(&fixture.store, content).unwrap();
+        }
+        let error = adopt_opencode_session(
+            &fixture.root,
+            &mut record,
+            fixture.receipt("ses_original", "msg_first"),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains(diagnostic), "{error:#}");
+    }
+    fs::remove_file(&fixture.store).unwrap();
+    let db = fixture.db();
+    let error = adopt_opencode_session(
+        &fixture.root,
+        &mut record,
+        fixture.receipt("ses_original", "msg_first"),
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("unrecognized OpenCode session storage schema"));
+    legacy(&db);
+    put_legacy_root(&fixture, &db, "ses_original", "msg_first", &brief);
+    let adopted = fixture.adopted(&record, "ses_original", "msg_first");
     fixture.set_store(&fixture.root.join("another.db"));
-    fixture.assert_rejected(&record, "store differs from the original dispatch");
+    fixture.assert_rejected(&adopted, "store differs from the original dispatch");
     fixture.set_store(&fixture.store);
     record["opencodeOpening"]["attempt"] = json!(NEXT_ATTEMPT);
-    fixture.assert_rejected(&record, "belongs to another attempt");
-    record["opencodeOpening"]["attempt"] = json!(ATTEMPT);
-    fs::remove_file(&fixture.store).unwrap();
-    let _db = fixture.db();
-    fixture.assert_rejected(&record, "unrecognized OpenCode session storage schema");
+    fixture.assert_rejected(&record, "does not match the recorded launch");
+}
+
+fn put_legacy_root(fixture: &Fixture, db: &Connection, id: &str, message: &str, brief: &str) {
+    db.execute(
+        "INSERT INTO session VALUES(?1,'project',?2,NULL)",
+        params![id, fixture.cwd.to_str().unwrap()],
+    )
+    .unwrap();
+    legacy_message(db, id, message, 1, "user", brief, false);
+}
+
+#[test]
+fn lone_unmarked_legacy_fork_cannot_be_adopted_by_lookup() {
+    let fixture = Fixture::new();
+    let (record, brief) = fixture.launch();
+    let db = fixture.db();
+    legacy(&db);
+    put_legacy_root(&fixture, &db, "ses_original", "msg_first", &brief);
+    let adopted = fixture.adopted(&record, "ses_original", "msg_first");
+    put_legacy_root(&fixture, &db, "ses_copy", "msg_copy", &brief);
+    db.execute("DELETE FROM session WHERE id='ses_original'", [])
+        .unwrap();
+    fixture.assert_rejected(
+        &record,
+        "missing verified original OpenCode adoption receipt",
+    );
+    fixture.assert_rejected(&adopted, "does not match the original first user message");
+}
+
+#[test]
+fn private_launch_and_adoption_identity_are_bound() {
+    let fixture = Fixture::new();
+    let shared = fixture.root.join("external.db");
+    fs::write(&shared, b"external fixture must never be opened").unwrap();
+    fixture.set_store(&shared);
+    let (old, launch) = fixture.start().unwrap();
+    assert_eq!(launch.env["OPENCODE_DB"], json!(shared));
+    assert_eq!(
+        fs::read(&shared).unwrap(),
+        b"external fixture must never be opened"
+    );
+    fixture.assert_rejected(&old, "missing private OpenCode opening evidence");
+    let mut legacy = old.clone();
+    legacy["opencodeOpening"] = json!({"attempt":ATTEMPT,"database":shared,"briefSha256":"old"});
+    legacy["hostSession"] = json!("ses_original");
+    legacy["opencodeSession"] = json!({"firstMessage":"msg_first","project":"project"});
+    fixture.assert_rejected(&legacy, "missing private OpenCode opening evidence");
+
+    fixture.configure(
+        json!({"WFC_OPENCODE_ISOLATED_STORE":"1","OPENCODE_DB":shared,"WFC_OPENCODE_DB":""}),
+    );
+    assert!(fixture
+        .start()
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("cannot use a configured database"));
+    fixture.configure(
+        json!({"WFC_OPENCODE_ISOLATED_STORE":"1","OPENCODE_DB":"","WFC_OPENCODE_DB":""}),
+    );
+    let (mut record, brief) = fixture.launch();
+    assert!(fixture
+        .start()
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("cannot reserve a fresh private"));
+    let db = fixture.db();
+    legacy(&db);
+    put_legacy_root(&fixture, &db, "ses_original", "msg_first", &brief);
+    put_legacy_root(&fixture, &db, "ses_copy", "msg_copy", &brief);
+
+    for receipt in [
+        OpencodeAdoption {
+            attempt: NEXT_ATTEMPT,
+            ..fixture.receipt("ses_original", "msg_first")
+        },
+        OpencodeAdoption {
+            cwd: &fixture.root,
+            ..fixture.receipt("ses_original", "msg_first")
+        },
+        OpencodeAdoption {
+            database: &shared,
+            ..fixture.receipt("ses_original", "msg_first")
+        },
+        OpencodeAdoption {
+            dispatch: "d-12345678",
+            ..fixture.receipt("ses_original", "msg_first")
+        },
+        fixture.receipt("ses_original", "msg_copy"),
+    ] {
+        assert!(adopt_opencode_session(&fixture.root, &mut record, receipt).is_err());
+        assert!(record["opencodeSession"].is_null());
+    }
+    record = fixture.adopted(&record, "ses_original", "msg_first");
+    adopt_opencode_session(
+        &fixture.root,
+        &mut record,
+        fixture.receipt("ses_original", "msg_first"),
+    )
+    .unwrap();
+    let error = adopt_opencode_session(
+        &fixture.root,
+        &mut record,
+        fixture.receipt("ses_copy", "msg_copy"),
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("conflicts with the recorded session"));
+    let mut stale = record.clone();
+    stale["attempt"] = json!(RETRY_ATTEMPT);
+    fixture.assert_rejected(&stale, "adoption conflicts");
+    let mut mismatched = record.clone();
+    mismatched["hostSession"] = json!("ses_copy");
+    fixture.assert_rejected(&mismatched, "adoption conflicts");
+    fs::rename(fixture.store.parent().unwrap(), fixture.root.join("parked")).unwrap();
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(fixture.store.parent().unwrap())
+        .unwrap();
+    fixture.assert_rejected(&record, "private OpenCode launch directory changed");
 }

@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     env, fs,
+    os::unix::fs::{DirBuilderExt, MetadataExt},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -17,7 +18,11 @@ use std::{
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Opening {
+    dispatch: String,
     attempt: String,
+    cwd: PathBuf,
+    device: u64,
+    inode: u64,
     database: PathBuf,
     brief_sha256: String,
 }
@@ -25,6 +30,9 @@ struct Opening {
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Proof {
+    adopted_attempt: String,
+    current_attempt: String,
+    session: String,
     project: String,
     first_message: String,
 }
@@ -54,82 +62,183 @@ fn selected_database(launch: &Map<String, Value>) -> Result<Option<PathBuf>> {
     Ok(host.or(lookup))
 }
 
+fn launch_directory(state: &Path, dispatch: &str, attempt: &str) -> Result<PathBuf> {
+    ensure!(
+        super::super::valid_id(dispatch) && super::super::valid_identity(attempt, "a-"),
+        "invalid OpenCode launch identity"
+    );
+    Ok(state
+        .canonicalize()?
+        .join(format!("opencode-{dispatch}-{attempt}")))
+}
+
+fn store_directory(path: &Path) -> Result<fs::Metadata> {
+    let info = fs::symlink_metadata(path).context("missing private OpenCode launch directory")?;
+    ensure!(
+        info.is_dir() && info.mode() & 0o777 == 0o700 && info.uid() == unsafe { libc::geteuid() },
+        "OpenCode launch directory is not private"
+    );
+    Ok(info)
+}
+
+fn verify_opening(state: &Path, record: &Value) -> Result<Opening> {
+    let opening = Opening::deserialize(&record["opencodeOpening"])
+        .context("missing private OpenCode opening evidence")?;
+    let directory = launch_directory(state, &opening.dispatch, &opening.attempt)?;
+    ensure!(
+        record["dispatch"] == opening.dispatch
+            && record["cwd"]
+                .as_str()
+                .is_some_and(|cwd| Path::new(cwd) == opening.cwd)
+            && opening.cwd.is_absolute()
+            && opening.database == directory.join("opencode.db")
+            && opening.brief_sha256.len() == 64
+            && opening.brief_sha256.bytes().all(|b| b.is_ascii_hexdigit()),
+        "OpenCode opening does not match the recorded launch"
+    );
+    let info = store_directory(&directory)?;
+    ensure!(
+        (info.dev(), info.ino()) == (opening.device, opening.inode),
+        "private OpenCode launch directory changed"
+    );
+    Ok(opening)
+}
+
+// Only a caller that authenticated the original host's adoption callback may
+// supply this receipt. Database rows and the rendered screen cannot issue it.
+pub(crate) struct OpencodeAdoption<'a> {
+    pub dispatch: &'a str,
+    pub attempt: &'a str,
+    pub cwd: &'a Path,
+    pub database: &'a Path,
+    pub session: &'a str,
+    pub first_message: &'a str,
+}
+
+#[allow(dead_code)] // Wired by the shared resume transaction after host adoption is verified.
+pub(crate) fn adopt_opencode_session(
+    state: &Path,
+    record: &mut Value,
+    receipt: OpencodeAdoption<'_>,
+) -> Result<()> {
+    let opening = verify_opening(state, record)?;
+    ensure!(
+        record["host"] == "opencode"
+            && record["backend"] == "tmux"
+            && record["round"] == 1
+            && record["attempt"] == opening.attempt
+            && receipt.dispatch == opening.dispatch
+            && receipt.attempt == opening.attempt
+            && receipt.cwd == opening.cwd
+            && receipt.database == opening.database,
+        "OpenCode adoption receipt belongs to a different launch"
+    );
+    let proof = verify_session(
+        &opening,
+        receipt.attempt,
+        receipt.session,
+        receipt.first_message,
+    )?;
+    let proof = serde_json::to_value(proof)?;
+    ensure!(
+        (record["hostSession"].is_null() && record["opencodeSession"].is_null())
+            || (record["hostSession"] == receipt.session && record["opencodeSession"] == proof),
+        "OpenCode adoption conflicts with the recorded session"
+    );
+    record["hostSession"] = json!(receipt.session);
+    record["opencodeSession"] = proof;
+    Ok(())
+}
+
 pub(super) fn prepare(
+    state: &Path,
     launch: &mut Map<String, Value>,
     record: &mut Value,
     original: Option<&Value>,
     brief: &str,
 ) -> Result<Option<String>> {
     let configured = selected_database(launch)?;
-    let Some(original) = original else {
-        if let Some(database) = configured.filter(|path| path.is_absolute()) {
-            // Pass the recorded store explicitly even through an older tmux server.
-            launch.insert(
-                "OPENCODE_DB".into(),
-                json!(database
-                    .to_str()
-                    .context("invalid OpenCode database path")?),
-            );
-            record["opencodeOpening"] = serde_json::to_value(Opening {
-                attempt: record["attempt"]
-                    .as_str()
-                    .context("missing attempt")?
-                    .into(),
-                database,
-                brief_sha256: format!("{:x}", Sha256::digest(brief.as_bytes())),
-            })?;
-        }
-        return Ok(None);
-    };
-
-    let opening: Opening = Opening::deserialize(&original["opencodeOpening"])
-        .context("missing recorded OpenCode launch evidence")?;
-    ensure!(
-        opening.database.is_absolute(),
-        "invalid recorded OpenCode store"
-    );
-    ensure!(
-        configured
-            .as_ref()
-            .is_none_or(|path| path == &opening.database),
-        "configured OpenCode store differs from the original dispatch"
-    );
-    ensure!(
-        super::super::valid_identity(&opening.attempt, "a-")
-            && opening.brief_sha256.len() == 64
-            && opening.brief_sha256.bytes().all(|b| b.is_ascii_hexdigit()),
-        "invalid OpenCode opening evidence"
-    );
-    let saved = if original["hostSession"].is_null() && original["opencodeSession"].is_null() {
+    if let Some(original) = original {
+        let opening = verify_opening(state, original)?;
         ensure!(
-            original["attempt"] == opening.attempt && original["round"] == 1,
-            "OpenCode opening evidence belongs to another attempt"
+            configured
+                .as_ref()
+                .is_none_or(|path| path == &opening.database),
+            "configured OpenCode store differs from the original dispatch"
         );
-        None
-    } else {
-        Some((
-            original["hostSession"]
-                .as_str()
-                .context("missing recorded OpenCode session ID")?,
-            Proof::deserialize(&original["opencodeSession"])
-                .context("invalid recorded OpenCode session proof")?,
-        ))
-    };
-    let cwd = original["cwd"]
-        .as_str()
-        .context("missing original OpenCode directory")?;
-    let (id, proof) = lookup(&opening, cwd)?;
-    if let Some((previous_id, previous_proof)) = saved {
+        let mut previous = Proof::deserialize(&original["opencodeSession"])
+            .context("missing verified original OpenCode adoption receipt")?;
         ensure!(
-            previous_id == id && previous_proof == proof,
+            original["hostSession"] == previous.session
+                && previous.adopted_attempt == opening.attempt
+                && original["attempt"] == previous.current_attempt,
+            "recorded OpenCode adoption conflicts with the launch"
+        );
+        ensure!(
+            verify_session(
+                &opening,
+                &previous.current_attempt,
+                &previous.session,
+                &previous.first_message
+            )? == previous,
             "recorded OpenCode session proof changed"
         );
+        launch.insert("OPENCODE_DB".into(), json!(opening.database));
+        for key in ["opencodeOpening", "hostSession"] {
+            record[key] = original[key].clone();
+        }
+        previous.current_attempt = record["attempt"]
+            .as_str()
+            .context("missing OpenCode resume attempt")?
+            .into();
+        record["opencodeSession"] = serde_json::to_value(&previous)?;
+        return Ok(Some(previous.session));
     }
-    launch.insert("OPENCODE_DB".into(), json!(opening.database));
-    record["opencodeOpening"] = original["opencodeOpening"].clone();
-    record["hostSession"] = json!(id);
-    record["opencodeSession"] = serde_json::to_value(proof)?;
-    Ok(Some(id))
+
+    let isolated = record["backend"] == "tmux"
+        && effective_setting(launch, "WFC_OPENCODE_ISOLATED_STORE")
+            .is_some_and(|value| value == Path::new("1"));
+    if isolated {
+        ensure!(
+            configured.is_none(),
+            "private OpenCode launch cannot use a configured database"
+        );
+        let dispatch = record["dispatch"].as_str().context("missing dispatch")?;
+        let attempt = record["attempt"].as_str().context("missing attempt")?;
+        let cwd = PathBuf::from(record["cwd"].as_str().context("missing cwd")?);
+        ensure!(cwd.is_absolute(), "invalid OpenCode launch directory");
+        let directory = launch_directory(state, dispatch, attempt)?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .context("cannot reserve a fresh private OpenCode launch directory")?;
+        let info = store_directory(&directory)?;
+        let database = directory.join("opencode.db");
+        launch.insert(
+            "OPENCODE_DB".into(),
+            json!(database
+                .to_str()
+                .context("invalid OpenCode database path")?),
+        );
+        record["opencodeOpening"] = serde_json::to_value(Opening {
+            dispatch: dispatch.into(),
+            attempt: attempt.into(),
+            cwd,
+            device: info.dev(),
+            inode: info.ino(),
+            database,
+            brief_sha256: format!("{:x}", Sha256::digest(brief.as_bytes())),
+        })?;
+    } else if let Some(database) = configured.filter(|path| path.is_absolute()) {
+        // Keep explicit first-launch storage selection without claiming provenance.
+        launch.insert(
+            "OPENCODE_DB".into(),
+            json!(database
+                .to_str()
+                .context("invalid OpenCode database path")?),
+        );
+    }
+    Ok(None)
 }
 
 fn path_contains(directory: &Path, cwd: &Path) -> bool {
@@ -198,18 +307,30 @@ fn modern_query(
         "SELECT s.id,m.id,s.project_id,p.worktree FROM {parent} s
          LEFT JOIN project p ON p.id=s.project_id
          JOIN session_message m ON m.session_id=s.id AND m.type='user'
-         WHERE s.directory=?1 AND s.parent_id IS NULL {root}
+         WHERE s.directory=?1 AND s.parent_id IS NULL AND s.id=?3 {root}
          AND m.seq=(SELECT MIN(first.seq) FROM session_message first WHERE first.session_id=s.id AND first.type='user')
          AND (SELECT COUNT(*) FROM session_message first WHERE first.session_id=s.id AND first.seq=m.seq)=1
          AND json_type(m.data,'$.text')='text' AND wfc_opening_digest(json_extract(m.data,'$.text'))=?2"
     ))))
 }
 
-fn lookup(opening: &Opening, cwd: &str) -> Result<(String, Proof)> {
+fn verify_session(
+    opening: &Opening,
+    current_attempt: &str,
+    id: &str,
+    first_message: &str,
+) -> Result<Proof> {
     ensure!(
-        Path::new(cwd).is_absolute(),
-        "invalid OpenCode launch directory"
+        id.strip_prefix("ses_").is_some_and(|s| !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')))
+            && !first_message.is_empty(),
+        "invalid OpenCode adoption identity"
     );
+    let cwd = opening
+        .cwd
+        .to_str()
+        .context("invalid OpenCode launch directory")?;
     ensure!(
         fs::symlink_metadata(&opening.database).is_ok_and(|info| info.is_file()),
         "the recorded OpenCode store is missing or inaccessible"
@@ -262,7 +383,7 @@ fn lookup(opening: &Opening, cwd: &str) -> Result<(String, Proof)> {
              JOIN message m ON m.session_id=s.id AND m.id=(
                 SELECT first.id FROM message first WHERE first.session_id=s.id AND json_extract(first.data,'$.role')='user'
                 ORDER BY first.time_created,first.id LIMIT 1)
-             WHERE s.directory=?1 AND s.parent_id IS NULL {unmigrated}
+             WHERE s.directory=?1 AND s.parent_id IS NULL AND s.id=?3 {unmigrated}
              AND ?2=(SELECT CASE WHEN COUNT(*)=1 THEN MAX(wfc_opening_digest(json_extract(t.data,'$.text'))) END
                 FROM part t WHERE t.message_id=m.id AND t.session_id=s.id
                 AND json_extract(t.data,'$.type')='text' AND json_type(t.data,'$.text')='text'
@@ -278,22 +399,22 @@ fn lookup(opening: &Opening, cwd: &str) -> Result<(String, Proof)> {
         let mut query = db
             .prepare(&sql)
             .context("cannot read OpenCode session schema")?;
-        let mut results = query.query(params![cwd, opening.brief_sha256])?;
+        let mut results = query.query(params![cwd, opening.brief_sha256, id])?;
         while let Some(row) = results
             .next()
             .context("cannot read OpenCode session evidence")?
         {
-            let id: String = row.get(0)?;
             let proof = Proof {
+                adopted_attempt: opening.attempt.clone(),
+                current_attempt: current_attempt.into(),
+                session: row.get(0)?,
                 first_message: row.get(1)?,
                 project: row.get(2)?,
             };
             let worktree: Option<String> = row.get(3)?;
             ensure!(
-                id.strip_prefix("ses_").is_some_and(|s| !s.is_empty()
-                    && s.bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')))
-                    && !proof.first_message.is_empty()
+                proof.session == id
+                    && proof.first_message == first_message
                     && !proof.project.is_empty(),
                 "invalid OpenCode session identity"
             );
@@ -311,15 +432,12 @@ fn lookup(opening: &Opening, cwd: &str) -> Result<(String, Proof)> {
                 )?,
                 "matching OpenCode session belongs to a different project"
             );
-            let candidate = (id, proof);
             ensure!(
-                matched
-                    .as_ref()
-                    .is_none_or(|previous| *previous == candidate),
-                "multiple root OpenCode sessions or first-message identities match this opening"
+                matched.as_ref().is_none_or(|previous| *previous == proof),
+                "conflicting OpenCode session proof"
             );
-            matched = Some(candidate);
+            matched = Some(proof);
         }
     }
-    matched.context("no root OpenCode session matches this attempt's first user message")
+    matched.context("adopted OpenCode session does not match the original first user message")
 }

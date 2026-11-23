@@ -11,6 +11,9 @@ use uuid::Uuid;
 
 #[cfg(target_os = "linux")]
 mod opencode;
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)] // The shared lifecycle will call the adoption adapter under its lock.
+pub(crate) use opencode::{adopt_opencode_session, OpencodeAdoption};
 
 #[derive(Default)]
 pub struct Options<'a> {
@@ -224,6 +227,7 @@ fn claude_trust(cwd: &Path) -> Result<Option<PathBuf>> {
 impl Options<'_> {
     pub fn prepare(&self, state: &Path, record: &mut Value) -> Result<Launch> {
         self.prepare_launch(state, record, None)
+            .map(|(launch, _)| launch)
     }
 
     // The resume transaction owns publication and the subsequent terminal input.
@@ -233,7 +237,7 @@ impl Options<'_> {
         state: &Path,
         original: &Value,
         next: &mut Value,
-    ) -> Result<Launch> {
+    ) -> Result<(Launch, String)> {
         ensure!(
             original["host"] == "opencode" && original["backend"] == "tmux",
             "expected an OpenCode tmux assignment"
@@ -245,10 +249,13 @@ impl Options<'_> {
                 && next["attempt"]
                     .as_str()
                     .is_some_and(|id| super::valid_identity(id, "a-"))
+                && original["attempt"]
+                    .as_str()
+                    .is_some_and(|id| super::valid_identity(id, "a-"))
                 && original["attempt"] != next["attempt"],
             "OpenCode resume requires the original dispatch and directory"
         );
-        Options {
+        let (launch, input) = Options {
             name: "opencode",
             backend: "tmux",
             config: original["launchConfig"].as_str(),
@@ -257,7 +264,8 @@ impl Options<'_> {
             git: original["git"] == true,
             ..Options::default()
         }
-        .prepare_launch(state, next, Some(original))
+        .prepare_launch(state, next, Some(original))?;
+        Ok((launch, input.context("missing OpenCode resume input")?))
     }
 
     fn prepare_launch(
@@ -265,7 +273,7 @@ impl Options<'_> {
         state: &Path,
         record: &mut Value,
         #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] original: Option<&Value>,
-    ) -> Result<Launch> {
+    ) -> Result<(Launch, Option<String>)> {
         let cwd = Path::new(record["cwd"].as_str().context("missing cwd")?);
         let report = Path::new(record["report"].as_str().context("missing report")?);
         let mut writable = vec![
@@ -319,6 +327,7 @@ impl Options<'_> {
         }
         let a = &mut launch.argv;
         let mut ignored = Vec::new();
+        let mut resume_input = None;
         match self.name {
             "codex" => {
                 a.extend(
@@ -353,7 +362,7 @@ impl Options<'_> {
             }
             "opencode" => {
                 #[cfg(target_os = "linux")]
-                let session = opencode::prepare(&mut launch.env, record, original, &brief)?;
+                let session = opencode::prepare(state, &mut launch.env, record, original, &brief)?;
                 #[cfg(not(target_os = "linux"))]
                 let session: Option<String> = None;
                 let cwd = record["cwd"].as_str().context("missing cwd")?;
@@ -373,6 +382,7 @@ impl Options<'_> {
                 }
                 if let Some(session) = session {
                     a.extend(["-s".into(), session]);
+                    resume_input = Some(brief);
                 } else {
                     a.extend(["--prompt".into(), brief]);
                 }
@@ -444,6 +454,6 @@ impl Options<'_> {
         launch
             .env
             .insert("WFC_BIN".into(), json!(env::current_exe()?));
-        Ok(launch)
+        Ok((launch, resume_input))
     }
 }
