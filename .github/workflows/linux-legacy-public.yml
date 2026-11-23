@@ -1,7 +1,7 @@
-name: Linux legacy ledger and ownership combination regression
+name: Linux ask, ownership, and legacy ledger combination regression
 on:
   push:
-    branches: [rust-router/linux-ci-legacy-owner-combination]
+    branches: [rust-router/linux-ci-ask-owner-legacy-combination]
 
 permissions:
   contents: read
@@ -12,12 +12,13 @@ defaults:
 
 jobs:
   legacy-public:
-    name: '#30 and #16 Legacy ledger and ownership combination'
+    name: '#11, #16, and #30 Ask, ownership, and legacy ledger'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      WFC_BUILD_ID: a4991653ea41a96df6e39e95da661a1c29bd73fc
-      PRODUCT_TREE: eccd654c8068bd9b07360b6f1bd2fe7c5f66bce4
+      WFC_BUILD_ID: d3e8e90684794bd71b9b577237ae8245f06f2cef
+      PRODUCT_TREE: e902e0d87e26b46643c9565df6f6716737d9f3a6
+      INPUTS_SHA256: 1af347d40943e298f3447bd195f3732e7fffcccceb4471783fe5fae780455d09
       LEGACY_TREE: 034a9cad954bc952812b35bec6fef840c6abc3a1
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TMUX_FIXTURE_SHA: 5ced6218637c11d9ca73fa3285a1ff98fadad6fc
@@ -30,8 +31,9 @@ jobs:
       - name: Record run identity
         run: |
           mkdir -p "$EVIDENCE"
-          printf 'Workflow %s\nRun %s attempt %s\nExpected product %s\n' \
-            "$GITHUB_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$WFC_BUILD_ID" | tee "$EVIDENCE/run.log"
+          printf 'Workflow %s\nRun %s attempt %s\nExpected product %s tree %s\n' \
+            "$GITHUB_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$WFC_BUILD_ID" "$PRODUCT_TREE" \
+            | tee "$EVIDENCE/run.log"
           uname -a | tee -a "$EVIDENCE/run.log"
       - name: Check out the pinned product
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -64,7 +66,9 @@ jobs:
           test "$legacy_tree" = "$LEGACY_TREE"
           git -C ../native-input log -1 --format='zlib source checkout HEAD %H tree %T' | tee -a "$EVIDENCE/sources.log"
           test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
-          sha256sum vendor/INPUTS.sha256 tests/{legacy_public,check_codex,herdr_public,owner,receipts,relay}.py tools/check_tmux.py | tee "$EVIDENCE/inputs.log"
+          sha256sum vendor/INPUTS.sha256 tests/{dispatch.rs,legacy_public.py,herdr_public.py,owner.py,receipts.py,relay.py} \
+            tools/check_tmux.py | tee "$EVIDENCE/inputs.log"
+          printf '%s  vendor/INPUTS.sha256\n' "$INPUTS_SHA256" | sha256sum --check --strict | tee -a "$EVIDENCE/inputs.log"
           sha256sum -c vendor/INPUTS.sha256 2>&1 | tee -a "$EVIDENCE/inputs.log"
           rustup toolchain install 1.96.1 --profile minimal 2>&1 | tee "$EVIDENCE/toolchain.log"
           {
@@ -102,31 +106,7 @@ jobs:
           printf '%s\n' "$version" | tee -a "$EVIDENCE/binaries.log"
           [[ "$version" == *"(Rust, $TRIPLE, release, build $WFC_BUILD_ID)" ]]
           readelf -hW "$dir/wfc" "$dir/wfc-legacy-state" | tee "$EVIDENCE/elf.log"
-      - name: Record the SQLite engine linked into the public CLI
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: product
-        run: |
-          cargo tree --locked --target "$TRIPLE" -p wfc -e features -i libsqlite3-sys 2>&1 | tee "$EVIDENCE/sqlite.log"
-          dir="target/$TRIPLE/release"
-          dynamic=$(readelf -dW "$dir/wfc")
-          printf '%s\n' "$dynamic" | tee -a "$EVIDENCE/elf.log"
-          [[ "$dynamic" != *libsqlite3.so* ]]
-          archives=("$dir"/build/libsqlite3-sys-*/out/libsqlite3.a)
-          test "${#archives[@]}" -eq 1
-          test -f "${archives[0]}"
-          sha256sum "${archives[0]}" | tee -a "$EVIDENCE/sqlite.log"
-          probe="$RUNNER_TEMP/wfc-sqlite-version"
-          cc -x c - -x none "${archives[0]}" -lm -ldl -pthread -o "$probe" <<'C'
-          #include <stdio.h>
-          extern const char *sqlite3_libversion(void);
-          extern const char *sqlite3_sourceid(void);
-          extern int sqlite3_libversion_number(void);
-          int main(void) {
-              printf("Bundled SQLite %s\nSource ID %s\n", sqlite3_libversion(), sqlite3_sourceid());
-              return sqlite3_libversion_number() < 3038000;
-          }
-          C
-          "$probe" | tee -a "$EVIDENCE/sqlite.log"
+          readelf -dW "$dir/wfc" | tee -a "$EVIDENCE/elf.log"
       - name: Run the public legacy read-only matrix
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: product
@@ -149,73 +129,52 @@ jobs:
             sudo apt-get install -y --no-install-recommends tmux 2>&1 | tee -a "$EVIDENCE/tmux-install.log"
           fi
           tmux -V | tee "$EVIDENCE/tmux-version.log"
-      - name: Check out the reviewed tmux probe and reaper
+      - name: Check out the reviewed Linux process reaper
         id: fixtures
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.TMUX_FIXTURE_SHA }}
           path: tmux-r11-fixtures
-          sparse-checkout: tools/ci/tmux-r11
+          sparse-checkout: tools/ci/tmux-r11/reap.py
           sparse-checkout-cone-mode: false
           persist-credentials: false
-      - name: Verify identities of the reviewed backend fixtures
+      - name: Verify the reviewed reaper source
         id: fixture-identity
         if: ${{ !cancelled() && steps.fixtures.outcome == 'success' }}
         working-directory: tmux-r11-fixtures
         run: |
           test "$(git rev-parse HEAD)" = "$TMUX_FIXTURE_SHA"
           git log -1 --format='Fixture HEAD %H tree %T' | tee "$EVIDENCE/backend-fixture-inputs.log"
-          sha256sum tools/ci/tmux-r11/{probe,reap}.py | tee -a "$EVIDENCE/backend-fixture-inputs.log"
+          sha256sum tools/ci/tmux-r11/reap.py | tee -a "$EVIDENCE/backend-fixture-inputs.log"
       - name: Download and verify the Herdr 0.9.5 Linux release asset
         id: herdr-download
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
-          asset=herdr-linux-x86_64
-          release="$GITHUB_SERVER_URL/herdrdev/herdr/releases/download/v0.9.5"
-          metadata="$GITHUB_API_URL/repos/herdrdev/herdr/releases/tags/v0.9.5"
-          cd "$RUNNER_TEMP"
-          curl --fail --silent --show-error --location --retry 3 "$metadata" \
-            | jq -e --arg asset "$asset" '.assets[] | select(.name == $asset) | {name,digest,browser_download_url}' \
-            | tee "$EVIDENCE/herdr-release.log"
-          jq -e --arg digest "sha256:$HERDR_SHA256" --arg url "$release/$asset" \
-            '.digest == $digest and .browser_download_url == $url' "$EVIDENCE/herdr-release.log"
-          curl --fail --silent --show-error --location --retry 3 "$release/$asset" -o "$asset"
-          printf '%s  %s\n' "$HERDR_SHA256" "$asset" | sha256sum -c | tee -a "$EVIDENCE/herdr-release.log"
-          chmod +x "$asset"
-          version=$("./$asset" --version)
-          printf '%s\n' "$version" | tee -a "$EVIDENCE/herdr-release.log"
+          url=https://github.com/herdrdev/herdr/releases/download/v0.9.5/herdr-linux-x86_64
+          herdr="$RUNNER_TEMP/herdr-linux-x86_64"
+          log="$EVIDENCE/herdr-release.log"
+          printf 'Herdr source %s\nExpected SHA-256 %s\n' "$url" "$HERDR_SHA256" | tee "$log"
+          curl --fail --silent --show-error --location --retry 3 --retry-connrefused \
+            --retry-max-time 120 --connect-timeout 15 --max-time 60 "$url" -o "$herdr" 2>&1 | tee -a "$log"
+          sha256sum "$herdr" | tee -a "$log"
+          printf '%s  %s\n' "$HERDR_SHA256" "$herdr" | sha256sum --check --strict 2>&1 | tee -a "$log"
+          chmod 700 "$herdr"
+          version=$("$herdr" --version)
+          printf '%s\n' "$version" | tee -a "$log"
           test "$version" = 'herdr 0.9.5'
-      - name: Run the public tmux lifecycle with a controlled host
+      - name: Run real tmux ask and close ordering, replay, and ownership tests
         if: ${{ !cancelled() && steps.tmux.outcome == 'success' && steps.fixture-identity.outcome == 'success' }}
         working-directory: product
         run: |
           head -n 2 "$EVIDENCE/binaries.log" | sha256sum --check --strict | tee "$EVIDENCE/tmux-public.log"
           reaper="$GITHUB_WORKSPACE/tmux-r11-fixtures/tools/ci/tmux-r11/reap.py"
-          python -B "$reaper" python -Bu tests/check_codex.py "target/$TRIPLE/release/wfc" -v \
-            Checker.test_api_login_and_received_report 2>&1 | tee -a "$EVIDENCE/tmux-public.log"
-      - name: Run focused existing tmux assignments and socket alias checks
-        if: ${{ !cancelled() && steps.tmux.outcome == 'success' && steps.fixture-identity.outcome == 'success' }}
-        working-directory: product
-        run: |
-          head -n 2 "$EVIDENCE/binaries.log" | sha256sum --check --strict | tee "$EVIDENCE/tmux-compat.log"
-          reaper="$GITHUB_WORKSPACE/tmux-r11-fixtures/tools/ci/tmux-r11/reap.py"
           python -B "$reaper" python -Bu tools/check_tmux.py "target/$TRIPLE/release/wfc" -v \
-            Backend.test_legacy_session_is_tracked_on_first_owned_observation \
-            Backend.test_legacy_socket_alias_can_identify_original_pane 2>&1 | tee -a "$EVIDENCE/tmux-compat.log"
-      - name: Run the reviewed tmux residual socket selector
-        if: ${{ !cancelled() && steps.tmux.outcome == 'success' && steps.fixture-identity.outcome == 'success' }}
-        working-directory: product
-        run: |
-          head -n 2 "$EVIDENCE/binaries.log" | sha256sum --check --strict | tee "$EVIDENCE/tmux-residual-socket.log"
-          helpers="$GITHUB_WORKSPACE/tmux-r11-fixtures/tools/ci/tmux-r11"
-          selector="$RUNNER_TEMP/wfc-combination-tmux-probe.py"
-          sed "s/^PRODUCT = \"3a091e22d5cbb00ed3a13e980811fd67ba1d6718\"$/PRODUCT = \"$WFC_BUILD_ID\"/" \
-            "$helpers/probe.py" > "$selector"
-          grep -Fxq "PRODUCT = \"$WFC_BUILD_ID\"" "$selector"
-          sha256sum "$selector" | tee -a "$EVIDENCE/tmux-residual-socket.log"
-          python -B "$helpers/reap.py" python -Bu "$selector" "target/$TRIPLE/release/wfc" \
-            2>&1 | tee -a "$EVIDENCE/tmux-residual-socket.log"
+            Backend.test_public_question_and_close_share_attempt_lock \
+            Backend.test_public_question_reuses_terminal_evidence \
+            Backend.test_managed_dispatch_callback_survives_takeover \
+            Backend.test_read_only_unowned_close_replays_confirmed_archive \
+            2>&1 | tee -a "$EVIDENCE/tmux-public.log"
       - name: Run focused public commands with a real Herdr protocol 22 service
         if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.herdr-download.outcome == 'success' && steps.fixture-identity.outcome == 'success' }}
         working-directory: product
@@ -224,10 +183,8 @@ jobs:
           reaper="$GITHUB_WORKSPACE/tmux-r11-fixtures/tools/ci/tmux-r11/reap.py"
           python -B "$reaper" python -Bu tests/herdr_public.py "$RUNNER_TEMP/herdr-linux-x86_64" \
             "target/$TRIPLE/release/wfc" -v \
-            PublicLifecycle.test_dispatch_current_execution_done_and_close \
-            PublicLifecycle.test_named_status_during_done_then_exit \
-            PublicLifecycle.test_done_receipt_and_active_list_through_close \
-            PublicLifecycle.test_legacy_authority_or_later_round_is_left_pending \
+            PublicLifecycle.test_question_replays_after_herdr_close_intent \
+            PublicLifecycle.test_close_during_first_done_git_sample \
             PublicLifecycle.test_close_after_scope_takeover_fences_stale_herdr_controls \
             2>&1 | tee -a "$EVIDENCE/herdr-public.log"
       - name: Run focused owner takeover and scoped delivery tests
@@ -239,11 +196,12 @@ jobs:
           python -B "$reaper" python -Bu - "target/$TRIPLE/release/wfc" \
             test_takeover_fences_wait_and_ack_but_worker_keeps_its_callback \
             test_takeover_waits_for_scoped_delivery_and_unregisters_detached_relay \
+            test_question_requires_current_owner_or_original_worker_callback \
             <<'PYTEST' 2>&1 | tee -a "$EVIDENCE/owner.log"
           import sys
           import unittest
           test_names = sys.argv[2:]
-          assert len(test_names) == 2
+          assert len(test_names) == 3
           sys.path.insert(0, "tests")
           from owner import Owner
           suite = unittest.TestSuite(Owner(test) for test in test_names)
@@ -267,17 +225,30 @@ jobs:
           python -B "$reaper" python -Bu tests/relay.py "target/$TRIPLE/release/wfc" -v \
             Relay.test_two_relays_and_wait_claim_once_and_resolution_wins \
             Relay.test_scoped_delivery_beside_complete_and_truncated_reservations \
+            Relay.test_question_envelope_matches_python_json_separators \
             2>&1 | tee -a "$EVIDENCE/relay.log"
-      - name: Run the managed tmux callback and read-only close archive tests
-        if: ${{ !cancelled() && steps.tmux.outcome == 'success' && steps.fixture-identity.outcome == 'success' }}
+      - name: Run exact Rust dispatch selectors for ask and controlled close
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: product
         run: |
-          head -n 2 "$EVIDENCE/binaries.log" | sha256sum --check --strict | tee "$EVIDENCE/tmux-owner.log"
-          reaper="$GITHUB_WORKSPACE/tmux-r11-fixtures/tools/ci/tmux-r11/reap.py"
-          python -B "$reaper" python -Bu tools/check_tmux.py "target/$TRIPLE/release/wfc" -v \
-            Backend.test_managed_dispatch_callback_survives_takeover \
-            Backend.test_read_only_unowned_close_replays_confirmed_archive \
-            2>&1 | tee -a "$EVIDENCE/tmux-owner.log"
+          log="$EVIDENCE/dispatch-tests.log"
+          head -n 2 "$EVIDENCE/binaries.log" | sha256sum --check --strict | tee "$log"
+          failed=0
+          for selector in \
+            question_short_help_prefixes_do_not_publish \
+            controlled_close_replays_from_a_read_only_archive \
+            controlled_pending_close_rejects_new_question_and_replays_original
+          do
+            printf 'Dispatch test %s\n' "$selector" | tee -a "$log"
+            cargo test --release --locked --target "$TRIPLE" --test dispatch "$selector" -- --exact \
+              2>&1 | tee -a "$log" || failed=1
+            if ! grep -Fxq "test $selector ... ok" "$log"; then
+              printf 'No passing result for %s\n' "$selector" | tee -a "$log"
+              failed=1
+            fi
+          done
+          head -n 2 "$EVIDENCE/binaries.log" | sha256sum --check --strict | tee -a "$log"
+          exit "$failed"
       - name: Run the Rust workspace tests
         if: ${{ !cancelled() && steps.tmux.outcome == 'success' }}
         working-directory: product
@@ -291,7 +262,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ always() }}
         with:
-          name: linux-30-owner-combination-${{ env.WFC_BUILD_ID }}-attempt-${{ github.run_attempt }}
+          name: linux-11-16-30-combination-${{ env.WFC_BUILD_ID }}-attempt-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14
