@@ -1065,6 +1065,57 @@ fn question_shorthand_accepts_frozen_unowned_argument_shapes() {
 }
 
 #[test]
+fn question_short_help_prefixes_do_not_publish() {
+    let f = Fixture::new();
+    let id = "d-12345678";
+    let dir = f.0.join("state/dispatches");
+    fs::create_dir_all(&dir).unwrap();
+    let row = json!({
+        "dispatch": id, "attempt": "a-0123456789ab", "round": 1, "scope": "test", "role": "tester",
+        "cwd": f.0,
+    });
+    fs::write(dir.join(format!("{id}.json")), row.to_string()).unwrap();
+    let ask = || {
+        let mut command = f.wfc();
+        command
+            .env("WFC_DISPATCH", id)
+            .env_remove("WFC_ATTEMPT")
+            .env_remove("WFC_ROUND")
+            .env_remove("WFC_SCOPE")
+            .env_remove("WFC_WORKER_CALLBACK")
+            .arg("ask");
+        command
+    };
+
+    let help = ask().arg("-h answer").output().unwrap();
+    assert_eq!(help.status.code(), Some(0));
+    assert!(help.stderr.is_empty());
+    assert!(String::from_utf8_lossy(&help.stdout).starts_with("wfc ask QUESTION "));
+    let missing = ask()
+        .args(["题文", "--options", "-help later,reset"])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(missing.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("option requires a value"));
+    let attached_value = ask().arg("-h=answer").output().unwrap();
+    assert_eq!(attached_value.status.code(), Some(2));
+    assert!(attached_value.stdout.is_empty());
+    assert!(!f.0.join("state/messages.json").exists());
+
+    run(ask().args(["--", "-h answer"]));
+    run(ask().args(["题文", "--options=-help later,reset"]));
+    let batch = run(f.wfc().args(["wait", "--scope", "test", "--timeout", "0"]));
+    let [literal, options] = batch["messages"].as_array().unwrap().as_slice() else {
+        panic!("expected only the two literal questions: {batch}");
+    };
+    assert_eq!(literal["question"], "-h answer");
+    assert_eq!(literal["options"], json!([]));
+    assert_eq!(options["question"], "题文");
+    assert_eq!(options["options"], json!(["-help later", "reset"]));
+}
+
+#[test]
 fn controller_receipts_survive_restarts_and_concurrent_confirmation() {
     let status = Command::new(PYTHON)
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/receipts.py"))

@@ -210,7 +210,11 @@ fn main() -> anyhow::Result<ExitCode> {
         }
         Some("ask") => {
             let request = match Ask::parse(&args) {
-                Ok(request) => request,
+                Ok(Some(request)) => request,
+                Ok(None) => {
+                    println!("{ASK_USAGE}");
+                    return Ok(ExitCode::SUCCESS);
+                }
                 Err(err) => {
                     eprintln!("wfc: {err}. {ASK_USAGE}");
                     return Ok(ExitCode::from(2));

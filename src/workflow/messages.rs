@@ -27,8 +27,17 @@ pub const WAIT_USAGE: &str = "wfc wait [--timeout SECONDS] [--scope NAME] [--dis
 fn options<'a, const N: usize>(
     args: &'a [OsString],
     names: [&str; N],
-    mut positional: Option<(&mut Option<&'a str>, &str)>,
+    positional: Option<(&mut Option<&'a str>, &str)>,
 ) -> Result<[Option<&'a str>; N]> {
+    parse_options(args, names, positional)?.context("unexpected help")
+}
+
+// None indicates an ask help request.
+fn parse_options<'a, const N: usize>(
+    args: &'a [OsString],
+    names: [&str; N],
+    mut positional: Option<(&mut Option<&'a str>, &str)>,
+) -> Result<Option<[Option<&'a str>; N]>> {
     let mut values = [None; N];
     let mut tokens = args.iter();
     let question = positional
@@ -41,6 +50,10 @@ fn options<'a, const N: usize>(
             if flag == "--" && !positional_only {
                 positional_only = true;
                 continue;
+            }
+            if question && !positional_only && flag.starts_with("-h") {
+                ensure!(!flag.starts_with("-h="), "help does not take a value");
+                return Ok(None);
             }
             if positional_only
                 || !flag.starts_with('-')
@@ -88,16 +101,19 @@ fn options<'a, const N: usize>(
             "duplicate option {flag:?}"
         );
     }
-    Ok(values)
+    Ok(Some(values))
 }
 
 fn literal_question_argument(text: &str, names: &[&str]) -> bool {
-    // Argparse recognizes a named option with "=" before applying its
-    // literal-space rule to other hyphen-prefixed arguments.
+    // Argparse recognizes attached short help and named options before
+    // applying its literal-space rule.
     let option = text.split_once('=').map_or(text, |(name, _)| name);
     !text.starts_with('-')
         || short_question(text)
-        || (text.contains(' ') && !matches!(option, "-h" | "--help") && !names.contains(&option))
+        || (text.contains(' ')
+            && !text.starts_with("-h")
+            && option != "--help"
+            && !names.contains(&option))
 }
 
 // Argparse accepts "-" and negative integer or decimal text as positionals.
@@ -830,20 +846,23 @@ pub struct Ask<'a> {
 }
 
 impl<'a> Ask<'a> {
-    pub fn parse(args: &'a [OsString]) -> Result<Self> {
+    pub fn parse(args: &'a [OsString]) -> Result<Option<Self>> {
         let mut question = None;
-        let [csv, attempt, reference, key] = options(
+        let Some([csv, attempt, reference, key]) = parse_options(
             args,
             ["--options", "--attempt", "--callback-ref", "--message-id"],
             Some((&mut question, "question")),
-        )?;
-        Ok(Self {
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
             question: question.context("missing question")?,
             csv,
             attempt,
             reference: reference.filter(|reference| !reference.is_empty()),
             key: key.filter(|key| !key.is_empty()),
-        })
+        }))
     }
 
     pub fn run(self) -> Result<Value> {
