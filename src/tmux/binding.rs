@@ -15,11 +15,30 @@ use uuid::Uuid;
 
 #[derive(Deserialize, Serialize)]
 pub(super) enum Claim {
+    LegacyPending {
+        execution: Option<String>,
+        socket: Option<PathBuf>,
+        pane: Option<String>,
+    },
+    Released(Option<String>),
     Launch(String),
     Observed {
+        execution: Option<String>,
         server: ServerSession,
         token: String,
     },
+}
+
+impl Claim {
+    fn execution_id(&self) -> Option<&str> {
+        match self {
+            Self::Launch(id) => Some(id),
+            Self::Observed {
+                execution, token, ..
+            } => Some(execution.as_deref().unwrap_or(token)),
+            Self::Released(id) | Self::LegacyPending { execution: id, .. } => id.as_deref(),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -31,6 +50,11 @@ pub(super) struct ServerSession {
     start_ticks: u64,
     session: String,
     pane: String,
+}
+
+pub(super) fn valid_pane(id: &str) -> bool {
+    id.strip_prefix('%')
+        .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn unknown() -> serde_json::Value {
@@ -200,16 +224,96 @@ impl Tmux<'_> {
         save(&self.claim_path(), &Claim::Launch(id.to_owned())).map_err(|_| unknown())
     }
 
-    pub(super) fn forget(&self) -> Reply<()> {
-        match fs::remove_file(self.claim_path()) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(_) => Err(unknown()),
+    pub(super) fn remember_existing(&self) -> Reply<()> {
+        let (execution, pane) = match self.claim()? {
+            Some(Claim::LegacyPending {
+                socket,
+                execution,
+                pane,
+            }) => {
+                if socket != self.socket
+                    || execution
+                        .as_deref()
+                        .zip(self.legacy_execution_id)
+                        .is_some_and(|(a, b)| a != b)
+                    || pane
+                        .as_deref()
+                        .zip(self.legacy_worker_pane)
+                        .is_some_and(|(a, b)| a != b)
+                {
+                    return Err(unknown());
+                }
+                if (execution.is_some() || self.legacy_execution_id.is_none())
+                    && (pane.is_some() || self.legacy_worker_pane.is_none())
+                {
+                    return Ok(());
+                }
+                (execution, pane)
+            }
+            Some(ref claim) if claim.execution_id() == self.legacy_execution_id => return Ok(()),
+            None | Some(Claim::Released(_)) => (None, None),
+            Some(previous) => {
+                // Its original server can prove the previous execution ended.
+                // That proves nothing about the newly supplied legacy execution.
+                self.confirm_absence(Some(previous), true)?;
+                (None, None)
+            }
+        };
+        save(
+            &self.claim_path(),
+            &Claim::LegacyPending {
+                execution: execution.or_else(|| self.legacy_execution_id.map(str::to_owned)),
+                socket: self.socket.clone(),
+                pane: pane.or_else(|| self.legacy_worker_pane.map(str::to_owned)),
+            },
+        )
+        .map_err(|_| unknown())
+    }
+
+    pub(super) fn release(&self) -> Reply<()> {
+        let claim = self.claim()?;
+        let execution = claim
+            .as_ref()
+            .and_then(Claim::execution_id)
+            .or(self.legacy_execution_id);
+        save(
+            &self.claim_path(),
+            &Claim::Released(execution.map(str::to_owned)),
+        )
+        .map_err(|_| unknown())
+    }
+
+    pub(super) fn exited_pane_absent(&self, t: &Target) -> Reply<bool> {
+        if !matches!(self.claim()?, Some(Claim::Launch(id)) if id == t.token) {
+            return Ok(false);
         }
+        let receipt = self
+            .state
+            .join("launches")
+            .join(format!("{}.json", t.token));
+        if !super::launch::read_receipt(&receipt)
+            .is_some_and(|r| r["category"] == "process_exited" && r["exitCode"].is_i64())
+        {
+            return Ok(false);
+        }
+        let list = self.run(&[
+            "-S",
+            &fd_path(&t.socket_fd),
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id}",
+        ])?;
+        let panes = std::str::from_utf8(&list.stdout).map_err(|_| unknown())?;
+        if !list.status.success() || panes.is_empty() || !panes.lines().all(valid_pane) {
+            return Err(unknown());
+        }
+        Ok(!panes.lines().any(|p| p == t.worker_pane))
     }
 
     fn binding(&self, claim: Claim) -> Reply<ServerSession> {
         match claim {
+            Claim::LegacyPending { .. } | Claim::Released(_) => Err(unknown()),
             Claim::Observed { server, .. } => Ok(server),
             Claim::Launch(id) => {
                 let id = Uuid::parse_str(&id).map_err(|_| unknown())?.simple();
@@ -221,8 +325,16 @@ impl Tmux<'_> {
     }
 
     pub(super) fn confirm_absence(&self, claim: Option<Claim>, reachable: bool) -> Reply<()> {
-        let Some(claim) = claim else {
-            return Ok(());
+        let claim = match claim {
+            None if self.protect_offline && !reachable => {
+                self.remember_existing()?;
+                return Err(unknown());
+            }
+            None | Some(Claim::Released(_)) => return Ok(()),
+            Some(Claim::Launch(ref id)) if super::launch::cancelled(self.state, id) => {
+                return Ok(())
+            }
+            Some(claim) => claim,
         };
         let binding = self.binding(claim)?;
         if !binding.server_alive().map_err(|_| unknown())? {
@@ -262,14 +374,12 @@ impl Tmux<'_> {
 
     pub(super) fn verify_claim(&self, claim: Option<Claim>, t: &mut Target) -> Reply<()> {
         match claim {
-            Some(claim) => {
-                let token = match &claim {
-                    Claim::Launch(id) => id,
-                    Claim::Observed { token, .. } => token,
-                };
-                if t.token != *token {
-                    return Err(unknown());
-                }
+            Some(Claim::Launch(ref token) | Claim::Observed { ref token, .. })
+                if *token != t.token =>
+            {
+                Err(unknown())
+            }
+            Some(claim @ (Claim::Launch(_) | Claim::Observed { .. })) => {
                 let server = self.binding(claim)?;
                 if t.session != server.session
                     || t.server_pid != server.pid.to_string()
@@ -277,22 +387,58 @@ impl Tmux<'_> {
                 {
                     return Err(unknown());
                 }
-                if !server
-                    .pane
-                    .strip_prefix('%')
-                    .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-                {
+                if !valid_pane(&server.pane) {
                     return Err(unknown());
                 }
                 t.worker_pane = server.pane;
                 Ok(())
             }
-            None => {
+            Some(Claim::LegacyPending { ref socket, .. }) if socket != &self.socket || !t.owned => {
+                Err(unknown())
+            }
+            Some(Claim::Released(Some(ref closed)))
+                if Some(closed.as_str()) == self.legacy_execution_id =>
+            {
+                // A closed legacy execution cannot own a newly visible session.
+                Err(unknown())
+            }
+            _ if !t.owned => Ok(()),
+            unbound => {
+                let (hint, execution) = match unbound {
+                    Some(Claim::LegacyPending {
+                        pane, execution, ..
+                    }) => (pane, execution),
+                    _ => (None, self.legacy_execution_id.map(str::to_owned)),
+                };
                 // Adopt a reachable owned session from before claims existed.
+                let panes = self.run(&[
+                    "-S",
+                    &fd_path(&t.socket_fd),
+                    "list-panes",
+                    "-s",
+                    "-t",
+                    &t.session,
+                    "-F",
+                    "#{pane_id}",
+                ])?;
+                let listing = std::str::from_utf8(&panes.stdout).map_err(|_| unknown())?;
+                let pane = match hint.as_deref() {
+                    Some(id) if listing.lines().any(|p| p == id) => id,
+                    None if listing.lines().count() == 1 => listing.trim_end(),
+                    _ => {
+                        return Err(failure(
+                            "uncertain",
+                            "could not identify the legacy worker pane",
+                        ))
+                    }
+                };
+                if !panes.status.success() || !valid_pane(pane) {
+                    return Err(unknown());
+                }
                 let server = ServerSession::capture(
                     t.server_pid.parse().map_err(|_| unknown())?,
                     t.session.clone(),
-                    t.pane.clone(),
+                    pane.to_owned(),
                     t.socket.clone().into(),
                 )
                 .map_err(|_| unknown())?;
@@ -301,13 +447,16 @@ impl Tmux<'_> {
                 let token = Uuid::new_v4().simple().to_string();
                 self.guarded(
                     t,
+                    pane,
                     &format!("set-environment -t '{}' WFC_TMUX_LAUNCH {token}", t.session),
-                    "1",
+                    super::EXCLUSIVE_WINDOW,
                 )?;
+                t.worker_pane = pane.to_owned();
                 t.token = token;
                 save(
                     &self.claim_path(),
                     &Claim::Observed {
+                        execution,
                         server,
                         token: t.token.clone(),
                     },

@@ -51,11 +51,56 @@ fn private_file(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-fn read_receipt(path: &Path) -> Option<Value> {
+pub(super) fn read_receipt(path: &Path) -> Option<Value> {
     serde_json::from_reader(File::open(path).ok()?).ok()
 }
 
+// Both parties must unlink the same one-shot spec before proceeding. Only
+// the winner can start or cancel. A recovery marker never contains the spec.
+fn revoke_spec(spec: &Path, receipt: &Path) -> Option<Value> {
+    fs::remove_file(spec).ok()?;
+    let mut reply = failure(
+        "definitely-not-sent",
+        "worker launch was cancelled before startup",
+    );
+    reply["category"] = json!("not_started");
+    if super::binding::save(receipt, &json!({"category":"not_started"})).is_ok() {
+        reply["receipt"] = json!(receipt);
+    } else {
+        reply["diagnostic"] =
+            json!("worker launch was cancelled but the receipt could not be written");
+        let marker = spec.with_extension("revoked");
+        if private_file(&marker, &()).is_ok() {
+            reply["cancellationEvidence"] = json!(marker);
+        }
+    }
+    Some(reply)
+}
+
+pub(super) fn cancelled(state: &Path, id: &str) -> bool {
+    let Ok(id) = Uuid::parse_str(id) else {
+        return false;
+    };
+    let prefix = state.join("launches").join(id.simple().to_string());
+    prefix.with_extension("revoked").is_file()
+        || read_receipt(&prefix.with_extension("json"))
+            .is_some_and(|r| r["category"] == "not_started")
+}
+
 impl Tmux<'_> {
+    pub(super) fn revoke_pending_launch(&self) -> Reply<()> {
+        if let Some(super::binding::Claim::Launch(id)) = self.claim()? {
+            let id =
+                Uuid::parse_str(&id).map_err(|_| failure("uncertain", "invalid tmux launch ID"))?;
+            let prefix = self.state.join("launches").join(id.simple().to_string());
+            revoke_spec(
+                &prefix.with_extension("spec"),
+                &prefix.with_extension("json"),
+            );
+        }
+        Ok(())
+    }
+
     pub(super) fn create(&self, launch: Launch) -> Reply<(Target, PathBuf)> {
         if self.target()?.is_some() {
             return Err(failure("refused", "named tmux session already exists"));
@@ -153,13 +198,7 @@ impl Tmux<'_> {
                     )
                 })?;
             self.reserve(&id)?;
-            let out = match self.run(&args) {
-                Err(e) if e["result"] == "definitely-not-sent" => {
-                    self.forget()?;
-                    return Err(e);
-                }
-                result => result?,
-            };
+            let out = self.run(&args)?;
             if !out.status.success() {
                 return Err(unknown());
             }
@@ -182,7 +221,10 @@ impl Tmux<'_> {
                         };
                         let target = self.owned().map_err(|_| started_unverified())?;
                         if binding.trim_end()
-                            != format!("{} {} {}", target.session, target.pane, target.server_pid)
+                            != format!(
+                                "{} {} {}",
+                                target.session, target.worker_pane, target.server_pid
+                            )
                         {
                             return Err(started_unverified());
                         }
@@ -196,9 +238,10 @@ impl Tmux<'_> {
                 }
             }
         })();
-        // The launcher also unlinks this one-shot environment file before spawning.
-        let _ = fs::remove_file(&spec_path);
         started.map(|t| (t, receipt.clone())).map_err(|mut e| {
+            if let Some(cancelled) = revoke_spec(&spec_path, &receipt) {
+                return cancelled;
+            }
             e["receipt"] = json!(receipt);
             e
         })

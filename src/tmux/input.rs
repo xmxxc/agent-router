@@ -138,6 +138,22 @@ fn uncertain(message: &str) -> Value {
     json!({"result":"uncertain","category":"input_uncertain","diagnostic":message})
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum ResumeInput {
+    SendBrief,
+    CheckReadOnly,
+}
+
+impl ResumeInput {
+    pub(super) fn for_host(host: Option<&str>, probe_read_only: bool) -> Option<Self> {
+        match host {
+            Some("opencode") => Some(Self::SendBrief),
+            Some("codex") if probe_read_only => Some(Self::CheckReadOnly),
+            _ => None,
+        }
+    }
+}
+
 impl Tmux<'_> {
     fn observe(&self, t: &Target, before: usize, window: Duration) -> Reply<()> {
         let start = Instant::now();
@@ -147,7 +163,7 @@ impl Tmux<'_> {
                     .saturating_sub(start.elapsed())
                     .min(Duration::from_millis(250)),
             );
-            check_notice(&self.capture(t)?, before)?;
+            check_notice(&self.capture(t, &t.worker_pane)?, before)?;
             if start.elapsed() >= window {
                 return Ok(());
             }
@@ -158,7 +174,7 @@ impl Tmux<'_> {
         if text.contains('\0') {
             return Err(failure("definitely-not-sent", "tmux input contains NUL"));
         }
-        let before = notices(&self.capture(t).map_err(|e| {
+        let before = notices(&self.capture(t, &t.worker_pane).map_err(|e| {
             if e["result"] == "refused" {
                 e
             } else {
@@ -173,18 +189,21 @@ impl Tmux<'_> {
         }
         // Single-quote for the tmux command parser inside if-shell. No shell is invoked.
         let literal = text.replace('\'', "'\\''");
-        self.pane_command(t, &format!("send-keys -t {} -l -- '{literal}'", t.pane))
-            .map_err(|mut err| {
-                if err["result"] == "uncertain" {
-                    err["category"] = json!("input_uncertain");
-                }
-                err
-            })?;
+        self.worker_command(
+            t,
+            &format!("send-keys -t {} -l -- '{literal}'", t.worker_pane),
+        )
+        .map_err(|mut err| {
+            if err["result"] == "uncertain" {
+                err["category"] = json!("input_uncertain");
+            }
+            err
+        })?;
         sleep(Duration::from_millis(500));
         let window = setting("WFC_TYPED_CHECK_SECONDS", 1.5);
         let mut earlier_refusals = before.refusals;
         for retry in 0..=2 {
-            self.pane_command(t, &format!("send-keys -t {} Enter", t.pane))
+            self.worker_command(t, &format!("send-keys -t {} Enter", t.worker_pane))
                 .map_err(|_| uncertain("text was typed but Enter was not confirmed"))?;
             let after_text = |err: Value| {
                 if err["category"] == "permission_required" {
@@ -198,13 +217,13 @@ impl Tmux<'_> {
             if host != Some("codex") {
                 break;
             }
-            let first = self.capture(t).map_err(after_text)?;
+            let first = self.capture(t, &t.worker_pane).map_err(after_text)?;
             check_notice(&first, earlier_refusals)?;
             let Some(draft) = codex_draft(&first).filter(|d| matches_input(d, text)) else {
                 break;
             };
             sleep(Duration::from_millis(300));
-            let second = self.capture(t).map_err(after_text)?;
+            let second = self.capture(t, &t.worker_pane).map_err(after_text)?;
             check_notice(&second, earlier_refusals)?;
             if Some(draft) != codex_draft(&second) {
                 break;
@@ -220,22 +239,21 @@ impl Tmux<'_> {
     pub(super) fn resume_input(
         &self,
         t: &Target,
-        host: Option<&str>,
+        action: ResumeInput,
         text: Option<&str>,
-        probe: bool,
     ) -> Reply<Value> {
-        if host == Some("opencode") {
+        if action == ResumeInput::SendBrief {
             let start = Instant::now();
             let mut last = String::new();
             while start.elapsed() < Duration::from_secs(30) {
-                let screen = self.capture(t).map_err(|_| {
+                let screen = self.capture(t, &t.worker_pane).map_err(|_| {
                     failure(
                         "definitely-not-sent",
                         "resumed worker started but its prompt could not be observed",
                     )
                 })?;
                 if !screen.trim().is_empty() && screen == last {
-                    return self.submit(t, text.unwrap_or_default(), host);
+                    return self.submit(t, text.unwrap_or_default(), Some("opencode"));
                 }
                 last = screen;
                 sleep(Duration::from_secs(1));
@@ -245,16 +263,14 @@ impl Tmux<'_> {
                 "resumed worker screen did not become ready",
             ));
         }
-        if host == Some("codex") && probe {
-            self.observe(t, 0, setting("WFC_RESUME_CHECK_SECONDS", 5.))
-                .map_err(|e| {
-                    if e["category"] == "permission_required" {
-                        e
-                    } else {
-                        uncertain("could not observe the resumed brief")
-                    }
-                })?;
-        }
+        self.observe(t, 0, setting("WFC_RESUME_CHECK_SECONDS", 5.))
+            .map_err(|e| {
+                if e["category"] == "permission_required" {
+                    e
+                } else {
+                    uncertain("could not observe the resumed brief")
+                }
+            })?;
         Ok(json!({"result":"accepted"}))
     }
 }

@@ -15,6 +15,10 @@ use std::process::{Command, Output};
 #[derive(Deserialize)]
 pub struct Request {
     dispatch: String,
+    #[serde(rename = "legacyExecutionId")]
+    legacy_execution_id: Option<String>,
+    #[serde(rename = "legacyWorkerPane")]
+    legacy_worker_pane: Option<String>,
     backend: Option<String>,
     #[serde(flatten)]
     op: Operation,
@@ -49,6 +53,9 @@ fn failure(result: &str, diagnostic: &str) -> Value {
 }
 
 struct Tmux<'a> {
+    protect_offline: bool,
+    legacy_execution_id: Option<&'a str>,
+    legacy_worker_pane: Option<&'a str>,
     state: &'a Path,
     dispatch: &'a str,
     session: String,
@@ -117,15 +124,24 @@ impl Tmux<'_> {
     fn target(&self) -> Reply<Option<Target>> {
         let claim = self.claim()?;
         let selector = format!("={}:", self.session);
-        let found = self.run(&[
-            "list-panes",
-            "-t",
-            &selector,
-            "-f",
-            "#{pane_active}",
-            "-F",
-            "#{session_id} #{pane_id} #{pid} #{start_time} :#{WFC_TMUX_LAUNCH}\n#{socket_path}",
-        ])?;
+        let found = self
+            .run(&[
+                "list-panes",
+                "-t",
+                &selector,
+                "-f",
+                "#{pane_active}",
+                "-F",
+                "#{session_id} #{pane_id} #{pid} #{start_time} :#{WFC_TMUX_LAUNCH}\n#{socket_path}",
+            ])
+            .map_err(|e| match claim {
+                Some(
+                    binding::Claim::LegacyPending { .. }
+                    | binding::Claim::Observed { .. }
+                    | binding::Claim::Launch(_),
+                ) => failure("uncertain", "could not inspect the original tmux service"),
+                _ => e,
+            })?;
         if !found.status.success() {
             let err = String::from_utf8_lossy(&found.stderr);
             let missing_name = err.trim_end() == format!("can't find session: {}", self.session);
@@ -244,7 +260,7 @@ impl Tmux<'_> {
 
     // Check the live binding and execute in one server command queue. A stale
     // name must never send a later Enter or kill to a replacement session.
-    fn guard(&self, t: &Target, condition: &str) -> String {
+    fn guard(&self, t: &Target, pane: &str, condition: &str) -> String {
         let owner = t
             .owner
             .replace('#', "##")
@@ -255,7 +271,7 @@ impl Tmux<'_> {
             ("start_time", &t.server_start),
             ("session_id", &t.session),
             ("session_name", &self.session),
-            ("pane_id", &t.pane),
+            ("pane_id", pane),
             ("WFC_STATE", &owner),
             ("WFC_TMUX_LAUNCH", &t.token),
         ];
@@ -266,8 +282,8 @@ impl Tmux<'_> {
             })
     }
 
-    fn guarded(&self, t: &Target, action: &str, condition: &str) -> Reply<String> {
-        let guard = self.guard(t, condition);
+    fn guarded(&self, t: &Target, pane: &str, action: &str, condition: &str) -> Reply<String> {
+        let guard = self.guard(t, pane, condition);
         // A format uses the global environment as a fallback. Require the
         // session-local owner entry to still exist in the same command queue.
         let yes = format!(
@@ -280,7 +296,7 @@ impl Tmux<'_> {
             "if-shell",
             "-F",
             "-t",
-            &format!("={}:", self.session),
+            pane,
             &guard,
             &yes,
             "display-message -p wfc-tmux-refused",
@@ -300,16 +316,21 @@ impl Tmux<'_> {
         Err(failure("uncertain", "tmux did not confirm the operation"))
     }
 
-    fn pane_command(&self, t: &Target, action: &str) -> Reply<String> {
-        // A window linked into another session shares its pane contents and keystrokes.
-        self.guarded(t, action, EXCLUSIVE_WINDOW)
+    fn worker_command(&self, t: &Target, action: &str) -> Reply<String> {
+        self.guarded(t, &t.worker_pane, action, EXCLUSIVE_WINDOW)
     }
 
-    fn capture(&self, target: &Target) -> Reply<String> {
-        self.pane_command(target, &format!("capture-pane -p -t {}", target.pane))
+    fn capture(&self, t: &Target, pane: &str) -> Reply<String> {
+        self.guarded(
+            t,
+            pane,
+            &format!("capture-pane -p -t {pane}"),
+            EXCLUSIVE_WINDOW,
+        )
     }
 
     fn close(&self) -> Reply<Value> {
+        self.revoke_pending_launch()?;
         if let Some(t) = self.target()? {
             if !t.owned {
                 return Err(failure(
@@ -321,13 +342,22 @@ impl Tmux<'_> {
             // Check all windows, even when the active window is exclusive.
             let exclusive = "#{m/r:^1+$,#{W:#{?#{==:#{window_linked_sessions},1},1,0}}}";
             let has_worker = format!("#{{m:*|{}|*,#{{W:#{{P:|#{{pane_id}}|}}}}}}", t.worker_pane);
+            // On this pinned server a pane ID cannot be reused. Once its worker
+            // has a terminal receipt and that ID is absent everywhere, it cannot
+            // move back between this observation and the guarded close.
+            let condition = if self.exited_pane_absent(&t)? {
+                exclusive.to_owned()
+            } else {
+                format!("#{{&&:{exclusive},{has_worker}}}")
+            };
             self.guarded(
                 &t,
+                &t.pane,
                 &format!("kill-session -t '{}'", t.session),
-                &format!("#{{&&:{exclusive},{has_worker}}}"),
+                &condition,
             )?;
         }
-        self.forget()?;
+        self.release()?;
         Ok(json!({"result":"completed"}))
     }
 }
@@ -350,6 +380,9 @@ pub(crate) fn attach(state: &Path, dispatch: &str, socket: &Path, token: &str) -
     let backend = Tmux {
         state: &state,
         dispatch,
+        protect_offline: true,
+        legacy_execution_id: None,
+        legacy_worker_pane: None,
         session: format!("wfc-{dispatch}"),
         socket: Some(socket.to_owned()),
     };
@@ -357,7 +390,12 @@ pub(crate) fn attach(state: &Path, dispatch: &str, socket: &Path, token: &str) -
         .lock_dispatch()
         .map_err(|_| anyhow::anyhow!("cannot verify tmux attach claim"))?;
     ensure!(
-        backend.claim().is_ok_and(|c| c.is_some()),
+        matches!(
+            backend.claim(),
+            Ok(Some(
+                binding::Claim::Launch(_) | binding::Claim::Observed { .. }
+            ))
+        ),
         "tmux attach claim expired"
     );
     let t = backend
@@ -371,7 +409,7 @@ pub(crate) fn attach(state: &Path, dispatch: &str, socket: &Path, token: &str) -
         "show-environment -t '{0}' WFC_STATE ; attach-session -E -t '{0}'",
         t.session
     );
-    let condition = backend.guard(&t, EXCLUSIVE_WINDOW);
+    let condition = backend.guard(&t, &t.pane, EXCLUSIVE_WINDOW);
     let status = backend.command()
         .args(["-N", "-S", &binding::fd_path(&t.socket_fd), "if-shell", "-F", "-t"])
         .arg(format!("={}:", backend.session))
@@ -389,6 +427,24 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
         "request selects another execution backend"
     );
     ensure!(valid_dispatch(&request.dispatch), "invalid dispatch ID");
+    ensure!(
+        request
+            .legacy_execution_id
+            .as_deref()
+            .is_none_or(|id| !id.is_empty()),
+        "empty legacy execution ID"
+    );
+    ensure!(
+        request.legacy_worker_pane.is_none() || request.legacy_execution_id.is_some(),
+        "legacy pane requires an execution ID"
+    );
+    ensure!(
+        request
+            .legacy_worker_pane
+            .as_deref()
+            .is_none_or(binding::valid_pane),
+        "invalid legacy worker pane"
+    );
     if matches!(request.op, Operation::Create(_) | Operation::Resume { .. }) {
         fs::create_dir_all(state).context("create tmux state directory")?;
     }
@@ -400,6 +456,9 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
     let backend = Tmux {
         state: &state,
         dispatch: &request.dispatch,
+        protect_offline: !matches!(&request.op, Operation::Create(_)),
+        legacy_execution_id: request.legacy_execution_id.as_deref(),
+        legacy_worker_pane: request.legacy_worker_pane.as_deref(),
         session: format!("wfc-{}", request.dispatch),
         socket: env::var_os("WFC_TMUX_SOCKET")
             .map(std::path::absolute)
@@ -409,14 +468,20 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
         Ok(lock) => lock,
         Err(result) => return Ok(result),
     };
+    if request.legacy_execution_id.is_some() {
+        if let Err(e) = backend.remember_existing() {
+            return Ok(e);
+        }
+    }
     let result = (|| match request.op {
         Operation::Inspect => backend.inspect(),
         Operation::Read => {
-            Ok(json!({"result":"accepted","screen":backend.capture(&backend.owned()?)?}))
+            let t = backend.owned()?;
+            Ok(json!({"result":"accepted","screen":backend.capture(&t,&t.pane)?}))
         }
         Operation::Interrupt => {
             let target = backend.owned()?;
-            backend.pane_command(&target, &format!("send-keys -t {} C-c", target.pane))?;
+            backend.worker_command(&target, &format!("send-keys -t {} C-c", target.worker_pane))?;
             Ok(json!({"result":"accepted"}))
         }
         Operation::Close => backend.close(),
@@ -438,11 +503,12 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
             text,
             probe_read_only,
         } => {
+            let input = input::ResumeInput::for_host(host.as_deref(), probe_read_only);
             let (target, receipt) = backend.create(launch).map_err(|mut e| {
-                if host.as_deref() == Some("opencode") {
+                if input == Some(input::ResumeInput::SendBrief) {
                     // OpenCode receives this brief only after create returns a verified target.
                     e["inputResult"] = json!("definitely-not-sent");
-                } else if host.as_deref() == Some("codex") && probe_read_only {
+                } else if input.is_some() {
                     e["inputResult"] = json!(if e["result"] == "definitely-not-sent"
                         || e["result"] == "refused"
                     {
@@ -453,15 +519,16 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
                 }
                 e
             })?;
-            let mut result = backend
-                .resume_input(&target, host.as_deref(), text.as_deref(), probe_read_only)
-                .unwrap_or_else(|e| e);
+            let mut result = if let Some(action) = input {
+                let mut observed = backend
+                    .resume_input(&target, action, text.as_deref())
+                    .unwrap_or_else(|e| e);
+                observed["inputResult"] = observed["result"].clone();
+                observed
+            } else {
+                json!({"result":"accepted"})
+            };
             result["launchResult"] = json!("accepted");
-            if host.as_deref() == Some("opencode")
-                || (host.as_deref() == Some("codex") && probe_read_only)
-            {
-                result["inputResult"] = result["result"].clone();
-            }
             if result["result"] != "accepted" && result["category"] != "permission_required" {
                 result["result"] = json!("uncertain");
             }
