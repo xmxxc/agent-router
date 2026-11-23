@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run the OpenCode argument validation method from the pinned product checkout.
+# Run each relay and ownership suite against the same pinned binary.
 set -euo pipefail
 ci_dir=$(cd "$(dirname "$0")" && pwd)
 binary=$(realpath "target/$TARGET/release/wfc")
@@ -36,6 +36,10 @@ run_suite() {
         tee -a "$EVIDENCE/results.log"
 }
 
-run_suite opencode tests/opencode_relay.py OpenCodeRelay.test_invalid_target_and_worker_callback_do_not_claim 1
+run_suite opencode tests/opencode_relay.py OpenCodeRelay 6
+run_suite managed-opencode "$ci_dir/managed_owner.py" ManagedOpenCode.test_current_owner_delivers_and_old_owner_cannot_claim 1
+run_suite codex tests/relay.py Relay 17
+run_suite owner-takeover tests/owner.py Owner.test_takeover_waits_for_scoped_delivery_and_unregisters_detached_relay 1
+run_suite owner-expiry tests/owner.py Owner.test_relay_settles_its_claim_after_lease_expires 1
 printf 'firstFailedSuite=%s\n' "$first_failure" | tee -a "$EVIDENCE/results.log"
 test "$first_failure" = none

@@ -42,6 +42,8 @@ int main(void) {
     printf("Bundled libcurl %s\n", version->version);
     printf("Bundled libcurl TLS backend %s\n",
            version->ssl_version ? version->ssl_version : "unavailable");
+    printf("Bundled libcurl zlib %s\n",
+           version->libz_version ? version->libz_version : "unavailable");
     int missing_ssl = version->ssl_version == NULL;
     curl_global_cleanup();
     return missing_ssl;

@@ -1,21 +1,22 @@
-name: Linux OpenCode argument validation retry
+name: Linux OpenCode combination and package
 on:
   push:
-    branches: [rust-router/38-opencode-arguments-ci]
+    branches: [rust-router/38-opencode-jammy-ci]
 
 permissions:
   contents: read
 
 jobs:
   relay:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 40
     defaults:
       run:
         shell: bash
     env:
-      PRODUCT_SHA: e2ccf20fb4be13328f63345e8d44b768ea1fbe76
-      PRODUCT_TREE: 1249fc0d65f17d20a90d90d43fb4d06ce2cce59b
+      PRODUCT_SHA: 453fe04cd18dfccd525c8070ebfe33e659146a1a
+      PRODUCT_TREE: a30c73e0c4fdb8bab531079edcbf622e9f59d560
+      PRODUCT_PARENTS: '3578eebb0aa13e7470ef72a088d5fa074546e268 3abcd84e8e6e98e56ed4b655daf950c1ac6d82e1'
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TARGET: x86_64-unknown-linux-gnu
       CARGO_BUILD_JOBS: '2'
@@ -35,12 +36,13 @@ jobs:
           ref: ${{ github.sha }}
           path: ci
           persist-credentials: false
-      - name: Check out the frozen PR #54 product
+      - name: Check out the frozen combination
         id: product
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.PRODUCT_SHA }}
           path: product
+          fetch-depth: 2
           persist-credentials: false
       - name: Check out the verified native CI zlib input
         id: native
@@ -60,6 +62,7 @@ jobs:
             git -C ../ci show -s --format='workflow=%H tree=%T parents=%P'
             test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
             test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+            test "$(git show -s --format=%P)" = "$PRODUCT_PARENTS"
             test -z "$(git status --porcelain)"
             git show -s --format='product=%H tree=%T parents=%P'
             test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
@@ -111,6 +114,7 @@ jobs:
               sudo apt-get update
               sudo apt-get install -y --no-install-recommends pkg-config libssl-dev zlib1g-dev tmux binutils openssl
             fi
+            cat /etc/os-release
             uname -srm
             id -u
             rustc +1.96.1 -vV
@@ -121,6 +125,7 @@ jobs:
             cc --version
             curl --version
             pkg-config --modversion openssl zlib
+            dpkg-query -W libssl3 zlib1g
           } 2>&1 | tee "$EVIDENCE/toolchain.log"
       - name: Materialize Ghostty and verify the fixed zlib package
         id: ghostty
@@ -165,7 +170,13 @@ jobs:
         working-directory: product
         run: |
           bash ../ci/tools/ci/opencode-relay/libraries.sh 2>&1 | tee "$EVIDENCE/libraries-step.log"
-      - name: Run the OpenCode invalid-target and callback test
+      - name: Package and verify the unpacked ELF and libcurl notices
+        id: package
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: |
+          bash ../ci/tools/ci/opencode-relay/package.sh 2>&1 | tee "$EVIDENCE/package.log"
+      - name: Run the OpenCode, Codex and scope owner regressions
         id: suites
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: product
@@ -185,13 +196,14 @@ jobs:
           WUFFS_OUTCOME: ${{ steps.wuffs.outcome }}
           BUILD_OUTCOME: ${{ steps.build.outcome }}
           LIBRARIES_OUTCOME: ${{ steps.libraries.outcome }}
+          PACKAGE_OUTCOME: ${{ steps.package.outcome }}
           SUITES_OUTCOME: ${{ steps.suites.outcome }}
         run: |
           mkdir -p "$EVIDENCE"
           cd "$EVIDENCE"
           first_failure=none
           {
-            for step in CI PRODUCT NATIVE SOURCES PYTHON ZIG TOOLCHAIN GHOSTTY WUFFS BUILD LIBRARIES SUITES; do
+            for step in CI PRODUCT NATIVE SOURCES PYTHON ZIG TOOLCHAIN GHOSTTY WUFFS BUILD LIBRARIES PACKAGE SUITES; do
               name="${step}_OUTCOME"
               result=${!name}
               printf '%s=%s\n' "$step" "$result"
@@ -202,13 +214,13 @@ jobs:
             printf 'firstFailedStep=%s\n' "$first_failure"
           } | tee outcomes.log
           shopt -s nullglob
-          sha256sum -- *.log *.sha256 > SHA256SUMS
+          sha256sum -- *.log *.sha256 *.tar.gz > SHA256SUMS
           sha256sum --check --strict SHA256SUMS
       - name: Upload Linux relay evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: linux-opencode-arguments-${{ github.run_id }}-${{ github.run_attempt }}
+          name: linux-opencode-jammy-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14
