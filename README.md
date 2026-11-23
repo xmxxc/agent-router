@@ -42,6 +42,8 @@ Rust 的这三个入口都不读写调度状态。与 Python 版并排使用时�
 
 启动 `wfc --kernel` 会收到一行 JSON 握手，其中含协议版本 1 和本次启动的 generation。保持标准输入打开，每行发送一个 JSON 请求。spawn 返回 nonce，后续 read、input、resize 和 close 使用同一个 unit、generation 和 nonce。关闭标准输入会结束内核。smoke 启动真实子进程，等待它就绪，调整窗口，输入随机文本并核对它回写的反转文本。
 
+Windows 下载包可直接使用系统 ConPTY 运行，无需安装 Herdr、tmux 或 Python。Windows smoke 用 Python 驱动测试，把内核的 PATH 限为 System32，再由内核启动系统自带的 Windows PowerShell。测试核对子进程报出的 PID，记录 Windows 创建时间，并持有该进程的句柄，在 close 返回后检查它已退出。
+
 WFC 的 `build.py --bundled-kernel <内核文件> --kernel-notices <许可证目录>` 接收以上两项输出，将内核放在 WFC 旁边，命名为 `wfc-kernel` 或 `wfc-kernel.exe`。这份同名兼容副本支持 Python 的无参数内核调用。运行时也可将 `WFC_BUNDLED_KERNEL` 指向该副本。Windows 默认使用系统 ConPTY（Windows 的伪终端接口）。
 
 旧安装若已将 `WFC_BUNDLED_KERNEL` 指向 `herdr-kernel-prototype`（Windows 为 `herdr-kernel-prototype.exe`），可保留原路径和文件名，用新产物替换该文件。Python 会以无参数方式启动它并读取握手。若原来使用其他自定义文件名，把新产物复制为 `wfc-kernel`（Windows 为 `wfc-kernel.exe`），将 `WFC_BUNDLED_KERNEL` 设为这份副本的绝对路径。能传入启动参数的调用方也可保留自定义文件名，显式传入 `--kernel`。
