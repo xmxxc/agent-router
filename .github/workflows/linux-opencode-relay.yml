@@ -1,7 +1,7 @@
-name: Linux startup progress, owner proof and resume integration
+name: Linux startup recovery, reply and resume combination
 on:
   push:
-    branches: [rust-router/linux-ci-startup-resume-owner]
+    branches: [rust-router/linux-ci-startup-reply-combination]
 
 permissions:
   contents: read
@@ -14,19 +14,19 @@ jobs:
       run:
         shell: bash
     env:
-      PRODUCT_SHA: 5ff93d92d980785a85363b92771597b04fd24b5e
-      PRODUCT_TREE: 95cdc5cfcdc11cffafec0e32a528d379681753b3
-      PRODUCT_PARENTS: 'cc98f8a65b438a8eab65b7eefd5f1ecad6b9758e e316d9aa6bc9d59c73767ff861c843cfa82a3642'
-      INPUTS_SHA256: 420d990f635d53fc2bcb46f6f6ab02990d665c7f5e72cf3cd5b7aef8972c033f
+      PRODUCT_SHA: fe94e3afe1103ff4c48e20e7a5d644317fccd90d
+      PRODUCT_TREE: 351c538dcfa4df1fd7677de98a64abc5234296b0
+      PRODUCT_PARENTS: 'beacb150e76330413596c5acfaf385e6110ed12f 8bdef7b562f2caaccc590f0b60e094a576d84b7b'
+      INPUTS_SHA256: ff80afa70e9e71763acf4381bbd7dab80102f4bfe57c10d3cb5c850a58583d44
       LOCK_SHA256: 759d7553d4023d05406dfaa81984fe2819ee88ceb982b35468dd2f78ce748709
-      PRIOR_RELAY_RUN: '45258027015'
-      PRIOR_STARTUP_RUN: '45242439722'
-      PRIOR_OPENCODE_RUN: '45240722301'
+      PRIOR_PUBLIC_RUN: '45262173949'
+      PRIOR_UNIT_RUN: '45264198018'
+      PRIOR_REPLY_RUN: '45262940269'
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TARGET: x86_64-unknown-linux-gnu
       CARGO_BUILD_JOBS: '2'
       LC_ALL: C.UTF-8
-      EVIDENCE: ${{ github.workspace }}/linux-bounded-startup-evidence
+      EVIDENCE: ${{ github.workspace }}/linux-startup-reply-evidence
     steps:
       - name: Record workflow run
         run: |
@@ -34,8 +34,8 @@ jobs:
           printf 'workflow=%s\nrun=%s\nattempt=%s\nexpectedProduct=%s\nexpectedTree=%s\n' \
             "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PRODUCT_SHA" "$PRODUCT_TREE" |
             tee "$EVIDENCE/run.log"
-          printf 'previousRelayRun=%s\npreviousStartupRun=%s\npreviousOpenCodeRun=%s\n' \
-            "$PRIOR_RELAY_RUN" "$PRIOR_STARTUP_RUN" "$PRIOR_OPENCODE_RUN" | tee -a "$EVIDENCE/run.log"
+          printf 'previousPublicRun=%s\npreviousUnitRun=%s\npreviousReplyRun=%s\n' \
+            "$PRIOR_PUBLIC_RUN" "$PRIOR_UNIT_RUN" "$PRIOR_REPLY_RUN" | tee -a "$EVIDENCE/run.log"
       - name: Check out the CI scripts
         id: ci
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -79,8 +79,10 @@ jobs:
             printf '%s  vendor/INPUTS.sha256\n%s  Cargo.lock\n' "$INPUTS_SHA256" "$LOCK_SHA256" |
               sha256sum --check --strict
             sha256sum vendor/INPUTS.sha256 Cargo.lock \
-              tests/{startup_failure.py,receipts.py,relay.py,opencode_relay.py} tools/check_tmux.py \
-              ../ci/tools/ci/opencode-relay/{libraries.sh,managed_owner.py,reap.py,run_selected.py,startup_recovery.py,verify.sh}
+              tests/{startup_failure.py,relay.py,opencode_relay.py,herdr_public.py} tools/check_tmux.py \
+              crates/herdr/tests/{composer.py,live.py} \
+              ../ci/tools/ci/opencode-relay/{libraries.sh,reap.py,run_selected.py,startup_recovery.py,verify.sh} \
+              ../ci/tools/ci/resume/{callback-fixture.patch,callback-fixture-reply.patch}
             sha256sum --check --strict vendor/INPUTS.sha256
           } 2>&1 | tee "$EVIDENCE/sources.log"
       - name: Set up Python
@@ -181,12 +183,29 @@ jobs:
         working-directory: product
         run: |
           bash ../ci/tools/ci/opencode-relay/libraries.sh 2>&1 | tee "$EVIDENCE/libraries-step.log"
-      - name: Run startup recovery and the OpenCode and Codex intersections
-        id: suites
+      - name: Prepare the pinned isolated Herdr server
+        id: herdr
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          {
+            asset=https://github.com/herdrdev/herdr/releases/download/v0.9.5/herdr-linux-x86_64
+            herdr="$RUNNER_TEMP/herdr-0.9.5"
+            printf 'Herdr source 2ecf19a92fc3a7fff75b6ce3655ef04f4625ec01\nAsset %s\n' "$asset"
+            curl --fail --silent --show-error --location --retry 3 --max-time 120 "$asset" -o "$herdr"
+            printf '%s  %s\n' 14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d \
+              "$herdr" | sha256sum --check --strict
+            chmod 700 "$herdr"
+            version=$("$herdr" --version)
+            printf '%s\n' "$version"
+            test "$version" = 'herdr 0.9.5'
+            printf 'HERDR_BINARY=%s\n' "$herdr" >> "$GITHUB_ENV"
+          } 2>&1 | tee "$EVIDENCE/herdr-input.log"
+      - name: Run the startup, public reply and lifecycle selections
+        id: suites
+        if: ${{ !cancelled() && steps.herdr.outcome == 'success' }}
         working-directory: product
         run: |
-          bash ../ci/tools/ci/opencode-relay/verify.sh resume-owner 2>&1 | tee "$EVIDENCE/suites-step.log"
+          bash ../ci/tools/ci/opencode-relay/verify.sh startup-reply 2>&1 | tee "$EVIDENCE/suites-step.log"
       - name: Record step outcomes and checksum the evidence
         if: ${{ always() }}
         env:
@@ -201,13 +220,14 @@ jobs:
           WUFFS_OUTCOME: ${{ steps.wuffs.outcome }}
           BUILD_OUTCOME: ${{ steps.build.outcome }}
           LIBRARIES_OUTCOME: ${{ steps.libraries.outcome }}
+          HERDR_OUTCOME: ${{ steps.herdr.outcome }}
           SUITES_OUTCOME: ${{ steps.suites.outcome }}
         run: |
           mkdir -p "$EVIDENCE"
           cd "$EVIDENCE"
           first_failure=none
           {
-            for step in CI PRODUCT NATIVE SOURCES PYTHON ZIG TOOLCHAIN GHOSTTY WUFFS BUILD LIBRARIES SUITES; do
+            for step in CI PRODUCT NATIVE SOURCES PYTHON ZIG TOOLCHAIN GHOSTTY WUFFS BUILD LIBRARIES HERDR SUITES; do
               name="${step}_OUTCOME"
               result=${!name}
               printf '%s=%s\n' "$step" "$result"
@@ -224,7 +244,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: linux-startup-resume-owner-jammy-${{ github.run_id }}-${{ github.run_attempt }}
+          name: linux-startup-reply-combination-jammy-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14

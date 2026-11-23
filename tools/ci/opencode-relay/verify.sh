@@ -12,6 +12,7 @@ test "$(id -u)" -ne 0
 first_failure=none
 run_suite() {
     local group=$1 script=$2 selector=$3 expected=$4
+    shift 4
     local verdict=pass log="$EVIDENCE/$group.log" work status=0 selection=not-confirmed
     work=$(mktemp -d "$RUNNER_TEMP/wfc-relay-$group.XXXXXXXX")
     mkdir "$work/home" "$work/tmp"
@@ -20,7 +21,7 @@ run_suite() {
         PYTHONUTF8=1 PYTHONDONTWRITEBYTECODE=1 \
         WFC_STATE="$work/state" WFC_TMUX_SOCKET="$work/tmux.sock" \
         "$python" -Bu "$ci_dir/reap.py" timeout --kill-after=5s 180s \
-        "$python" -Bu "$ci_dir/run_selected.py" "$script" "$binary" "$selector" "$expected" \
+        "$python" -Bu "$ci_dir/run_selected.py" "$script" "$binary" "$selector" "$expected" "$@" \
         2>&1 | tee -a "$log" || status=$?
     local count_label="$expected tests"
     if (( expected == 1 )); then
@@ -71,6 +72,7 @@ run_startup_units() {
         fi
     done
     if (( status != 0 || checked != 8 )) ||
+        ! grep -Eq '^test result: ok\. 8 passed; 0 failed; 0 ignored; 0 measured;' "$log" ||
         ! grep -Fxq 'Own descendants reaped: ECHILD, extra cleanup signals: 0' "$log"; then
         verdict=fail
         if [[ "$first_failure" == none ]]; then
@@ -148,6 +150,48 @@ run_resume_owner_suites() {
     sha256sum --check --strict "$EVIDENCE/binary.sha256"
 }
 
+run_startup_reply_suites() {
+    run_suite startup-blocked-progress tests/startup_failure.py StartupFailure.test_long_wait_advances_when_checkpoint_stays_blocked 1
+    run_suite startup-resume-polls tests/startup_failure.py StartupFailure.test_short_wait_restarts_resume_after_processed_prefix 1
+    run_suite codex-scope-refresh tests/relay.py Relay.test_running_relay_refreshes_repaired_and_legacy_owner_records 1
+    run_suite opencode-refused tests/opencode_relay.py OpenCodeRelay.test_connection_refused_is_unsent_and_can_retry_original_id 1
+    run_suite startup-opencode "$ci_dir/startup_recovery.py" StartupOpenCode.test_recovers_interrupted_notice_through_scoped_http 1
+    run_suite startup-confirmation tests/startup_failure.py StartupFailure.test_tmux_exit_follows_the_create_confirmation 1
+    run_suite startup-managed tests/startup_failure.py StartupFailure.test_managed_startup_recovery_rechecks_owner 1
+    run_suite startup-readonly-close tests/startup_failure.py StartupFailure.test_script_preflight_close_replays_from_read_only_history 1
+    run_suite codex-short-neighbor tests/relay.py Relay.test_short_relay_retries_across_ordinary_neighbor_updates 1
+
+    run_suite reply-once tools/check_tmux.py Backend.test_public_reply_once_and_original_done 1
+    run_suite reply-short-empty tools/check_tmux.py Backend.test_public_reply_keeps_claim_when_tmux_draft_reappears 1
+    run_suite reply-reclaim-startup tools/check_tmux.py Backend.test_public_reply_and_reclaim_preserve_controller_receipts 1
+    run_suite herdr-managed-reply tests/herdr_public.py PublicLifecycle.test_managed_herdr_reply_rechecks_owner_while_waiting 1 "$HERDR_BINARY"
+
+    run_suite resume-pending tools/check_tmux.py Backend.test_public_resume_fences_pending_and_lost_launch_responses 1
+    run_suite resume-spawn tools/check_tmux.py Backend.test_public_resume_records_definite_spawn_failure 1
+    local copy overlay
+    copy=$(mktemp -d "$RUNNER_TEMP/wfc-approved-resume.XXXXXXXX")
+    overlay=$(realpath "$ci_dir/../resume/callback-fixture-reply.patch")
+    mkdir "$copy/tools"
+    cp -- tools/check_tmux.py "$copy/tools/check_tmux.py"
+    {
+        printf '%s  %s\n' 3352bcc9d9784cb99adb975f0c04d7a5a21bd6d9570cf8f9f3e8f706771af6d8 \
+            "$ci_dir/../resume/callback-fixture.patch" | sha256sum --check --strict
+        printf '%s  %s\n' 888d8e5fb1254cea64cd92681d6ff562ee3647f713de04b02a27ec79d8e7ff38 \
+            "$overlay" | sha256sum --check --strict
+        printf '%s  %s\n' ccb0b68d7676e451a7b1d74e51423c1792723d5021824b53e2e5b67e802070a2 \
+            "$copy/tools/check_tmux.py" | sha256sum --check --strict
+        git -C "$copy" apply --no-index "$overlay"
+        printf '%s  %s\n' 0306f9e6fe6867464713f78b3d093abd024e85cd575dbe5aece102979c24411a \
+            "$copy/tools/check_tmux.py" | sha256sum --check --strict
+    } | tee "$EVIDENCE/resume-fixture.log"
+    run_suite resume-reclaim "$copy/tools/check_tmux.py" Backend.test_public_resume_after_reclaim_preserves_history 1
+    rm -r -- "$copy"
+    run_suite reclaim-owner tools/check_tmux.py Backend.test_public_reclaim_rechecks_selected_execution_under_scope_lock 1
+
+    run_startup_units
+    sha256sum --check --strict "$EVIDENCE/binary.sha256"
+}
+
 case "${1:-all}" in
   all)
     run_opencode_suites
@@ -170,8 +214,11 @@ case "${1:-all}" in
   resume-owner)
     run_resume_owner_suites
     ;;
+  startup-reply)
+    run_startup_reply_suites
+    ;;
   *)
-    printf 'expected all, owner-only, target-validation, startup-opencode, relay-retry or resume-owner\n' >&2
+    printf 'expected all, owner-only, target-validation, startup-opencode, relay-retry, resume-owner or startup-reply\n' >&2
     exit 2
     ;;
 esac

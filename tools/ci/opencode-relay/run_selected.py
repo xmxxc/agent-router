@@ -6,11 +6,11 @@ from types import SimpleNamespace
 import unittest
 
 
-def load_suite(script, binary, selector, expected):
+def load_suite(script, binary, selector, expected, *fixture_args):
     script = Path(script).resolve()
     sys.path.insert(0, str(script.parent))
-    # The existing fixtures read the wfc path from argv[1] at import time.
-    sys.argv[:] = [str(script), binary]
+    # Herdr's fixture reads its server path before the wfc path.
+    sys.argv[:] = [str(script), *fixture_args, binary]
     fixture = SimpleNamespace(**runpy.run_path(str(script), run_name="_wfc_test"))
     loader = unittest.TestLoader()
     suite = loader.loadTestsFromName(selector, fixture)
@@ -23,8 +23,8 @@ def load_suite(script, binary, selector, expected):
 
 
 if __name__ == "__main__":
-    script, binary, selector, expected = sys.argv[1:]
+    script, binary, selector, expected, *fixture_args = sys.argv[1:]
     count = int(expected)
-    suite = load_suite(script, binary, selector, count)
+    suite = load_suite(script, binary, selector, count, *fixture_args)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.exit(0 if result.wasSuccessful() and result.testsRun == count and not result.skipped else 1)

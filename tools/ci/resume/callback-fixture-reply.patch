@@ -1,0 +1,47 @@
+--- a/tools/check_tmux.py
++++ b/tools/check_tmux.py
+@@ -615,15 +615,40 @@
+         resumed = self.resume_cli("resume", dispatch, "--task", "task2", "--report", "reports/r2.md", **owner)
+         self.assertEqual((resumed["session"], resumed["round"], resumed["launchResult"]), (session, 2, "accepted"))
+         self.assertNotEqual(resumed["attempt"], attempt)
+-        self.assertEqual(self.resumed_host(resumed["attempt"])["argv"][-2], session)
+-        self.assertIn("attempt is no longer accepted",
+-                      self.resume_callback(first, "done", "--report", str(report), code=1))
++        current = self.resumed_host(resumed["attempt"])
++        self.assertEqual((current["argv"][-2], current["WFC_ROUND"], current["WFC_ATTEMPT"]),
++                         (session, "2", resumed["attempt"]))
++        self.assertTrue(first["WFC_WORKER_CALLBACK"] and current["WFC_WORKER_CALLBACK"]
++                        and first["WFC_WORKER_CALLBACK"] != current["WFC_WORKER_CALLBACK"])
++        current_report = Path(current["WFC_REPORT"])
++        self.assertEqual(current_report, self.work / "reports" / "r2.md")
++        current_report.write_text("unsubmitted second round report")
++        ledger = self.state / "messages.json"
++        assignment = self.state / "dispatches" / f"{dispatch}.json"
++        before = (ledger.read_bytes(), assignment.read_bytes())
++        cases = (
++            ("round", first, report, f"Error: round mismatch for {dispatch}"),
++            ("attempt", {**current, "WFC_ATTEMPT": attempt}, current_report,
++             f"Error: attempt is no longer accepted for {dispatch}"),
++            ("callback", {**current, "WFC_WORKER_CALLBACK": first["WFC_WORKER_CALLBACK"]}, current_report,
++             {"error": "invalid_worker_callback", "operation": "done"}),
++        )
++        for boundary, worker, candidate_report, expected in cases:
++            with self.subTest(boundary=boundary):
++                error = self.resume_callback(worker, "done", "--report", str(candidate_report), code=1)
++                self.assertEqual(json.loads(error) if boundary == "callback" else error.strip(), expected)
++                self.assertEqual((ledger.read_bytes(), assignment.read_bytes()), before)
+         row = self.resume_status(dispatch)
+         self.assertNotIn("reclaimed", row)
+-        self.assertEqual([m["messageId"] for m in row["messages"]], [done["messageId"], event["messageId"]])
++        self.assertEqual([(m["id"], m["messageId"]) for m in row["messages"]],
++                         [(done["message"], done["messageId"]), (event["id"], event["messageId"])])
+         self.assertEqual([(r["round"], r["attempt"], r["state"]) for r in row["rounds"]],
+                          [(1, attempt, "completed"), (2, resumed["attempt"], "running")])
+         self.assertEqual(report.read_text(), "original round report")
++        print(json.dumps({"callbackRejections": [boundary for boundary, *_ in cases],
++                          "dispatch": dispatch, "round": row["round"], "attempt": row["attempt"],
++                          "history": [{"id": m["id"], "messageId": m["messageId"]} for m in row["messages"]],
++                          "ledgerAndAssignmentUnchanged": True}), flush=True)
+
+     def test_read_only_unowned_close_replays_confirmed_archive(self):
+         self.assertNotEqual(os.geteuid(), 0, "read-only fixture requires an ordinary user")
