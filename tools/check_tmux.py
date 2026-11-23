@@ -1,4 +1,5 @@
 """Exercise the private backend interface with a fresh tmux server and state roots."""
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -672,7 +673,7 @@ os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
         shim.chmod(0o700)
         closed = self.call("close", environ={"PATH": str(self.work)})
         self.assertEqual((closed["result"], closed.get("closeEffect")), ("completed", "already_absent"))
-        self.assertEqual(json.loads(receipt.read_bytes()), {"category": "process_exited", "exitCode": 37})
+        self.assertEqual(json.loads(receipt.read_bytes()), {"category": "process_exited", "exitCode": 37, "launchId": receipt.stem})
         # Same dispatch, new live worker; its previous receipt still exists.
         self.assertEqual(self.call("resume", **self.launch)["result"], "accepted")
         closed = self.call("close")
@@ -1213,6 +1214,191 @@ os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
         reply = self.call("create", **{**self.launch, "argv": argv}, environ={"PATH": str(self.work)})
         self.assertEqual((reply["result"], reply.get("category"), reply.get("exitCode")),
                          ("uncertain", "process_exited", 23), reply)
+
+    def check_legacy_pane_process(self, r1):
+        self.state.mkdir()
+        session = "wfc-d-abc12345"
+        original_log = self.root / "original.log"
+        argv = [sys.executable, str(Path(__file__).resolve()), "--composer", "ready", str(original_log), "original"]
+        args = dict(legacyExecutionId="import-A")
+        if r1:
+            created = self.call("create", binary=LEGACY_WFC, **{**self.launch, "argv": argv})
+            self.assertEqual(created["result"], "accepted", created)
+            receipt = Path(created["receipt"])
+            hold = receipt.with_suffix(".hold")
+            receipt.rename(hold)
+        else:
+            subprocess.run(self.tmux + ["new-session", "-d", "-s", session, "-e", f"WFC_STATE={self.state}", *argv], check=True)
+        pane = self.active_pane()
+        inspected = self.call("inspect", **args, legacyWorkerPane=pane)
+        self.assertNotIn("receipt", inspected)
+        if r1:
+            hold.rename(receipt)
+        else:
+            self.assertTrue(inspected["workerBound"], inspected)
+            deadline = time.monotonic() + 5
+            while "model" not in self.call("read")["screen"]:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.02)
+            self.assertEqual(self.call("submit", **args, text="hi")["result"], "accepted")
+            self.assertEqual(self.call("interrupt", **args)["result"], "accepted")
+            self.assertEqual(bytes.fromhex("".join(e[0] for e in self.events(original_log, 4))), b"hi\r\x03")
+        replacement = self.root / "replacement.log"
+        argv[-2:] = [str(replacement), "replacement"]
+        subprocess.run(self.tmux + ["respawn-pane", "-k", "-t", pane, *argv], check=True)
+        self.assertEqual(self.active_pane(), pane)
+        deadline = time.monotonic()+5
+        while "model" not in self.call("read")["screen"]:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.02)
+        for fields in [args, {**args, "legacyWorkerPane": pane}]:
+            with self.subTest(fields=fields):
+                seen = self.call("inspect", **fields)
+                self.assertFalse(seen["workerBound"], seen)
+                self.assertNotIn("receipt", seen)
+                for op in ("submit", "interrupt"):
+                    result = self.call(op, **fields, **({"text": "boundary"} if op == "submit" else {}))
+                    self.assertEqual(result.get("inputResult"), "definitely-not-sent", result)
+                self.assertIn(self.call("close", **fields)["result"], {"refused", "uncertain"})
+        self.assertEqual(self.events(replacement, 0), [])
+        self.assertIn("model", self.call("read")["screen"])
+        self.assertEqual(subprocess.check_output(self.tmux + ["list-sessions", "-F", "#{session_name}"],
+                                               text=True).splitlines(), ["sibling", session])
+
+    def test_plain_legacy_pane_process(self):
+        self.check_legacy_pane_process(False)
+
+    @unittest.skipUnless(LEGACY_WFC, "set WFC_TEST_R1_BINARY to the R1 executable for the upgrade test")
+    def test_r1_pane_process_when_receipt_was_unavailable(self):
+        self.check_legacy_pane_process(True)
+
+    def test_disconnected_pane_hint_cannot_bind_a_new_process(self):
+        self.state.mkdir()
+        subprocess.run(self.tmux + ["new-session", "-d", "-s", "wfc-d-abc12345", "-e",
+                                    f"WFC_STATE={self.state}", "/bin/cat"], check=True)
+        pane = self.active_pane()
+        args = dict(legacyExecutionId="import", legacyWorkerPane=pane)
+        parked = self.root / "parked"
+        os.rename(self.socket, parked)
+        try:
+            self.assertEqual(self.call("inspect", **args)["result"], "uncertain")
+            subprocess.run([TMUX, "-S", str(parked), "respawn-pane", "-k", "-t", pane, "/bin/cat"], check=True)
+        finally:
+            os.rename(parked, self.socket)
+        self.assertFalse(self.call("inspect", **args)["workerBound"])
+        self.assertNotEqual(self.call("close", **args)["result"], "completed")
+        self.assertEqual(self.active_pane(), pane)
+
+    def test_first_hint_precedes_wait_for_dispatch_lock(self):
+        (self.state/"tmux").mkdir(parents=True)
+        subprocess.run(self.tmux + ["new-session", "-d", "-s", "wfc-d-abc12345", "-e",
+                                    f"WFC_STATE={self.state}", "/bin/cat"], check=True)
+        pane = self.active_pane()
+        request = dict(op="inspect", dispatch="d-abc12345", legacyExecutionId="earlier", legacyWorkerPane=pane)
+        with (self.state/"tmux/d-abc12345.lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with subprocess.Popen([WFC, "--tmux-backend"], env={**self.env, "WFC_STATE": str(self.state)},
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
+                try:
+                    child.stdin.write(json.dumps(request))
+                    child.stdin.close()
+                    subprocess.run(self.tmux + ["respawn-pane", "-k", "-t", pane, "/bin/cat"], check=True)
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                self.assertEqual(child.wait(timeout=10), 0)
+                self.assertFalse(json.load(child.stdout)["workerBound"])
+        self.assertEqual(self.active_pane(), pane)
+
+    def test_offline_pane_hint_requires_the_original_server(self):
+        self.state.mkdir()
+        alternate = self.root / "alternate"
+        alternate_tmux = [TMUX, "-f", "/dev/null", "-S", str(alternate)]
+        self.addCleanup(subprocess.run, alternate_tmux + ["kill-server"], capture_output=True, env=self.env)
+        subprocess.run(alternate_tmux + ["new-session", "-d", "-s", "peer", "/bin/cat"], check=True)
+        launch = ["new-session", "-d", "-s", "wfc-d-abc12345", "-e", f"WFC_STATE={self.state}", "/bin/cat"]
+        for server in [self.tmux, alternate_tmux]:
+            subprocess.run(server + launch, check=True)
+        pane = self.active_pane()
+        parked = self.root / "original"
+        os.rename(self.socket, parked)
+        try:
+            args = dict(legacyExecutionId="old", legacyWorkerPane=pane)
+            self.assertEqual(self.call("inspect", **args)["result"], "uncertain")
+            os.rename(alternate, self.socket)
+            try:
+                seen = self.call("inspect", **args)
+                self.assertFalse(seen.get("workerBound", False), seen)
+                self.assertNotEqual(self.call("close", **args)["result"], "completed")
+                self.assertEqual(self.active_pane(), pane)
+            finally:
+                os.rename(self.socket, alternate)
+        finally:
+            os.rename(parked, self.socket)
+        self.assertTrue(self.call("inspect", **args)["workerBound"])
+        self.assertEqual(self.call("close", **args)["result"], "completed")
+
+    def test_native_close_uses_the_same_terminal_proof_as_inspect(self):
+        trigger = self.root / "done"
+        argv = [sys.executable, "-c", "import pathlib,sys,time\nwhile not pathlib.Path(sys.argv[1]).exists(): time.sleep(.01)\nsys.exit(41)", str(trigger)]
+        args = dict(executionId="A")
+        made = self.call("create", **args, **{**self.launch, "argv": argv})
+        receipt = Path(made["receipt"])
+        original = self.active_pane()
+        subprocess.run(self.tmux + ["new-window", "-t", "=wfc-d-abc12345:", "/bin/cat"], check=True)
+        trigger.touch()
+        deadline = time.monotonic() + 5
+        while json.loads(receipt.read_bytes()).get("exitCode") != 41 or original in subprocess.check_output(
+                self.tmux + ["list-panes", "-a", "-F", "#{pane_id}"], text=True).splitlines():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.02)
+        original_receipt = receipt.read_bytes()
+        receipt.write_text(json.dumps(dict(category="process_exited", exitCode=17)))
+        self.assertNotIn("receipt", self.call("inspect", **args))
+        close = self.call("close", **args, closeOperationId="end")
+        self.assertNotIn("closeEffect", close)
+        self.assertNotEqual(close["result"], "completed")
+        subprocess.run(self.tmux + ["has-session", "-t", "=wfc-d-abc12345"], check=True)
+        receipt.write_bytes(original_receipt)
+        self.assertEqual(self.call("close", **args, closeOperationId="end")["closeEffect"], "worker_exited")
+
+    def test_first_native_lookup_recovers_offline_exit(self):
+        trigger = self.root / "go"
+        argv = [sys.executable, "-c", "import pathlib,sys,time\nwhile not pathlib.Path(sys.argv[1]).exists(): time.sleep(.01)\nsys.exit(41)", str(trigger)]
+        request = dict(op="create", dispatch="d-abc12345", executionId="A", **{**self.launch, "argv": argv})
+        subprocess.run([WFC, "--tmux-backend"], input=json.dumps(request), text=True, stdout=subprocess.DEVNULL,
+                       env={**self.env, "WFC_STATE": str(self.state)}, check=True)
+        receipt, = (self.state/"launches").glob("*.json")
+        sibling = self.call("create", dispatch="other", executionId="B", **self.launch)
+        self.assertEqual(sibling["result"], "accepted")
+        held = self.root/"parked"
+        os.rename(self.socket, held)
+        try:
+            trigger.touch()
+            deadline = time.monotonic()+5
+            while json.loads(receipt.read_bytes()).get("exitCode") != 41:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.02)
+            # This is the first client lookup. No online inspect primed a cache.
+            got = self.call("inspect", executionId="A")
+            self.assertEqual((got["result"], got.get("executionId"), got.get("launchId"), got.get("receipt")),
+                             ("uncertain", "A", receipt.stem, str(receipt)), got)
+            self.assertNotIn("alive", got)
+            self.assertEqual(json.loads(Path(got["receipt"]).read_bytes())["exitCode"], 41)
+            self.assertEqual(self.call("close", executionId="A")["result"], "uncertain")
+            self.assertNotIn("receipt", self.call("inspect", executionId="B"))
+            self.assertNotIn("receipt", self.call("inspect", dispatch="other", executionId="B"))
+            original = receipt.read_bytes()
+            receipt.unlink()
+            self.assertNotIn("receipt", self.call("inspect", executionId="A"))
+            for wrong in [dict(category="process_exited", exitCode=17, launchId=Path(sibling["receipt"]).stem),
+                          dict(category="process_exited", exitCode=17)]:
+                receipt.write_text(json.dumps(wrong))
+                self.assertNotIn("receipt", self.call("inspect", executionId="A"))
+            receipt.write_bytes(original)
+        finally:
+            os.rename(held, self.socket)
+        self.assertEqual(self.call("inspect", executionId="A").get("receipt"), str(receipt))
+        self.assertTrue(self.call("inspect", dispatch="other", executionId="B")["workerBound"])
 
     def test_lifecycle(self):
         # Keep the worker alive across Ctrl-C so close tests the active-session path.

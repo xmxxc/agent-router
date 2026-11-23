@@ -37,10 +37,123 @@ pub(super) enum Claim {
     },
 }
 
+// Persist the first trusted pane hint even when the socket is offline. A
+// process first seen on reconnect must already have existed at that hint.
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+enum PaneEvidence {
+    Hint {
+        boot: String,
+        namespace: u64,
+        listener: u64,
+        ticks: u64,
+    },
+    Bound(PaneProcess),
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+pub(super) struct PaneProcess {
+    pub(super) pid: u32,
+    ticks: u64,
+}
+
+impl PaneProcess {
+    pub(super) fn live(&self) -> bool {
+        process_start(self.pid).is_ok_and(|ticks| ticks == Some(self.ticks))
+    }
+}
+
+fn listener_inode(line: &[u8], socket: &Path) -> Option<u64> {
+    // The seven numeric columns are ASCII. Paths may contain spaces or
+    // non-UTF-8 bytes, and the kernel pads short inode numbers with spaces.
+    let (columns, address) = line.split_at(line.iter().position(|b| *b == b'/')?);
+    if address != socket.as_os_str().as_encoded_bytes() {
+        return None;
+    }
+    let mut fields = std::str::from_utf8(columns).ok()?.split_ascii_whitespace();
+    if fields.nth(3)? != "00010000" || fields.next()? != "0001" || fields.next()? != "01" {
+        return None;
+    }
+    let inode = fields.next()?.parse().ok()?;
+    fields.next().is_none().then_some(inode)
+}
+
+impl PaneEvidence {
+    fn hint(t: &Tmux<'_>) -> Option<Self> {
+        // The kernel retains a listening socket's bound name across rename.
+        // Require one stream listener for the historical address, even if its
+        // filesystem entry is temporarily inaccessible.
+        let socket = match &t.socket {
+            Some(path) => path.clone(),
+            None => {
+                let out = t
+                    .run(&[
+                        "-N",
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &format!("={}:", t.session),
+                        "#{socket_path}",
+                    ])
+                    .ok()?;
+                PathBuf::from(std::str::from_utf8(&out.stdout).ok()?.strip_suffix('\n')?)
+            }
+        };
+        let sockets = fs::read("/proc/net/unix").ok()?;
+        let mut listeners = sockets
+            .split(|b| *b == b'\n')
+            .filter_map(|line| listener_inode(line, &socket));
+        let listener = listeners.next()?;
+        if listeners.next().is_some() {
+            return None;
+        }
+        // The request's CLI process was born before parsing, waiting on the
+        // dispatch lock or locating the socket. A same-tick birth is ambiguous.
+        let ticks = process_start(std::process::id()).ok()??;
+        Some(Self::Hint {
+            boot: boot_id().ok()?,
+            namespace: fs::metadata("/proc/self/ns/pid").ok()?.ino(),
+            listener,
+            ticks,
+        })
+    }
+
+    fn verify_server(&self, server: &ServerSession) -> Reply<()> {
+        let Self::Hint {
+            boot,
+            namespace,
+            listener,
+            ..
+        } = self
+        else {
+            return Ok(()); // A bound process is covered by its stored ServerSession.
+        };
+        let expected = PathBuf::from(format!("socket:[{listener}]"));
+        if boot == &server.boot
+            && *namespace == server.namespace
+            && fs::read_dir(format!("/proc/{}/fd", server.pid)).is_ok_and(|fds| {
+                fds.flatten()
+                    .any(|fd| fs::read_link(fd.path()).is_ok_and(|path| path == expected))
+            })
+        {
+            Ok(())
+        } else {
+            Err(unknown())
+        }
+    }
+
+    fn matches(&self, process: &PaneProcess) -> bool {
+        match self {
+            Self::Bound(original) => original == process,
+            Self::Hint { ticks, .. } => process.ticks < *ticks,
+        }
+    }
+}
+
 #[derive(Clone, Default, Deserialize, PartialEq, Serialize)]
 pub(super) struct LegacyHints {
     pane: Option<String>,
     launch: Option<String>,
+    evidence: Option<PaneEvidence>,
 }
 
 impl LegacyHints {
@@ -57,12 +170,19 @@ impl LegacyHints {
         // Probe the new hints on their own; an unverified stale hint must
         // neither hide a verified match nor authorize a pane-only fallback.
         Self {
+            evidence: self
+                .evidence
+                .clone()
+                .filter(|_| self.pane.as_deref() == t.legacy_worker_pane),
             pane: t.legacy_worker_pane.map(str::to_owned),
             launch: t.legacy_launch_id.map(str::to_owned),
         }
     }
 
     fn merge(&mut self, t: &Tmux<'_>) -> Reply<()> {
+        if self.pane.is_none() && t.legacy_worker_pane.is_some() {
+            self.evidence = PaneEvidence::hint(t);
+        }
         for (saved, supplied) in [
             (&mut self.pane, t.legacy_worker_pane),
             (&mut self.launch, t.legacy_launch_id),
@@ -92,6 +212,8 @@ impl Claim {
 
 #[derive(Clone, Deserialize, Serialize)]
 pub(super) struct ServerSession {
+    #[serde(rename = "launchId", skip_serializing_if = "Option::is_none")]
+    launch_id: Option<String>,
     socket: PathBuf,
     boot: String,
     namespace: u64,
@@ -212,6 +334,7 @@ impl ServerSession {
     fn capture(pid: u32, session: String, pane: Option<String>, socket: PathBuf) -> Result<Self> {
         Ok(Self {
             socket,
+            launch_id: None,
             boot: boot_id()?,
             namespace: fs::metadata("/proc/self/ns/pid")?.ino(),
             pid,
@@ -311,7 +434,9 @@ pub(super) fn record_server(dir: &Path, id: &str) -> Result<()> {
             .is_some_and(|s| s.parse::<u32>().is_ok()),
         "invalid tmux pane ID"
     );
-    let binding = ServerSession::capture(pid, format!("${session}"), Some(pane), socket.into())?;
+    let mut binding =
+        ServerSession::capture(pid, format!("${session}"), Some(pane), socket.into())?;
+    binding.launch_id = Some(id.to_owned());
     save(&dir.join(format!("{id}.server")), &binding)
 }
 
@@ -372,8 +497,20 @@ impl Tmux<'_> {
         let target = self.owned()?;
         let mut lookup = hints.lookup(self);
         let live = self.find_supervisor(&target, Some(id), &mut lookup)?;
-        if let Some((launch, _)) = live {
+        if let Some((launch, pid)) = live {
+            if let Some(PaneEvidence::Bound(original)) = &hints.evidence {
+                if hints.pane != lookup.pane || pid != original.pid || !original.live() {
+                    return Err(unknown());
+                }
+            }
             if receipt.as_deref().is_some_and(|old| old != launch) {
+                return Err(unknown());
+            }
+            if hints.pane.is_some()
+                && hints.evidence.is_none()
+                && receipt.is_none()
+                && lookup.expected_launch(Some(id)).is_none()
+            {
                 return Err(unknown());
             }
             *hints = lookup;
@@ -471,8 +608,9 @@ impl Tmux<'_> {
         if self.legacy_launch_id.is_some() {
             pending.launch = None;
         }
-        if self.legacy_worker_pane.is_some() {
+        if self.legacy_worker_pane.is_some() && self.legacy_worker_pane != pending.pane.as_deref() {
             pending.pane = None;
+            pending.evidence = None;
         }
         pending.merge(self)?;
         self.replace_claim(&Claim::LegacyPending {
@@ -491,9 +629,14 @@ impl Tmux<'_> {
         self.replace_claim(&Claim::Released(execution.map(str::to_owned)))
     }
 
-    pub(super) fn confirm_launch(&self, id: &str) -> Reply<()> {
-        self.binding(Claim::Launch(id.to_owned()))?;
-        self.receipt_worker(id).map(|_| ())
+    pub(super) fn confirm_launch(&self, id: &str) -> Reply<Worker> {
+        let server = self.binding(Claim::Launch(id.to_owned()))?;
+        let path = self.state.join("launches").join(format!("{id}.json"));
+        let receipt = super::launch::read_receipt(&path).ok_or_else(unknown)?;
+        if server.launch_id.is_some() && receipt["launchId"] != id {
+            return Err(unknown());
+        }
+        Self::worker_from_receipt(&receipt)
     }
 
     pub(super) fn close_worker(&self, t: &Target) -> Reply<Worker> {
@@ -503,7 +646,9 @@ impl Tmux<'_> {
                 None => return Ok(Worker::LegacyPane),
                 _ => return Err(unknown()),
             },
-            Some(Claim::Launch(id) | Claim::Registered { id, .. }) if id == t.token => id,
+            Some(Claim::Launch(id) | Claim::Registered { id, .. }) if id == t.token => {
+                return self.confirm_launch(&id)
+            }
             _ => return Err(unknown()),
         };
         self.receipt_worker(&id)
@@ -512,6 +657,10 @@ impl Tmux<'_> {
     pub(super) fn receipt_worker(&self, id: &str) -> Reply<Worker> {
         let path = self.state.join("launches").join(format!("{id}.json"));
         let receipt = super::launch::read_receipt(&path).unwrap_or_default();
+        Self::worker_from_receipt(&receipt)
+    }
+
+    fn worker_from_receipt(receipt: &serde_json::Value) -> Reply<Worker> {
         match (receipt["category"].as_str(), receipt["exitCode"].as_u64()) {
             (Some("started"), _) => receipt["pid"]
                 .as_u64()
@@ -555,9 +704,9 @@ impl Tmux<'_> {
             }
             Claim::Launch(id) | Claim::Registered { id, .. } => {
                 let id = Uuid::parse_str(&id).map_err(|_| unknown())?.simple();
-                let f = File::open(self.state.join("launches").join(format!("{id}.server")))
-                    .map_err(|_| unknown())?;
-                serde_json::from_reader(f).map_err(|_| unknown())
+                let path = self.state.join("launches").join(format!("{id}.server"));
+                serde_json::from_value(super::launch::read_receipt(&path).ok_or_else(unknown)?)
+                    .map_err(|_| unknown())
             }
         }
     }
@@ -609,6 +758,22 @@ impl Tmux<'_> {
             }
         }
         Err(unknown())
+    }
+
+    fn pane_process(&self, target: &Target, pane: &str) -> Option<PaneProcess> {
+        let output = self
+            .guarded(
+                target,
+                pane,
+                &format!("display-message -p -t {pane} '#{{pane_pid}}'"),
+                "#{==:#{pane_dead},0}",
+            )
+            .ok()?;
+        let pid = output.trim().parse().ok()?;
+        Some(PaneProcess {
+            pid,
+            ticks: process_start(pid).ok()??,
+        })
     }
 
     // The launcher writes the launch ID in the supervisor argv and the actual worker PID
@@ -672,8 +837,9 @@ impl Tmux<'_> {
                 let mut hints = LegacyHints {
                     pane: server.pane.clone(),
                     launch: Some(id),
+                    evidence: None,
                 };
-                t.supervised = true;
+
                 if t.owned {
                     t.supervisor = self.find_supervisor(t, None, &mut hints)?;
                 }
@@ -728,6 +894,11 @@ impl Tmux<'_> {
             }
         };
         let saved = hints.clone();
+        if adopting {
+            if let Some(evidence) = &saved.evidence {
+                evidence.verify_server(&server)?;
+            }
+        }
         if receipt.is_none() && self.legacy_execution_id.is_some() {
             hints = saved.lookup(self);
         }
@@ -736,12 +907,32 @@ impl Tmux<'_> {
         } else {
             None
         };
+        // A stored pane without process evidence (including pre-R7 rows)
+        // cannot attest to whoever happens to occupy that pane today.
+        let original = match (&saved.pane, &saved.evidence) {
+            (Some(pane), Some(evidence)) if receipt.is_none() => {
+                self.pane_process(t, pane).filter(|p| evidence.matches(p))
+            }
+            _ => None,
+        };
+        let pinned = matches!(saved.evidence, Some(PaneEvidence::Bound(_)));
+        let pane_only =
+            saved.pane.is_some() && hints.expected_launch(execution.as_deref()).is_none();
+        let checked = checked.filter(|(_, pid)| {
+            receipt.is_some()
+                || (!pinned && !pane_only)
+                || (saved.pane == hints.pane && original.as_ref().is_some_and(|p| p.pid == *pid))
+        });
         if checked.is_none() && saved != hints {
-            // Keep a trusted pane-only observation stable. Never downgrade an
-            // outstanding launch hint to pane-only input without fresh proof.
             let mut compatible = saved.clone();
             compatible.merge(self)?;
             hints = compatible;
+        }
+        if let Some(process) = original.filter(|_| saved.pane == hints.pane) {
+            if hints.expected_launch(execution.as_deref()).is_none() {
+                hints.evidence = Some(PaneEvidence::Bound(process.clone()));
+                t.pane_process = Some(process);
+            }
         }
         t.supervisor = checked.filter(|(id, _)| receipt.as_ref().is_none_or(|saved| saved == id));
         let checked = t.supervisor.as_ref().map(|(id, _)| id.clone());
@@ -752,7 +943,7 @@ impl Tmux<'_> {
             ));
         }
         let newly_verified = receipt.is_none() && checked.is_some();
-        t.supervised = receipt.is_some() || checked.is_some();
+
         t.worker_pane = if hints.expected_launch(execution.as_deref()).is_some()
             && checked.is_none()
             && receipt.is_none()
@@ -781,5 +972,24 @@ impl Tmux<'_> {
             })?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::listener_inode;
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::Path};
+
+    #[test]
+    fn listening_address_keeps_path_bytes_and_accepts_padded_inodes() {
+        let path = Path::new(OsStr::from_bytes(b"/tmp/x \xff"));
+        assert_eq!(
+            listener_inode(b"0000: 0003 0000 00010000 0001 01    42 /tmp/x \xff", path),
+            Some(42)
+        );
+        assert_eq!(
+            listener_inode(b"0000: 0003 0000 00010000 0001 01    42 @/tmp/x \xff", path),
+            None
+        );
     }
 }
