@@ -16,8 +16,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      WFC_BUILD_ID: de5a8a48e19ab1b05ff9bc7d38486a631e43abe8
-      PRODUCT_TREE: cddd34b05d05db3c1e8e1cdece17504fea213f1f
+      WFC_BUILD_ID: 895d3689b4bf8632dae9db3f20886846e1f13ac1
+      PRODUCT_TREE: aef7db20d63799024f23fd382ff848dd3f247d60
       LEGACY_TREE: 034a9cad954bc952812b35bec6fef840c6abc3a1
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TRIPLE: x86_64-unknown-linux-gnu
@@ -128,7 +128,15 @@ jobs:
       - name: Run the public legacy read-only matrix
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: product
-        run: python -Bu tests/legacy_public.py "target/$TRIPLE/release/wfc" 2>&1 | tee "$EVIDENCE/legacy-public.log"
+        run: |
+          uid=$(id -u)
+          test "$uid" -ne 0
+          log="$EVIDENCE/legacy-public.log"
+          python -Bu tests/legacy_public.py "target/$TRIPLE/release/wfc" 2>&1 | tee "$log"
+          test "$(wc -l < "$log")" -eq 15
+          grep -Fxq -- "ordinary UID $uid named status keeps Rust priority with traversal only; lists report EACCES" "$log"
+          grep -Fxq -- 'a messages.json directory reports the path type error; the legacy ledger is unchanged' "$log"
+          printf 'Public legacy matrix: 13 baseline + 2 R12 cases (uid %s)\n' "$uid" | tee "$EVIDENCE/legacy-public-summary.log"
       - name: Ensure native tmux is available
         id: tmux
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
