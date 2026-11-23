@@ -29,18 +29,31 @@ pub fn merged_history(row: &Value, ledger: Vec<Value>) -> Result<Vec<Value>> {
                         "conflicting {field} for message {key}"
                     );
                 }
-                let newer_delivery = message["statusVersion"].as_u64().unwrap_or(0)
-                    >= original["statusVersion"].as_u64().unwrap_or(0);
+                let delivery_fields = ["state", "statusVersion", "delivered", "resolution"];
+                if message["statusVersion"].as_u64().unwrap_or(0)
+                    >= original["statusVersion"].as_u64().unwrap_or(0)
+                {
+                    for key in delivery_fields {
+                        if let Some(value) = message.get(key) {
+                            original[key] = value.clone();
+                        } else {
+                            original.as_object_mut().unwrap().remove(key);
+                        }
+                    }
+                }
+                // Older archived views can omit this derived flag. Derive it
+                // from the chosen version, never from another delivery snapshot.
+                match original["state"].as_str() {
+                    Some("received" | "processed") => original["delivered"] = json!(true),
+                    Some("unsent" | "unknown") => original["delivered"] = json!(false),
+                    _ => {}
+                }
                 for (k, v) in message.as_object().unwrap() {
-                    if original.get(k).is_none()
-                        || (original[k].is_null()
-                            && matches!(k.as_str(), "round" | "attempt" | "type" | "report"))
-                        || k == "id"
-                        || (newer_delivery
-                            && matches!(
-                                k.as_str(),
-                                "state" | "statusVersion" | "delivered" | "resolution"
-                            ))
+                    if !delivery_fields.contains(&k.as_str())
+                        && (original.get(k).is_none()
+                            || (original[k].is_null()
+                                && matches!(k.as_str(), "round" | "attempt" | "type" | "report"))
+                            || k == "id")
                     {
                         original[k] = v.clone();
                     }
@@ -154,6 +167,23 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_fields_follow_one_version_in_either_snapshot_order() -> Result<()> {
+        let initial = json!({"messageId":"m","dispatch":"d","state":"unsent","statusVersion":1,
+            "delivered":false,"resolution":"old","head":"original"});
+        let processed = json!({"messageId":"m","dispatch":"d","state":"processed","statusVersion":3,"head":"later"});
+        for (first, second) in [(&initial, &processed), (&processed, &initial)] {
+            let row = json!({"dispatch":"d","messages":[first]});
+            let merged = &merged_history(&row, vec![second.clone()])?[0];
+            assert_eq!(merged["statusVersion"], 3);
+            assert_eq!(merged["state"], "processed");
+            assert_eq!(merged["delivered"], true);
+            assert!(merged.get("resolution").is_none());
+            assert_eq!(merged["head"], first["head"]);
+        }
+        Ok(())
+    }
 
     #[test]
     fn archive_and_live_receipts_share_stable_ids_across_delivery_transitions() -> Result<()> {
