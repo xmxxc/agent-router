@@ -8,7 +8,16 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
-use uuid::Uuid;
+#[cfg(target_os = "linux")]
+pub(super) mod claude;
+#[cfg(target_os = "linux")]
+pub(crate) use claude::session_start as claude_session_start;
+
+#[cfg(target_os = "linux")]
+mod opencode;
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)] // The shared lifecycle will call the adoption adapter under its lock.
+pub(crate) use opencode::{adopt_opencode_session, OpencodeAdoption};
 
 #[derive(Default)]
 pub struct Options<'a> {
@@ -148,7 +157,7 @@ fn resolve_script(paths: impl IntoIterator<Item = PathBuf>) -> Result<PathBuf> {
     Err(ScriptUnavailable::Missing.into())
 }
 
-fn configured(path: &Path, name: &str, cwd: &Path) -> Result<Launch> {
+fn configured(path: &Path, name: &str, cwd: &Path) -> Result<(Launch, bool)> {
     let data: Value = serde_json::from_reader(fs::File::open(path)?)?;
     ensure!(
         data.as_object()
@@ -178,6 +187,7 @@ fn configured(path: &Path, name: &str, cwd: &Path) -> Result<Launch> {
     append_env(&mut env, selected.get("env"))?;
     let mut prefix = argv(selected, "runtime")?;
     let mut command = argv(selected, "command")?;
+    let default_command = prefix.is_empty() && command.is_empty();
     if command.is_empty() {
         command.push(name.to_owned());
     }
@@ -200,63 +210,7 @@ fn configured(path: &Path, name: &str, cwd: &Path) -> Result<Launch> {
             .to_owned();
     }
     prefix.extend(command);
-    Ok(Launch { argv: prefix, env })
-}
-
-// Match the host's existing trust decision for this directory or a real
-// ancestor. Serialize router updates to the config, including symlinked files.
-#[cfg(unix)]
-fn claude_trust(cwd: &Path) -> Result<Option<PathBuf>> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let Some(config) = env::var_os("WFC_CLAUDE_CONFIG")
-        .map(PathBuf::from)
-        .or_else(|| env::home_dir().map(|p| p.join(".claude.json")))
-    else {
-        return Ok(None);
-    };
-    let path = match config.canonicalize() {
-        Ok(p) => p,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let name = path
-        .file_name()
-        .context("missing Claude config filename")?
-        .to_string_lossy();
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(path.with_file_name(format!(".{name}.wfc.lock")))?;
-    lock.lock()?;
-    let f = fs::File::open(&path)?;
-    let permissions = f.metadata()?.permissions();
-    let mut config: Value = serde_json::from_reader(f)?;
-    let Some(projects) = config.get_mut("projects").and_then(Value::as_object_mut) else {
-        return Ok(None);
-    };
-    let key = cwd.to_str().context("cwd must be UTF-8")?;
-    if projects
-        .get(key)
-        .is_some_and(|p| p["hasTrustDialogAccepted"] == true)
-    {
-        return Ok(Some(cwd.to_owned()));
-    }
-    let ancestor = projects
-        .iter()
-        .filter(|(_, v)| v["hasTrustDialogAccepted"] == true)
-        .filter_map(|(k, _)| Path::new(k).canonicalize().ok())
-        .filter(|p| p != cwd && cwd.starts_with(p))
-        .max_by_key(|p| p.components().count());
-    if ancestor.is_some() {
-        let project = projects.entry(key.to_owned()).or_insert_with(|| json!({}));
-        ensure!(project.is_object(), "invalid Claude project");
-        project["hasTrustDialogAccepted"] = json!(true);
-        super::write_json(&path, &config, Some(permissions))?;
-    }
-    Ok(ancestor)
+    Ok((Launch { argv: prefix, env }, default_command))
 }
 
 pub(super) const FIRST_BRIEF: &str = "You are a worker dispatched by the controller";
@@ -281,24 +235,75 @@ impl Options<'_> {
         record: &mut Value,
         resume: Option<&str>,
     ) -> Result<Launch> {
-        let cwd = PathBuf::from(record["cwd"].as_str().context("missing cwd")?);
-        let report = Path::new(record["report"].as_str().context("missing report")?);
-        let mut writable = vec![
-            state.to_owned(),
-            report
-                .parent()
-                .context("missing report directory")?
-                .to_owned(),
-        ];
-        let mut brief = worker_brief(record, resume.unwrap_or(FIRST_BRIEF))?;
-        if self.name == "opencode" && self.backend == "herdr" {
-            brief.push_str(&format!(
-                " Current attempt {}.",
-                record["attempt"].as_str().context("missing attempt")?
-            ));
+        self.prepare_launch(state, record, resume, None)
+            .map(|(launch, _)| launch)
+    }
+    // The resume transaction owns publication and the subsequent terminal input.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)] // Called when the shared resume transaction admits OpenCode.
+    pub fn prepare_opencode_resume(
+        state: &Path,
+        original: &Value,
+        next: &mut Value,
+    ) -> Result<(Launch, String)> {
+        ensure!(
+            original["host"] == "opencode" && original["backend"] == "tmux",
+            "expected an OpenCode tmux assignment"
+        );
+        ensure!(
+            original["dispatch"].is_string()
+                && original["dispatch"] == next["dispatch"]
+                && original["cwd"] == next["cwd"]
+                && next["attempt"]
+                    .as_str()
+                    .is_some_and(|id| super::valid_identity(id, "a-"))
+                && original["attempt"]
+                    .as_str()
+                    .is_some_and(|id| super::valid_identity(id, "a-"))
+                && original["attempt"] != next["attempt"],
+            "OpenCode resume requires the original dispatch and directory"
+        );
+        let (launch, input) = Options {
+            name: "opencode",
+            backend: "tmux",
+            config: original["launchConfig"].as_str(),
+            model: original["model"].as_str(),
+            effort: original["effort"].as_str(),
+            git: original["git"] == true,
+            ..Options::default()
         }
+        .prepare_launch(state, next, None, Some(original))?;
+        Ok((launch, input.context("missing OpenCode resume input")?))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn prepare_claude_resume(
+        &self,
+        state: &Path,
+        previous: &Value,
+        next: &mut Value,
+        opening: &str,
+    ) -> Result<(Launch, claude::ResumeProof)> {
+        let cwd = PathBuf::from(next["cwd"].as_str().context("missing cwd")?);
+        let (mut launch, config, _) = self.launch_prefix(&cwd, false)?;
+        ensure!(
+            previous["launchConfig"] == json!(config),
+            "configured Claude launch config differs from the original dispatch"
+        );
+        let brief = worker_brief(next, opening)?;
+        let writable = writable_paths(state, next)?;
+        let proof = claude::prepare_resume(state, previous, next, &mut launch, brief, &writable)?;
+        bind_environment(state, next, &mut launch)?;
+        Ok((launch, proof))
+    }
+
+    fn launch_prefix(
+        &self,
+        cwd: &Path,
+        allow_default_config: bool,
+    ) -> Result<(Launch, Option<PathBuf>, bool)> {
         let path = self.config.map(PathBuf::from).or_else(|| {
-            if resume.is_some() {
+            if !allow_default_config {
                 return None;
             }
             env::var_os("WFC_LAUNCH_CONFIG")
@@ -306,7 +311,7 @@ impl Options<'_> {
                 .map(PathBuf::from)
         });
         let mut selected_config = None;
-        let mut launch = match path {
+        let (launch, default_command) = match path {
             Some(path) => {
                 let path = match path.strip_prefix("~/") {
                     Ok(rest) => env::home_dir()
@@ -316,7 +321,7 @@ impl Options<'_> {
                 };
                 let path = path.canonicalize().context("invalid launch config path")?;
                 selected_config = Some(path.clone());
-                configured(&path, self.name, &cwd).map_err(|err| {
+                configured(&path, self.name, cwd).map_err(|err| {
                     if err.is::<ScriptUnavailable>() {
                         err
                     } else {
@@ -324,13 +329,46 @@ impl Options<'_> {
                     }
                 })?
             }
-            None => Launch {
-                argv: vec![self.name.to_owned()],
-                env: Map::new(),
-            },
+            None => (
+                Launch {
+                    argv: vec![self.name.to_owned()],
+                    env: Map::new(),
+                },
+                true,
+            ),
         };
+        Ok((launch, selected_config, default_command))
+    }
+
+    fn prepare_launch(
+        &self,
+        state: &Path,
+        record: &mut Value,
+        resume: Option<&str>,
+        original: Option<&Value>,
+    ) -> Result<(Launch, Option<String>)> {
+        let cwd = PathBuf::from(record["cwd"].as_str().context("missing cwd")?);
+        let mut writable = writable_paths(state, record)?;
+        let mut brief = worker_brief(record, resume.unwrap_or(FIRST_BRIEF))?;
+        if self.name == "opencode" {
+            brief.push_str(&format!(
+                " Current attempt {}.",
+                record["attempt"].as_str().context("missing attempt")?
+            ));
+        }
+        let (mut launch, selected_config, default_command) =
+            self.launch_prefix(&cwd, resume.is_none())?;
+        #[cfg(not(target_os = "linux"))]
+        let _ = default_command;
+        if let Some(original) = original {
+            ensure!(
+                original["launchConfig"] == json!(selected_config),
+                "configured OpenCode launch config differs from the original dispatch"
+            );
+        }
         let a = &mut launch.argv;
         let mut ignored = Vec::new();
+        let mut resume_input = None;
         match self.name {
             "codex" => {
                 if resume.is_some() {
@@ -367,42 +405,39 @@ impl Options<'_> {
                 a.push(brief);
             }
             "opencode" => {
-                a.push(cwd.to_str().unwrap().into());
+                #[cfg(target_os = "linux")]
+                let session = opencode::prepare(state, &mut launch.env, record, original, &brief)?;
+                #[cfg(not(target_os = "linux"))]
+                let session: Option<String> = None;
+                let cwd = record["cwd"].as_str().context("missing cwd")?;
+                ensure!(
+                    Path::new(cwd).is_absolute(),
+                    "OpenCode requires an absolute cwd"
+                );
+                a.push(cwd.into());
+                if let Some(effort) = self.effort {
+                    record["effort"] = json!(effort);
+                }
                 if let Some(m) = self.model {
                     a.extend(["-m".into(), m.into()]);
                 }
                 if let Some(e) = self.effort {
                     a.extend(["--variant".into(), e.into()]);
                 }
-                a.extend(["--prompt".into(), brief]);
+                if let Some(session) = session {
+                    a.extend(["-s".into(), session]);
+                    resume_input = Some(brief);
+                } else {
+                    a.extend(["--prompt".into(), brief]);
+                }
                 launch.env.insert("OPENCODE_CONFIG_CONTENT".into(),json!(json!({"permission":{"external_directory":{"*":"allow"},"read":{"*.env":"allow","*.env.*":"allow"}}}).to_string()));
             }
+            #[cfg(target_os = "linux")]
             "claude" => {
-                a.extend([brief, "--permission-mode".into(), "auto".into()]);
-                if let Some(m) = self.model {
-                    a.extend(["--model".into(), m.into()]);
+                claude::prepare_initial(state, self, record, &mut launch, brief, &writable)?;
+                if default_command {
+                    claude::apply_existing_trust(record, &mut launch)?;
                 }
-                if let Some(e) = self.effort {
-                    a.extend(["--effort".into(), e.into()]);
-                }
-                let session = Uuid::new_v4().to_string();
-                a.extend([
-                    "--name".into(),
-                    record["label"].as_str().context("missing label")?.into(),
-                    "--session-id".into(),
-                    session.clone(),
-                    "--add-dir".into(),
-                ]);
-                for p in writable {
-                    a.push(p.to_str().context("writable path must be UTF-8")?.into());
-                }
-                #[cfg(unix)]
-                match claude_trust(&cwd) {
-                    Ok(Some(ancestor)) => record["trustedBy"] = json!(ancestor),
-                    Ok(None) => {}
-                    Err(_) => eprintln!("wfc: could not confirm Claude worktree trust"),
-                }
-                record["hostSession"] = json!(session);
             }
             _ => bail!("unsupported host"),
         }
@@ -447,25 +482,41 @@ impl Options<'_> {
                 ));
             }
         }
-        for key in ["dispatch", "scope", "role", "attempt", "task", "report"] {
-            launch.env.insert(
-                format!("WFC_{}", key.to_ascii_uppercase()),
-                record[key].clone(),
-            );
-        }
-        launch.env.insert(
-            "WFC_ROUND".into(),
-            json!(record["round"]
-                .as_u64()
-                .context("missing round")?
-                .to_string()),
-        );
-        launch.env.insert("WFC_STATE".into(), json!(state));
-        launch
-            .env
-            .insert("WFC_BIN".into(), json!(env::current_exe()?));
-        Ok(launch)
+        bind_environment(state, record, &mut launch)?;
+        Ok((launch, resume_input))
     }
+}
+
+fn writable_paths(state: &Path, record: &Value) -> Result<Vec<PathBuf>> {
+    let report = Path::new(record["report"].as_str().context("missing report")?);
+    Ok(vec![
+        state.to_owned(),
+        report
+            .parent()
+            .context("missing report directory")?
+            .to_owned(),
+    ])
+}
+
+fn bind_environment(state: &Path, record: &Value, launch: &mut Launch) -> Result<()> {
+    for key in ["dispatch", "scope", "role", "attempt", "task", "report"] {
+        launch.env.insert(
+            format!("WFC_{}", key.to_ascii_uppercase()),
+            record[key].clone(),
+        );
+    }
+    launch.env.insert(
+        "WFC_ROUND".into(),
+        json!(record["round"]
+            .as_u64()
+            .context("missing round")?
+            .to_string()),
+    );
+    launch.env.insert("WFC_STATE".into(), json!(state));
+    launch
+        .env
+        .insert("WFC_BIN".into(), json!(env::current_exe()?));
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

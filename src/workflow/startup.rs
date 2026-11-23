@@ -90,7 +90,7 @@ impl Startup {
     pub(super) fn script_unavailable(
         &self,
         error: super::host::ScriptUnavailable,
-        ledger: std::fs::File,
+        ledger: super::messages::PublishLock,
     ) {
         let (category, diagnostic) = match error {
             super::host::ScriptUnavailable::Missing => (

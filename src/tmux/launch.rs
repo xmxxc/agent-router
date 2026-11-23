@@ -43,7 +43,7 @@ fn private_file(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-fn read_private_json(path: &Path) -> Option<Value> {
+pub(super) fn read_private_json(path: &Path) -> Option<Value> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -83,6 +83,154 @@ pub(super) struct Submission {
     pub(super) socket: Option<PathBuf>,
     pub(super) origin: Option<super::binding::ServerSession>,
     pub(super) phase: SubmissionPhase,
+}
+
+impl Submission {
+    fn identifies(&self, launch: &str, dispatch: &str, execution: Option<&str>) -> bool {
+        self.launch_id == launch
+            && self.dispatch == dispatch
+            && self.execution_id.as_deref() == execution
+    }
+}
+
+pub(crate) struct NonStartProofs<'a> {
+    dir: PathBuf,
+    dispatch: &'a str,
+    launches: BTreeMap<String, String>,
+}
+
+impl<'a> NonStartProofs<'a> {
+    pub(crate) fn read(state: &Path, dispatch: &'a str) -> Result<Self> {
+        let state = state.canonicalize()?;
+        Ok(Self {
+            dir: state.join("launches"),
+            dispatch,
+            launches: super::history::attempt_launches(&state, dispatch)?,
+        })
+    }
+
+    // A pre-submission refusal can have no private launch at all. If tmux
+    // registered a launch, check it even when the public attempt has no path.
+    pub(crate) fn verify(&self, attempt: &str, outcome: &Value) -> Result<()> {
+        let error = "tmux launch evidence does not verify that the worker never started";
+        let category = &outcome["category"];
+        ensure!(category.is_null() || category.is_string(), "{error}");
+        let indexed = self.launches.get(attempt).map(String::as_str);
+        let reference = match (&outcome["receipt"], &outcome["cancellationEvidence"]) {
+            (Value::String(path), Value::Null) => Some((Path::new(path), "json")),
+            (Value::Null, Value::String(path)) => Some((Path::new(path), "revoked")),
+            (Value::Null, Value::Null) => None,
+            _ => anyhow::bail!("{error}"),
+        };
+        let id = match (reference, indexed) {
+            (Some((path, _)), _) => path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .context(error)?,
+            (None, Some(id)) => id,
+            (None, None) => {
+                ensure!(!spawn_refusal(category), "{error}");
+                return Ok(());
+            }
+        };
+        ensure!(
+            super::binding::valid_launch_id(id)
+                && indexed.is_none_or(|registered| registered == id)
+                && self.dir.symlink_metadata()?.is_dir(),
+            "{error}"
+        );
+        let prefix = self.dir.join(id);
+        let marker = prefix.with_extension("revoked");
+        let path = if let Some((path, extension)) = reference {
+            ensure!(path == prefix.with_extension(extension), "{error}");
+            path.to_owned()
+        } else if missing(&marker) {
+            prefix.with_extension("json")
+        } else {
+            marker.clone()
+        };
+        let proof = read_receipt(&path).context(error)?;
+        ensure!(
+            (category.is_null() || proof.get("category") == Some(category))
+                && missing(&prefix.with_extension("spec")),
+            "{error}"
+        );
+        let spawn_refusal = spawn_refusal(&proof["category"]);
+        let dispatch = self.dispatch;
+        let submission = prefix.with_extension("submission");
+        if spawn_refusal || !missing(&submission) {
+            let submission: Submission =
+                serde_json::from_value(read_receipt(&submission).context(error)?).context(error)?;
+            ensure!(
+                submission.identifies(id, dispatch, Some(attempt)),
+                "{error}"
+            );
+        }
+        if spawn_refusal {
+            let binding = if ["launchId", "dispatch", "executionId"]
+                .iter()
+                .all(|&key| proof.get(key).is_none())
+            {
+                // Older writers omitted the identifiers after recording the
+                // supervisor's server binding and claiming the descriptor.
+                read_receipt(&prefix.with_extension("server")).is_some_and(|server| {
+                    server["launchId"] == id
+                        && serde_json::from_value::<super::binding::ServerSession>(server).is_ok()
+                })
+            } else {
+                proof["launchId"] == id
+                    && proof["dispatch"] == dispatch
+                    && proof["executionId"] == attempt
+            };
+            ensure!(
+                path != marker
+                    && binding
+                    && ["pid", "exitCode", "processStart", "startupExit"]
+                        .iter()
+                        .all(|&key| proof[key].is_null())
+                    && missing(&marker),
+                "{error}"
+            );
+        } else {
+            ensure!(
+                proof == cancellation_record(id, dispatch, Some(attempt), None)
+                    && missing(&prefix.with_extension("server")),
+                "{error}"
+            );
+            let receipt = prefix.with_extension("json");
+            if path == marker {
+                // A marker can replace an unwritable initial receipt, never a
+                // receipt recording that the worker acquired the launch.
+                ensure!(
+                    missing(&receipt)
+                        || read_receipt(&receipt).is_some_and(|record| {
+                            record == json!({"category":"unknown", "launchId":id})
+                        }),
+                    "{error}"
+                );
+            } else {
+                ensure!(missing(&marker), "{error}");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn spawn_refusal(category: &Value) -> bool {
+    matches!(
+        category.as_str(),
+        Some("executable_missing" | "permission_denied" | "spawn_failed")
+    )
+}
+
+fn cancellation_record(
+    id: &str,
+    dispatch: &str,
+    execution: Option<&str>,
+    operation: Option<&str>,
+) -> Value {
+    json!({"category":"not_started", "dispatch":dispatch, "executionId":execution,
+        "closeOperationId":operation, "launchId":id})
 }
 
 fn save_cancellation(spec: &Path, receipt: &Path, proof: &Value) -> Reply<PathBuf> {
@@ -141,9 +289,7 @@ impl Tmux<'_> {
         let unknown = super::binding::unknown;
         let value = read_receipt(&self.launch_path(id, "submission")).ok_or_else(unknown)?;
         let submission: Submission = serde_json::from_value(value).map_err(|_| unknown())?;
-        if submission.launch_id != id
-            || submission.dispatch != self.dispatch
-            || submission.execution_id.as_deref() != execution
+        if !submission.identifies(id, self.dispatch, execution)
             || !super::binding::same_selection(submission.socket.as_deref(), self.socket.as_deref())
         {
             return Err(unknown());
@@ -212,8 +358,7 @@ impl Tmux<'_> {
         execution: Option<&str>,
         operation: Option<&str>,
     ) -> Value {
-        json!({"category":"not_started", "dispatch":self.dispatch, "executionId":execution,
-            "closeOperationId":operation, "launchId":id})
+        cancellation_record(id, self.dispatch, execution, operation)
     }
 
     // A host server record means it acquired the descriptor. It can never
@@ -677,6 +822,7 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
         }
     }
     let startup = crate::workflow::startup::Startup::hosted(&spec.env, id);
+    let execution = spec.env.get("WFC_ATTEMPT").cloned();
     fs::remove_file(spec_path)?;
     super::binding::record_server(&dir, id)?;
     let mut cmd = Command::new(spec.argv.first().context("empty launch argv")?);
@@ -700,7 +846,11 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
                 ErrorKind::PermissionDenied => "permission_denied",
                 _ => "spawn_failed",
             };
-            super::binding::save(&receipt, &json!({"category":category}))?;
+            super::binding::save(
+                &receipt,
+                &json!({"category":category,"launchId":id,
+                "dispatch":dispatch,"executionId":execution}),
+            )?;
             return Ok(ExitCode::FAILURE);
         }
     };

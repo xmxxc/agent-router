@@ -1,11 +1,14 @@
 //! Per-dispatch execution identities and replayable close operations.
 use super::binding::{save, unknown, valid_launch_id, Claim};
 use super::{failure, Reply, Tmux};
+use anyhow::{ensure, Context, Result};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     io::ErrorKind,
+    path::Path,
 };
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -33,6 +36,54 @@ struct Registry {
     legacy_launches: BTreeMap<String, String>,
     closed: BTreeSet<String>,
     close_operations: BTreeMap<String, BTreeMap<String, CloseOperation>>,
+}
+
+pub(super) fn attempt_launches(state: &Path, dispatch: &str) -> Result<BTreeMap<String, String>> {
+    fn read<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+        if super::launch::missing(path) {
+            return Ok(None);
+        }
+        let value =
+            super::launch::read_private_json(path).context("unreadable tmux launch index")?;
+        Ok(Some(
+            serde_json::from_value(value).context("invalid tmux launch index")?,
+        ))
+    }
+    ensure!(
+        super::valid_dispatch(dispatch),
+        "invalid tmux dispatch identity"
+    );
+    let dir = state.join("tmux");
+    if super::launch::missing(&dir) {
+        return Ok(BTreeMap::new());
+    }
+    ensure!(
+        dir.symlink_metadata()?.is_dir(),
+        "invalid tmux launch index directory"
+    );
+    let path = dir.join(format!("{dispatch}.json"));
+    // The backend archives the old claim before replacing it. Read the claim
+    // first so a concurrent archive cannot hide the outgoing attempt.
+    let claim = read::<Claim>(&path)?;
+    let registry = read::<Registry>(&path.with_extension("executions.json"))?.unwrap_or_default();
+    let active = match claim {
+        Some(Claim::Registered { id, execution }) => Some((execution, id)),
+        Some(Claim::Observed {
+            execution: Some(execution),
+            receipt: Some(id),
+            ..
+        }) => Some((execution, id)),
+        _ => None,
+    };
+    let mut launches = registry.launches;
+    for (attempt, launch) in registry.legacy_launches.into_iter().chain(active) {
+        ensure!(
+            launches.get(&attempt).is_none_or(|id| id == &launch),
+            "conflicting tmux launch index"
+        );
+        launches.insert(attempt, launch);
+    }
+    Ok(launches)
 }
 
 impl Tmux<'_> {

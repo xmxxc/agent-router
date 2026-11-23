@@ -66,9 +66,17 @@ impl<'a> Resume<'a> {
             row == initial,
             "dispatch changed while preparing resume; inspect status and retry"
         );
+        if row["backend"] == "tmux" && row["host"] == "opencode" {
+            return Ok(reconcile(
+                &row,
+                Value::Null,
+                "public OpenCode resume requires an authenticated adoption and terminal readiness path",
+            ));
+        }
+        let claude = row["host"] == "claude";
         ensure!(
-            row["backend"] == "tmux" && row["host"] == "codex",
-            "resume requires a Linux Codex dispatch using the tmux backend"
+            row["backend"] == "tmux" && (row["host"] == "codex" || claude),
+            "resume requires a Linux Codex or Claude dispatch using the tmux backend"
         );
         ensure!(
             assignment::identified(&row) && row["controllerOwner"].is_null(),
@@ -186,7 +194,7 @@ impl<'a> Resume<'a> {
             next.as_object_mut().unwrap().remove(field);
         }
         let options = host::Options {
-            name: "codex",
+            name: row["host"].as_str().context("missing host")?,
             backend: "tmux",
             config: row["launchConfig"].as_str(),
             model: row["model"].as_str(),
@@ -200,41 +208,60 @@ impl<'a> Resume<'a> {
         } else {
             "[router] Your session was interrupted and has been resumed. Check the worktree and what you already did, then continue"
         };
-        let mut launch = options.prepare_worker(&state, &mut next, Some(opening))?;
-        if !row["codexHome"].is_null()
-            && row["codexHome"] != next["codexHome"]
-            && !row["codexHome"]
-                .as_str()
-                .zip(next["codexHome"].as_str())
-                .is_some_and(|(saved, current)| {
-                    host::matches_unresolved_codex_home(Path::new(saved), Path::new(current))
-                })
-        {
-            return Ok(reconcile(
-                &row,
-                Value::Null,
-                "configured Codex home differs from the original dispatch",
-            ));
-        }
-        let session = match conversation(&old, &next) {
-            Ok(session) => session,
-            Err(e) => {
+        let (mut launch, claude_proof, session) = if claude {
+            match options.prepare_claude_resume(&state, &row, &mut next, opening) {
+                Ok((launch, proof)) => (
+                    launch,
+                    Some(proof),
+                    next["hostSession"]
+                        .as_str()
+                        .context("missing Claude session")?
+                        .to_owned(),
+                ),
+                Err(e) => {
+                    return Ok(reconcile(
+                        &row,
+                        Value::Null,
+                        &format!("cannot verify the original Claude conversation: {e}"),
+                    ));
+                }
+            }
+        } else {
+            let mut launch = options.prepare_worker(&state, &mut next, Some(opening))?;
+            if !row["codexHome"].is_null()
+                && row["codexHome"] != next["codexHome"]
+                && !row["codexHome"]
+                    .as_str()
+                    .zip(next["codexHome"].as_str())
+                    .is_some_and(|(saved, current)| {
+                        host::matches_unresolved_codex_home(Path::new(saved), Path::new(current))
+                    })
+            {
                 return Ok(reconcile(
                     &row,
                     Value::Null,
-                    &format!("cannot verify the original Codex conversation: {e}"),
-                ))
+                    "configured Codex home differs from the original dispatch",
+                ));
             }
+            let session = match conversation(&old, &next) {
+                Ok(session) => session.to_string(),
+                Err(e) => {
+                    return Ok(reconcile(
+                        &row,
+                        Value::Null,
+                        &format!("cannot verify the original Codex conversation: {e}"),
+                    ))
+                }
+            };
+            launch.argv.insert(launch.argv.len() - 1, session.clone());
+            next["hostSession"] = json!(session);
+            (launch, None, session)
         };
-        launch
-            .argv
-            .insert(launch.argv.len() - 1, session.to_string());
-        next["hostSession"] = json!(session.to_string());
         super::bind_worker_callback(&mut next, Some(&mut launch));
 
         let path = dir.join(format!("{}.json", self.dispatch));
         let event = {
-            let _ledger = messages::lock_for_publish(&state)?;
+            let ledger = messages::lock_for_publish(&state)?;
             ensure!(
                 authorize()? == generation && read()? == row,
                 "assignment or owner changed while preparing resume"
@@ -276,12 +303,28 @@ impl<'a> Resume<'a> {
             audit.push(
                 json!({"id":event,"operation":"resume","dispatch":self.dispatch,
                 "round":round,"attempt":attempt,"fromAttempt":row["attempt"],"toAttempt":attempt,
-                "fromHost":row["host"],"toHost":row["host"],"session":session.to_string(),
+                "fromHost":row["host"],"toHost":row["host"],"session":session,
                 "at":now.to_rfc3339(),"ownerGeneration":generation,"result":"pending",
                 "priorInspection":inspection,"priorWorker":worker,"priorCreate":row["create"]}),
             );
-            super::write_json(&path, &next, None)?;
-            messages::sync_directory(&dir)?;
+            if let Some(proof) = claude_proof {
+                if let Err(error) = proof.publish(&ledger, &row, &mut next, &launch) {
+                    let current = read()?;
+                    let audit = if current["attempt"] == next["attempt"] {
+                        json!(event)
+                    } else {
+                        Value::Null
+                    };
+                    return Ok(reconcile(
+                        &current,
+                        audit,
+                        &format!("cannot publish Claude resume: {error}"),
+                    ));
+                }
+            } else {
+                super::write_json(&path, &next, None)?;
+                messages::sync_directory(&dir)?;
+            }
             event
         };
 
@@ -299,12 +342,27 @@ impl<'a> Resume<'a> {
             _ => "uncertain",
         };
         answer["launchResult"] = json!(launch_result);
+        if claude && answer["result"] == "accepted" {
+            host::claude::wait_for_resume_adoption(&state, &next);
+        }
         {
-            let _ledger = messages::lock_for_publish(&state)?;
+            let ledger = messages::lock_for_publish(&state)?;
             ensure!(
                 read()? == next,
                 "assignment changed during resume; inspect its lifecycle audit"
             );
+            if claude && answer["result"] == "accepted" {
+                if host::claude::resume_adopted(&ledger, &next).is_ok() {
+                    answer["adoptionResult"] = json!("accepted");
+                } else {
+                    answer["result"] = json!("uncertain");
+                    answer["adoptionResult"] = json!("uncertain");
+                    answer["error"] = json!("lifecycle_reconcile_required");
+                    answer["category"] = json!("host_adoption_unconfirmed");
+                    answer["diagnostic"] =
+                        json!("Claude did not confirm adoption of the resumed session");
+                }
+            }
             for field in ["dispatch", "round", "attempt"] {
                 answer[field] = next[field].clone();
             }
@@ -315,6 +373,7 @@ impl<'a> Resume<'a> {
                 "diagnostic",
                 "launchResult",
                 "inputResult",
+                "adoptionResult",
                 "category",
                 "receipt",
                 "exitCode",
@@ -334,7 +393,7 @@ impl<'a> Resume<'a> {
         }
         answer["operation"] = json!("resume");
         answer["audit"] = json!(event);
-        answer["session"] = json!(session.to_string());
+        answer["session"] = json!(session);
         answer["tmux"] = next["tmux"].clone();
         if answer["result"] == "accepted" {
             answer["resumed"] = json!(self.dispatch);
