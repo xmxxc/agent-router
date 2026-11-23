@@ -1,0 +1,111 @@
+name: Linux package CI
+on:
+  push:
+    branches: [rust-router/linux-package-ci]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      WFC_BUILD_ID: 94f8ce5ec39adf05d1a63a04b149048155346ed0
+      TRIPLE: x86_64-unknown-linux-gnu
+      CARGO_BUILD_JOBS: '2'
+      PYTHONUTF8: '1'
+    steps:
+      - name: Check out workflow tools and the verified zlib archive
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: ci
+          persist-credentials: false
+      - name: Check out the frozen Linux product
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.WFC_BUILD_ID }}
+          path: product
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        with:
+          version: '0.16.0'
+      - run: rustup toolchain install 1.96.1 --profile minimal
+      - name: Verify inputs and build the frozen product
+        working-directory: product
+        run: |
+          test "$(git rev-parse HEAD)" = "$WFC_BUILD_ID"
+          sha256sum --check --strict vendor/INPUTS.sha256
+          python tools/prepare.py --zlib-archive ../ci/vendor/zlib-1.3.1.tar.gz
+          cargo build --release --locked --target "$TRIPLE"
+      - name: Package the CLI, licenses and checksums
+        working-directory: product
+        run: |
+          stage="$RUNNER_TEMP/linux-package/stage"
+          dist="$RUNNER_TEMP/linux-package/dist"
+          mkdir -p "$stage" "$dist"
+          install -m 755 "target/$TRIPLE/release/wfc" "$stage/wfc"
+          python tools/collect_notices.py "$TRIPLE" "$stage/bundled-notices"
+          git rev-parse HEAD > "$stage/COMMIT.txt"
+          (cd "$stage" && sha256sum wfc > BINARY-SHA256SUMS)
+          base="wfc-linux-x64-$WFC_BUILD_ID.tar.gz"
+          tar -czf "$dist/$base" -C "$stage" .
+          (cd "$dist" && sha256sum "$base" > SHA256SUMS)
+      - name: Verify the unpacked artifact and record runtime requirements
+        working-directory: product
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          work="$RUNNER_TEMP/linux-package"
+          dist="$work/dist"
+          unpacked="$work/unpacked"
+          base="wfc-linux-x64-$WFC_BUILD_ID.tar.gz"
+          (cd "$dist" && sha256sum --check --strict SHA256SUMS)
+          mkdir "$unpacked"
+          tar -xzf "$dist/$base" -C "$unpacked"
+          (cd "$unpacked" && sha256sum --check --strict BINARY-SHA256SUMS)
+          test "$(cat "$unpacked/COMMIT.txt")" = "$WFC_BUILD_ID"
+          diff -r "$work/stage/bundled-notices" "$unpacked/bundled-notices"
+          bin="$unpacked/wfc"
+          {
+            printf '%s\n' "product_commit=$WFC_BUILD_ID" "workflow_commit=$GITHUB_SHA" \
+              "run_id=$GITHUB_RUN_ID" "run_attempt=$GITHUB_RUN_ATTEMPT" \
+              "runner=$RUNNER_ENVIRONMENT ($RUNNER_OS/$RUNNER_ARCH)" \
+              "runner_image=${ImageOS:-unknown}/${ImageVersion:-unknown}" "target=$TRIPLE"
+            cat /etc/os-release
+            uname -srm
+            lscpu
+            test "$RUNNER_OS" = Linux
+            test "$(uname -m)" = x86_64
+            rustc --version
+            zig version
+            python --version
+            stat --format='%n %s bytes' "$dist/$base" "$bin"
+            cat "$dist/SHA256SUMS" "$unpacked/BINARY-SHA256SUMS"
+            file "$bin"
+            readelf --file-header --program-headers --dynamic --version-info "$bin"
+            dependencies=$(ldd "$bin")
+            printf '%s\n' "$dependencies"
+            [[ "$dependencies" != *'not found'* ]]
+            version=$("$bin" --version)
+            printf '%s\n' "$version"
+            [[ "$version" == *"(Rust, $TRIPLE, release, build $WFC_BUILD_ID)" ]]
+          } | tee "$dist/runtime.log"
+      - name: Smoke-test ordinary Linux dispatch and acknowledgments
+        timeout-minutes: 3
+        run: |
+          work="$RUNNER_TEMP/linux-package"
+          bash ci/tools/check_linux_package.sh "$work/unpacked/wfc" 2>&1 | tee "$work/dist/smoke.log"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-package-ci-${{ env.WFC_BUILD_ID }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/linux-package/dist/
+          if-no-files-found: error
+          retention-days: 14
