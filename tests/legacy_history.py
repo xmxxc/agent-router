@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import traceback
 
 from legacy_offline_import import (
     CURRENT, DISPATCH, FIRST, NEW, SCOPE, build_source, denied, digest, identifier,
@@ -65,6 +66,8 @@ def seed_full_history(source, work):
                    result,owner_generation,resolver_actor,resolution_evidence,resolution_owner_generation,
                    resolved_at,created) VALUES (9,?,'close',2,?,?,'completed',7,'fixture','stopped',8,17,14)""",
                    (DISPATCH, CURRENT, CURRENT))
+        db.execute("""INSERT INTO lifecycle_event (id,dispatch,operation,round,attempt,result,owner_generation,created)
+                   VALUES (3,?,'resume',1,?,'completed',6,11)""", (DISPATCH, FIRST))
         db.execute("""INSERT INTO dispatch (id,host,backend,cwd,task,created,scope,role,current_round,current_attempt,report)
                    VALUES (?,'codex','tmux',?,?,10,?,'worker',1,?,?)""",
                    (FAULTED, str(work), str(work / "task.md"), SCOPE, FAULT_ATTEMPT, str(work / "faulted.md")))
@@ -107,40 +110,39 @@ def rejects_unverified(binary, root, source):
         assert not target.exists() and snapshot(rejected) == before
 
 
-def rejects_inconsistent_ledger(binary, root, source):
-    for scenario in ("head", "dirty", "duplicate-numeric-id"):
-        rejected = root / f"consistency-{scenario}"
-        target = root / f"unpublished-{scenario}"
-        rejected.mkdir()
-        database = Path(shutil.copyfile(source / "router.db", rejected / "router.db"))
-        with closing(sqlite3.connect(database)) as db, db:
-            if scenario == "duplicate-numeric-id":
-                # Keep the same columns and rows while removing the PK constraint
-                # in this synthetic copy. The archived fault collides with done.
-                db.executescript("""CREATE TABLE message_copy AS SELECT * FROM message;
-                                   DROP TABLE message;
-                                   ALTER TABLE message_copy RENAME TO message;
-                                   INSERT INTO sqlite_sequence(name,seq) VALUES ('message',125);
-                                   UPDATE message SET id=41 WHERE id=76;""")
-                assert db.execute("SELECT dispatch, message_uid FROM message WHERE id=41 ORDER BY dispatch").fetchall() == [
-                    (DISPATCH, identifier(41)), (FAULTED, identifier(76))]
-                diagnostic = "duplicate legacy numeric receipt ID 41"
-            else:
-                result, = db.execute("SELECT result FROM dispatch_round WHERE dispatch=? AND round=2",
-                                     (DISPATCH,)).fetchone()
-                damaged = {**json.loads(result), scenario: {"head": "d" * 40, "dirty": False}[scenario]}
-                db.execute("UPDATE dispatch_round SET result=? WHERE dispatch=? AND round=2",
-                           (json.dumps(damaged), DISPATCH))
-                diagnostic = f"legacy dispatch {DISPATCH} round 2 attempt {CURRENT} final done receipt 49"
-        before = snapshot(rejected)
-        proof = proof_for(root / f"consistency-{scenario}.json", database, target)
-        result = run(binary, root, target, *import_args(rejected, proof))
-        denied(result, diagnostic)
-        if scenario != "duplicate-numeric-id":
-            assert "conflicting stored result and final done receipt" in result.stderr, result
-        assert not target.exists() and snapshot(rejected) == before
-        print(json.dumps({"rejectedConsistencyCase": scenario, "sourceBeforeAfter": before["router.db"][1],
-                          "publishedTarget": False}), flush=True)
+def rejects_inconsistent_ledger(binary, root, source, scenario):
+    rejected = root / f"consistency-{scenario}"
+    target = root / f"unpublished-{scenario}"
+    rejected.mkdir()
+    database = Path(shutil.copyfile(source / "router.db", rejected / "router.db"))
+    with closing(sqlite3.connect(database)) as db, db:
+        if scenario == "duplicate-numeric-id":
+            # Keep the same columns and rows while removing the PK constraint
+            # in this synthetic copy. The archived fault collides with done.
+            db.executescript("""CREATE TABLE message_copy AS SELECT * FROM message;
+                               DROP TABLE message;
+                               ALTER TABLE message_copy RENAME TO message;
+                               INSERT INTO sqlite_sequence(name,seq) VALUES ('message',125);
+                               UPDATE message SET id=41 WHERE id=76;""")
+            assert db.execute("SELECT dispatch, message_uid FROM message WHERE id=41 ORDER BY dispatch").fetchall() == [
+                (DISPATCH, identifier(41)), (FAULTED, identifier(76))]
+            diagnostic = "duplicate legacy numeric receipt ID 41"
+        else:
+            result, = db.execute("SELECT result FROM dispatch_round WHERE dispatch=? AND round=2",
+                                 (DISPATCH,)).fetchone()
+            damaged = {**json.loads(result), scenario: {"head": "d" * 40, "dirty": False}[scenario]}
+            db.execute("UPDATE dispatch_round SET result=? WHERE dispatch=? AND round=2",
+                       (json.dumps(damaged), DISPATCH))
+            diagnostic = f"legacy dispatch {DISPATCH} round 2 attempt {CURRENT} final done receipt 49"
+    before = snapshot(rejected)
+    proof = proof_for(root / f"consistency-{scenario}.json", database, target)
+    result = run(binary, root, target, *import_args(rejected, proof))
+    denied(result, diagnostic)
+    if scenario != "duplicate-numeric-id":
+        assert "conflicting stored result and final done receipt" in result.stderr, result
+    assert not target.exists() and snapshot(rejected) == before
+    print(json.dumps({"rejectedConsistencyCase": scenario, "sourceBeforeAfter": before["router.db"][1],
+                      "publishedTarget": False}), flush=True)
 
 
 def lookup(binary, root, target, dispatch):
@@ -151,32 +153,56 @@ def lookup(binary, root, target, dispatch):
     return result, view["undelivered"]
 
 
-def verify_history(binary, root, target, archived, bodies, work):
+def verify_resolution_history(binary, root, target, work):
     done, _ = lookup(binary, root, target, DISPATCH)
     by_id = {row["id"]: row for row in done["messages"]}
-    assert list(by_id) == [39, 40, 41, 43, 44, 45, 46, 47, 49, 51, 60, 61, 65]
     assert done["status"] == "completed" and done["backendAlive"] is False
     assert [(by_id[number]["head"], by_id[number]["dirty"]) for number in (47, 49, 51)] == [
         ("a" * 40, False), (FINAL_HEAD, True), ("c" * 40, False)]
     assert done["rounds"][1]["result"] == {"report": str(work / "last.md"), "head": FINAL_HEAD, "dirty": True}
-    assert done["legacyAudit"][0]["ownerGeneration"] == 7
-    assert done["legacyAudit"][0]["resolutionOwnerGeneration"] == 8
-    assert done["legacyResolutions"][0]["messageId"] == identifier(39)
-    assert by_id[39]["resolution"]["evidence"] == "proof"
+    audit = {event["id"]: event for event in done["legacyAudit"]}
+    assert list(audit) == [3, 9]
+    assert audit[3]["resolutionOwnerGeneration"] is None
+    close = audit[9]
+    assert (close["operation"], close["round"], close["attempt"], close["result"]) == (
+        "close", 2, CURRENT, "completed")
+    assert (close["ownerGeneration"], close["resolutionOwnerGeneration"], close["resolution_owner_generation"]) == (
+        7, 8, 8)
+    assert (close["resolver_actor"], close["resolution_evidence"], close["resolved_at"]) == ("fixture", "stopped", 17)
+    assert by_id[65]["result"] == "pending"
+    question = by_id[39]
+    resolution, = done["legacyResolutions"]
+    assert (question["id"], question["messageId"], question["state"], question["statusVersion"]) == (
+        39, identifier(39), "processed", 4)
+    assert resolution == {"id": 8, "message": 39, "messageId": identifier(39), "bodyHash": question["bodyHash"],
+                          "actor": "fixture", "source": "operator", "reason": "received", "evidence": "proof",
+                          "fromState": "unknown", "toState": "received", "created": 15}
+    for field in ("actor", "source", "reason", "evidence"):
+        assert question["resolution"][field] == resolution[field]
+    print(json.dumps({"lifecycleAuditId": close["id"], "ownerGeneration": close["ownerGeneration"],
+                      "resolutionOwnerGeneration": close["resolutionOwnerGeneration"],
+                      "messageResolutionId": resolution["id"], "resolvedMessage": resolution["message"]}), flush=True)
+
+
+def verify_archive_direction(binary, root, target, archived, work):
+    done, _ = lookup(binary, root, target, DISPATCH)
+    by_id = {row["id"]: row for row in done["messages"]}
+    assert list(by_id) == [39, 40, 41, 43, 44, 45, 46, 47, 49, 51, 60, 61, 65]
     reply = by_id[40]
     assert (reply["type"], reply["recipient"], reply["to"], reply["questionMessageId"], reply["answer"]) == (
         "reply", "worker", 39, identifier(39), "yes")
     assert (reply["round"], reply["attempt"], reply["statusVersion"], reply["state"]) == (1, FIRST, 1, "unsent")
     assert by_id[43]["attempt"] is None and by_id[46]["attempt"] is None
     assert by_id[45]["report"] == str(work / "last.md") and by_id[45]["attempt"] == CURRENT
-    assert by_id[65]["result"] == "pending" and done["legacyAudit"][0]["result"] == "completed"
-    assert by_id[60]["state"] == "unknown"
     faulted, undelivered = lookup(binary, root, target, FAULTED)
     assert undelivered == [] and faulted["status"] == "failed" and faulted["backendAlive"] is False
     assert faulted["fault"]["category"] == "process_exited" and faulted["fault"]["created"] == 17
     assert faulted["hostError"] == "fixture host turn" and faulted["screenObservedSince"] == 16
     assert faulted["watchdogFaults"] == [{"round": 1, "attempt": FAULT_ATTEMPT, "kind": "timeout", "fingerprint": "deadline"}]
     assert all(item["attempt"] is None for item in faulted["messages"])
+    assert [(item["id"], item["recipient"], item["type"], item["state"], item["statusVersion"])
+            for item in faulted["messages"]] == [
+        (76, "controller", "unknown", "unknown", 2), (82, "controller", "exited", "unsent", 1)]
     by_id.update({item["id"]: item for item in faulted["messages"]})
     for number, raw in archived.items():
         seen = by_id[number]
@@ -187,6 +213,14 @@ def verify_history(binary, root, target, archived, bodies, work):
         denied(run(binary, root, target, "ack", receipt, token=NEW), "no controller message")
     denied(run(binary, root, target, "resolve", "76", "--actor", "fixture", "--reason", "fixture",
                "--evidence", "fixture", "--body-hash", digest(archived[76].encode()), token=NEW), "no controller message")
+    print(json.dumps({"archivedMessages": sorted(archived), "preservedReplyQuestion": 39,
+                      "terminalFaultReadOnly": True}), flush=True)
+
+
+def verify_controller_ledger(binary, root, target, bodies, work):
+    done, _ = lookup(binary, root, target, DISPATCH)
+    by_id = {row["id"]: row for row in done["messages"]}
+    assert by_id[60]["state"] == "unknown" and by_id[61]["legacyDeliveryHeld"] is True
     empty = output(run(binary, root, target, "wait", "--scope", SCOPE, "--timeout", "0", token=NEW), code=3)
     assert empty["messages"] == []
     one = output(run(binary, root, target, "ack", "41", "--body", bodies[41], token=NEW))
@@ -194,8 +228,8 @@ def verify_history(binary, root, target, archived, bodies, work):
     assert one["messageId"] == identifier(41) and one["statusVersion"] == 4 and not one["duplicate"]
     assert two == {**one, "duplicate": True}
     current, _ = lookup(binary, root, target, DISPATCH)
-    assert next(item for item in current["messages"] if item["id"] == 60) == by_id[60]
-    assert next(item for item in current["messages"] if item["id"] == 40) == reply
+    assert [item for item in current["messages"] if item["id"] in (40, 60, 61)] == [
+        by_id[number] for number in (40, 60, 61)]
     task, report = work / "task.md", work / "new-report.md"
     report.write_text("fixture report")
     row = output(run(binary, root, target, "dispatch", "--scope", SCOPE, "--role", "worker", "--cwd", work,
@@ -206,7 +240,53 @@ def verify_history(binary, root, target, archived, bodies, work):
         assert native["message"] == 126
     finally:
         output(run(binary, root, target, "close", row["dispatch"], token=NEW))
-    return native["message"]
+    print(json.dumps({"ackedOriginal": one["messageId"], "statusVersion": one["statusVersion"],
+                      "nextNativeId": native["message"]}), flush=True)
+
+
+def verify_publication(binary, root, source, target, original):
+    proof = proof_for(root / "history-proof.json", source / "router.db", target)
+    result = output(run(binary, root, target, *import_args(source, proof)))
+    assert result["messages"] == 15 and result["messageHighWater"] == 125
+    backup = Path(result["backup"])
+    assert digest(backup.read_bytes()) == original["router.db"][1]
+    assert snapshot(source) == original
+    print(json.dumps({"sourceAndBackup": original["router.db"][1], "messageHighWater": 125}), flush=True)
+
+
+def verify_reclaimed(binary, root, source):
+    # The newest reclaim still projects the resource state. Its receipt lacks
+    # an execution identity and must not change the known completed round.
+    reclaimed_source = root / "reclaimed-source"
+    reclaimed_source.mkdir()
+    database = Path(shutil.copyfile(source / "router.db", reclaimed_source / "router.db"))
+    with closing(sqlite3.connect(database)) as db, db:
+        post(db, 83, DISPATCH, "worker", "reclaimed", {"tmux": f"wfc-{DISPATCH}"})
+    before = snapshot(reclaimed_source)
+    reclaimed_target = root / "reclaimed-native"
+    proof = proof_for(root / "reclaimed-proof.json", database, reclaimed_target)
+    output(run(binary, root, reclaimed_target, *import_args(reclaimed_source, proof)))
+    reclaimed, _ = lookup(binary, root, reclaimed_target, DISPATCH)
+    assert reclaimed["status"] == "reclaimed" and reclaimed["state"] == "done"
+    assert reclaimed["last"]["id"] == 83 and reclaimed["last"]["attempt"] is None
+    assert snapshot(reclaimed_source) == before
+
+
+def verify_source_integrity(source, original):
+    assert snapshot(source) == original
+
+
+def run_group(version, group, check, *args):
+    marker = f"history schema={version} group={group}"
+    print(f"{marker} outcome=started", flush=True)
+    try:
+        check(*args)
+    except Exception:
+        traceback.print_exc()
+        print(f"{marker} outcome=failed", flush=True)
+        return False
+    print(f"{marker} outcome=passed", flush=True)
+    return True
 
 
 def fixture(binary, schema, root, version, backend):
@@ -215,39 +295,32 @@ def fixture(binary, schema, root, version, backend):
     source, work, bodies = build_source(root, schema, backend)
     archived = seed_full_history(source, work)
     original = snapshot(source)
-    rejects_unverified(binary, root, source)
-    rejects_inconsistent_ledger(binary, root, source)
     target = root / "native"
-    proof = proof_for(root / "history-proof.json", source / "router.db", target)
-    result = output(run(binary, root, target, *import_args(source, proof)))
-    assert result["messages"] == 15 and result["messageHighWater"] == 125
-    backup = Path(result["backup"])
-    assert digest(backup.read_bytes()) == original["router.db"][1]
-    new_id = verify_history(binary, root, target, archived, bodies, work)
-    assert snapshot(source) == original
-
-    # The newest reclaim still projects the resource state. Its receipt lacks
-    # an execution identity and must not change the known completed round.
-    reclaimed_source = root / "reclaimed-source"
-    reclaimed_source.mkdir()
-    database = Path(shutil.copyfile(source / "router.db", reclaimed_source / "router.db"))
-    with closing(sqlite3.connect(database)) as db, db:
-        post(db, 83, DISPATCH, "worker", "reclaimed", {"tmux": f"wfc-{DISPATCH}"})
-    reclaimed_target = root / "reclaimed-native"
-    proof = proof_for(root / "reclaimed-proof.json", database, reclaimed_target)
-    output(run(binary, root, reclaimed_target, *import_args(reclaimed_source, proof)))
-    reclaimed, _ = lookup(binary, root, reclaimed_target, DISPATCH)
-    assert reclaimed["status"] == "reclaimed" and reclaimed["state"] == "done"
-    assert reclaimed["last"]["id"] == 83 and reclaimed["last"]["attempt"] is None
-    print(json.dumps({"syntheticPythonSchema": version, "sourceAndBackup": original["router.db"][1],
-                      "archivedMessages": sorted(archived), "nextNativeId": new_id,
-                      "preservedReplyQuestion": 39, "terminalFaultReadOnly": True}), flush=True)
+    checks = [run_group(version, "identity-rejections", rejects_unverified, binary, root, source)]
+    for scenario in ("head", "dirty", "duplicate-numeric-id"):
+        checks.append(run_group(version, f"consistency-{scenario}",
+                                rejects_inconsistent_ledger, binary, root, source, scenario))
+    checks.append(run_group(version, "reclaim-history", verify_reclaimed, binary, root, source))
+    published = run_group(version, "publish-and-backup", verify_publication, binary, root, source, target, original)
+    history_checks = (
+        ("resolution-history", verify_resolution_history, (work,)),
+        ("archive-direction", verify_archive_direction, (archived, work)),
+        ("controller-ack-and-high-water", verify_controller_ledger, (bodies, work)),
+    )
+    for group, check, args in history_checks:
+        if published:
+            checks.append(run_group(version, group, check, binary, root, target, *args))
+        else:
+            print(f"history schema={version} group={group} outcome=blocked", flush=True)
+    checks.append(run_group(version, "source-integrity", verify_source_integrity, source, original))
+    return published and all(checks)
 
 
 if __name__ == "__main__":
     binary = Path(sys.argv[1]).resolve(strict=True)
     schema = Path(__file__).resolve().parents[1] / "crates/legacy-state/src/schema.sql"
     with tempfile.TemporaryDirectory(prefix="wfc-legacy-history-") as directory:
-        for version, backend in (("39", "tmux"), ("40", "herdr")):
-            fixture(binary, schema, Path(directory) / version, version, backend)
+        passed = [fixture(binary, schema, Path(directory) / version, version, backend)
+                  for version, backend in (("39", "tmux"), ("40", "herdr"))]
     assert not Path(directory).exists()
+    raise SystemExit(0 if all(passed) else 1)

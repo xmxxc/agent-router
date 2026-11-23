@@ -72,7 +72,8 @@ pub fn stopped_ledger(database: &Path) -> Result<StoppedLedger> {
         owners: rows(&db, "SELECT scope,owner,token,generation,lease_until FROM controller_owner ORDER BY scope", [])?,
         audit: rows(&db, "SELECT dispatch,id,operation,round,attempt,from_attempt AS fromAttempt,to_attempt AS toAttempt,
             from_host AS fromHost,to_host AS toHost,result,diagnostic,owner_generation AS ownerGeneration,
-            resolver_actor,resolution_evidence,resolution_owner_generation,resolved_at,consumed_at,created
+            resolver_actor,resolution_evidence,resolution_owner_generation,
+            resolution_owner_generation AS resolutionOwnerGeneration,resolved_at,consumed_at,created
             FROM lifecycle_event ORDER BY id", [])?,
         faults: rows(&db, "SELECT dispatch,operation,outcome,category,diagnostic,created
             FROM fault_event ORDER BY dispatch", [])?,
