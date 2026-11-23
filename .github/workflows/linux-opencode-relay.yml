@@ -1,7 +1,7 @@
-name: Linux startup progress, owner proof and resume integration
+name: Linux startup Rust unit tests
 on:
   push:
-    branches: [rust-router/linux-ci-startup-resume-owner]
+    branches: [rust-router/linux-ci-startup-merge-unit-callers]
 
 permissions:
   contents: read
@@ -14,19 +14,18 @@ jobs:
       run:
         shell: bash
     env:
-      PRODUCT_SHA: 5ff93d92d980785a85363b92771597b04fd24b5e
-      PRODUCT_TREE: 95cdc5cfcdc11cffafec0e32a528d379681753b3
-      PRODUCT_PARENTS: 'cc98f8a65b438a8eab65b7eefd5f1ecad6b9758e e316d9aa6bc9d59c73767ff861c843cfa82a3642'
-      INPUTS_SHA256: 420d990f635d53fc2bcb46f6f6ab02990d665c7f5e72cf3cd5b7aef8972c033f
+      PRODUCT_SHA: 8bdef7b562f2caaccc590f0b60e094a576d84b7b
+      PRODUCT_TREE: 0cdedb1de41553bd108296c409fc62987f1905ad
+      PRODUCT_PARENTS: '5ff93d92d980785a85363b92771597b04fd24b5e'
+      INPUTS_SHA256: 437c1c6e275aee2019cecb633596afa786e307008f1b0eaffa1c38662ec8d9e7
       LOCK_SHA256: 759d7553d4023d05406dfaa81984fe2819ee88ceb982b35468dd2f78ce748709
-      PRIOR_RELAY_RUN: '45258027015'
-      PRIOR_STARTUP_RUN: '45242439722'
-      PRIOR_OPENCODE_RUN: '45240722301'
+      PRIOR_PUBLIC_RUN: '45262173949'
+      PRIOR_PUBLIC_ARTIFACT: '14860268615'
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TARGET: x86_64-unknown-linux-gnu
       CARGO_BUILD_JOBS: '2'
       LC_ALL: C.UTF-8
-      EVIDENCE: ${{ github.workspace }}/linux-bounded-startup-evidence
+      EVIDENCE: ${{ github.workspace }}/linux-startup-unit-evidence
     steps:
       - name: Record workflow run
         run: |
@@ -34,8 +33,8 @@ jobs:
           printf 'workflow=%s\nrun=%s\nattempt=%s\nexpectedProduct=%s\nexpectedTree=%s\n' \
             "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PRODUCT_SHA" "$PRODUCT_TREE" |
             tee "$EVIDENCE/run.log"
-          printf 'previousRelayRun=%s\npreviousStartupRun=%s\npreviousOpenCodeRun=%s\n' \
-            "$PRIOR_RELAY_RUN" "$PRIOR_STARTUP_RUN" "$PRIOR_OPENCODE_RUN" | tee -a "$EVIDENCE/run.log"
+          printf 'previousPublicRun=%s\npreviousPublicArtifact=%s\n' \
+            "$PRIOR_PUBLIC_RUN" "$PRIOR_PUBLIC_ARTIFACT" | tee -a "$EVIDENCE/run.log"
       - name: Check out the CI scripts
         id: ci
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -78,9 +77,7 @@ jobs:
               ../native-input/vendor/zlib-1.3.1.tar.gz | sha256sum --check --strict
             printf '%s  vendor/INPUTS.sha256\n%s  Cargo.lock\n' "$INPUTS_SHA256" "$LOCK_SHA256" |
               sha256sum --check --strict
-            sha256sum vendor/INPUTS.sha256 Cargo.lock \
-              tests/{startup_failure.py,receipts.py,relay.py,opencode_relay.py} tools/check_tmux.py \
-              ../ci/tools/ci/opencode-relay/{libraries.sh,managed_owner.py,reap.py,run_selected.py,startup_recovery.py,verify.sh}
+            sha256sum vendor/INPUTS.sha256 Cargo.lock ../ci/tools/ci/opencode-relay/{reap.py,verify.sh}
             sha256sum --check --strict vendor/INPUTS.sha256
           } 2>&1 | tee "$EVIDENCE/sources.log"
       - name: Set up Python
@@ -160,33 +157,14 @@ jobs:
             printf 'Wuffs Zig package %s\n' "$package"
             test "$package" = 'N-V-__8AAP5JWgCGP_AD0teWpa4krRvE9VPZzvviGdbmN4jI'
           } 2>&1 | tee "$EVIDENCE/wuffs.log"
-      - name: Build and identify the frozen release
-        id: build
+      - name: Run the eight startup Rust unit tests
+        id: suites
         working-directory: product
-        env:
-          WFC_BUILD_ID: ${{ env.PRODUCT_SHA }}
         run: |
           {
             cargo fmt --all -- --check
-            cargo build --release --locked --target "$TARGET" --bin wfc
-            binary="target/$TARGET/release/wfc"
-            version=$("$binary" --version)
-            printf '%s\n' "$version"
-            [[ "$version" == *"(Rust, $TARGET, release, build $PRODUCT_SHA)" ]]
-            sha256sum "$binary" | tee "$EVIDENCE/binary.sha256"
-          } 2>&1 | tee "$EVIDENCE/build.log"
-      - name: Record ELF, GLIBC, libcurl and OpenSSL
-        id: libraries
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: product
-        run: |
-          bash ../ci/tools/ci/opencode-relay/libraries.sh 2>&1 | tee "$EVIDENCE/libraries-step.log"
-      - name: Run startup recovery and the OpenCode and Codex intersections
-        id: suites
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: product
-        run: |
-          bash ../ci/tools/ci/opencode-relay/verify.sh resume-owner 2>&1 | tee "$EVIDENCE/suites-step.log"
+            bash ../ci/tools/ci/opencode-relay/verify.sh startup-units
+          } 2>&1 | tee "$EVIDENCE/suites-step.log"
       - name: Record step outcomes and checksum the evidence
         if: ${{ always() }}
         env:
@@ -199,15 +177,13 @@ jobs:
           TOOLCHAIN_OUTCOME: ${{ steps.toolchain.outcome }}
           GHOSTTY_OUTCOME: ${{ steps.ghostty.outcome }}
           WUFFS_OUTCOME: ${{ steps.wuffs.outcome }}
-          BUILD_OUTCOME: ${{ steps.build.outcome }}
-          LIBRARIES_OUTCOME: ${{ steps.libraries.outcome }}
           SUITES_OUTCOME: ${{ steps.suites.outcome }}
         run: |
           mkdir -p "$EVIDENCE"
           cd "$EVIDENCE"
           first_failure=none
           {
-            for step in CI PRODUCT NATIVE SOURCES PYTHON ZIG TOOLCHAIN GHOSTTY WUFFS BUILD LIBRARIES SUITES; do
+            for step in CI PRODUCT NATIVE SOURCES PYTHON ZIG TOOLCHAIN GHOSTTY WUFFS SUITES; do
               name="${step}_OUTCOME"
               result=${!name}
               printf '%s=%s\n' "$step" "$result"
@@ -220,11 +196,11 @@ jobs:
           shopt -s nullglob
           sha256sum -- *.log *.sha256 > SHA256SUMS
           sha256sum --check --strict SHA256SUMS
-      - name: Upload Linux relay evidence
+      - name: Upload Linux startup unit test evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: linux-startup-resume-owner-jammy-${{ github.run_id }}-${{ github.run_attempt }}
+          name: linux-startup-units-jammy-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14

@@ -2,12 +2,14 @@
 # Run each relay and ownership suite against the same pinned binary.
 set -euo pipefail
 ci_dir=$(cd "$(dirname "$0")" && pwd)
-binary=$(realpath "${RELAY_TEST_BINARY:-target/$TARGET/release/wfc}")
 python=$(command -v python3)
 test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
 test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
-sha256sum --check --strict "$EVIDENCE/binary.sha256"
 test "$(id -u)" -ne 0
+if [[ "${1:-all}" != startup-units ]]; then
+    binary=$(realpath "${RELAY_TEST_BINARY:-target/$TARGET/release/wfc}")
+    sha256sum --check --strict "$EVIDENCE/binary.sha256"
+fi
 
 first_failure=none
 run_suite() {
@@ -71,6 +73,7 @@ run_startup_units() {
         fi
     done
     if (( status != 0 || checked != 8 )) ||
+        ! grep -Eq '^test result: ok\. 8 passed; 0 failed; 0 ignored; 0 measured;' "$log" ||
         ! grep -Fxq 'Own descendants reaped: ECHILD, extra cleanup signals: 0' "$log"; then
         verdict=fail
         if [[ "$first_failure" == none ]]; then
@@ -164,6 +167,9 @@ case "${1:-all}" in
   startup-opencode)
     run_startup_opencode_suites
     ;;
+  startup-units)
+    run_startup_units
+    ;;
   relay-retry)
     run_relay_retry_suites
     ;;
@@ -171,7 +177,7 @@ case "${1:-all}" in
     run_resume_owner_suites
     ;;
   *)
-    printf 'expected all, owner-only, target-validation, startup-opencode, relay-retry or resume-owner\n' >&2
+    printf 'expected all, owner-only, target-validation, startup-opencode, startup-units, relay-retry or resume-owner\n' >&2
     exit 2
     ;;
 esac
