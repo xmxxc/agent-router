@@ -42,6 +42,8 @@ enum Operation {
     Create(launch::Launch),
     Inspect,
     Read,
+    #[serde(rename = "observe-screen")]
+    ObserveScreen,
     Submit {
         text: String,
         host: Option<String>,
@@ -527,6 +529,10 @@ impl Tmux<'_> {
                 let t = self.owned()?;
                 Ok(json!({"result":"accepted","screen":self.capture(&t,&t.pane)?}))
             }
+            Operation::ObserveScreen => {
+                let t = self.owned()?;
+                Ok(json!({"result":"accepted","screen":self.worker_screen(&t)?}))
+            }
             Operation::Interrupt => {
                 let target = self.input_target()?;
                 self.worker_command(
@@ -908,6 +914,10 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
         std::path::absolute(state)?
     };
     let launching = matches!(&request.op, Operation::Create(_) | Operation::Resume { .. });
+    ensure!(
+        !matches!(request.op, Operation::ObserveScreen) || request.execution_id.is_some(),
+        "screen observation requires a native execution selector"
+    );
     ensure!(request.execution_id.as_deref().is_none_or(|id| !id.is_empty() && (launching || request.legacy_execution_id.is_none())), "invalid or competing execution selector");
     ensure!(
         request

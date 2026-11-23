@@ -5,7 +5,7 @@ pub(crate) mod queue_owner;
 mod registration;
 pub use registration::waiters;
 
-use super::{state_dir, Inbox, State};
+use super::{runtime::Monitor, state_dir, Inbox, State};
 use crate::workflow::{read_record, valid_id, worker_owner};
 use anyhow::{bail, ensure, Context, Result};
 use codex::Outcome;
@@ -29,6 +29,7 @@ pub struct Relay<'a> {
     thread: Option<&'a str>,
     detach: bool,
     lifetime: Option<Duration>,
+    stall_after: Duration,
 }
 
 fn seconds(value: &str) -> Result<Duration> {
@@ -67,13 +68,12 @@ impl<'a> Relay<'a> {
         }
         let thread = opts.get("--codex-thread").copied();
         ensure!(codex != thread.is_some(), "give --codex or --codex-thread");
-        if let Some(value) = opts.get("--stall-after") {
-            seconds(value)?;
-        }
+        let stall_after = seconds(opts.get("--stall-after").copied().unwrap_or("300"))?;
         Ok(Self {
             scope: opts.get("--scope").copied(),
             thread,
             detach,
+            stall_after,
             lifetime: opts
                 .get("--for")
                 .map(|v| seconds(v))
@@ -115,6 +115,7 @@ impl<'a> Relay<'a> {
             if let Some(limit) = self.lifetime {
                 cmd.args(["--for", &limit.as_secs_f64().to_string()]);
             }
+            cmd.args(["--stall-after", &self.stall_after.as_secs_f64().to_string()]);
             worker_owner::new_session(&mut cmd);
             let child = cmd
                 .stdin(Stdio::null())
@@ -135,6 +136,7 @@ impl<'a> Relay<'a> {
         // Linux MAX_ARG_STRLEN counts the terminating NUL.
         let mut budget = page_size as usize * 32;
         let mut diagnosed = HashSet::new();
+        let mut runtime = Monitor::new(self.stall_after);
         while !remaining().is_zero() {
             let order = transport_lock(&state, self.scope)?;
             let batch = match &order {
@@ -182,6 +184,9 @@ impl<'a> Relay<'a> {
                 }
             }
             drop(order);
+            if !remaining().is_zero() && runtime.poll(&state, None, self.scope)? {
+                continue;
+            }
             std::thread::sleep(remaining().min(Duration::from_millis(500)));
         }
         Ok(())

@@ -309,6 +309,20 @@ pub(super) fn create(state: &Path, row: &Value, launch: host::Launch) -> Result<
     Ok(unit.row)
 }
 
+pub(super) fn runtime_screen(state: &Path, row: &Value) -> Result<Option<String>> {
+    let id = row["dispatch"].as_str().context("missing dispatch")?;
+    let unit = Assignment::lock(state, id, None)?;
+    if ["scope", "round", "attempt", "backendHandle"]
+        .iter()
+        .any(|&field| unit.row[field] != row[field])
+        || unit.pending_close()
+        || unit.completed_close().is_some()
+    {
+        return Ok(None);
+    }
+    Ok(unit.handle()?.read().ok().map(|screen| screen.text))
+}
+
 pub(super) fn observe(state: &Path, row: &mut Value) -> Result<(Value, Value)> {
     let observed = (|| -> Result<_> {
         let id = row["dispatch"].as_str().context("missing dispatch")?;

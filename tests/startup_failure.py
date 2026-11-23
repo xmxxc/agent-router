@@ -1,4 +1,5 @@
 """Public Linux startup failure reports, delivered through the existing inbox."""
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -376,6 +377,9 @@ class StartupFailure(unittest.TestCase):
         self.assertEqual((late["type"], fault["exitCode"]), ("exited", 0))
         self.assertEqual((fault["launchId"], fault["pid"]), (evidence["launchId"], evidence["pid"]))
         self.assertEqual(self.check_ack(late)["worker"]["exit_code"], 0)
+        quiet = self.cli("wait", "--scope", "late-zero", "--dispatch", late["dispatch"],
+                         "--timeout", ".35", code=3)
+        self.assertFalse(quiet["messages"])
         print(json.dumps({"case": "late-zero", "messageId": late["messageId"],
                           "attempt": late["attempt"], "exitCode": fault["exitCode"], **evidence}), flush=True)
 
@@ -390,6 +394,195 @@ class StartupFailure(unittest.TestCase):
         self.assertEqual(row["worker"]["exit_code"], 0)
         self.assertNotIn("startupFailure", row)
         self.assertFalse(self.cli("wait", "--scope", "accepted-zero", "--timeout", "0", code=3)["messages"])
+        runtime, = self.cli("wait", "--scope", "accepted-zero", "--dispatch", dispatch,
+                            "--timeout", "4")["messages"]
+        self.assertEqual((runtime["kind"], runtime["type"], runtime["fault"]["exitCode"]),
+                         ("host_runtime", "exited", 0))
+        self.assertEqual(runtime["attempt"], accepted["attempt"])
+        self.assertGreater(runtime["fault"]["pid"], 0)
+        self.assertRegex(runtime["fault"]["processStart"], r"^linux:[0-9a-f-]+:\d+$")
+        current = self.cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertNotIn("startupFailure", current)
+        self.assertEqual([m["messageId"] for m in current["messages"]], [runtime["messageId"]])
+        quiet = self.cli("wait", "--scope", "accepted-zero", "--dispatch", dispatch,
+                         "--timeout", ".35", code=3)
+        self.assertFalse(quiet["messages"])
+        print(json.dumps({"case": "accepted-zero", "scope": runtime["scope"],
+                          "dispatch": dispatch, "attempt": runtime["attempt"],
+                          "messageId": runtime["messageId"], "fault": runtime["fault"]}), flush=True)
+
+
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_host_runtime_observations(self):
+        self.start_tmux()
+        fixture = textwrap.dedent(r"""
+            import json
+            import os
+            from pathlib import Path
+            import subprocess
+            import sys
+            import time
+
+            command = Path(sys.argv[1])
+            boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+            start = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
+            command.with_suffix(".identity").write_text(json.dumps({
+                "pid": os.getpid(), "processStart": f"linux:{boot}:{start}",
+            }))
+            previous = None
+            frame = 0
+            while True:
+                view = command.read_text()
+                if view == "done":
+                    subprocess.run([os.environ["WFC_BIN"], "done", "--report", os.environ["WFC_REPORT"],
+                                    "--attempt", os.environ["WFC_ATTEMPT"]], check=True)
+                    break
+                if view == "exit":
+                    sys.exit(23)
+                if view != previous or view == "refresh":
+                    frame += 1
+                    text = f"Working: frame {frame}" if view == "refresh" else view
+                    print("\x1b[2J\x1b[H" + text, flush=True)
+                    previous = view
+                time.sleep(.05)
+            """)
+
+        def write(path, content):
+            temp = path.with_suffix(".tmp")
+            temp.write_text(content)
+            temp.replace(path)
+
+        def launch(host, scope, screen):
+            command = self.cwd / scope
+            write(command, screen)
+            job = self.deploy(scope, [sys.executable, "-c", fixture, str(command)], host=host)
+            return command, job
+
+        def observe(job, *, timeout="4", code=0, stall="0", deadline="0", scope=None):
+            return self.cli("wait", "--scope", scope or job["scope"], "--dispatch", job["dispatch"],
+                            "--timeout", timeout, "--stall-after", stall, code=code,
+                            extra={"WFC_MAX_TURN_SECONDS": deadline})["messages"]
+
+        def assert_notice(job, message, kind, category, evidence, state):
+            self.assertEqual((message["dispatch"], message["round"], message["attempt"], message["scope"]),
+                             (job["dispatch"], 1, job["attempt"], job["scope"]))
+            self.assertEqual((message["type"], message["kind"], message["host"]),
+                             (kind, "host_runtime", job["host"]))
+            self.assertEqual((message["fault"]["category"], message["fault"]["evidence"]),
+                             (category, evidence))
+            self.assertEqual((message["state"], message["statusVersion"]), ("received", 2))
+            status = self.cli("status", "--dispatch", job["dispatch"])["dispatches"][0]
+            self.assertEqual(status["hostActivity"]["state"], state)
+            self.assertNotIn(status["state"], ("done", "completed"))
+            self.assertNotIn(SECRET, json.dumps(status))
+            body = {key: message[key] for key in
+                    ("attempt", "report", "role", "round", "scope", "kind", "host", "message", "fault")}
+            encoded = json.dumps(body, sort_keys=True, ensure_ascii=False)
+            ack = self.cli("ack", message["messageId"], "--body", encoded)
+            self.assertEqual((ack["state"], ack["statusVersion"], ack["duplicate"]),
+                             ("processed", 3, False))
+            self.assertTrue(self.cli("ack", message["messageId"], "--body", encoded)["duplicate"])
+            print(json.dumps({"case": "runtime-tmux", "dispatch": job["dispatch"],
+                              "attempt": job["attempt"], "scope": job["scope"], "host": job["host"],
+                              "messageId": message["messageId"], "state": state,
+                              "fault": message["fault"], "ackVerified": True}), flush=True)
+
+        for host, screen, kind, category, state in (
+            ("codex", "Quota exceeded", "blocked", "quota", "blocked"),
+            ("opencode", "Approval required", "blocked", "permission_required", "awaiting_permission"),
+            ("claude", "Connection reset", "unknown", "protocol_disconnected", "disconnected"),
+        ):
+            with self.subTest(host=host):
+                command, job = launch(host, host, f"{screen}: {SECRET}")
+                self.assertFalse(observe(job, scope="unrelated", timeout=".15", code=3))
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    # Different scopes stay independent while two fresh wait
+                    # processes for the right scope contend for the same receipt.
+                    futures = [pool.submit(subprocess.run,
+                        [BINARY, "wait", "--scope", host, "--dispatch", job["dispatch"], "--timeout", "3"],
+                        cwd=self.cwd, env=self.env, capture_output=True, text=True, timeout=8)
+                        for _ in range(2)]
+                    results = [future.result() for future in futures]
+                self.assertEqual(sorted(r.returncode for r in results), [0, 3], results)
+                message, = [item for r in results for item in json.loads(r.stdout)["messages"]]
+                assert_notice(job, message, kind, category, "screen_notice", state)
+                write(command, f"{screen}: {SECRET}-updated")
+                self.assertFalse(observe(job, timeout="1.25", code=3, stall=".1"))
+
+                write(command, f"Working: {SECRET}")
+                recovery, = observe(job)
+                assert_notice(job, recovery, "recovered", "recovered", "changed_activity", "active")
+                self.assertFalse(observe(job, timeout=".25", code=3))
+                write(command, f"{screen}: {SECRET}")
+                again, = observe(job)
+                assert_notice(job, again, kind, category, "screen_notice", state)
+                self.assertNotEqual(again["messageId"], message["messageId"])
+
+                write(command, "done")
+                done, = observe(job)
+                self.assertEqual(done["type"], "done")
+                self.assertFalse(observe(job, timeout=".15", code=3))
+                complete = self.cli("status", "--dispatch", job["dispatch"])["dispatches"][0]
+                self.assertEqual(complete["state"], "done")
+                self.assertNotIn("hostActivity", complete)
+
+        idle_command, idle = launch("codex", "idle", "Ready")
+        stalled, = observe(idle, stall=".5")
+        assert_notice(idle, stalled, "stalled", "timeout", "unchanged_screen", "stalled")
+        self.assertIsInstance(stalled["fault"]["elapsedSeconds"], int)
+        self.assertFalse(observe(idle, stall=".5", timeout="1.25", code=3))
+        write(idle_command, f"Working: {SECRET}")
+        recovery, = observe(idle)
+        assert_notice(idle, recovery, "recovered", "recovered", "changed_activity", "active")
+
+        _, refreshing = launch("claude", "refreshing", "refresh")
+        deadline, = observe(refreshing, stall=".5", deadline="2")
+        assert_notice(refreshing, deadline, "unknown", "timeout", "turn_deadline", "timed_out")
+        self.assertGreaterEqual(deadline["fault"]["elapsedSeconds"], 2)
+        self.assertFalse(observe(refreshing, stall=".5", deadline="2", timeout="1.25", code=3))
+
+        command, blocked = launch("codex", "other-faults", "Login required")
+        for screen, kind, category, state in (
+            ("Login required", "blocked", "authentication", "blocked"),
+            ("Policy rejected", "blocked", "policy_rejected", "blocked"),
+            ("Read-only session", "blocked", "permission_required", "awaiting_permission"),
+            ("Request timed out", "unknown", "timeout", "timed_out"),
+        ):
+            with self.subTest(screen=screen):
+                write(command, f"{screen}: {SECRET}")
+                message, = observe(blocked)
+                assert_notice(blocked, message, kind, category, "screen_notice", state)
+        write(command, "exit")
+        message, = observe(blocked)
+        assert_notice(blocked, message, "exited", "process_exited", "verified_exit", "exited")
+        self.assertEqual(message["fault"]["exitCode"], 23)
+        identity = json.loads(command.with_suffix(".identity").read_text())
+        self.assertEqual({key: message["fault"][key] for key in identity}, identity)
+        self.assertFalse(observe(blocked, timeout="1.25", code=3))
+
+        _, awaiting = launch("opencode", "awaiting", f"Quota exceeded: {SECRET}")
+        # The Rust base reserves ask/reply. Seed a private question receipt of
+        # the existing shape and exercise the real controller read and wait.
+        ledger = self.state / "messages.json"
+        messages = json.loads(ledger.read_text())
+        question = dict(type="question", id=len(messages) + 1, messageId="m-question",
+                        state="processed", statusVersion=3,
+                        question_payload={"text": "fixture question", "options": ["one", "two"]},
+                        **{key: awaiting[key] for key in ("dispatch", "round", "attempt", "scope", "role")})
+        write(ledger, json.dumps([*messages, {**question, "scope": "unrelated"}]))
+        fault, = observe(awaiting)
+        assert_notice(awaiting, fault, "blocked", "quota", "screen_notice", "blocked")
+        messages = json.loads(ledger.read_text())
+        write(ledger, json.dumps([*messages, {**question, "id": len(messages) + 1,
+                                             "messageId": "m-current-question"}]))
+        self.assertFalse(observe(awaiting, timeout="1.25", deadline=".1", code=3))
+        status = self.cli("status", "--dispatch", awaiting["dispatch"])["dispatches"][0]
+        self.assertEqual(status["hostActivity"]["state"], "awaiting_answer")
+        self.assertNotEqual(status["state"], "done")
+        self.assertNotIn(SECRET, ledger.read_text())
+        for path in (self.state / "dispatches").glob("*.host-watch"):
+            self.assertNotIn(SECRET, path.read_text())
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

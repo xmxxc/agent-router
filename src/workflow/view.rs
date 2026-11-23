@@ -199,6 +199,8 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
         row["tmuxAlive"] = json!(alive);
     }
     row["rounds"] = json!(rounds);
+    #[cfg(target_os = "linux")]
+    super::messages::runtime::project(row, history);
     row["last"] = history.last().cloned().unwrap_or(Value::Null);
     if named {
         row["messages"] = json!(history);

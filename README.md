@@ -94,6 +94,10 @@ python3 tools/check_codex.py target/x86_64-unknown-linux-gnu/release/wfc \
 
 点名查询 `wfc status --dispatch ID` 返回当前 worker 进程状态、各轮任务结果及消息。接入 #6/#7 后，首条完成回报固定该轮的报告和 Git 快照，后续领取或进程退出仍能查回。已完成且会话仍存活的任务在 `status --active` 的 reclaimable 数组中。长编号和旧版短编号均可查询、关闭。
 
+Linux 的 `wait` 与 `relay` 会检查当前绑定的宿主，并沿用同一 scope、round 和 attempt 的消息回执。`status` 的 `hostActivity` 展示最近记录的宿主活动，`worker` 和各轮结果仍分别表达进程与任务状态。屏幕识别使用有限的故障和活动提示。运行期通知保留固定诊断、证据类型及可核实的计时或退出信息。私有状态只保存有盐的屏幕摘要和时间。
+
+`--stall-after` 控制静屏阈值，默认为 300 秒。`WFC_MAX_TURN_SECONDS` 控制从派发起算的整轮阈值，默认为 3600 秒，持续刷新也会计时。阈值设为 0 可关闭相应计时。已观察到的同一故障只发一次，可见活动恢复后会记一条变化。完成和当前待答回执结束本轮诊断轮询。受控回归入口为 `python3 tests/startup_failure.py /path/to/wfc StartupFailure.test_host_runtime_observations -v`。
+
 tmux 会话的首次关闭动作记录在 `closeEffect` 中。若同一 worker 在会话关闭后才写出退出码，后续查询和重复关闭都会返回该退出码，并保留首次动作。创建响应丢失时按原 attempt 查询启动登记；关闭归档写入失败时，重试会按原 attempt 重放同一次关闭。证据不足时，关闭返回未决。
 
 `dispatch` 接收调用方指定的角色、任务文件和工作目录。`--` 后依次放受控 worker 的程序和参数。下面的 Bash 示例让 worker 在工作目录中写出它实际读到的任务，再由另一个 CLI 查回编号。

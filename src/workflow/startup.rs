@@ -198,6 +198,10 @@ pub(crate) struct Running<'a> {
 }
 
 impl Running<'_> {
+    pub(crate) fn identity(&self) -> Value {
+        json!({"pid":self.pid,"processStart":self.process_start})
+    }
+
     fn during_startup(&self, observed: Instant) -> bool {
         observed.saturating_duration_since(self.since) <= STARTUP_WINDOW
     }
@@ -213,7 +217,7 @@ impl Running<'_> {
             return None;
         }
         if status.success() {
-            return Some(self.zero_evidence());
+            return Some(self.identity());
         }
         self.publish_exit(status);
         None
@@ -223,14 +227,10 @@ impl Running<'_> {
         if status.success() {
             // The create operation decides whether this launch passed its
             // final session confirmation. Preserve the evidence until then.
-            return Some(self.zero_evidence());
+            return Some(self.identity());
         }
         self.exited(status, observed);
         None
-    }
-
-    fn zero_evidence(&self) -> Value {
-        json!({"pid":self.pid,"processStart":self.process_start})
     }
 
     fn publish_exit(&self, status: ExitStatus) {

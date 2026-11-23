@@ -114,6 +114,38 @@ for line in sys.stdin:
         os.kill(pid, 0)
         self.assertEqual((self.root/'events').read_text().splitlines(), ['finish'])
 
+    def test_runtime_notice_reads_the_bound_private_pane(self):
+        secret = "private-herdr-screen-token"
+        self.worker.write_text(
+            f"import sys\nprint('Quota exceeded: {secret}', flush=True)\n"
+            "for line in sys.stdin:\n    pass\n"
+        )
+        self.dispatch()
+        self.env["WFC_HERDR_ENDPOINT"] = "/missing/different.sock"
+        wait = ('wait', '--scope', self.row['scope'], '--dispatch', self.dispatch_id)
+        notice, = self.cli(*wait, '--timeout', '4')['messages']
+        self.assertEqual((notice['kind'], notice['type'], notice['fault']['category'],
+                          notice['fault']['evidence']),
+                         ('host_runtime', 'blocked', 'quota', 'screen_notice'))
+        for key in ('scope', 'dispatch', 'round', 'attempt'):
+            self.assertEqual(notice[key], self.row[key])
+        status = self.status()
+        self.assertTrue(status['backendAlive'])
+        self.assertEqual(status['backendHandle']['pane'], self.h['pane'])
+        self.assertEqual(status['hostActivity']['state'], 'blocked')
+        self.assertNotIn(secret, json.dumps(status))
+        ack = self.cli('ack', notice['messageId'])
+        self.assertEqual((ack['state'], ack['statusVersion']), ('processed', 3))
+        quiet = self.cli(*wait, '--timeout', '1.25', error='"timedOut":true')
+        self.assertFalse(json.loads(quiet)['messages'])
+        self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+        self.assertFalse(self.status()['backendAlive'])
+        print(json.dumps({'case': 'runtime-herdr', 'protocol': self.service.api('ping')['protocol'],
+                          'dispatch': self.dispatch_id, 'attempt': notice['attempt'],
+                          'scope': notice['scope'], 'pane': self.h['pane'],
+                          'messageId': notice['messageId'], 'fault': notice['fault'],
+                          'ack': ack, 'closed': True}), flush=True)
+
     def test_claim_survives_lost_ack_and_reconcile(self):
         sends = []
         def lose(req, reply):
