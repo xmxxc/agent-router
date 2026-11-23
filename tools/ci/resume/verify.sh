@@ -4,6 +4,20 @@ set -euo pipefail
 
 group=${1:?test group required}
 case "$group" in
+    public-handoff)
+        fixture=tools/check_tmux.py
+        selectors=(
+            Backend.test_public_handoff_switches_host_once_in_the_same_round
+            Backend.test_public_handoff_requires_new_paths_after_done_and_preserves_receipts
+            Backend.test_public_handoff_refuses_stale_owner_and_foreign_tmux_binding
+            Backend.test_public_handoff_interruption_after_close_does_not_launch_twice
+            Backend.test_public_handoff_never_launches_while_the_original_writer_survives
+            Backend.test_public_handoff_blocks_owner_if_intent_cannot_be_published
+            Backend.test_public_resume_after_reclaim_preserves_history
+            Backend.test_public_reply_and_reclaim_preserve_controller_receipts
+            Backend.test_read_only_unowned_close_replays_confirmed_archive
+        )
+        ;;
     public-interrupt)
         fixture=tools/check_tmux.py
         selectors=(
