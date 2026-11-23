@@ -12,8 +12,9 @@ use uuid::Uuid;
 #[cfg(target_os = "linux")]
 mod opencode;
 #[cfg(target_os = "linux")]
-#[allow(unused_imports)] // The shared lifecycle will call the adoption adapter under its lock.
-pub(crate) use opencode::{adopt_opencode_session, OpencodeAdoption};
+pub(crate) use opencode::adoption::first_message as opencode_first_message;
+#[cfg(target_os = "linux")]
+pub(super) use opencode::adoption::preserve_pending as preserve_opencode_adoption;
 
 #[derive(Default)]
 pub struct Options<'a> {
@@ -386,7 +387,18 @@ impl Options<'_> {
                 } else {
                     a.extend(["--prompt".into(), brief]);
                 }
-                launch.env.insert("OPENCODE_CONFIG_CONTENT".into(),json!(json!({"permission":{"external_directory":{"*":"allow"},"read":{"*.env":"allow","*.env.*":"allow"}}}).to_string()));
+                #[allow(unused_mut)] // Only Linux offers the controlled first-launch hook.
+                let mut config = json!({
+                    "permission":{"external_directory":{"*":"allow"},
+                                  "read":{"*.env":"allow","*.env.*":"allow"}}
+                });
+                #[cfg(target_os = "linux")]
+                if original.is_none() && record["opencodeOpening"].is_object() {
+                    opencode::adoption::configure(state, &launch.env, record, &mut config)?;
+                }
+                launch
+                    .env
+                    .insert("OPENCODE_CONFIG_CONTENT".into(), json!(config.to_string()));
             }
             "claude" => {
                 a.extend([brief, "--permission-mode".into(), "auto".into()]);

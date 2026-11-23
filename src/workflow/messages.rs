@@ -506,6 +506,28 @@ pub(super) fn lock_for_publish(dir: &Path) -> Result<File> {
     Ok(lock)
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn lock_for_private_publish(dir: &Path) -> Result<File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let lock = private_file()
+        .create(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dir.join("messages.lock"))
+        .context("open private Inbox lock")?;
+    let info = lock.metadata()?;
+    ensure!(
+        info.is_file()
+            && info.nlink() == 1
+            && info.mode() & 0o777 == 0o600
+            && info.uid() == unsafe { libc::geteuid() },
+        "unsafe private Inbox lock"
+    );
+    lock.lock().context("lock controller messages")?;
+    Ok(lock)
+}
+
 pub(super) fn sync_directory(_dir: &Path) -> Result<()> {
     #[cfg(unix)]
     File::open(_dir)?.sync_all()?;

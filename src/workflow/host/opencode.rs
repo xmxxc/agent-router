@@ -1,4 +1,5 @@
 //! Proof of the OpenCode session that accepted an original worker launch.
+pub(super) mod adoption;
 #[cfg(test)]
 mod tests;
 
@@ -124,11 +125,20 @@ pub(crate) struct OpencodeAdoption<'a> {
     pub first_message: &'a str,
 }
 
-#[allow(dead_code)] // Wired by the shared resume transaction after host adoption is verified.
-pub(crate) fn adopt_opencode_session(
+#[cfg(test)]
+fn adopt_opencode_session(
     state: &Path,
     record: &mut Value,
     receipt: OpencodeAdoption<'_>,
+) -> Result<()> {
+    adopt_receipt(state, record, receipt, None)
+}
+
+fn adopt_receipt(
+    state: &Path,
+    record: &mut Value,
+    receipt: OpencodeAdoption<'_>,
+    hook_source: Option<StorageSource>,
 ) -> Result<()> {
     let opening = verify_opening(state, record)?;
     ensure!(
@@ -152,12 +162,19 @@ pub(crate) fn adopt_opencode_session(
         );
         Some(proof)
     };
+    let saved_source = previous.as_ref().map(|proof| proof.storage_source);
+    ensure!(
+        saved_source
+            .zip(hook_source)
+            .is_none_or(|(saved, hook)| saved == hook),
+        "OpenCode hook conflicts with the recorded storage source"
+    );
     let proof = verify_session(
         &opening,
         receipt.attempt,
         receipt.session,
         receipt.first_message,
-        previous.as_ref().map(|proof| proof.storage_source),
+        saved_source.or(hook_source),
     )?;
     ensure!(
         previous.as_ref().is_none_or(|previous| previous == &proof),
@@ -228,6 +245,7 @@ pub(super) fn prepare(
             configured.is_none(),
             "private OpenCode launch cannot use a configured database"
         );
+        adoption::prepare_state(state)?;
         let dispatch = record["dispatch"].as_str().context("missing dispatch")?;
         let attempt = record["attempt"].as_str().context("missing attempt")?;
         let cwd = PathBuf::from(record["cwd"].as_str().context("missing cwd")?);

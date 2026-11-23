@@ -17,7 +17,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let root = env::temp_dir().join(format!("wfc-opencode-{}", Uuid::new_v4()));
-        fs::create_dir(&root).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
         let root = root.canonicalize().unwrap();
         let cwd = root.join("checkout with space");
         fs::create_dir(&cwd).unwrap();
@@ -32,7 +32,8 @@ impl Fixture {
             store,
         };
         fixture.configure(
-            json!({"WFC_OPENCODE_ISOLATED_STORE":"1","OPENCODE_DB":"","WFC_OPENCODE_DB":""}),
+            json!({"WFC_OPENCODE_ISOLATED_STORE":"1","OPENCODE_DB":"","WFC_OPENCODE_DB":"",
+                   "OPENCODE_CONFIG_CONTENT":""}),
         );
         fixture
     }
@@ -91,9 +92,14 @@ impl Fixture {
         assert!(!record.to_string().contains(&brief));
         assert!(record["hostSession"].is_null());
         assert!(!self.store.exists());
+        let overlay: Value =
+            serde_json::from_str(launch.env["OPENCODE_CONFIG_CONTENT"].as_str().unwrap()).unwrap();
+        let plugin = self.store.with_file_name("wfc-adoption.mjs");
+        assert_eq!(overlay["plugin"][0][0], json!(plugin));
+        assert!(plugin.is_file());
         assert_eq!(
             fs::read_dir(self.store.parent().unwrap()).unwrap().count(),
-            0
+            3
         );
         (record, brief)
     }
