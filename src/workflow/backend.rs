@@ -283,7 +283,7 @@ fn closed_path(state: &Path, row: &Value) -> Result<PathBuf> {
     )))
 }
 
-fn archive(state: &Path, row: &Value) -> Result<Option<Value>> {
+pub(super) fn archive(state: &Path, row: &Value) -> Result<Option<Value>> {
     match File::open(closed_path(state, row)?) {
         Ok(f) => {
             let saved: Value = serde_json::from_reader(f)?;

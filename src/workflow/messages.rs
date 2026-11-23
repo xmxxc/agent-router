@@ -1,4 +1,4 @@
-//! A worker can retry a keyed completion. A controller claims a batch
+//! A worker can retry a keyed message. A controller claims a batch
 //! before printing it, so another waiter cannot deliver the same messages.
 mod receipt;
 #[cfg(target_os = "linux")]
@@ -20,38 +20,54 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub const DONE_USAGE: &str = "wfc done --report FILE [--attempt ID] [--message-id KEY]";
+pub const ASK_USAGE: &str =
+    "wfc ask QUESTION [--options CSV] [--attempt ID] [--callback-ref REF] [--message-id KEY]";
 pub const WAIT_USAGE: &str = "wfc wait [--timeout SECONDS] [--scope NAME] [--dispatch ID]";
 
 fn options<'a, const N: usize>(
     args: &'a [OsString],
     names: [&str; N],
-    mut positional: Option<&mut Option<&'a str>>,
+    mut positional: Option<(&mut Option<&'a str>, &str)>,
 ) -> Result<[Option<&'a str>; N]> {
     let mut values = [None; N];
     let mut tokens = args.iter();
+    let mut positional_only = false;
     while let Some(token) = tokens.next() {
         let flag = token.to_str().context("expected UTF-8 argument")?;
-        if let Some(slot) = positional.as_deref_mut() {
-            if !flag.starts_with('-') {
+        if let Some((slot, name)) = positional.as_mut() {
+            if flag == "--" && !positional_only {
+                positional_only = true;
+                continue;
+            }
+            if positional_only || !flag.starts_with('-') {
                 ensure!(
-                    !flag.is_empty() && slot.replace(flag).is_none(),
-                    "expected one message id"
+                    (!flag.is_empty() || *name == "question") && slot.replace(flag).is_none(),
+                    "expected one {name}"
                 );
                 continue;
             }
         }
+        let (flag, inline) = flag
+            .split_once('=')
+            .map_or((flag, None), |(flag, value)| (flag, Some(value)));
         let index = names
             .iter()
             .position(|name| flag == *name)
             .with_context(|| format!("unknown option {flag:?}"))?;
-        let value = tokens
-            .next()
-            .context("option requires a value")?
-            .to_str()
-            .context("expected UTF-8 option value")?;
-        ensure!(!value.is_empty() || flag == "--body", "empty option value");
+        let value = match inline {
+            Some(value) => value,
+            None => tokens
+                .next()
+                .context("option requires a value")?
+                .to_str()
+                .context("expected UTF-8 option value")?,
+        };
         ensure!(
-            positional.is_none() || !value.starts_with("--"),
+            !value.is_empty() || matches!(flag, "--body" | "--options"),
+            "empty option value"
+        );
+        ensure!(
+            inline.is_some() || positional.is_none() || !value.starts_with("--"),
             "option requires a value"
         );
         ensure!(
@@ -77,6 +93,14 @@ impl Identity {
         // Pre-scope receipts still have a stable, per-dispatch scope.
         self.scope.as_deref().unwrap_or(&self.dispatch)
     }
+
+    fn fields(&self) -> Map<String, Value> {
+        Map::from_iter([
+            ("attempt".into(), json!(self.attempt)),
+            ("role".into(), json!(self.role)),
+            ("round".into(), json!(self.round)),
+        ])
+    }
 }
 
 #[derive(Deserialize)]
@@ -87,6 +111,17 @@ struct Assignment {
     cwd: PathBuf,
     #[serde(rename = "controllerOwner")]
     controller_owner: Option<Value>,
+    #[serde(rename = "workerCallbackHash")]
+    callback_hash: Option<String>,
+    #[serde(default)]
+    host: Value,
+    #[cfg(target_os = "linux")]
+    #[serde(rename = "worker")]
+    process: Option<Value>,
+    #[serde(default)]
+    rounds: Value,
+    #[serde(default)]
+    messages: Value,
 }
 
 impl Assignment {
@@ -124,16 +159,48 @@ impl Assignment {
         );
         Ok(assignment)
     }
+
+    fn verify_callback(&self, reference: Option<&str>) -> Result<()> {
+        let secret = env::var_os("WFC_WORKER_CALLBACK").filter(|value| !value.is_empty());
+        if secret.is_some() || reference.is_some() {
+            // First-launch credentials bind directly to the assignment. A
+            // reference is for a later assignment in the same live session.
+            ensure!(
+                reference.is_none()
+                    && secret.as_deref().and_then(|v| v.to_str()).is_some_and(|v| {
+                        self.callback_hash.as_deref() == Some(body_hash(v).as_str())
+                    }),
+                "invalid_worker_callback"
+            );
+        }
+        Ok(())
+    }
+
+    fn execution_finished(&self, state: &Path) -> Result<bool> {
+        if self.host.is_string() {
+            return Ok(super::backend::archive(state, &json!(self.worker))?.is_some());
+        }
+        #[cfg(target_os = "linux")]
+        if self.process.is_some() {
+            let outcome =
+                super::worker_owner::status(&state.join("dispatches"), &json!(self.worker))?;
+            return Ok(outcome["state"] != "running");
+        }
+        Ok(false)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
-struct Completion {
+struct Message {
     id: u64,
     #[serde(rename = "messageId")]
     message_id: String,
     #[serde(flatten)]
     worker: Identity,
-    report: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    report: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    question_payload: Option<Question>,
     request_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     body_hash: Option<String>,
@@ -148,31 +215,98 @@ struct Completion {
     additional_fields: Map<String, Value>,
 }
 
-fn body_hash(body: &str) -> String {
+#[derive(Serialize, Deserialize)]
+struct Question {
+    text: String,
+    options: Vec<String>,
+}
+
+pub(super) fn body_hash(body: &str) -> String {
     format!("{:x}", Sha256::digest(body.as_bytes()))
 }
 
 fn canonical_body(body: Map<String, Value>) -> String {
     // Python #40 uses sorted keys, UTF-8, and a space after each separator.
-    // All done payload fields are scalar. Map iterates in sorted key order.
+    // Map iterates in sorted key order, and question options are strings.
     let fields: Vec<_> = body
         .into_iter()
-        .map(|(key, value)| format!("{}: {value}", json!(key)))
+        .map(|(key, value)| {
+            let value = match value {
+                Value::Array(items) => {
+                    let strings: Vec<_> = items.iter().map(Value::to_string).collect();
+                    format!("[{}]", strings.join(", "))
+                }
+                value => value.to_string(),
+            };
+            format!("{}: {value}", json!(key))
+        })
         .collect();
     format!("{{{}}}", fields.join(", "))
 }
 
-impl Completion {
-    fn original_body(&self) -> Map<String, Value> {
+impl Question {
+    fn fields(&self) -> Map<String, Value> {
         Map::from_iter([
-            ("attempt".into(), json!(self.worker.attempt)),
-            ("report".into(), json!(self.report)),
-            ("role".into(), json!(self.worker.role)),
-            ("round".into(), json!(self.worker.round)),
+            ("question".into(), json!(self.text)),
+            ("options".into(), json!(self.options)),
         ])
     }
 
+    fn body(&self, worker: &Identity) -> Map<String, Value> {
+        let mut body = worker.fields();
+        body.extend(self.fields());
+        body.insert("scope".into(), json!(worker.scope()));
+        body
+    }
+
+    fn key_suffix(&self) -> String {
+        use std::fmt::Write as _;
+
+        // The request key uses Python's default ASCII escaping, including
+        // surrogate pairs. The separately stored body digest uses UTF-8.
+        let mut ascii = String::new();
+        for c in canonical_body(self.fields()).chars() {
+            if c < '\u{7f}' {
+                ascii.push(c);
+            } else {
+                for &unit in c.encode_utf16(&mut [0; 2]).iter() {
+                    write!(ascii, "\\u{unit:04x}").unwrap();
+                }
+            }
+        }
+        body_hash(&ascii)[..16].to_owned()
+    }
+}
+
+impl Message {
+    fn new(id: u64, worker: Identity, request_key: Option<String>) -> Self {
+        Self {
+            id,
+            message_id: format!("m-{}", Uuid::new_v4().simple()),
+            worker,
+            report: None,
+            question_payload: None,
+            request_key,
+            body_hash: None,
+            delivery: Delivery::unsent(),
+            resolution: None,
+            created_at: Some(receipt::timestamp()),
+            additional_fields: Map::new(),
+        }
+    }
+
+    fn original_body(&self) -> Map<String, Value> {
+        let mut body = self.worker.fields();
+        if let Some(report) = &self.report {
+            body.insert("report".into(), json!(report));
+        }
+        body
+    }
+
     fn body(&self) -> Map<String, Value> {
+        if let Some(question) = &self.question_payload {
+            return question.body(&self.worker);
+        }
         let mut body = self.original_body();
         for key in ["head", "dirty"] {
             if let Some(value) = self.additional_fields.get(key) {
@@ -203,7 +337,8 @@ impl Completion {
         // request key on every row. Its rewrite dropped newer fields. Only
         // publication-time values count: later claims can bind a digest or
         // add null Git fields even on a genuine legacy row.
-        self.request_key.is_some()
+        self.report.is_some()
+            && self.request_key.is_some()
             && self.worker.scope.is_none()
             && self.created_at.is_none()
             && self
@@ -256,7 +391,14 @@ impl Completion {
             ("id".into(), json!(self.id)),
             ("messageId".into(), json!(self.message_id)),
             ("dispatch".into(), json!(self.worker.dispatch)),
-            ("type".into(), json!("done")),
+            (
+                "type".into(),
+                json!(if self.question_payload.is_some() {
+                    "question"
+                } else {
+                    "done"
+                }),
+            ),
             ("state".into(), json!(state)),
             ("statusVersion".into(), json!(version)),
         ]);
@@ -282,7 +424,7 @@ fn private_file() -> OpenOptions {
 
 struct Inbox {
     dir: PathBuf,
-    messages: Vec<Completion>,
+    messages: Vec<Message>,
     // The lock lives on a stable file because save replaces the data file.
     _lock: File,
 }
@@ -300,13 +442,18 @@ impl Inbox {
         let path = dir.join("messages.json");
         match File::open(&path) {
             Ok(file) => {
-                let mut messages: Vec<Completion> = serde_json::from_reader(BufReader::new(file))
+                let mut messages: Vec<Message> = serde_json::from_reader(BufReader::new(file))
                     .context("read controller messages")?;
                 // The first scoped wait on an unclaimed pre-snapshot completion
                 // supplies an unknown Git snapshot. Preserve an already bound
                 // body (including the earlier four-field form) byte for byte.
                 for m in &mut messages {
-                    if m.delivery.legacy_unclaimed
+                    ensure!(
+                        m.report.is_some() != m.question_payload.is_some(),
+                        "invalid controller message payload"
+                    );
+                    if m.report.is_some()
+                        && m.delivery.legacy_unclaimed
                         && m.body_hash.is_none()
                         && m.worker.scope.is_none()
                         && !m.additional_fields.contains_key("head")
@@ -384,14 +531,14 @@ impl Inbox {
         let history = || {
             self.messages
                 .iter()
-                .filter(|m| m.worker.dispatch == worker.dispatch)
+                .filter(|m| m.worker.dispatch == worker.dispatch && m.report.is_some())
         };
-        let prior = key.and_then(|key| history().find(|m| m.request_key.as_deref() == Some(key)));
+        let prior = key.and_then(|key| self.prior(&worker.dispatch, key));
         if let (Some(key), Some(prior)) = (key, prior) {
             ensure!(
                 prior.worker.attempt == worker.attempt
                     && prior.worker.round == worker.round
-                    && prior.report == report,
+                    && prior.report.as_deref() == Some(report),
                 "message request {key} conflicts with an existing receipt"
             );
         }
@@ -400,7 +547,7 @@ impl Inbox {
         if let Some(bound) = assignment
             .report
             .as_deref()
-            .or_else(|| previous.map(|m| m.report.as_path()))
+            .or_else(|| previous.and_then(|m| m.report.as_deref()))
         {
             ensure!(
                 report == bound,
@@ -422,7 +569,7 @@ impl Inbox {
             ensure!(
                 !history().any(|m| (m.worker.round != worker.round
                     || m.worker.attempt != worker.attempt)
-                    && m.report == report),
+                    && m.report.as_deref() == Some(report)),
                 "ambiguous report for {}; supply --attempt",
                 worker.dispatch
             );
@@ -437,6 +584,20 @@ impl Inbox {
             );
         }
         Ok(None)
+    }
+
+    fn prior(&self, dispatch: &str, key: &str) -> Option<&Message> {
+        self.messages
+            .iter()
+            .find(|m| m.worker.dispatch == dispatch && m.request_key.as_deref() == Some(key))
+    }
+
+    fn publish(&mut self, mut message: Message) -> Result<Value> {
+        message.body_hash = Some(message.computed_hash());
+        let receipt = message.receipt(false);
+        self.messages.push(message);
+        self.save()?;
+        Ok(receipt)
     }
 
     fn save(&self) -> Result<()> {
@@ -514,6 +675,7 @@ impl<'a> Done<'a> {
         let check = || {
             let inbox = Inbox::open(&state)?;
             let assignment = Assignment::current(&state, &dispatch, self.attempt)?;
+            assignment.verify_callback(None)?;
             // R1 dispatches had neither field and derived the default key from
             // the worker's launch environment. Assignment::current checked it.
             let r1_worker = assignment.report.is_none()
@@ -549,25 +711,125 @@ impl<'a> Done<'a> {
         if let Some(receipt) = duplicate {
             return Ok(receipt);
         }
-        let mut message = Completion {
-            id: inbox.messages.len() as u64 + 1,
-            message_id: format!("m-{}", Uuid::new_v4().simple()),
-            worker: current.worker,
-            report,
-            request_key: key,
-            body_hash: None,
-            delivery: Delivery::unsent(),
-            resolution: None,
-            created_at: Some(receipt::timestamp()),
-            additional_fields: Map::from_iter([
-                ("head".into(), json!(snapshot.head)),
-                ("dirty".into(), json!(snapshot.dirty)),
-            ]),
+        let mut message = Message::new(inbox.messages.len() as u64 + 1, current.worker, key);
+        message.report = Some(report);
+        message.additional_fields = Map::from_iter([
+            ("head".into(), json!(snapshot.head)),
+            ("dirty".into(), json!(snapshot.dirty)),
+        ]);
+        inbox.publish(message).context("publish completion")
+    }
+}
+
+pub struct Ask<'a> {
+    question: &'a str,
+    csv: Option<&'a str>,
+    attempt: Option<&'a str>,
+    reference: Option<&'a str>,
+    key: Option<&'a str>,
+}
+
+impl<'a> Ask<'a> {
+    pub fn parse(args: &'a [OsString]) -> Result<Self> {
+        let mut question = None;
+        let [csv, attempt, reference, key] = options(
+            args,
+            ["--options", "--attempt", "--callback-ref", "--message-id"],
+            Some((&mut question, "question")),
+        )?;
+        Ok(Self {
+            question: question.context("missing question")?,
+            csv,
+            attempt,
+            reference,
+            key,
+        })
+    }
+
+    pub fn run(self) -> Result<Value> {
+        let state = state_dir()?;
+        let dispatch = env::var("WFC_DISPATCH")
+            .context("run ask inside a dispatched worker (WFC_DISPATCH)")?;
+        ensure!(valid_id(&dispatch), "invalid dispatch ID");
+        let mut inbox = Inbox::open(&state)?;
+        let assignment = Assignment::current(&state, &dispatch, self.attempt)?;
+        assignment.verify_callback(self.reference)?;
+        let worker = &assignment.worker;
+        ensure!(
+            env::var_os("WFC_SCOPE").is_none_or(|v| v.to_str() == Some(worker.scope())),
+            "scope mismatch for {dispatch}"
+        );
+        let payload = Question {
+            text: self.question.to_owned(),
+            options: self
+                .csv
+                .unwrap_or_default()
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect(),
         };
-        message.body_hash = Some(message.computed_hash());
-        let receipt = message.receipt(false);
-        inbox.messages.push(message);
-        inbox.save().context("publish completion")?;
+        let key = self.key.map(str::to_owned).or_else(|| {
+            self.attempt
+                .map(|id| format!("ask:{dispatch}:{id}:{}", payload.key_suffix()))
+        });
+        if let Some((key, prior)) = key
+            .as_deref()
+            .and_then(|key| inbox.prior(&dispatch, key).map(|prior| (key, prior)))
+        {
+            ensure!(
+                prior.question_payload.is_some()
+                    && prior.matches_hash(&body_hash(&canonical_body(payload.body(worker)))),
+                "message request {key} conflicts with an existing receipt"
+            );
+            inbox.sync_directory().context("sync question receipt")?;
+            return Ok(prior.receipt(true));
+        }
+        let rounds = assignment.rounds.as_array().into_iter().flatten();
+        ensure!(
+            self.attempt.is_some()
+                || (worker.round == 1
+                    && !rounds.clone().any(|r| {
+                        !r["attempt"].is_null()
+                            && r["attempt"] != worker.attempt
+                            && r["report"] == json!(assignment.report)
+                    })
+                    && !inbox.messages.iter().any(|m| {
+                        m.worker.dispatch == dispatch
+                            && m.worker.round == 1
+                            && m.worker.attempt != worker.attempt
+                    })),
+            "attempt is no longer accepted for {dispatch}; supply --attempt"
+        );
+        let current_round = rounds
+            .filter(|r| r["round"] == worker.round && r["attempt"] == worker.attempt)
+            .last();
+        let confirmed_done = inbox.messages.iter().any(|m| {
+            m.worker.dispatch == dispatch
+                && m.worker.round == worker.round
+                && m.worker.attempt == worker.attempt
+                && m.report.is_some()
+        }) || assignment
+            .messages
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|m| {
+                m["type"] == "done"
+                    && m["dispatch"] == dispatch
+                    && m["round"] == worker.round
+                    && m["attempt"] == worker.attempt
+            });
+        ensure!(
+            !confirmed_done
+                && current_round.map_or(worker.round == 1, |r| r["state"] == "running")
+                && !assignment.execution_finished(&state)?,
+            "attempt is no longer accepted for {dispatch}; its round is not running"
+        );
+        let mut message = Message::new(inbox.messages.len() as u64 + 1, assignment.worker, key);
+        message.question_payload = Some(payload);
+        let mut receipt = inbox.publish(message).context("publish question")?;
+        receipt["next"] = json!("End your turn now; the answer arrives as your next message.");
         Ok(receipt)
     }
 }

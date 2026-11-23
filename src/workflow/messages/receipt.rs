@@ -1,6 +1,6 @@
 //! Receipt transitions and operator evidence. The caller holds the inbox lock
 //! from lookup until the updated receipt and its evidence are published.
-use super::{options, Completion, Inbox};
+use super::{options, Inbox, Message};
 use crate::workflow::state_dir;
 use anyhow::{bail, ensure, Context, Result};
 use chrono::Local;
@@ -117,7 +117,7 @@ impl<'a> Confirm<'a> {
     pub fn parse(command: &str, args: &'a [OsString]) -> Result<Self> {
         let mut id = None;
         let action = if command == "ack" {
-            let [body] = options(args, ["--body"], Some(&mut id))?;
+            let [body] = options(args, ["--body"], Some((&mut id, "message id")))?;
             Confirmation::Ack { body }
         } else {
             let [actor, source, reason, evidence, hash] = options(
@@ -129,7 +129,7 @@ impl<'a> Confirm<'a> {
                     "--evidence",
                     "--body-hash",
                 ],
-                Some(&mut id),
+                Some((&mut id, "message id")),
             )?;
             let required = |value: Option<&'a str>, name| -> Result<String> {
                 Ok(value
@@ -180,7 +180,7 @@ impl<'a> Confirm<'a> {
 }
 
 impl Confirmation<'_> {
-    fn apply(self, message: &mut Completion, earlier: &[Completion]) -> Result<bool> {
+    fn apply(self, message: &mut Message, earlier: &[Message]) -> Result<bool> {
         match self {
             Self::Ack { body } => {
                 ensure!(message.delivery.delivered(), "ACK requires received");

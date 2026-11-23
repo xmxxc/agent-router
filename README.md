@@ -79,6 +79,8 @@ wfc status --dispatch ID
 ```sh
 # worker 写好报告后提交，可用同一条命令安全重试
 wfc done --report "$WFC_REPORT" --attempt "$WFC_ATTEMPT"
+# worker 需要总控决定时发问
+wfc ask "先检查哪项？" --options "构建,测试" --attempt "$WFC_ATTEMPT"
 # 总控领取派发到 team-a 的消息
 wfc wait --scope team-a --timeout 30
 ```
@@ -87,7 +89,9 @@ wfc wait --scope team-a --timeout 30
 
 显式传入 `--attempt ID` 时，默认重试键为 `done:<dispatch>:<attempt>`；也可自定 `--message-id KEY`。同一派发、同一键与相同报告重试，返回原数字编号 `message` 和稳定编号 `messageId`，标记 `duplicate: true`，保留该消息首次采集的 Git 快照。不同键分别创建消息。旧式调用可只设置 `WFC_DISPATCH`，新派发同时省略两个选项时，每次调用各产生一条消息。升级前尚无报告绑定和 scope 的 R1 派发，worker 保留原启动环境并重试原命令时，会取回原编号和领取状态。跨轮复用报告路径或轮次历史不全时，应传入本轮的 `--attempt`。
 
-`wait` 默认等待 3600 秒，`--timeout` 接受小数秒，设为 0 可立即查询。它按提交顺序返回 `messages`，包含派发、轮次、attempt、角色、scope、报告路径、Git 快照、数字编号 `id` 和 `messageId`。可按 `--scope NAME`、`--dispatch ID` 或两者共同筛选。首次提交为 `unsent`（版本 1），领取为 `received`（版本 2）。消息在输出前标记为已收取，其他等待者可领取剩余消息。超时返回 `{"messages":[],"timedOut":true}`，退出码为 3。
+`ask` 把问题交给派发所属的总控组。`--options` 按逗号拆分并去掉空项，省略时为空列表。显式提供 `--attempt` 时，相同问题和选项重试会取回原编号。也可用 `--message-id` 自定键，同一派发内用同一键提交不同内容会报冲突。任务存活并等待答复时，状态显示 `asking` 和 `waiting-human`。
+
+`wait` 默认等待 3600 秒，`--timeout` 接受小数秒，设为 0 可立即查询。它按提交顺序返回 `messages`，包含派发、轮次、attempt、角色、scope、数字编号 `id` 和 `messageId`。报告消息包含路径和 Git 快照，问题消息包含 `question` 和 `options`。可按 `--scope NAME`、`--dispatch ID` 或两者共同筛选。首次提交为 `unsent`（版本 1），领取为 `received`（版本 2）。消息在输出前标记为已收取，其他等待者可领取剩余消息。超时返回 `{"messages":[],"timedOut":true}`，退出码为 3。
 
 总控重启后，运行 `wfc status --dispatch ID`，从 `dispatches[0].messages` 找回原消息。历史按提交顺序排列，查询不会改变回执。处理完报告后，用消息的数字编号或稳定编号运行 `wfc ack MESSAGE`。回执变为 `processed`，版本增加一次。并发确认时只有一个调用实际推进状态，其余调用和稍后的重试返回同一版本，并标记 `duplicate: true`。
 

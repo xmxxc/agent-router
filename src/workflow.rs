@@ -318,6 +318,7 @@ impl<'a> Dispatch<'a> {
         fs::rename(&pending, records.join(format!("{dispatch}.json"))).with_context(|| {
             format!("worker succeeded but publishing dispatch {dispatch} failed")
         })?;
+        record.as_object_mut().unwrap().remove("workerCallbackHash");
         Ok(record)
     }
 }
@@ -486,6 +487,7 @@ fn status_with_history(
     let mut undelivered = Vec::new();
     let mut reclaimable = Vec::new();
     for record in &mut dispatches {
+        record.as_object_mut().unwrap().remove("workerCallbackHash");
         if record["createPending"] == true && record["publicationDiagnostic"].is_string() {
             record["worker"] = json!({"state":"unknown"});
             record["backendResult"] = json!("uncertain");

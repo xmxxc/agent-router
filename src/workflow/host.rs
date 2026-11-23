@@ -235,7 +235,10 @@ impl Options<'_> {
                 .to_owned(),
         ];
         let task = record["task"].as_str().context("missing task")?;
-        let brief = format!("You are a worker dispatched by the controller (dispatch {}). Read and do the task in {}. Stop any server or background process you started before reporting. Write the report to {}. Run \"$WFC_BIN\" done --report \"$WFC_REPORT\" --attempt \"$WFC_ATTEMPT\".", record["dispatch"].as_str().context("missing dispatch")?, task, report.display());
+        let brief = format!(
+            "You are a worker dispatched by the controller (dispatch {}). Read and do the task in {}. Stop any server or background process you started before reporting. Write the report to {}. Run \"$WFC_BIN\" done --report \"$WFC_REPORT\" --attempt \"$WFC_ATTEMPT\". If you need a decision, run \"$WFC_BIN\" ask \"<question>\" [--options a,b] --attempt \"$WFC_ATTEMPT\" and end your turn. The answer arrives as your next message.",
+            record["dispatch"].as_str().context("missing dispatch")?, task, report.display()
+        );
         let path = self.config.map(PathBuf::from).or_else(|| {
             env::var_os("WFC_LAUNCH_CONFIG")
                 .filter(|p| !p.is_empty())
@@ -369,6 +372,11 @@ impl Options<'_> {
         launch
             .env
             .insert("WFC_BIN".into(), json!(env::current_exe()?));
+        let callback = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        record["workerCallbackHash"] = json!(super::messages::body_hash(&callback));
+        launch
+            .env
+            .insert("WFC_WORKER_CALLBACK".into(), json!(callback));
         Ok(launch)
     }
 }
