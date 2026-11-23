@@ -275,7 +275,7 @@ fn submit(
             controller::Owners::read(state)?.require(scope, token, "reply")?;
             match row["backend"].as_str() {
                 Some("tmux") => {
-                    if let Some(_input_lock) = assignment::try_reply_lock(state, row)? {
+                    if let Some(_input_lock) = assignment::try_attempt_lock(state, row)? {
                         ensure!(
                             backend::archive(state, row)?.is_none(),
                             "execution resources are closing or closed"

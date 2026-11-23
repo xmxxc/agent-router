@@ -143,6 +143,25 @@ fn record<'a>(snapshot: &'a Value, list: &str, key: &str, id: &str) -> Result<Op
     Ok(found)
 }
 
+/// Evidence about the pane from the bound Herdr service.
+pub enum PaneObservation {
+    Present { writer_alive: bool },
+    Stopped,
+    MissingWithLiveWriter,
+}
+
+impl PaneObservation {
+    fn presence(self) -> Result<(bool, bool)> {
+        match self {
+            Self::Present { writer_alive } => Ok((true, writer_alive)),
+            Self::Stopped => Ok((false, false)),
+            Self::MissingWithLiveWriter => {
+                Err(Failure::unknown("writer survives missing Herdr pane"))
+            }
+        }
+    }
+}
+
 impl Handle {
     /// Call once for a reserved create. Failure after workspace creation keeps
     /// the last checkpoint pending. Only observation may be retried.
@@ -372,21 +391,27 @@ impl Handle {
 
     /// Returns false only when every recorded writer has positively stopped.
     pub fn inspect(&mut self, save: impl FnMut(&Self) -> std::io::Result<()>) -> Result<bool> {
-        self.observe(save).map(|(_, live)| live)
+        self.observe(save)?.presence().map(|(_, live)| live)
     }
 
     /// Checks the original pane or writers without changing the saved binding.
     pub fn resource_present(&mut self) -> Result<bool> {
-        self.observe(|_| Ok(()))
+        self.observe_pane()?
+            .presence()
             .map(|(present, live)| present || live)
+    }
+
+    /// Read the bound pane's identity without changing the saved binding.
+    pub fn observe_pane(&mut self) -> Result<PaneObservation> {
+        self.observe(|_| Ok(()))
     }
 
     fn observe(
         &mut self,
         mut save: impl FnMut(&Self) -> std::io::Result<()>,
-    ) -> Result<(bool, bool)> {
+    ) -> Result<PaneObservation> {
         if self.verified_stopped()? {
-            return Ok((false, false));
+            return Ok(PaneObservation::Stopped);
         }
         let observation = (|| {
             let rpc = self.session()?;
@@ -395,29 +420,38 @@ impl Handle {
                 self.checkpoint_writers(&rpc, &mut save)?;
             }
             let live = self.writers_alive()?;
-            if live && !present {
-                return Err(Failure::unknown("writer survives missing Herdr pane"));
-            }
-            Ok((present, live))
+            Ok(match (present, live) {
+                (true, writer_alive) => PaneObservation::Present { writer_alive },
+                (false, true) => PaneObservation::MissingWithLiveWriter,
+                (false, false) => PaneObservation::Stopped,
+            })
         })();
-        observation.map_err(|err| match err.kind {
+        observation.map_err(|err: Failure| match err.kind {
             FailureKind::DefinitelyNotSent => Failure::unknown(err.diagnostic),
             _ => err,
         })
     }
 
     pub fn read(&self) -> Result<Screen> {
-        self.read_screen("text")
+        self.read_screen("text", None)
     }
 
     fn read_ansi(&self) -> Result<Screen> {
-        self.read_screen("ansi")
+        self.read_screen("ansi", None)
     }
 
-    fn read_screen(&self, format: &str) -> Result<Screen> {
+    /// Report when the bound pane.read frame is sent and when its exchange ends.
+    pub fn read_with_progress(&self, progress: Option<&mut dyn FnMut(bool)>) -> Result<Screen> {
+        self.read_screen("text", progress)
+    }
+
+    fn read_screen(&self, format: &str, progress: Option<&mut dyn FnMut(bool)>) -> Result<Screen> {
         let rpc = self.session()?;
         self.guarded(&rpc, false)?;
-        let data = rpc.call("pane.read",json!({"pane_id":self.pane,"source":"recent","format":format,"strip_ansi":format != "ansi","lines":200}))?;
+        let data = rpc.read_pane(
+            json!({"pane_id":self.pane,"source":"recent","format":format,"strip_ansi":format != "ansi","lines":200}),
+            progress,
+        )?;
         if data["read"]["pane_id"].as_str() != self.pane.as_deref()
             || data["read"]["workspace_id"].as_str() != self.workspace.as_deref()
             || (format == "ansi"

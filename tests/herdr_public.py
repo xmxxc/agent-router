@@ -3,9 +3,13 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
+import threading
+import time
 import unittest
+import uuid
 
 # Both suites use the same isolated Herdr server, fault proxy and child reaper.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'crates/herdr/tests'))
@@ -117,6 +121,262 @@ for line in sys.stdin:
         os.kill(pid, 0)
         self.assertEqual((self.root/'events').read_text().splitlines(), ['finish'])
 
+    def test_runtime_read_evidence_and_independent_recovery(self):
+        hold = threading.Event()
+        hide_pane = threading.Event()
+        hold_snapshot = threading.Event()
+        requests = []
+        hidden = []
+        stalled_snapshots = []
+        methods = []
+        withheld = []
+        peer_closed = []
+        trace = []
+        started = time.monotonic()
+        self.addCleanup(lambda: print(json.dumps({"case": "herdr-recovery-request-trace",
+                                                   "events": trace[-64:]}), flush=True))
+        secret = "private-herdr-transport-token"
+        screen = self.root / "screen"
+        screen.write_text("Ready.")
+        self.worker.write_text(r"""
+import time
+from pathlib import Path
+last = None
+while True:
+    text = Path("screen").read_text()
+    if text != last:
+        print("\x1b[2J\x1b[H" + text, flush=True)
+        last = text
+    time.sleep(.025)
+""")
+        self.env["WFC_MAX_TURN_SECONDS"] = "0"
+
+        def record(req, phase):
+            trace.append({"method": req["method"], "requestId": req["id"],
+                          "phase": phase, "ms": int((time.monotonic() - started) * 1000)})
+
+        def read_request(stream):
+            frame = stream.readline()
+            if not frame:
+                return None
+            req = json.loads(frame)
+            methods.append(req["method"])
+            poller = select.poll()
+            poller.register(stream, select.POLLHUP)
+            if any(flags & select.POLLHUP for _, flags in poller.poll(0)):
+                self.assertEqual(stream.read(1), b"", "a closed client carried another frame")
+                record(req, "closed_before_forward")
+                return None
+            if req["method"] == "session.snapshot" and hold_snapshot.is_set():
+                record(req, "snapshot_withheld_before_read")
+                stalled_snapshots.append(req["id"])
+                poller.modify(stream, select.POLLIN | select.POLLHUP)
+                self.assertTrue(poller.poll(3000), "the snapshot probe did not close its connection")
+                self.assertEqual(stream.read(1), b"")
+                return None
+            if req["method"] != "pane.read":
+                return frame
+            pane = req["params"]["pane_id"]
+            key = (req["id"], pane)
+            requests.append(key)
+            if not hold.is_set():
+                return frame
+            # Forward the actual request once, then withhold only this reply.
+            reply = json.loads(live.exchange(self.service.endpoint, req))
+            self.assertEqual(reply["id"], req["id"])
+            self.assertEqual(reply["result"]["type"], "pane_read")
+            self.assertEqual(reply["result"]["read"]["pane_id"], pane)
+            withheld.append(key)
+            record(req, "withheld")
+
+            # Each probe owns its deadline. Releasing only when the outer
+            # wait exits would queue a later probe behind the withheld reply.
+            poller.modify(stream, select.POLLIN | select.POLLHUP)
+            self.assertTrue(poller.poll(3000), "the timed probe did not close its connection")
+            self.assertEqual(stream.read(1), b"", "a withheld connection carried another frame")
+            peer_closed.append(key)
+            record(req, "peer_closed")
+            return None
+
+        def observe_reply(req, reply):
+            if req["method"] == "session.snapshot" and hide_pane.is_set():
+                snapshot = reply["result"]["snapshot"]
+                panes = snapshot["panes"]
+                snapshot["panes"] = [p for p in panes if p["pane_id"] != self.h["pane"]]
+                self.assertEqual(len(panes) - len(snapshot["panes"]), 1)
+                hidden.append(req["id"])
+                record(req, "bound_pane_absent")
+            if req["method"] == "pane.read":
+                record(req, "reply")
+            return reply
+
+        def run_wait(timeout, quiet=False):
+            args = ("wait", "--scope", self.row["scope"], "--dispatch", self.dispatch_id,
+                    "--stall-after", "0", "--timeout", timeout)
+            result = self.cli(*args, error='"timedOut":true' if quiet else None)
+            return json.loads(result)["messages"] if quiet else result["messages"]
+
+        def slow_wait(timeout, quiet=False, may_retry=False):
+            start = len(withheld)
+            hold.set()
+            try:
+                messages = run_wait(timeout, quiet)
+            finally:
+                hold.clear()
+            # The proxy serves one connection at a time. A fresh private ping
+            # proves it drained earlier connections before checking their EOFs.
+            ping = {"id": uuid.uuid4().hex, "method": "ping", "params": {}}
+            pong = json.loads(live.exchange(endpoint, ping))
+            self.assertEqual(pong["id"], ping["id"])
+            self.assertEqual(pong["result"]["type"], "pong")
+            record(ping, "proxy_drained")
+            reads = withheld[start:]
+            self.assertTrue(reads, "the bound pane.read reached Herdr")
+            if not may_retry:
+                self.assertEqual(len(reads), 1)
+            self.assertTrue(all(pane == self.h["pane"] for _, pane in reads))
+            self.assertEqual(peer_closed[start:], reads)
+            return messages
+
+        def show(text):
+            tmp = screen.with_suffix(".tmp")
+            tmp.write_text(text)
+            tmp.replace(screen)
+            live.wait_for(lambda: text in self.service.api("pane.read", pane_id=self.h["pane"],
+                source="recent", format="text", strip_ansi=True, lines=10)["read"]["text"])
+
+        def ack(notice):
+            for key in ("scope", "dispatch", "round", "attempt"):
+                self.assertEqual(notice[key], self.row[key])
+            first = self.cli("ack", notice["messageId"])
+            self.assertEqual((first["state"], first["statusVersion"]), ("processed", 3))
+            self.assertTrue(self.cli("ack", notice["messageId"])["duplicate"])
+
+        def verify(notices, expected):
+            self.assertEqual([m["fault"]["evidence"] for m in notices], expected)
+            self.assertNotIn(secret, json.dumps(notices))
+            for message in notices:
+                ack(message)
+
+        with self.service.fault_proxy(observe_reply, read_frame=read_request) as endpoint:
+            self.dispatch(endpoint=endpoint)
+            hide_pane.set()
+            self.assertFalse(run_wait("1.4", quiet=True))
+            self.assertTrue(hidden)
+            self.assertFalse(requests, "a missing pane has no valid pane.read request")
+            hide_pane.clear()
+            self.assertFalse(run_wait("1.4", quiet=True))
+            self.assertTrue(requests, "the original bound pane was read successfully")
+            state = Path(self.env["WFC_STATE"])
+            watch = state / "dispatches" / f"{self.dispatch_id}.host-watch"
+            execution = json.loads(watch.read_text())["execution"]
+            self.assertTrue(execution)
+
+            def absence():
+                previous_requests, previous_hidden = len(requests), len(hidden)
+                hide_pane.set()
+                notices = run_wait("3")
+                verify(notices, ["backend_unavailable"])
+                self.assertEqual(self.status()["hostActivity"]["readState"], "unavailable")
+                self.assertFalse(run_wait("1.4", quiet=True))
+                self.assertEqual(len(requests), previous_requests)
+                self.assertGreater(len(hidden), previous_hidden)
+                hide_pane.clear()
+                restored = run_wait("3")
+                verify(restored, ["read_restored"])
+                self.assertEqual(self.status()["hostActivity"]["readState"], "readable")
+                self.assertEqual(json.loads(watch.read_text())["execution"], execution)
+                return notices[0]["messageId"], restored[0]["messageId"]
+
+            absent, restored = absence()
+            absent_again, restored_again = absence()
+            self.assertEqual(len({absent, restored, absent_again, restored_again}), 4)
+
+            # A reply from a different peer at the exact path cannot prove absence.
+            self.assertEqual(self.h["service"]["pid"], os.getpid())
+            self.assertNotEqual(self.h["service"]["pid"], self.service.server.pid)
+            proxy_backup = endpoint.with_suffix(".held")
+            endpoint.rename(proxy_backup)
+            try:
+                self.service.endpoint.rename(endpoint)
+                try:
+                    self.assertFalse(run_wait("1.4", quiet=True))
+                finally:
+                    endpoint.rename(self.service.endpoint)
+            finally:
+                proxy_backup.rename(endpoint)
+
+            previous_requests = len(requests)
+            hold_snapshot.set()
+            try:
+                self.assertFalse(run_wait("1.4", quiet=True))
+            finally:
+                hold_snapshot.clear()
+            self.assertTrue(stalled_snapshots)
+            self.assertEqual(len(requests), previous_requests)
+            lockfile = state / "dispatches" / f"{self.dispatch_id}.herdr-lock"
+            start = len(requests)
+            rpc_count = len(methods)
+            with lockfile.open("rb") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                self.assertFalse(run_wait("1.4", quiet=True))
+                self.assertEqual(len(methods), rpc_count)
+                self.assertEqual(len(requests), start)
+            self.assertFalse(run_wait(".55", quiet=True))
+            self.assertGreater(len(requests), start)
+            self.assertFalse(slow_wait(".65", quiet=True))
+            first = slow_wait("3")
+            verify(first, ["backend_unavailable"])
+            self.assertFalse(slow_wait("1.4", quiet=True, may_retry=True))
+
+            show(f"Quota exceeded: {secret}")
+            before = len(trace)
+            quota_restored = run_wait("3")
+            self.assertTrue(any(event["phase"] == "reply" for event in trace[before:]),
+                            "the proxy accepted a fresh pane.read after the clipped retries")
+            verify(quota_restored, ["screen_notice", "read_restored"])
+            quota = self.status()["hostActivity"]
+            self.assertEqual((quota["state"], quota["fault"]["category"], quota["readState"]),
+                             ("blocked", "quota", "readable"))
+            again = slow_wait("3")
+            verify(again, ["backend_unavailable"])
+            self.assertNotEqual(first[0]["messageId"], again[0]["messageId"])
+            self.assertEqual(len({req_id for req_id, _ in requests}), len(requests))
+            self.assertEqual(self.status()["hostActivity"]["readState"], "unavailable")
+
+            ledger = state / "messages.json"
+            messages = json.loads(ledger.read_text())
+            question = {key: self.row[key] for key in ("dispatch", "scope", "round", "attempt", "role")}
+            messages.append(dict(question, type="question", id=len(messages) + 1, messageId="m-test-question",
+                                 state="processed", statusVersion=3,
+                                 question_payload={"text": "private pending answer", "options": []}))
+            pending = ledger.with_suffix(".tmp")
+            pending.write_text(json.dumps(messages))
+            pending.replace(ledger)
+            show(f"Approval required: {secret}")
+            permission_restored = run_wait("3")
+            verify(permission_restored, ["screen_notice", "read_restored"])
+            activity = self.status()["hostActivity"]
+            self.assertEqual((activity["state"], activity["fault"]["category"], activity["readState"],
+                              activity["awaitingAnswer"]),
+                             ("awaiting_permission", "permission_required", "readable", True))
+            self.assertFalse(run_wait(".55", quiet=True))
+            self.assertNotIn(secret, ledger.read_text())
+            self.assertEqual(self.cli("close", self.dispatch_id)["result"], "completed")
+            hide_pane.set()
+            self.assertFalse(run_wait("1.4", quiet=True))
+            print(json.dumps({"case": "herdr-transport-classification", "dispatch": self.dispatch_id,
+                              "snapshotAbsence": [absent, absent_again],
+                              "snapshotRestoration": [restored, restored_again],
+                              "sideServiceSilent": True, "unprovedReadSilent": True,
+                              "closedSilent": True,
+                              "attempt": self.row["attempt"], "pane": self.h["pane"],
+                              "busyIssuedNoRequest": True, "clippedReadSilent": True,
+                              "slowReadReceipts": [first[0]["messageId"], again[0]["messageId"]],
+                              "quotaRestored": quota_restored[-1]["messageId"],
+                              "permissionRestored": permission_restored[-1]["messageId"],
+                              "pendingAnswerPreserved": True, "close": "completed"}), flush=True)
+
     def test_reclaim_uses_verified_herdr_close_and_keeps_sibling(self):
         self.dispatch()
         sibling, pid = self.sibling()
@@ -222,7 +482,7 @@ for line in sys.stdin:
     def reply_attempts(self):
         return [m for m in self.status()['messages'] if m['type'] == 'reply']
 
-    def assert_reply_worker_finished(self, question, outcome, earlier=()):
+    def assert_reply_worker_finished(self, question, outcome, earlier=(), *, question_received=False):
         replies = self.reply_attempts()
         self.assertEqual([m['inputResult'] for m in replies], [*earlier, outcome])
         reply = replies[-1]
@@ -234,8 +494,9 @@ for line in sys.stdin:
         accepted = self.root/'accepted'
         received = live.wait_for(lambda: accepted.exists() and accepted.read_text())
         self.assertEqual(received.splitlines(), [f"[router] Answer to question {question['message']}: once"])
-        first, = self.cli('wait', '--scope', self.row['scope'], '--timeout', 0)['messages']
-        self.assertEqual(first['type'], 'question')
+        if not question_received:
+            first, = self.cli('wait', '--scope', self.row['scope'], '--timeout', 0)['messages']
+            self.assertEqual(first['type'], 'question')
         (self.root/'finish').touch()
         done, = self.cli('wait', '--scope', self.row['scope'], '--timeout', 8)['messages']
         self.assertEqual((done['type'], done['attempt']), ('done', self.row['attempt']))
@@ -389,6 +650,9 @@ for line in sys.stdin:
         sends = []
         expiring = False
         lose_receipt = False
+        hide_pane = False
+        sent_input = threading.Event()
+        release_input = threading.Event()
 
         def read_frame(stream):
             frame = stream.readline()
@@ -403,12 +667,32 @@ for line in sys.stdin:
             if method in ('pane.send_input', 'pane.send_keys'):
                 sends.append(method)
                 if lose_receipt:
+                    sent_input.set()
+                    self.assertTrue(release_input.wait(10), "reply fixture did not release the receipt")
                     return None
+            if hide_pane and method == 'session.snapshot':
+                snapshot = reply["result"]["snapshot"]
+                panes = snapshot["panes"]
+                snapshot["panes"] = [p for p in panes if p["pane_id"] != self.h["pane"]]
+                self.assertEqual(len(panes) - len(snapshot["panes"]), 1)
             return reply
 
         with self.service.fault_proxy(observe, read_frame=read_frame) as proxy:
             question = self.setup_reply_worker(proxy)
             number = str(question['message'])
+            self.env["WFC_MAX_TURN_SECONDS"] = "0"
+            wait = ("wait", "--scope", self.row["scope"], "--dispatch", self.dispatch_id,
+                    "--stall-after", "0", "--timeout")
+            received, = self.cli(*wait, "0")["messages"]
+            self.assertEqual((received["type"], received["messageId"]), ("question", question["messageId"]))
+
+            def quiet():
+                result = self.cli(*wait, "1.4", error='"timedOut":true')
+                self.assertEqual(json.loads(result)["messages"], [])
+
+            quiet()
+            watch = Path(self.env["WFC_STATE"]) / "dispatches" / f"{self.dispatch_id}.host-watch"
+            baseline = watch.read_bytes()
             expiring = True
             # Connections 1–6 read text and ANSI, then 7–10 prepare the send.
             # Delay the exit of the input connection syscall past its session
@@ -436,10 +720,42 @@ for line in sys.stdin:
             self.assertEqual(attempt['inputResult'], 'definitely-not-sent')
             self.assertEqual(attempt['diagnostic'], 'Herdr reply input was not sent')
             lose_receipt = True
-            self.cli('reply', number, 'once', error='uncertain')
+            with subprocess.Popen([live.DRIVER, "reply", number, "once"], env=self.env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as writer:
+                try:
+                    self.assertTrue(sent_input.wait(7), "the original peer did not receive the reply")
+                    quiet()
+                    self.assertEqual(watch.read_bytes(), baseline)
+                finally:
+                    release_input.set()
+                output, error = writer.communicate(timeout=12)
+            self.assertEqual((writer.returncode, output), (1, ""), error)
+            self.assertIn("uncertain", error)
             self.assertTrue(self.status()['pendingInput'])
-            self.assert_reply_worker_finished(question, 'uncertain', earlier=('definitely-not-sent',))
+            replies = self.reply_attempts()
+            self.assertEqual([item["inputResult"] for item in replies], ["definitely-not-sent", "uncertain"])
+            for missing, evidence, read_state in (
+                    (True, "backend_unavailable", "unavailable"),
+                    (False, "read_restored", "readable")):
+                hide_pane = missing
+                notice, = self.cli(*wait, "3")["messages"]
+                self.assertEqual((notice["kind"], notice["fault"]["evidence"]), ("host_runtime", evidence))
+                for key in ("dispatch", "scope", "round", "attempt"):
+                    self.assertEqual(notice[key], self.row[key])
+                self.assertEqual(self.cli("ack", notice["messageId"])["state"], "processed")
+                status = self.status()
+                self.assertTrue(status['pendingInput'])
+                self.assertEqual((status["hostActivity"]["readState"], status["hostActivity"]["state"]),
+                                 (read_state, "awaiting_answer"))
+                original, = [item for item in status["messages"] if item["type"] == "question"]
+                self.assertEqual((original["messageId"], original["state"]), (question["messageId"], "received"))
+                self.assertEqual([item for item in status["messages"] if item["type"] == "reply"], replies)
+            self.assert_reply_worker_finished(question, 'uncertain', earlier=('definitely-not-sent',),
+                                              question_received=True)
             self.assertEqual(sends, ['pane.send_input'])
+            print(json.dumps({"case": "herdr-reply-diagnostics", "question": question["messageId"],
+                              "reply": replies[-1]["messageId"], "afterZeroWrite": "definitely-not-sent",
+                              "afterLostReceipt": "uncertain", "sends": sends}), flush=True)
 
     def test_public_reply_protects_herdr_placeholder_like_and_ambiguous_drafts(self):
         sends = []

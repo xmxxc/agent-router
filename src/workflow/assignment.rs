@@ -72,9 +72,11 @@ pub(super) fn unresolved_resume(row: &Value) -> Option<&Value> {
 
 #[cfg(target_os = "linux")]
 pub(super) fn unresolved_lifecycle(row: &Value) -> Option<&Value> {
-    row["audit"].as_array()?.iter().rev().find(|event| {
-        matches!(event["result"].as_str(), Some("pending" | "uncertain"))
-    })
+    row["audit"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|event| matches!(event["result"].as_str(), Some("pending" | "uncertain")))
 }
 
 pub(super) fn public_record(dir: &Path, id: &str) -> Result<Option<Value>> {
@@ -141,7 +143,7 @@ pub(super) fn close_lock(state: &Path, row: &Value) -> Result<File> {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn try_reply_lock(state: &Path, row: &Value) -> Result<Option<File>> {
+pub(super) fn try_attempt_lock(state: &Path, row: &Value) -> Result<Option<File>> {
     let file = attempt_lock_file(state, row)?;
     Ok(try_input_lock(&file)?.then_some(file))
 }
@@ -157,7 +159,7 @@ pub(super) fn try_input_lock(file: &File) -> Result<bool> {
     }
 }
 
-fn attempt_lock_file(state: &Path, row: &Value) -> Result<File> {
+pub(super) fn attempt_lock_file(state: &Path, row: &Value) -> Result<File> {
     let dir = state.join("close-locks");
     let id = row["dispatch"]
         .as_str()

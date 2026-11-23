@@ -3,6 +3,7 @@
 mod binding;
 mod history;
 mod input;
+pub(crate) use input::codex_read_only;
 pub(crate) mod launch;
 
 use anyhow::{ensure, Context, Result};
@@ -44,6 +45,8 @@ enum Operation {
     Create(launch::Launch),
     Inspect,
     Read,
+    #[serde(rename = "observe-screen")]
+    ObserveScreen,
     Submit {
         text: String,
         host: Option<String>,
@@ -564,6 +567,16 @@ impl Tmux<'_> {
                 let t = self.owned()?;
                 Ok(json!({"result":"accepted","screen":self.capture(&t,&t.pane)?}))
             }
+            Operation::ObserveScreen => match self.target()? {
+                None => Ok(json!({"result":"accepted","observation":"target_absent"})),
+                Some(t) if t.owned => {
+                    Ok(json!({"result":"accepted","screen":self.worker_screen(&t)?}))
+                }
+                Some(_) => Err(failure(
+                    "refused",
+                    "session ownership does not match WFC_STATE",
+                )),
+            },
             Operation::Interrupt => {
                 let target = self.input_target()?;
                 self.worker_command(
@@ -971,11 +984,15 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
         "legacyRecovery requires ordinary inspect"
     );
     ensure!(
+        !matches!(request.op, Operation::ObserveScreen) || request.execution_id.is_some(),
+        "screen observation requires a native execution selector"
+    );
+    ensure!(
         !request.read_only
-            || (matches!(request.op, Operation::Inspect)
+            || (matches!(request.op, Operation::Inspect | Operation::ObserveScreen)
                 && !request.fresh_dispatch
                 && request.legacy_recovery.is_none()),
-        "readOnly requires ordinary inspect without legacy recovery"
+        "readOnly requires observation without legacy recovery"
     );
     let native_id;
     let mut backend = Tmux {
@@ -1004,6 +1021,7 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
         Err(result) => return Ok(result),
     };
     let inspect = matches!(request.op, Operation::Inspect);
+    let observe_screen = matches!(request.op, Operation::ObserveScreen);
     if let Some(execution) = request.execution_id.as_deref().filter(|_| !launching) {
         native_id = match backend.registered_launch(execution) {
             Ok(id) => id,
@@ -1019,6 +1037,18 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
             }
             error
         });
+    if observe_screen && result["result"] == "accepted" {
+        let execution = request.execution_id.as_deref().expect("native observation");
+        let id = backend.legacy_execution_id.expect("resolved execution");
+        match backend.confirm_launch(id) {
+            Ok(binding::Worker::Started(_)) => (),
+            Ok(_) => return Ok(failure("refused", "original worker is no longer running")),
+            Err(reply) => return Ok(reply),
+        }
+        result["executionId"] = json!(execution);
+        result["launchId"] = json!(id);
+        result["receipt"] = json!(state.join("launches").join(format!("{id}.json")));
+    }
     if inspect {
         if request.read_only && result["alive"] == true && result["owned"] == false {
             return Ok(result);
