@@ -13,7 +13,14 @@ case "$group" in
             Backend.test_public_interrupt_leaves_pending_when_owner_expires
             Backend.test_public_interrupt_backend_spawn_failure_is_definitely_not_sent
             Backend.test_read_only_unowned_close_replays_confirmed_archive
+            Backend.test_public_interrupt_preflight_zero_send_allows_takeover
+            Backend.test_public_interrupt_blocks_owner_change_after_backend_dies_with_queued_key
         )
+        ;;
+    public-herdr-close)
+        fixture=tests/herdr_public.py
+        test -x "${HERDR_BINARY:?fixed Herdr binary required}"
+        selectors=(PublicLifecycle.test_close_executed_without_reply)
         ;;
     codex-home-paths)
         fixture=tools/check_tmux.py
@@ -93,6 +100,7 @@ printf 'HOME=%s CODEX_HOME=%s WFC_STATE=%s TMPDIR=%s WFC_TMUX_SOCKET=%s\n' \
     "$scratch/home" "$scratch/codex" "$scratch/state" "$scratch/tmp" "$scratch/tmux.sock"
 status=0
 env -i PATH="$PATH" LC_ALL=C.UTF-8 TERM=xterm-256color PYTHONUTF8=1 \
+    HERDR_BINARY="${HERDR_BINARY:-}" \
     HOME="$scratch/home" CODEX_HOME="$scratch/codex" WFC_STATE="$scratch/state" \
     TMPDIR="$scratch/tmp" WFC_TMUX_SOCKET="$scratch/tmux.sock" \
     "$python" -Bu "$reaper" timeout --kill-after=10s 4m "$python" -Bu "$runner" \

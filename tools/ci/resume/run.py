@@ -80,6 +80,8 @@ def run(group_root, fixture, binary, evidence, selectors):
     layout = group_layout(group_root)
     fixture = Path(fixture).resolve()
     sys.argv[:] = [str(fixture), binary]
+    if fixture.name == "herdr_public.py":
+        sys.argv.insert(1, os.environ["HERDR_BINARY"])
     sys.path.insert(0, str(fixture.parent))
     spec = importlib.util.spec_from_file_location("wfc_ci_fixture", fixture)
     module = importlib.util.module_from_spec(spec)
@@ -153,7 +155,7 @@ def run(group_root, fixture, binary, evidence, selectors):
             def stopTest(self, case):
                 root = getattr(case, "root", None)
                 env = getattr(case, "env", {})
-                socket = getattr(case, "socket", env.get("WFC_TMUX_SOCKET"))
+                socket = getattr(case, "socket", env.get("WFC_TMUX_SOCKET", env.get("WFC_HERDR_ENDPOINT")))
                 state = getattr(case, "state", env.get("WFC_STATE"))
                 codex_home = getattr(case, "codex_home", env.get("CODEX_HOME"))
                 home = env.get("HOME")
