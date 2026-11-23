@@ -13,9 +13,9 @@ jobs:
       run:
         shell: bash
     env:
-      PRODUCT_SHA: 29690908a7ac3fd1a44ee95b394613ed6383139e
-      PRODUCT_TREE: 548a9b9a6ef8e1edc13b8203d1d511a103b2d4f4
-      PRODUCT_PARENTS: 502082bbe7c2cb4c18ac7cd3531d243188dee962
+      PRODUCT_SHA: f1399cb409dff733d492cbf4b7f3b6bd3ec5cb68
+      PRODUCT_TREE: 994dada5f2ca4e490f7000b98d2d7636dceae69a
+      PRODUCT_PARENTS: 29690908a7ac3fd1a44ee95b394613ed6383139e
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TARGET: x86_64-unknown-linux-gnu
       CARGO_BUILD_JOBS: '2'
@@ -59,7 +59,7 @@ jobs:
             git -C ../native-input show -s --format='native-input=%H tree=%T'
             printf '%s  %s\n' 17e88863f3600672ab49182f217281b6fc4d3c762bde361935e436a95214d05c \
               ../native-input/vendor/zlib-1.3.1.tar.gz | sha256sum --check --strict
-            printf '%s  %s\n' 4ee26c9d5d814a5ffc72c793b9452ab853c5f0d0b8db4f9cbedacab656ec082a \
+            printf '%s  %s\n' 4e45099a8e10ba175ced707bd02fda1db7011df25a12879bcb0c4c5b157a5e29 \
               vendor/INPUTS.sha256 | sha256sum --check --strict
             sha256sum --check --strict vendor/INPUTS.sha256
           } 2>&1 | tee "$EVIDENCE/sources.log"
@@ -150,11 +150,12 @@ jobs:
             historical_root_sequence_and_adopted_id_ignore_other_roots \
             unified_sessions_use_recorded_worktree_and_actual_user_sequence \
             missing_conflicting_or_unreadable_launch_evidence_stops_resume \
+            adopted_unified_message_cannot_fall_back_to_same_id_legacy_message \
             lone_unmarked_legacy_fork_cannot_be_adopted_by_lookup \
             private_launch_and_adoption_identity_are_bound; do
             grep -F "test workflow::host::opencode::tests::$case ... ok" "$EVIDENCE/identity.log"
           done
-          grep -Eq '^test result: ok\. 6 passed; 0 failed; 0 ignored;' "$EVIDENCE/identity.log"
+          grep -Eq '^test result: ok\. 7 passed; 0 failed; 0 ignored;' "$EVIDENCE/identity.log"
       - name: Checksum the evidence
         if: ${{ always() }}
         run: |
