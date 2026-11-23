@@ -221,7 +221,7 @@ class OpenCodeRelay(unittest.TestCase):
                      self.target(self.url + "#frag"), self.target("http://user@127.0.0.1"),
                      self.target(session="../other"), self.target(session="%2Fother")):
             with self.subTest(args=args):
-                self.cli("relay", *args, "--scope", "ours", "--for", ".05", code=1)
+                self.cli("relay", *args, "--scope", "ours", "--for", ".05", code=2)
         self.cli("relay", *self.target(), "--scope", "ours", "--for", ".05",
                  code=1, WFC_WORKER_CALLBACK="fixture")
         self.assertEqual(self.posts, [])
