@@ -106,7 +106,7 @@ fn argv(object: &Value, key: &str) -> Result<Vec<String>> {
         .collect()
 }
 
-fn configured(path: &Path, name: &str, cwd: &Path) -> Result<Launch> {
+fn configured(path: &Path, name: &str, cwd: &Path) -> Result<(Launch, bool)> {
     let data: Value = serde_json::from_reader(fs::File::open(path)?)?;
     ensure!(
         data.as_object()
@@ -136,6 +136,7 @@ fn configured(path: &Path, name: &str, cwd: &Path) -> Result<Launch> {
     append_env(&mut env, selected.get("env"))?;
     let mut prefix = argv(selected, "runtime")?;
     let mut command = argv(selected, "command")?;
+    let default_command = prefix.is_empty() && command.is_empty();
     if command.is_empty() {
         command.push(name.to_owned());
     }
@@ -162,7 +163,7 @@ fn configured(path: &Path, name: &str, cwd: &Path) -> Result<Launch> {
             .to_owned();
     }
     prefix.extend(command);
-    Ok(Launch { argv: prefix, env })
+    Ok((Launch { argv: prefix, env }, default_command))
 }
 
 impl Options<'_> {
@@ -193,7 +194,7 @@ impl Options<'_> {
                 .map(PathBuf::from)
         });
         let mut selected_config = None;
-        let mut launch = match path {
+        let (mut launch, default_command) = match path {
             Some(path) => {
                 let path = match path.strip_prefix("~/") {
                     Ok(rest) => env::home_dir()
@@ -207,11 +208,16 @@ impl Options<'_> {
                     anyhow::anyhow!("invalid launch config or missing configured script")
                 })?
             }
-            None => Launch {
-                argv: vec![self.name.to_owned()],
-                env: Map::new(),
-            },
+            None => (
+                Launch {
+                    argv: vec![self.name.to_owned()],
+                    env: Map::new(),
+                },
+                true,
+            ),
         };
+        #[cfg(not(target_os = "linux"))]
+        let _ = default_command;
         let a = &mut launch.argv;
         let mut ignored = Vec::new();
         match self.name {
@@ -260,7 +266,9 @@ impl Options<'_> {
             #[cfg(target_os = "linux")]
             "claude" => {
                 claude::prepare_initial(state, self, record, &mut launch, brief, &writable)?;
-                claude::apply_existing_trust(record, &launch)?;
+                if default_command {
+                    claude::apply_existing_trust(record, &mut launch)?;
+                }
             }
             _ => bail!("unsupported host"),
         }

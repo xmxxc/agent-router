@@ -23,7 +23,7 @@ def controlled_claude():
     assert start["matcher"] == "startup"
     [hook] = start["hooks"]
     cwd = Path.cwd()
-    profile = Path(os.environ["CLAUDE_CONFIG_DIR"])
+    profile = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path(os.environ["HOME"]) / ".claude"))
     transcript = profile / "projects" / "controlled-path" / (session + ".jsonl")
     event = {
         "hook_event_name": "SessionStart",
@@ -164,6 +164,96 @@ class ClaudeDispatch(unittest.TestCase):
                     self.assertFalse(path.with_name(f".{path.name}.wfc.lock").exists())
             finally:
                 subprocess.run(tmux + ["kill-server"], env=env, capture_output=True, timeout=5)
+
+    def test_launcher_wrappers_leave_trust_to_claude(self):
+        for mode in ("command-rewrites", "runtime-forwards", "path-shim-rewrites"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix="wfc-claude-wrapper-") as tmp:
+                self.check_wrapper_trust(Path(tmp).resolve(), mode)
+
+    def check_wrapper_trust(self, root, mode):
+        router = root / "router-home"
+        worker = root / "worker-home"
+        profile = root / "wrapper-profile"
+        cwd = root / "trusted-parent" / "worktree"
+        wrapper = root / "claude"
+        task = root / "task.md"
+        task.write_text("Synthetic Claude wrapper dispatch.\n", encoding="utf-8")
+        for directory in (router / ".claude", worker / ".claude", profile, cwd):
+            directory.mkdir(parents=True)
+        configs = {}
+        hooks = b'{"hooks":{"SessionStart":[]}}\n'
+        for name, home, settings_dir in [
+            ("router", router, router / ".claude"),
+            ("worker", worker, worker / ".claude"),
+            ("profile", profile, profile),
+        ]:
+            config = home / ".claude.json"
+            config_bytes = json.dumps({"domain": name, "projects": {
+                str(cwd.parent): {"hasTrustDialogAccepted": True},
+            }}).encode()
+            settings = settings_dir / "settings.json"
+            for path, data, permissions in [(config, config_bytes, 0o640), (settings, hooks, 0o600)]:
+                path.write_bytes(data)
+                path.chmod(permissions)
+                configs[path] = (data, permissions)
+
+        forward = mode == "runtime-forwards"
+        rewrite = 'export HOME="$R19_WORKER_HOME"\nexport CLAUDE_CONFIG_DIR="$R19_PROFILE"\n'
+        command = [sys.executable, str(Path(__file__).resolve()), "--controlled-claude"]
+        script = "#!/bin/sh\n"
+        selection = {}
+        if forward:
+            script += 'exec "$@"\n'
+            selection = {"runtime": [str(wrapper)], "command": command, "env": {"HOME": str(worker)}}
+        elif mode == "command-rewrites":
+            script += rewrite + 'exec "$@"\n'
+            selection = {"command": [str(wrapper), *command]}
+        else:
+            script += rewrite + 'exec "$R19_PYTHON" "$R19_FIXTURE" --controlled-claude "$@"\n'
+        wrapper.write_text(script, encoding="utf-8")
+        wrapper.chmod(0o700)
+
+        launch = root / "launch.json"
+        launch.write_text(json.dumps({"hosts": {"claude": selection}}), encoding="utf-8")
+        socket = root / "sock"
+        state = root / "state"
+        env = {
+            "HOME": str(router), "PATH": os.pathsep.join([str(root), os.environ["PATH"]]),
+            "TERM": "xterm-256color", "WFC_STATE": str(state), "WFC_TMUX_SOCKET": str(socket),
+            # This file contains a trusted parent and would otherwise be eligible.
+            "WFC_CLAUDE_CONFIG": str((worker if forward else router) / ".claude.json"),
+            "R19_WORKER_HOME": str(worker), "R19_PROFILE": str(profile),
+            "R19_PYTHON": command[0], "R19_FIXTURE": command[1],
+        }
+        tmux = ["tmux", "-f", "/dev/null", "-S", str(socket)]
+        try:
+            subprocess.run(tmux + ["new-session", "-d", "-s", "fixture", "/bin/cat"],
+                           env=env, check=True, capture_output=True, timeout=5)
+            dispatch = subprocess.run(
+                [WFC, "dispatch", "--host", "claude", "--backend", "tmux", "--cwd", cwd,
+                 "--task", task, "--report", root / "report.md", "--launch-config", launch],
+                env=env, text=True, capture_output=True, timeout=15,
+            )
+            self.assertEqual(dispatch.returncode, 0, dispatch.stderr)
+            row = json.loads(dispatch.stdout)
+            self.assertNotIn("trustedBy", row)
+            result = cwd / "controlled.json"
+            deadline = time.monotonic() + 5
+            while not result.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            trace = json.loads(result.read_text(encoding="utf-8"))
+            self.assertEqual(trace["home"], str(worker))
+            self.assertEqual(trace["profile"], str(worker / ".claude" if forward else profile))
+            self.assertNotEqual(trace["rejected"], 0)
+            self.assertEqual(trace["accepted"] == 0, forward, trace["hook_stderr"])
+            evidence = state / "claude-evidence" / f'{row["dispatch"]}.{row["attempt"]}'
+            self.assertEqual((evidence / "adopted.json").exists(), forward)
+            for path, (data, permissions) in configs.items():
+                self.assertEqual(path.read_bytes(), data)
+                self.assertEqual(path.stat().st_mode & 0o777, permissions)
+            self.assertEqual(list(root.rglob("*.wfc.lock")), [])
+        finally:
+            subprocess.run(tmux + ["kill-server"], env=env, capture_output=True, timeout=5)
 
 
 if __name__ == "__main__":

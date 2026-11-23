@@ -7,9 +7,10 @@ use crate::workflow::messages::PublishLock;
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     env,
-    ffi::OsStr,
+    ffi::{CString, OsStr},
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
@@ -18,6 +19,33 @@ use std::{
 use uuid::Uuid;
 
 const MAX_EVENT: u64 = 16 * 1024;
+
+// Claude Code 2.1.325 Linux native artifacts from Anthropic's signed manifest.
+// An unrecognized installation can still launch and handle its own trust prompt.
+#[cfg(target_arch = "x86_64")]
+const NATIVE_RELEASE: &[(u64, &str)] = &[
+    (
+        365842960,
+        "0dc4f4a9a165fc60746d7ae8489712e5fc352f1e7ad4eb22e7141bd0812eb0cf",
+    ),
+    (
+        352201992,
+        "a5e3bd36dce97db0429705aa5c3573eea346a77938a89104b9c28fce409b20cd",
+    ),
+];
+#[cfg(target_arch = "aarch64")]
+const NATIVE_RELEASE: &[(u64, &str)] = &[
+    (
+        364701112,
+        "7b6e484b1989a5a14a4b354709ccc8672518a3ec5b9ccd7981fc6254327fde67",
+    ),
+    (
+        349795272,
+        "14dc17cd958f62d82fb2ff6276368fc611a88be303e0ae1a8cca580495964efe",
+    ),
+];
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const NATIVE_RELEASE: &[(u64, &str)] = &[];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -273,17 +301,104 @@ pub(super) fn prepare_initial(
     )
 }
 
-pub(super) fn apply_existing_trust(record: &mut Value, launch: &Launch) -> Result<()> {
+fn verified_native(cwd: &Path, search: &OsStr, release: &[(u64, &str)]) -> Option<PathBuf> {
+    for directory in env::split_paths(search) {
+        let candidate = cwd.join(directory).join("claude");
+        let metadata = match candidate.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+            continue;
+        }
+        // Command resolution would try this executable before later entries.
+        // A shim in front of the official binary must leave trust to Claude.
+        let &(size, checksum) = release.iter().find(|(size, _)| *size == metadata.len())?;
+        let path = candidate.canonicalize().ok()?;
+        let executable = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+        if unsafe {
+            libc::faccessat(
+                libc::AT_FDCWD,
+                executable.as_ptr(),
+                libc::X_OK,
+                libc::AT_EACCESS,
+            )
+        } != 0
+        {
+            return None;
+        }
+        let trusted_owner = |metadata: &fs::Metadata| {
+            metadata.uid() == 0 || metadata.uid() == unsafe { libc::geteuid() }
+        };
+        if !path.ancestors().skip(1).all(|parent| {
+            parent.metadata().is_ok_and(|metadata| {
+                metadata.is_dir()
+                    && trusted_owner(&metadata)
+                    && (metadata.mode() & 0o022 == 0 || metadata.mode() & 0o1000 != 0)
+            })
+        }) {
+            return None;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+            .ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file()
+            || metadata.mode() & 0o6022 != 0
+            || !trusted_owner(&metadata)
+            || metadata.len() != size
+        {
+            return None;
+        }
+        let mut bytes = [0; 64 * 1024];
+        let mut stream = file.take(size + 1);
+        let mut digest = Sha256::new();
+        loop {
+            let count = stream.read(&mut bytes).ok()?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&bytes[..count]);
+        }
+        return (format!("{:x}", digest.finalize()) == checksum).then_some(path);
+    }
+    None
+}
+
+pub(super) fn apply_existing_trust(record: &mut Value, launch: &mut Launch) -> Result<()> {
     let home = worker_path(launch, "HOME");
     let profile = worker_path(launch, "CLAUDE_CONFIG_DIR");
+    if home.as_ref().is_none_or(|path| !path.is_absolute())
+        || profile.is_some()
+        || ["LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "BUN_OPTIONS"]
+            .iter()
+            .any(|key| worker_path(launch, key).is_some_and(|path| !path.as_os_str().is_empty()))
+    {
+        return Ok(());
+    }
+    let cwd = Path::new(field(record, "cwd")?);
+    let Some(path) = worker_path(launch, "PATH")
+        .and_then(|search| verified_native(cwd, search.as_os_str(), NATIVE_RELEASE))
+    else {
+        return Ok(());
+    };
+    let Some(program) = path.to_str() else {
+        return Ok(());
+    };
     let requested = worker_path(launch, "WFC_CLAUDE_CONFIG");
     match trust(
-        Path::new(field(record, "cwd")?),
+        cwd,
         home.as_deref(),
         profile.as_deref(),
         requested.as_deref(),
     ) {
-        Ok(Some(ancestor)) => record["trustedBy"] = json!(ancestor),
+        Ok(Some(ancestor)) => {
+            launch.argv[0] = program.to_owned();
+            record["trustedBy"] = json!(ancestor);
+        }
         Ok(None) => {}
         Err(_) => eprintln!("wfc: could not confirm Claude worktree trust"),
     }

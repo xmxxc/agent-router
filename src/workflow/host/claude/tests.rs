@@ -7,6 +7,37 @@ use std::time::Duration;
 
 const TOKEN: &str = workflow::controller::WORKER_CALLBACK;
 
+#[test]
+fn direct_trust_requires_verified_first_path_executable() {
+    const FIXTURE_RELEASE: &[(u64, &str)] = &[(
+        3,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    )];
+    let f = Fixture::new();
+    let front = f.0.join("front");
+    let install = f.0.join("installed");
+    fs::create_dir(&front).unwrap();
+    fs::create_dir(&install).unwrap();
+    let binary = install.join("pinned-claude");
+    fs::write(&binary, b"abc").unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(&binary, install.join("claude")).unwrap();
+    let search = env::join_paths(["front", "installed"]).unwrap();
+    assert_eq!(
+        verified_native(&f.0, &search, FIXTURE_RELEASE),
+        Some(binary.canonicalize().unwrap())
+    );
+    assert!(verified_native(&f.0, &search, NATIVE_RELEASE).is_none());
+    let shim = front.join("claude");
+    fs::write(&shim, b"xyz").unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(verified_native(&f.0, &search, FIXTURE_RELEASE).is_none());
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(verified_native(&f.0, &search, FIXTURE_RELEASE).is_some());
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o775)).unwrap();
+    assert!(verified_native(&f.0, &search, FIXTURE_RELEASE).is_none());
+}
+
 struct Fixture(PathBuf);
 
 impl Fixture {
