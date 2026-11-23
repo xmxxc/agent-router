@@ -347,13 +347,25 @@ impl Handle {
         Ok(live)
     }
 
+    /// Validate a stopped binding committed by reconciliation.
+    pub fn verified_stopped(&self) -> Result<bool> {
+        let Some(evidence) = &self.stopped_evidence else {
+            return Ok(false);
+        };
+        if evidence.trim().is_empty() {
+            return Err(Failure::unknown("blank Herdr writer stop evidence"));
+        }
+        if !self.writers.is_empty() {
+            return Err(Failure::unknown(
+                "Herdr writer stop evidence conflicts with recorded writers",
+            ));
+        }
+        Ok(true)
+    }
+
     /// Returns false only when every recorded writer has positively stopped.
     pub fn inspect(&mut self, mut save: impl FnMut(&Self) -> std::io::Result<()>) -> Result<bool> {
-        if let Some(evidence) = &self.stopped_evidence {
-            // Reconcile commits this stopped binding and its audit together.
-            if evidence.trim().is_empty() || !self.writers.is_empty() {
-                return Err(INVALID);
-            }
+        if self.verified_stopped()? {
             return Ok(false);
         }
         let observation = (|| {
@@ -435,6 +447,9 @@ impl Handle {
     /// Close only the bound pane. Persist all observed writers before closing,
     /// so a lost response cannot erase the evidence needed by a later close.
     pub fn close(&mut self, mut save: impl FnMut(&Self) -> std::io::Result<()>) -> Result<()> {
+        if self.verified_stopped()? {
+            return Ok(());
+        }
         self.prepare_close(&mut save)?.finish()
     }
 
@@ -444,6 +459,7 @@ impl Handle {
         &mut self,
         mut save: impl FnMut(&Self) -> std::io::Result<()>,
     ) -> Result<PreparedClose<'_>> {
+        self.verified_stopped()?;
         let rpc = self.session()?;
         let present = self.pane(&rpc.snapshot()?)?.is_some();
         if present {
@@ -461,6 +477,9 @@ impl Handle {
         &mut self,
         mut save: impl FnMut(&Self) -> std::io::Result<()>,
     ) -> Result<bool> {
+        if self.verified_stopped()? {
+            return Ok(true);
+        }
         let rpc = self.session()?;
         if self.pane(&rpc.snapshot()?)?.is_some() {
             self.checkpoint_writers(&rpc, &mut save)?;

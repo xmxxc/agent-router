@@ -116,6 +116,7 @@ fn close_is_pending(event: &Value) -> bool {
     matches!(event["result"].as_str(), Some("pending" | "uncertain"))
 }
 
+#[cfg(target_os = "linux")]
 pub(super) fn pending_herdr_close(row: &Value) -> Option<&Value> {
     herdr_closes(row)
         .next_back()
@@ -136,6 +137,7 @@ pub(super) fn herdr_close_blocks_done(state: &Path, row: &Value) -> Result<bool>
     )
 }
 
+#[cfg(target_os = "linux")]
 pub(super) fn verify_herdr_close_target(row: &Value, event: &Value) -> Result<()> {
     let current = &row["backendHandle"];
     let target = &event["target"];
@@ -171,15 +173,18 @@ pub(super) fn verify_herdr_close_target(row: &Value, event: &Value) -> Result<()
         archived.iter().all(|writer| known.contains(writer)),
         "close intent target changed: unrecognized Herdr writer"
     );
-    if known.is_empty() {
-        ensure!(
-            current["writerStoppedEvidence"]
-                .as_str()
-                .is_some_and(|v| !v.trim().is_empty())
-                && target["writerStoppedEvidence"] == current["writerStoppedEvidence"],
-            "close intent target changed: missing or changed Herdr writer stop evidence"
-        );
-    }
+    let verify_stop = |binding: &Value| -> Result<bool> {
+        let handle: wfc_herdr::Handle = serde_json::from_value(binding.clone())?;
+        Ok(handle.verified_stopped()?)
+    };
+    let current_stopped = verify_stop(current).context("close intent target changed")?;
+    let archived_stopped = verify_stop(target).context("close intent target changed")?;
+    ensure!(
+        current_stopped == archived_stopped
+            && (!known.is_empty() || current_stopped)
+            && target["writerStoppedEvidence"] == current["writerStoppedEvidence"],
+        "close intent target changed: missing or changed Herdr writer stop evidence"
+    );
     Ok(())
 }
 

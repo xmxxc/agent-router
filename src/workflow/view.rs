@@ -16,6 +16,7 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
             "created":row["created"],"completed":null,"state":"running","result":null}));
     }
     let pending_close = row["closePending"] == true;
+    #[cfg(target_os = "linux")]
     let prior_exit = super::backend::pending_herdr_close(row)
         .filter(|event| {
             pending_close && super::backend::verify_herdr_close_target(row, event).is_ok()
@@ -23,7 +24,10 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
         .map(|event| &event["workerOnClose"])
         .filter(|worker| worker["state"] == "exited" && worker["exit_code"].is_i64())
         .cloned();
-    let unresolved_worker = pending_close && prior_exit.is_none();
+    #[cfg(not(target_os = "linux"))]
+    let prior_exit: Option<Value> = None;
+    let unresolved_worker =
+        (pending_close || row["closeWorkerDiagnostic"].is_string()) && prior_exit.is_none();
     if let Some(exit) = prior_exit {
         row["worker"] = exit;
     }

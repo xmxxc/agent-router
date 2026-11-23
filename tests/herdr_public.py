@@ -447,6 +447,64 @@ Path('done-received').write_bytes(reply)
             self.assertEqual((view['status'], view['worker']['state'], view['backendAlive']),
                              ('unknown', 'unknown', None))
 
+    def test_conflicting_stop_evidence_cannot_close_live_writers(self):
+        calls = []
+        self.dispatch(endpoint=self.drop_close(calls))
+        sibling, sibling_pid = self.sibling()
+        binding = self.status()['backendHandle']
+        root_pid = binding['writerProcesses'][0]['pid']
+        path = Path(self.env['WFC_STATE'])/'dispatches'/(self.dispatch_id+'.json')
+        original = json.loads(path.read_bytes())
+        for evidence, writers, diagnostic in [
+            ('   ', binding['writerProcesses'], 'blank Herdr writer stop evidence'),
+            ('claimed stopped', binding['writerProcesses'], 'conflicts with recorded writers'),
+            ('   ', [], 'blank Herdr writer stop evidence'),
+        ]:
+            handle = binding | {'writerStoppedEvidence':evidence, 'writerProcesses':writers}
+            path.write_text(json.dumps(original | {'backendHandle':handle}))
+            view = self.assert_pending_views('unknown')
+            self.assertIsNone(view['backendAlive'])
+            self.assertIn(diagnostic, view['backendDiagnostic'])
+            self.unconfirmed_close(diagnostic)
+            self.unconfirmed_close(diagnostic)
+            self.assertEqual(self.status()['audit'], [])
+            self.assertEqual(self.service.api('pane.process_info', pane_id=self.h['pane'])['process_info']['shell_pid'],
+                             root_pid)
+            self.assertEqual(self.service.api('pane.process_info', pane_id=sibling)['process_info']['shell_pid'],
+                             sibling_pid)
+        self.assertEqual(calls, [])
+
+    def test_old_worker_data_does_not_override_verified_resource_close(self):
+        self.dispatch()
+        sibling, sibling_pid = self.sibling()
+        self.submit('finish')
+        first, = live.wait_for(lambda: self.status()['messages'])
+        self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+        path = Path(self.env['WFC_STATE'])/'dispatches'/(self.dispatch_id+'.json')
+        row = json.loads(path.read_bytes())
+        row['audit'][-1]['workerOnClose'] = {'state':'exited', 'exit_code':'legacy'}
+        for archived_result in ('completed', 'uncertain'):
+            row['audit'][-1]['result'] = archived_result
+            path.write_text(json.dumps(row))
+            if archived_result == 'uncertain':
+                self.assert_pending_views('completed')
+            for _ in range(2):
+                close = self.cli('close', self.dispatch_id)
+                self.assertEqual(close['result'], 'completed')
+                self.assertIn('invalid closed worker outcome', close['closeWorkerDiagnostic'])
+                view = self.status()
+                self.assertEqual((view['backendResult'], view['backendAlive'], view['closePending']),
+                                 ('completed', False, False))
+                self.assertEqual(view['status'], 'completed')
+                self.assertIn('invalid closed worker outcome', view['closeWorkerDiagnostic'])
+                self.assertEqual(view['messages'], [first])
+            with self.callback() as callback:
+                out, error = callback.communicate(timeout=10)
+                self.assertEqual(callback.returncode, 0, error)
+                self.assertEqual(json.loads(out)['messageId'], first['messageId'])
+        self.assertEqual(self.service.api('pane.process_info', pane_id=sibling)['process_info']['shell_pid'],
+                         sibling_pid)
+
     def test_close_archive_requires_the_original_root_writer(self):
         requests = []
         def count_close(req, reply):
@@ -492,6 +550,7 @@ Path('done-received').write_bytes(reply)
             ({'writerProcesses':[other]}, 'root writer'),
             ({'writerProcesses':[]}, 'root writer'),
             ({'writerProcesses':[root | {'creation':'other-birth'}]}, 'root writer'),
+            ({'writerStoppedEvidence':'claimed stopped'}, 'conflicts with recorded writers'),
             ({'nonce':'other-execution'}, 'close intent target changed'),
         ]:
             with self.subTest(changes=changes):
@@ -528,7 +587,13 @@ Path('done-received').write_bytes(reply)
         stopped['writerStoppedEvidence'] = 'inspected and stopped'
         path.write_text(json.dumps(original | {'audit':[], 'backendHandle':stopped}))
         legacy.write_text(json.dumps(archive | {'worker':{'state':'running'}}))
-        self.cli('close', self.dispatch_id, error='invalid closed worker outcome')
+        close = self.cli('close', self.dispatch_id)
+        self.assertEqual(close['result'], 'completed')
+        self.assertIn('invalid closed worker outcome', close['closeWorkerDiagnostic'])
+        view = self.status()
+        self.assertIs(view['backendAlive'], False)
+        self.assertFalse(view['closePending'])
+        self.assertIn('invalid closed worker outcome', view['closeWorkerDiagnostic'])
 
         self.assertEqual(self.service.api('pane.process_info', pane_id=sibling)['process_info']['shell_pid'],
                          sibling_pid)
@@ -818,7 +883,20 @@ for line in sys.stdin:
         self.assertEqual(view['backendHandle']['state'], 'not-started')
         self.assertIsNone(view['backendHandle']['receipt'])
         self.assertEqual(json.loads(view['audit'][0]['resolution']['evidence'])['writers'], [])
-        self.cli('close', self.dispatch_id)
+        self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+        path = Path(self.env['WFC_STATE'])/'dispatches'/(self.dispatch_id+'.json')
+        row = json.loads(path.read_bytes())
+        event = row['audit'][-1]
+        original = event['target']['writerStoppedEvidence']
+        for proof in ('', '  ', 'different stop evidence'):
+            event['target']['writerStoppedEvidence'] = proof
+            path.write_text(json.dumps(row))
+            self.assertIn('close intent target changed', self.assert_pending_views('unknown')['backendDiagnostic'])
+            self.cli('close', self.dispatch_id, error='close intent target changed')
+        event['target']['writerStoppedEvidence'] = original
+        path.write_text(json.dumps(row))
+        self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+        self.assertFalse(self.status()['backendAlive'])
 
 
 if __name__ == '__main__':

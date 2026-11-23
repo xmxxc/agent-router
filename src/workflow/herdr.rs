@@ -33,6 +33,12 @@ fn launch_receipt(state: &Path, create: &Value) -> Result<Value> {
     Ok(launch)
 }
 
+const INVALID_CLOSE_WORKER: &str = "invalid closed worker outcome";
+
+fn valid_close_worker(worker: &Value) -> bool {
+    worker["state"] == "cancelled" || (worker["state"] == "exited" && worker["exit_code"].is_i64())
+}
+
 struct Assignment<'a> {
     state: &'a Path,
     _lock: File,
@@ -304,18 +310,25 @@ pub(super) fn observe(state: &Path, row: &mut Value) -> Result<(Value, Value)> {
         let mut unit = Assignment::lock(state, id, None)?;
         let bound = unit.bound_record().is_ok();
         let mut close_pending = unit.pending_close();
+        let mut invalid_close_worker = false;
         let observed = (|| -> Result<_> {
             let handle = unit.handle().inspect_err(|_| {
                 close_pending |= unit.completed_close().is_some();
             })?;
             let archive = unit
-                .closed_worker(&handle)
+                .verified_archive(&handle)
+                .inspect_err(|_| close_pending = true)?;
+            let stopped = handle
+                .verified_stopped()
                 .inspect_err(|_| close_pending = true)?;
             if let Some(event) = backend::pending_herdr_close(&unit.row) {
                 backend::verify_herdr_close_target(&unit.row, event)?;
+                invalid_close_worker = !valid_close_worker(&event["workerOnClose"]);
             }
             let inspection = if archive.is_some() {
                 json!({"result":"completed","alive":false})
+            } else if stopped {
+                json!({"result":"accepted","alive":false,"owned":true})
             } else {
                 unit.inspect()?
             };
@@ -337,7 +350,11 @@ pub(super) fn observe(state: &Path, row: &mut Value) -> Result<(Value, Value)> {
                 json!({"result":"uncertain","diagnostic":format!("{error:#}")}),
             )
         });
-        let worker = archive.unwrap_or_else(|| {
+        invalid_close_worker |= archive.as_ref().is_some_and(|w| !valid_close_worker(w));
+        if invalid_close_worker {
+            row["closeWorkerDiagnostic"] = json!(INVALID_CLOSE_WORKER);
+        }
+        let worker = archive.filter(valid_close_worker).unwrap_or_else(|| {
             if bound {
                 backend::worker(&row["launch"], &inspection)
             } else {
@@ -365,32 +382,21 @@ impl Assignment<'_> {
             .filter(|event| event["result"] == "completed")
     }
 
-    fn closed_worker(&self, handle: &Handle) -> Result<Option<Value>> {
-        let worker = if let Some(event) = self.completed_close() {
+    fn verified_archive(&self, handle: &Handle) -> Result<Option<Value>> {
+        if let Some(event) = self.completed_close() {
             backend::verify_herdr_close_target(&self.row, event)?;
-            Some(event["workerOnClose"].clone())
-        } else {
-            let archive = backend::closed(self.state, &self.row)?;
-            if archive.is_some() {
-                ensure!(
-                    handle.writers.is_empty()
-                        && handle
-                            .stopped_evidence
-                            .as_deref()
-                            .is_some_and(|s| !s.trim().is_empty()),
-                    "close intent target changed: legacy archive has no Herdr writer identity"
-                );
-            }
-            archive
-        };
-        if let Some(worker) = &worker {
+            return Ok(Some(event["workerOnClose"].clone()));
+        }
+        let archive = backend::closed(self.state, &self.row)?;
+        if archive.is_some() {
             ensure!(
-                worker["state"] == "cancelled"
-                    || (worker["state"] == "exited" && worker["exit_code"].is_i64()),
-                "invalid closed worker outcome"
+                handle
+                    .verified_stopped()
+                    .context("legacy archive stop evidence")?,
+                "close intent target changed: legacy archive has no Herdr writer identity"
             );
         }
-        Ok(worker)
+        Ok(archive)
     }
 
     fn close_receipt(&self, outcome: Value) -> Value {
@@ -402,7 +408,7 @@ impl Assignment<'_> {
         receipt
     }
 
-    fn finish_close(&mut self, outcome: Value) -> Result<Value> {
+    fn finish_close(&mut self, mut outcome: Value) -> Result<Value> {
         let mut next = self.row.clone();
         let event = next["audit"]
             .as_array_mut()
@@ -412,6 +418,9 @@ impl Assignment<'_> {
             event["operation"] == "close" && event["attempt"] == self.row["attempt"],
             "close intent changed"
         );
+        if outcome["result"] == "completed" && !valid_close_worker(&event["workerOnClose"]) {
+            outcome["closeWorkerDiagnostic"] = json!(INVALID_CLOSE_WORKER);
+        }
         event["result"] = outcome["result"].clone();
         event["diagnostic"] = outcome["diagnostic"].clone();
         self.save(next)?;
@@ -430,10 +439,17 @@ pub(super) fn close(state: &Path, row: &Value) -> Result<Value> {
         "Herdr attempt changed"
     );
     let mut handle = unit.handle()?;
-    if unit.closed_worker(&handle)?.is_some() {
-        return Ok(unit
-            .close_receipt(json!({"result":"completed","diagnostic":"session was already gone"})));
+    if let Some(worker) = unit.verified_archive(&handle)? {
+        let mut outcome = json!({"result":"completed","diagnostic":"session was already gone"});
+        if !valid_close_worker(&worker) {
+            outcome["closeWorkerDiagnostic"] = json!(INVALID_CLOSE_WORKER);
+        }
+        return Ok(unit.close_receipt(outcome));
     }
+    let stopped = match handle.verified_stopped() {
+        Ok(stopped) => stopped,
+        Err(error) => return Ok(unit.close_receipt(json!(error))),
+    };
     if let Some(event) = backend::pending_herdr_close(&unit.row) {
         backend::verify_herdr_close_target(&unit.row, event)?;
         let outcome = match handle.confirm_closed(|h| unit.checkpoint(h)) {
@@ -445,18 +461,19 @@ pub(super) fn close(state: &Path, row: &Value) -> Result<Value> {
         };
         return Ok(unit.close_receipt(outcome));
     }
-    if unit.row["create"]["result"] != "accepted" && handle.stopped_evidence.is_none() {
+    if unit.row["create"]["result"] != "accepted" && !stopped {
         return Ok(unit.close_receipt(json!({"result":"uncertain","diagnostic":"unresolved Herdr create requires lifecycle resolution"})));
     }
-    let mut handle = match unit.tracked_handle() {
-        Ok(h) => h,
-        Err(e) => {
-            return Ok(unit.close_receipt(json!({"result":"uncertain","diagnostic":e.to_string()})))
-        }
-    };
-    let prepared = if handle.stopped_evidence.is_some() {
+    let prepared = if stopped {
         None
     } else {
+        handle = match unit.tracked_handle() {
+            Ok(handle) => handle,
+            Err(error) => {
+                return Ok(unit
+                    .close_receipt(json!({"result":"uncertain","diagnostic":error.to_string()})));
+            }
+        };
         match handle.prepare_close(|h| unit.checkpoint(h)) {
             Ok(close) => Some(close),
             Err(e) => return Ok(unit.close_receipt(json!(e))),
@@ -516,7 +533,7 @@ pub fn submit(input: Input) -> Result<Value> {
         "stale Herdr input assignment"
     );
     ensure!(
-        unit.closed_worker(&unit.handle()?)?.is_none(),
+        unit.verified_archive(&unit.handle()?)?.is_none(),
         "Herdr dispatch closed"
     );
     ensure!(!unit.pending_close(), "Herdr close still pending");
@@ -601,7 +618,7 @@ impl Reconcile {
         let state = state_dir()?;
         let mut unit = Assignment::lock(&state, &self.dispatch, None)?;
         ensure!(
-            unit.closed_worker(&unit.handle()?)?.is_none(),
+            unit.verified_archive(&unit.handle()?)?.is_none(),
             "Herdr dispatch closed"
         );
         ensure!(!unit.pending_close(), "Herdr close still pending");
