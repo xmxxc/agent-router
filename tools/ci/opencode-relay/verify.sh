@@ -107,6 +107,17 @@ run_startup_opencode_suites() {
     sha256sum --check --strict "$EVIDENCE/binary.sha256"
 }
 
+run_relay_retry_suites() {
+    run_suite opencode-refused tests/opencode_relay.py OpenCodeRelay.test_connection_refused_is_unsent_and_can_retry_original_id 1
+    run_suite opencode-uncertain tests/opencode_relay.py OpenCodeRelay.test_errors_redirects_timeouts_and_eof_never_replay 1
+    run_suite opencode-order tests/opencode_relay.py OpenCodeRelay.test_204_detached_preserves_batch_order_scope_and_session 1
+    run_suite codex-retry tests/relay.py Relay.test_queue_outcomes_and_restart 1
+    run_suite startup-resume-polls tests/startup_failure.py StartupFailure.test_short_wait_restarts_resume_after_processed_prefix 1
+    run_suite codex-scope-refresh tests/relay.py Relay.test_running_relay_refreshes_repaired_and_legacy_owner_records 1
+    run_suite startup-opencode "$ci_dir/startup_recovery.py" StartupOpenCode.test_recovers_interrupted_notice_through_scoped_http 1
+    sha256sum --check --strict "$EVIDENCE/binary.sha256"
+}
+
 case "${1:-all}" in
   all)
     run_opencode_suites
@@ -123,8 +134,11 @@ case "${1:-all}" in
   startup-opencode)
     run_startup_opencode_suites
     ;;
+  relay-retry)
+    run_relay_retry_suites
+    ;;
   *)
-    printf 'expected all, owner-only, target-validation or startup-opencode\n' >&2
+    printf 'expected all, owner-only, target-validation, startup-opencode or relay-retry\n' >&2
     exit 2
     ;;
 esac
