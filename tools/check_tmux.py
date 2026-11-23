@@ -1840,7 +1840,8 @@ mode = os.environ.get("QUESTION_TEST_GATE")
 root = Path({str(self.root)!r})
 ready = root / (str(mode) + "-ready")
 closing = mode == "close" and any("kill-session -t " in arg for arg in args)
-inspecting = mode == "ask" and "display-message" in args and any(arg.startswith("=wfc-") for arg in args)
+probe = ["list-panes", "-t", os.environ.get("QUESTION_TEST_TARGET")]
+inspecting = mode == "ask" and any(args[i:i + len(probe)] == probe for i in range(len(args)))
 if (closing or inspecting) and not ready.exists():
     result = subprocess.run([{TMUX!r}, *args], capture_output=True) if inspecting else None
     ready.touch()
@@ -1891,6 +1892,8 @@ time.sleep(45)
                 child_env["WFC_DISPATCH"] = dispatch
             if gate:
                 child_env.update(PATH=str(self.work) + ":" + env["PATH"], QUESTION_TEST_GATE=gate)
+            if gate == "ask":
+                child_env["QUESTION_TEST_TARGET"] = f"=wfc-{dispatch}:"
             proc = subprocess.Popen([WFC, *args], cwd=cwd or self.work, env=child_env,
                                     text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             processes.append(proc)
