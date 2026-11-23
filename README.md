@@ -47,6 +47,30 @@ wfc status --active
 
 默认使用 tmux。此组合调用同一可执行文件中的 tmux 后端（#31）。宿主可选 codex、opencode 或 claude，`--launch-config` 或 `WFC_LAUNCH_CONFIG` 指向带有 env、hosts 的 JSON 配置。每个宿主可指定 command、runtime 参数数组及 env。完整参数见 `wfc dispatch --help`。独立的 herdr、bundled 后端和控制器授权由对应工单接入。
 
+`--launch-config` 优先于 `WFC_LAUNCH_CONFIG`。启动参数依次为宿主的 `runtime` 数组、`command` 数组、wfc 为本次任务生成的 Codex 参数。路径含空格时直接写在同一个 JSON 字符串中。例如 npm 安装的 Codex 可以指定 Node 和脚本各自的绝对路径。
+
+```json
+{
+  "hosts": {
+    "codex": {
+      "runtime": ["/opt/Node bin/node"],
+      "command": ["/opt/Codex CLI/bin/codex.js"],
+      "env": {"CODEX_HOME": "/srv/worker profile"}
+    }
+  }
+}
+```
+
+使用原生 Codex 可执行文件时，在 `command` 中填入该文件并省略 `runtime`。worker 先继承调用进程的环境，再依次叠加顶层 `env`、宿主 `env` 和 wfc 的本轮身份、状态及报告路径。Codex 默认以 `workspace-write` 和 `never` 审批策略启动。
+
+Linux 真实宿主验收需要 tmux、已登录的 Codex 或可用的 `OPENAI_API_KEY`，以及能执行 Codex 沙箱命令的主机。下面的命令使用私有临时 HOME、状态目录和 tmux socket，启动模型执行一项写报告的任务，从 Rust `wait` 返回的路径读回报告，并核对 `status` 中的同一条回执。把路径和模型替换成当前机器的值。使用 API 密钥时可省略 `--auth-file`。
+
+```sh
+python3 tools/check_codex.py target/x86_64-unknown-linux-gnu/release/wfc \
+  --codex "/path/to/codex" --model "your-model" \
+  --auth-file "$HOME/.codex/auth.json"
+```
+
 回执包含 dispatch、round、attempt、host、backend、scope、role、label、tmux 和报告绝对路径。省略 scope 会分配新值，默认 role 来自报告目录名最后一个连字符后的部分。Codex 的 git/network 开关作用于宿主参数，OpenCode 和 Claude 的回执会说明这些开关的处理结果。tmux 服务地址在派发时绑定，后续查询和关闭沿用原服务。
 
 点名查询 `wfc status --dispatch ID` 返回当前 worker 进程状态、各轮任务结果及消息。接入 #6/#7 后，首条完成回报固定该轮的报告和 Git 快照，后续领取或进程退出仍能查回。已完成且会话仍存活的任务在 `status --active` 的 reclaimable 数组中。长编号和旧版短编号均可查询、关闭。
