@@ -662,3 +662,36 @@ fn orphan_completion_requires_evidence_and_keeps_the_parent_absent() {
         }
     }
 }
+
+#[test]
+fn missing_transition_round_requires_one_consistent_target_round() {
+    for repeated_attempt in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _) = wfc_legacy_state::open_offline_copy(dir.path()).unwrap();
+        db.execute_batch("INSERT INTO dispatch(id,scope,role,report,current_round,current_attempt)
+            VALUES('old','s','worker','/r',2,'b');
+            INSERT INTO dispatch_round(dispatch,round,attempt,state,report) VALUES('old',1,'a','unknown','/r');
+            INSERT INTO lifecycle_event(dispatch,operation,from_attempt,to_attempt,result)
+                VALUES('old','resume','a','b','accepted');").unwrap();
+        if repeated_attempt {
+            db.execute_batch(
+                "INSERT INTO dispatch_round(dispatch,round,attempt,state,report)
+                VALUES('old',1,'b','unknown','/r'),('old',2,'b','running','/r')",
+            )
+            .unwrap();
+        } else {
+            db.execute_batch(
+                r#"UPDATE dispatch SET current_round=3;
+                INSERT INTO message(dispatch,type,body,created)
+                VALUES('old','done','{"attempt":"b","round":3,"report":"/r"}',30.5)"#,
+            )
+            .unwrap();
+        }
+        drop(db);
+        let path = dir.path().join("router.db");
+        let before = fs::read(&path).unwrap();
+        let error = wfc_legacy_state::open_offline_copy(dir.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("dispatch old"));
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+}

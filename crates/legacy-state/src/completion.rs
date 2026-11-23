@@ -2,9 +2,24 @@
 use anyhow::{ensure, Context, Result};
 use rusqlite::{params, Connection};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::recovery::{agree, text};
+
+struct Done {
+    raw: String,
+    body: Value,
+    created: Option<f64>,
+}
+
+fn has_git_result(body: &Value) -> bool {
+    body["report"].as_str().is_some_and(|p| !p.is_empty())
+        && match (body.get("head"), body.get("dirty")) {
+            (Some(Value::Null), Some(Value::Null)) => true,
+            (Some(Value::String(head)), Some(Value::Bool(_))) => !head.is_empty(),
+            _ => false,
+        }
+}
 
 struct Snapshot {
     rowid: i64,
@@ -14,8 +29,9 @@ struct Snapshot {
     report: Option<String>,
     result: Option<String>,
     completed: Option<f64>,
-    receipt: Option<String>,
-    receipt_time: Option<f64>,
+    receipt: Option<Done>,
+    varying_results: bool,
+    repeated_attempt: bool,
     missing_report: bool,
     current: bool,
 }
@@ -70,7 +86,7 @@ impl Snapshot {
         )
     }
 
-    fn attach(&mut self, raw: String, body: &Value, time: Option<f64>) -> Result<()> {
+    fn attach(&mut self, raw: String, body: Value, mut time: Option<f64>) -> Result<()> {
         if !self.eligible() {
             // A historical unknown snapshot remains diagnostic after a later
             // attempt takes over. A terminal cancellation/failure contradicts done.
@@ -82,43 +98,109 @@ impl Snapshot {
             );
             return Ok(());
         }
-        self.accept_result(body)?;
-        if let Some(stored) = &self.result {
-            let original: Value = serde_json::from_str(stored)?;
-            let fields = original
-                .as_object()
-                .context("invalid stored completion result")?;
-            ensure!(
-                fields
+        self.accept_result(&body)?;
+        if let Some(previous) = &self.receipt {
+            // Python appends each fresh completion, then rewrites this one snapshot
+            // in the same transaction. Numeric message ID is the commit order.
+            let modern = body["round"].as_i64() == Some(self.round)
+                && body["attempt"].as_str() == Some(self.attempt.as_str());
+            self.repeated_attempt |= modern;
+            if previous.raw != raw {
+                let old = previous.body.as_object().unwrap();
+                let new = body.as_object().unwrap();
+                let pre_attempt = !old.contains_key("round") && !old.contains_key("attempt");
+                let compatible = old
                     .iter()
-                    .all(|(k, v)| body.get(k).is_none_or(|other| other == v)),
-                "conflicting stored result and done receipt"
-            );
+                    .all(|(k, v)| matches!(k.as_str(), "head" | "dirty") || new.get(k) == Some(v))
+                    && new.keys().all(|k| {
+                        old.contains_key(k)
+                            || pre_attempt
+                                && matches!(k.as_str(), "round" | "attempt" | "scope" | "role")
+                    });
+                ensure!(
+                    modern && has_git_result(&previous.body) && has_git_result(&body) && compatible,
+                    "conflicting done results"
+                );
+                self.varying_results = true;
+            } else if !modern && self.completed.is_none() {
+                agree(&mut time, previous.created, "legacy done receipt times")?;
+            }
         }
-        agree(&mut self.receipt, Some(raw), "done results")?;
-        if self.completed.is_none() {
-            agree(&mut self.receipt_time, time, "done receipt times")?;
-        }
+        self.receipt = Some(Done {
+            raw,
+            body,
+            created: time,
+        });
         Ok(())
     }
 
     fn update(self) -> Result<Option<Update>> {
-        let completed = self.state.as_deref() == Some("completed");
-        if self.receipt.is_none() && !completed {
+        if !self.eligible() {
             return Ok(None);
+        }
+        let completed = self.state.as_deref() == Some("completed");
+        let stored: Option<Value> = self
+            .result
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?;
+        if let Some(receipt) = &self.receipt {
+            if self.varying_results {
+                ensure!(
+                    stored.as_ref().is_some_and(has_git_result),
+                    "conflicting done results without a final snapshot result"
+                );
+            }
+            if self.repeated_attempt {
+                if let (Some(saved_time), Some(observed)) = (self.completed, receipt.created) {
+                    ensure!(
+                        saved_time >= observed,
+                        "stored completion time precedes the final done receipt"
+                    );
+                }
+            }
+            if let Some(original) = &stored {
+                let fields = original
+                    .as_object()
+                    .context("invalid stored completion result")?;
+                ensure!(
+                    fields
+                        .iter()
+                        .all(|(k, v)| receipt.body.get(k).is_none_or(|other| other == v)),
+                    "conflicting stored result and final done receipt"
+                );
+            }
+        } else if !completed {
+            // Failed launches can leave a diagnostic result on a running attempt.
+            // The Python completion result records the report and both Git fields.
+            if self.state.as_deref() != Some("running")
+                || (self.completed.is_none()
+                    && !stored.as_ref().is_some_and(|v| {
+                        ["report", "head", "dirty"]
+                            .iter()
+                            .any(|key| v.get(key).is_some())
+                    }))
+            {
+                return Ok(None);
+            }
+            ensure!(
+                stored.as_ref().is_some_and(has_git_result) && self.completed.is_some(),
+                "running snapshot has incomplete completion evidence"
+            );
         }
         let needs_update =
             !completed || self.missing_report || self.result.is_none() || self.completed.is_none();
         let report = self.report.context("missing completed report")?;
+        let receipt_time = self.receipt.as_ref().and_then(|r| r.created);
         let result = self
             .result
-            .or(self.receipt)
+            .or_else(|| self.receipt.map(|r| r.raw))
             .context("missing completed result")?;
         // Python samples the snapshot clock separately. If that value is lost,
         // the matched receipt time is the only durable completion observation.
         let completed = self
             .completed
-            .or(self.receipt_time)
+            .or(receipt_time)
             .context("missing completion time evidence")?;
         Ok(needs_update.then_some(Update {
             rowid: self.rowid,
@@ -167,7 +249,7 @@ fn attach_receipt(
             recipient.as_deref().is_none_or(|v| v == "controller"),
             "unexpected done recipient"
         );
-        rounds[i].attach(raw, &body, time)?;
+        rounds[i].attach(raw, body, time)?;
     } else {
         ensure!(!qualified, "done has no unique attempt snapshot");
     }
@@ -202,7 +284,8 @@ pub fn plan(db: &Connection) -> Result<Completions> {
             result: r.get(6)?,
             completed: r.get(7)?,
             receipt: None,
-            receipt_time: None,
+            varying_results: false,
+            repeated_attempt: false,
             missing_report,
             current: r.get(9)?,
         };
@@ -219,13 +302,22 @@ pub fn plan(db: &Connection) -> Result<Completions> {
     }
     // Scan the message table once even when many dispatches share this ledger.
     let mut receipts = db.prepare(
-        "SELECT dispatch,body,created,recipient FROM message WHERE type='done' ORDER BY id",
+        "SELECT dispatch,body,created,recipient,nullif(request_key,'') FROM message WHERE type='done' ORDER BY id",
     )?;
     let mut messages = receipts.query([])?;
+    let mut request_keys = BTreeSet::new();
     while let Some(row) = messages.next()? {
         let id: Option<String> = row.get(0)?;
         let Some(id) = id else { continue };
         if let Some(rounds) = groups.get_mut(&id) {
+            // A keyed retry returns the existing receipt in Python. Only a fresh
+            // submission can append another message to the completion history.
+            if let Some(key) = row.get::<_, Option<String>>(4)? {
+                ensure!(
+                    request_keys.insert((id.clone(), key)),
+                    "dispatch {id} has duplicate done request keys"
+                );
+            }
             let mut check = || attach_receipt(rounds, row.get(1)?, row.get(2)?, row.get(3)?);
             check().with_context(|| format!("cannot reconcile completions for dispatch {id}"))?;
         }

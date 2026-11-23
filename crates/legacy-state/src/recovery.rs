@@ -21,6 +21,38 @@ struct Evidence {
 
 type Key = (i64, String);
 
+// Python commits the identity change before asking the host to launch. The
+// outcome describes that launch, including failure, not whether this edge exists.
+// Walk backwards from each terminal attempt to map its predecessors to that tip.
+const CHANGES: &str = "WITH RECURSIVE receipts AS MATERIALIZED (
+    SELECT id,dispatch,type,body FROM message WHERE json_valid(body)),
+    known_rounds(dispatch,attempt,n) AS (
+        SELECT dispatch,attempt,round FROM dispatch_round
+        UNION SELECT dispatch,body->>'$.attempt',body->>'$.round' FROM receipts
+        UNION SELECT dispatch,body->>'$.toAttempt',body->>'$.round' FROM receipts
+        UNION SELECT dispatch,coalesce(to_attempt,attempt),round FROM lifecycle_event
+        UNION SELECT dispatch,attempt,round FROM watchdog_fault),
+    moves AS (
+        SELECT l.dispatch,l.id,coalesce(l.round,(SELECT min(k.n) FROM known_rounds k
+            WHERE k.dispatch=l.dispatch AND k.attempt=l.to_attempt HAVING count(DISTINCT k.n)=1)) round,
+            l.from_attempt old,l.to_attempt new,l.attempt FROM lifecycle_event l
+        WHERE operation IN ('resume','handoff') AND from_attempt<>to_attempt),
+    tips(dispatch,old,tip) AS (
+        SELECT m.dispatch,m.old,m.new FROM moves m WHERE NOT EXISTS
+            (SELECT 1 FROM moves n WHERE n.dispatch=m.dispatch AND n.old=m.new)
+        UNION SELECT m.dispatch,m.old,t.tip FROM moves m JOIN tips t
+            ON t.dispatch=m.dispatch AND t.old=m.new),
+    invalid(dispatch) AS (
+        SELECT dispatch FROM moves GROUP BY dispatch,old HAVING count(*)>1
+        UNION SELECT dispatch FROM moves GROUP BY dispatch,new HAVING count(*)>1
+        UNION SELECT m.dispatch FROM moves m JOIN moves next ON next.dispatch=m.dispatch AND next.old=m.new
+            WHERE next.id<=m.id OR next.round NOT BETWEEN m.round AND m.round+1
+        UNION SELECT m.dispatch FROM moves m WHERE m.attempt<>m.new OR m.round IS NULL
+            OR NOT EXISTS(SELECT 1 FROM tips t WHERE t.dispatch=m.dispatch AND t.old=m.old)
+            OR EXISTS(SELECT 1 FROM known_rounds k WHERE k.dispatch=m.dispatch AND
+                ((k.attempt=m.old AND m.round NOT BETWEEN k.n AND k.n+1)
+                OR (k.attempt=m.new AND k.n<>m.round))))";
+
 pub(super) fn agree<T: PartialEq>(
     known: &mut Option<T>,
     other: Option<T>,
@@ -129,35 +161,19 @@ fn read_receipts(
     Ok(modern)
 }
 
-fn read_audits(
-    db: &Connection,
-    id: &str,
-    facts: &mut Vec<Evidence>,
-    superseded: &mut BTreeSet<String>,
-) -> Result<bool> {
+fn read_audits(db: &Connection, id: &str, facts: &mut Vec<Evidence>) -> Result<bool> {
     let mut any = false;
     // from_attempt may name the previous round. Only the operation's target
     // is bound to its recorded round. Watchdog rows also pin a specific writer.
     let mut audits = db.prepare(
-        "SELECT round,attempt,to_attempt,from_attempt,operation,result FROM lifecycle_event WHERE dispatch=?1
-        UNION ALL SELECT round,attempt,NULL,NULL,NULL,NULL FROM watchdog_fault WHERE dispatch=?1",
+        "SELECT round,attempt,to_attempt,from_attempt FROM lifecycle_event WHERE dispatch=?1
+        UNION ALL SELECT round,attempt,NULL,NULL FROM watchdog_fault WHERE dispatch=?1",
     )?;
     let mut rows = audits.query([id])?;
     while let Some(row) = rows.next()? {
         any = true;
         let previous: Option<String> = row.get(3)?;
         let target: Option<String> = row.get(2)?;
-        let op: Option<String> = row.get(4)?;
-        let result: Option<String> = row.get(5)?;
-        if matches!(op.as_deref(), Some("resume" | "handoff"))
-            && result.as_deref() == Some("accepted")
-        {
-            if let (Some(old), Some(new)) = (&previous, &target) {
-                if old != new {
-                    superseded.insert(old.clone());
-                }
-            }
-        }
         let mut attempt = row.get(1)?;
         agree(&mut attempt, target, "audit target attempt")?;
         facts.push(Evidence {
@@ -258,12 +274,10 @@ fn bind_evidence(parent: &Evidence, mut facts: Vec<Evidence>) -> Result<BTreeMap
         agree(&mut known.stored_state, f.stored_state, "snapshot state")?;
         known.continued |= f.continued;
         agree(&mut known.started, f.started, "attempt start")?;
-        if let Some(done) = f.done {
-            ensure!(
-                known.done.as_ref().is_none_or(|old| old.0 == done.0),
-                "conflicting done results"
-            );
-            known.done.get_or_insert(done);
+        // Completion reconciliation compares the ordered receipts against the
+        // final snapshot. Identity recovery only needs evidence that a done exists.
+        if known.done.is_none() {
+            known.done = f.done;
         }
     }
 
@@ -279,7 +293,7 @@ fn recover(db: &Connection, id: &str) -> Result<()> {
 
     let mut facts: Vec<Evidence> = db
         .prepare("SELECT round,attempt,coalesce(nullif(report,''),CASE WHEN json_valid(result) THEN result->>'$.report' END),
-            task,state,rowid FROM dispatch_round WHERE dispatch=?")?
+            nullif(task,''),state,rowid FROM dispatch_round WHERE dispatch=?")?
         .query_map([id], |r| {
             Ok(Evidence {
                 round: r.get(0)?,
@@ -295,8 +309,7 @@ fn recover(db: &Connection, id: &str) -> Result<()> {
     let mut modern =
         !facts.is_empty() || parent.attempt.is_some() || parent.round.is_some_and(|n| n != 1);
     modern |= read_receipts(db, id, &mut facts, &mut scope, &mut role)?;
-    let mut superseded = BTreeSet::new();
-    modern |= read_audits(db, id, &mut facts, &mut superseded)?;
+    modern |= read_audits(db, id, &mut facts)?;
     if !modern {
         // An old completion with a single known report still identifies it when
         // the dispatch predates the report column.
@@ -323,14 +336,38 @@ fn recover(db: &Connection, id: &str) -> Result<()> {
         return Ok(());
     }
 
+    let invalid: bool = db.query_row(
+        &format!("{CHANGES} SELECT EXISTS(SELECT 1 FROM invalid WHERE dispatch=?)"),
+        [id],
+        |r| r.get(0),
+    )?;
+    ensure!(!invalid, "conflicting attempt transition history");
     let mut history = bind_evidence(&parent, facts)?;
     let (&(last, _), _) = history.last_key_value().context("no historical attempts")?;
+    let mut q = db.prepare(&format!(
+        "{CHANGES} SELECT m.old,t.tip,m.round FROM moves m JOIN tips t
+        ON t.dispatch=m.dispatch AND t.old=m.old WHERE m.dispatch=?"
+    ))?;
+    let mut successors: BTreeMap<String, String> = BTreeMap::new();
+    let mut last_tip = None;
+    let mut rows = q.query([id])?;
+    while let Some(row) = rows.next()? {
+        let tip: String = row.get(1)?;
+        if row.get::<_, i64>(2)? == last {
+            agree(
+                &mut last_tip,
+                Some(tip.clone()),
+                "transition tips in the latest round",
+            )?;
+        }
+        successors.insert(row.get(0)?, tip);
+    }
     // A complete pointer to a real older snapshot can lag a committed continue.
     // Move it only if both ends have independent snapshot evidence. An invented
     // first attempt or a half-recorded transition cannot authorize a new writer.
     let old_key = parent.round.zip(parent.attempt.clone());
     let stale = old_key.as_ref().is_some_and(|key| {
-        (key.0 < last || superseded.contains(&key.1))
+        (key.0 < last || successors.contains_key(&key.1))
             && history.get(key).is_some_and(|f| {
                 f.snapshot_row.is_some()
                     && parent
@@ -345,7 +382,7 @@ fn recover(db: &Connection, id: &str) -> Result<()> {
     });
     let mut candidates = history.iter().filter(|(key, f)| {
         key.0 == last
-            && !superseded.contains(&key.1)
+            && !successors.contains_key(&key.1)
             && if stale {
                 f.snapshot_row.is_some()
             } else {
@@ -363,8 +400,13 @@ fn recover(db: &Connection, id: &str) -> Result<()> {
         !history.iter().any(|(key, f)| f.continued
             && key.0 == last
             && *key != current
-            && !superseded.contains(&key.1)),
+            && successors.get(&key.1) != Some(&current.1)),
         "continue conflicts with current attempt"
+    );
+    // A second disconnected lineage cannot authorize a writer in this round.
+    ensure!(
+        last_tip.is_none_or(|tip| tip == current.1),
+        "current attempt conflicts with transition history"
     );
     let selected = history.get_mut(&current).unwrap();
     if !stale {
@@ -407,7 +449,7 @@ fn save_snapshots(
             );
             // Keep the original row and its callback fields when completing its identity.
             db.execute(
-                "UPDATE dispatch_round SET task=coalesce(task,?1),report=coalesce(nullif(report,''),?2),
+                "UPDATE dispatch_round SET task=coalesce(nullif(task,''),?1),report=coalesce(nullif(report,''),?2),
                     round=?3, attempt=?4 WHERE rowid=?5",
                 params![f.task, f.report, round, attempt, row_id],
             )?;
@@ -438,9 +480,7 @@ fn save_snapshots(
 // Include a ledger already opened by an older migrator that created a new
 // first attempt despite a receipt naming a different, now missing snapshot.
 pub fn candidates(db: &Connection) -> Result<Vec<String>> {
-    let mut query = db.prepare("WITH receipts AS MATERIALIZED (
-            SELECT id,dispatch,type,body FROM message WHERE json_valid(body)),
-        continues AS (
+    let mut query = db.prepare(&format!("{CHANGES}, continues AS (
             SELECT id,dispatch,body->>'$.round' n,body->>'$.attempt' a,
                 body->>'$.task' task,body->>'$.report' report FROM receipts WHERE type='continue'),
         possible AS (
@@ -468,12 +508,13 @@ pub fn candidates(db: &Connection) -> Result<Vec<String>> {
           OR NOT EXISTS(SELECT 1 FROM dispatch_round r WHERE r.dispatch=d.id)
           OR EXISTS(SELECT 1 FROM dispatch_round r WHERE r.dispatch=d.id AND r.round=d.current_round
               AND r.attempt=d.current_attempt AND ((r.report IS NOT NULL AND nullif(d.report,'') IS NULL)
-              OR (r.task IS NOT NULL AND nullif(d.task,'') IS NULL)))
+              OR (nullif(r.task,'') IS NOT nullif(d.task,''))))
           OR EXISTS(SELECT 1 FROM dispatch_round r WHERE r.dispatch=d.id
               AND (r.round IS NULL OR r.attempt IS NULL OR coalesce(r.state,'')='' OR r.round>d.current_round))
-        UNION SELECT d.id FROM dispatch d JOIN lifecycle_event l ON l.dispatch=d.id
-          WHERE l.operation IN ('resume','handoff') AND l.result='accepted' AND l.from_attempt=d.current_attempt
-            AND l.to_attempt IS NOT NULL AND l.to_attempt<>l.from_attempt
+        UNION SELECT d.id FROM dispatch d JOIN invalid i ON i.dispatch=d.id
+        UNION SELECT d.id FROM dispatch d JOIN moves m ON m.dispatch=d.id
+            JOIN tips t ON t.dispatch=m.dispatch AND t.old=m.old
+            WHERE m.old=d.current_attempt OR (m.round=d.current_round AND t.tip<>d.current_attempt)
         UNION SELECT d.id FROM bindings b JOIN dispatch d ON d.id=b.dispatch
           WHERE (b.choices>1 AND b.compatible_count<>1)
             OR ((b.choices=1 OR b.compatible) AND (
@@ -483,13 +524,12 @@ pub fn candidates(db: &Connection) -> Result<Vec<String>> {
                    (b.task IS NOT NULL AND d.task IS NOT b.task)
                    OR (b.report IS NOT NULL AND d.report IS NOT b.report)))
                OR (b.round=d.current_round AND b.attempt<>d.current_attempt AND NOT EXISTS(
-                   SELECT 1 FROM lifecycle_event l WHERE l.dispatch=d.id AND l.from_attempt=b.attempt
-                   AND l.operation IN ('resume','handoff') AND l.result='accepted' AND l.to_attempt<>l.from_attempt))))
+                   SELECT 1 FROM tips t WHERE t.dispatch=d.id AND t.old=b.attempt AND t.tip=d.current_attempt))))
         UNION SELECT d.id FROM message m JOIN dispatch d ON d.id=m.dispatch
             WHERE m.type='continue' AND NOT json_valid(m.body)
         UNION SELECT e.id FROM attested e JOIN dispatch d ON d.id=e.id
           WHERE (e.n IS NOT NULL OR e.a IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM dispatch_round r
-              WHERE r.dispatch=e.id AND (e.n IS NULL OR r.round=e.n) AND (e.a IS NULL OR r.attempt=e.a))")?;
+              WHERE r.dispatch=e.id AND (e.n IS NULL OR r.round=e.n) AND (e.a IS NULL OR r.attempt=e.a))"))?;
     let rows = query.query_map([], |r| r.get(0))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }

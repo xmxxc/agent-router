@@ -64,6 +64,18 @@ def run(early, later, binary):
                         assert snap[2:] == (str(report), "completed", body, when)
                         assert db.execute("SELECT current_round,current_attempt FROM dispatch").fetchone() == snap[:2]
                     print(name, "pre-attempt reports", n, "selected done", mid, "clock", when, "messages", len(messages))
+                    if source and n == 1:
+                        # The same original report can be completed again after Python upgrades the database.
+                        subprocess.run([sys.executable, "-B", source / "router.py", "done", "--report", str(report)],
+                                       env={**settings, "WFC_DISPATCH": did}, check=True, capture_output=True)
+                        mixed, mixed_sha = dump(db_path), digest(db_path)
+                        with closing(sqlite3.connect(db_path)) as db:
+                            bodies = [json.loads(row[0]) for row in db.execute("SELECT body FROM message ORDER BY id")]
+                            assert len(bodies) == 2 and "attempt" not in bodies[0] and bodies[1]["attempt"] == snap[1]
+                        for _ in range(2):
+                            opened = json.loads(subprocess.check_output([binary, "migrate", "--offline-copy", work], env=settings))
+                            assert opened["backup"] is None and dump(db_path) == mixed and digest(db_path) == mixed_sha
+                        print(name, "pre-attempt -> modern repeated done", mid, "all rows and bytes unchanged", mixed_sha)
                 if n == 2:
                     conflict = Path(tmp) / "conflict"
                     conflict.mkdir()

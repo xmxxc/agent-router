@@ -53,6 +53,8 @@
 快照缺失时，迁移会核对回执正文、生命周期审计和已有尝试记录。能确定归属的 done 按原轮次、attempt、报告及原始正文恢复。
 逐轮核对会保留已有结果原文和快照完成时间。Python 写入快照与 done 收件时分别读取时钟；
 快照时间丢失时，仅能以唯一匹配的 done 收件时间作为完成的观察时间。两处时间都缺失时会拒写。
+现代账本可包含同一报告多次完成的回执。按消息编号核对提交顺序，最终快照须能印证同一 attempt 的最后一次 Git 结果。
+resume 或 handoff 的前后 attempt 在启动前已提交，离线核验沿审计链确定当前身份，并保留每次启动的原始结果。
 早期库保留各报告的历史消息，用当前报告定位对应的 done。旧父行若仍指向已被后续记录替代的快照，
 需要历史记录能唯一确定其后继才会更新。
 缺少结果证据、存在多个当前候选或证据冲突时，迁移点名任务并回滚。早于 attempt 机制的记录仍可分配首轮身份。
@@ -63,6 +65,7 @@
 cargo test --locked -p wfc-legacy-state
 python3 crates/legacy-state/tests/python_ledger.py /path/to/workflow-core-checkout target/debug/wfc-legacy-state
 python3 crates/legacy-state/tests/python_recovery.py /path/to/workflow-core-checkout target/debug/wfc-legacy-state
+python3 -B crates/legacy-state/tests/python_history.py /path/to/workflow-core-checkout target/debug/wfc-legacy-state
 python3 -B crates/legacy-state/tests/python_pre_attempt.py /path/to/pr39 /path/to/pr40 target/debug/wfc-legacy-state
 ```
 
