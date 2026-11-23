@@ -487,6 +487,7 @@ fn retry_checks_current_and_historical_tmux_receipts_under_the_inbox_lock() {
         None,
     )
     .unwrap();
+    assert!(resume_source_adoption(&ledger, &next).is_err());
     workflow::write_json(
         path,
         &json!({"category":"started","launchId":launch,"pid":1}),
