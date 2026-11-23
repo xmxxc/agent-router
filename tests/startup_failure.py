@@ -194,12 +194,37 @@ class StartupFailure(unittest.TestCase):
         self.assertNotIn("startupFailure", closed)
         self.assertFalse(self.cli("wait", "--scope", "active-cancel", "--timeout", "0", code=3)["messages"])
 
-    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
-    def test_hosted_failures(self):
+    def start_tmux(self):
         subprocess.run([*self.tmux, "new-session", "-d", "-s", "sentinel", "/bin/cat"],
                        env=self.env, check=True, timeout=10)
         self.addCleanup(subprocess.run, [*self.tmux, "kill-server"], env=self.env,
                         capture_output=True, timeout=10)
+
+    @unittest.skipIf(os.geteuid() == 0, "script lookup requires a regular user")
+    def test_script_lookup_permission_failure(self):
+        hidden = self.cwd / SECRET
+        hidden.mkdir()
+        script = hidden / "script.py"
+        script.touch()
+        hidden.chmod(0)
+        self.addCleanup(hidden.chmod, 0o700)
+        with self.assertRaises(PermissionError):
+            script.stat()
+        error = self.deploy("script-denied", [str(script)], host="codex", runtime=[sys.executable], code=1)
+        self.assertIn("permission denied while resolving configured script", error)
+        self.assertNotIn(SECRET, error)
+        message = self.wait("script-denied")
+        fault = message["fault"]
+        self.assertEqual((message["type"], fault["category"]), ("blocked", "permission_denied"))
+        self.assertEqual(message["message"], "Permission denied while resolving the configured worker script")
+        self.assertTrue(all(fault[key] is None for key in ("pid", "processStart", "exitCode", "signal", "launchId")))
+        row = self.check_ack(message)
+        self.assertEqual((row["scope"], row["attempt"], row["round"]), ("script-denied", message["attempt"], 1))
+        self.assertEqual(row["worker"]["state"], "not_started")
+
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_hosted_failures(self):
+        self.start_tmux()
         invalid = self.deploy("invalid-config", [str(self.cwd / SECRET)], host="codex", runtime=SECRET, code=1)
         self.assertIn("invalid launch config", invalid)
         self.assertNotIn(SECRET, invalid)
@@ -289,11 +314,107 @@ class StartupFailure(unittest.TestCase):
         self.assertFalse(self.cli("wait", "--scope", "host-zero-done", "--timeout", "0", code=3)["messages"])
 
     @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_tmux_zero_follows_the_create_confirmation(self):
+        self.start_tmux()
+        real_tmux = self.tmux[0]
+        shim_dir = self.cwd / "bin"
+        shim_dir.mkdir()
+        shim = shim_dir / "tmux"
+        gate = self.cwd / "pre-confirmation-exit"
+        shim.write_text(f"#!{sys.executable}\n" + textwrap.dedent(f"""\
+            import os
+            from pathlib import Path
+            import subprocess
+            import sys
+            import time
+
+            argv = [{real_tmux!r}, *sys.argv[1:]]
+            if "new-session" not in argv:
+                os.execv(argv[0], argv)
+            result = subprocess.run(argv)
+            if result.returncode:
+                sys.exit(result.returncode)
+            # Hold the genuine tmux response until the real child reaches
+            # its exit, so create cannot yet confirm the launch.
+            gate = Path({str(gate)!r})
+            deadline = time.monotonic() + 3
+            while not gate.exists() and time.monotonic() < deadline:
+                time.sleep(.005)
+            sys.exit(0 if gate.exists() else 1)
+        """))
+        shim.chmod(0o700)
+        probe = textwrap.dedent("""\
+            import json
+            import os
+            from pathlib import Path
+            import time
+
+            launches = Path(os.environ["WFC_STATE"]) / "launches"
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                for path in launches.glob("*.json"):
+                    receipt = json.loads(path.read_text())
+                    if receipt.get("category") == "started" and receipt.get("pid") == os.getpid():
+                        ready = time.monotonic()
+                        time.sleep(.35)
+                        elapsed = time.monotonic() - ready
+                        Path("pre-confirmation-exit").write_text(json.dumps({"launchId": receipt["launchId"],
+                            "pid": os.getpid(), "startedToExitMs": int(elapsed * 1000)}))
+                        raise SystemExit(0)
+                time.sleep(.005)
+            raise SystemExit(125)
+        """)
+        old_path = self.env["PATH"]
+        self.env["PATH"] = f"{shim_dir}:{old_path}"
+        try:
+            self.deploy("late-zero", [sys.executable, "-c", probe], host="codex", code=1)
+        finally:
+            self.env["PATH"] = old_path
+        evidence = json.loads(gate.read_text())
+        self.assertGreaterEqual(evidence["startedToExitMs"], 350)
+        late = self.wait("late-zero")
+        fault = late["fault"]
+        self.assertEqual((late["type"], fault["exitCode"]), ("exited", 0))
+        self.assertEqual((fault["launchId"], fault["pid"]), (evidence["launchId"], evidence["pid"]))
+        self.assertEqual(self.check_ack(late)["worker"]["exit_code"], 0)
+        quiet = self.cli("wait", "--scope", "late-zero", "--dispatch", late["dispatch"],
+                         "--timeout", ".35", code=3)
+        self.assertFalse(quiet["messages"])
+        print(json.dumps({"case": "late-zero", "messageId": late["messageId"],
+                          "attempt": late["attempt"], "exitCode": fault["exitCode"], **evidence}), flush=True)
+
+        accepted = self.deploy("accepted-zero", ["/bin/sh", "-c",
+            'for i in $(seq 200); do test ! -e release-accepted || exit 0; sleep .01; done; exit 125'],
+            host="codex")
+        (self.cwd / "release-accepted").touch()
+        dispatch = accepted["dispatch"]
+        self.until(lambda: self.cli("status", "--dispatch", dispatch)["dispatches"][0]["worker"]["state"] == "exited",
+                   "wait for accepted worker to exit")
+        row = self.cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual(row["worker"]["exit_code"], 0)
+        self.assertNotIn("startupFailure", row)
+        self.assertFalse(self.cli("wait", "--scope", "accepted-zero", "--timeout", "0", code=3)["messages"])
+        runtime, = self.cli("wait", "--scope", "accepted-zero", "--dispatch", dispatch,
+                            "--timeout", "4")["messages"]
+        self.assertEqual((runtime["kind"], runtime["type"], runtime["fault"]["exitCode"]),
+                         ("host_runtime", "exited", 0))
+        self.assertEqual(runtime["attempt"], accepted["attempt"])
+        self.assertGreater(runtime["fault"]["pid"], 0)
+        self.assertRegex(runtime["fault"]["processStart"], r"^linux:[0-9a-f-]+:\d+$")
+        current = self.cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertNotIn("startupFailure", current)
+        self.assertEqual([m["messageId"] for m in current["messages"]], [runtime["messageId"]])
+        quiet = self.cli("wait", "--scope", "accepted-zero", "--dispatch", dispatch,
+                         "--timeout", ".35", code=3)
+        self.assertFalse(quiet["messages"])
+        print(json.dumps({"case": "accepted-zero", "scope": runtime["scope"],
+                          "dispatch": dispatch, "attempt": runtime["attempt"],
+                          "messageId": runtime["messageId"], "fault": runtime["fault"]}), flush=True)
+
+
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
     def test_host_runtime_observations(self):
-        subprocess.run([*self.tmux, "new-session", "-d", "-s", "sentinel", "/bin/cat"],
-                       env=self.env, check=True, timeout=10)
-        self.addCleanup(subprocess.run, [*self.tmux, "kill-server"], env=self.env,
-                        capture_output=True, timeout=10)
+        self.start_tmux()
         fixture = textwrap.dedent(r"""
             import json
             import os
@@ -361,6 +482,10 @@ class StartupFailure(unittest.TestCase):
             self.assertEqual((ack["state"], ack["statusVersion"], ack["duplicate"]),
                              ("processed", 3, False))
             self.assertTrue(self.cli("ack", message["messageId"], "--body", encoded)["duplicate"])
+            print(json.dumps({"case": "runtime-tmux", "dispatch": job["dispatch"],
+                              "attempt": job["attempt"], "scope": job["scope"], "host": job["host"],
+                              "messageId": message["messageId"], "state": state,
+                              "fault": message["fault"], "ackVerified": True}), flush=True)
 
         for host, screen, kind, category, state in (
             ("codex", "Quota exceeded", "blocked", "quota", "blocked"),

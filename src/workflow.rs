@@ -253,17 +253,19 @@ impl<'a> Dispatch<'a> {
             }
             match host.prepare(&state, &mut record) {
                 Ok(launch) => Some(launch),
-                #[cfg(target_os = "linux")]
-                Err(err) if err.is::<host::MissingScript>() => {
-                    record["create"] = json!({"result":"definitely-not-sent","category":"configured_script_missing",
-                        "dispatch":dispatch,"attempt":attempt,"round":round});
-                    record["worker"] =
-                        json!({"state":"not_started","exit_code":null,"signal":null});
-                    write_json(&records.join(format!("{dispatch}.json")), &record, None)?;
-                    startup::Startup::new(&state, &dispatch, &attempt, None).script_missing();
+                Err(err) => {
+                    #[cfg(target_os = "linux")]
+                    if let Some(failure) = err.downcast_ref::<host::ScriptUnavailable>() {
+                        record["create"] = json!({"result":"definitely-not-sent","category":failure.category(),
+                            "dispatch":dispatch,"attempt":attempt,"round":round});
+                        record["worker"] =
+                            json!({"state":"not_started","exit_code":null,"signal":null});
+                        write_json(&records.join(format!("{dispatch}.json")), &record, None)?;
+                        startup::Startup::new(&state, &dispatch, &attempt, None)
+                            .script_unavailable(*failure);
+                    }
                     return Err(err);
                 }
-                Err(err) => return Err(err),
             }
         } else {
             None

@@ -128,6 +128,10 @@ sys.exit(1 if mode else 0)
         self.assertEqual((ack["state"], ack["statusVersion"]), ("processed", 4))
         self.cli("relay", "--codex", "--scope", "failure", "--for", "1.25")
         self.assertEqual(self.calls(), [call])
+        print(json.dumps({"case": "runtime-private-queue", "scope": notice["scope"],
+                          "dispatch": notice["dispatch"], "attempt": notice["attempt"],
+                          "messageId": notice["messageId"], "fault": notice["fault"],
+                          "queueCalls": 1, "ack": ack}), flush=True)
 
     def test_detached_scope(self):
         other = self.publish("other")

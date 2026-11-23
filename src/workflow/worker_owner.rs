@@ -1,4 +1,4 @@
-//! One detached, single-threaded wfc owns and reaps one Linux worker tree.
+//! One detached wfc owns and reaps one Linux worker tree.
 use super::{read_record, state_dir, valid_id, valid_identity};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
@@ -273,8 +273,9 @@ fn supervise(args: &[OsString]) -> Result<()> {
     };
     let watching = startup.watch(&child);
     let root = child.id() as i32;
-    let observed_root = exit_pending(root).unwrap_or(false).then(Instant::now);
-    let published = fs::rename(&pending, dir.join(format!("{id}.json")));
+    let (published, observed_root) = publish_while_observing(root, || {
+        fs::rename(&pending, dir.join(format!("{id}.json")))
+    });
     if published.is_ok() {
         let _ = writeln!(io::stdout().lock(), "ready");
     }
@@ -292,6 +293,36 @@ fn supervise(args: &[OsString]) -> Result<()> {
     file.write_all_at(result.to_string().as_bytes(), header.len() as u64)?;
     file.sync_data()?;
     Ok(())
+}
+
+fn publish_while_observing(
+    root: i32,
+    publish: impl FnOnce() -> io::Result<()>,
+) -> (io::Result<()>, Option<Instant>) {
+    if exit_pending(root).unwrap_or(false) {
+        let observed = Instant::now();
+        return (publish(), Some(observed));
+    }
+    let (finished, publishing) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        // WNOWAIT leaves the child pinned for the owner, which still reaps
+        // and distinguishes natural exit from an actual close signal.
+        let observer = std::thread::Builder::new().spawn_scoped(scope, move || loop {
+            if exit_pending(root).unwrap_or(false) {
+                return Some(Instant::now());
+            }
+            match publishing.recv_timeout(Duration::from_millis(5)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (),
+                _ => return exit_pending(root).unwrap_or(false).then(Instant::now),
+            }
+        });
+        let published = publish();
+        let _ = finished.send(());
+        let observed = observer
+            .ok()
+            .and_then(|thread| thread.join().ok().flatten());
+        (published, observed)
+    })
 }
 
 fn watch_tree(
@@ -414,5 +445,57 @@ fn exit_pending(pid: i32) -> io::Result<bool> {
         if err.kind() != io::ErrorKind::Interrupted {
             return Err(err);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_observes_natural_exit_during_controlled_publication() -> Result<()> {
+        let state = std::env::temp_dir().join(format!("wfc-slow-publish-{}", uuid::Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let dispatch = "d-aabbccdd";
+            let attempt = "a-123456789abc";
+            let dir = state.join("dispatches");
+            fs::create_dir_all(&dir)?;
+            let pending = super::super::assignment::reserve(
+                &dir,
+                dispatch,
+                &json!({
+                    "dispatch":dispatch,"attempt":attempt,"round":1,"scope":"slow-publication",
+                    "role":"fixture","cwd":state,"report":state.join("report"),
+                }),
+            )?;
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", "read -r line; exit 17"])
+                .stdin(Stdio::piped())
+                .spawn()?;
+            let pid = child.id();
+            let startup = super::super::startup::Startup::new(&state, dispatch, attempt, None);
+            let watching = startup.watch(&child);
+            let (published, observed) = publish_while_observing(pid as i32, || {
+                drop(child.stdin.take());
+                std::thread::sleep(Duration::from_millis(350));
+                fs::rename(&pending, dir.join(format!("{dispatch}.json")))
+            });
+            let exit = child.wait()?;
+            published?;
+            assert_eq!(exit.code(), Some(17));
+            watching.exited(
+                exit,
+                observed.context("exit was not observed during publication")?,
+            );
+            let history = super::super::messages::history(&state, dispatch)?;
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0]["attempt"], attempt);
+            assert_eq!(history[0]["scope"], "slow-publication");
+            assert_eq!(history[0]["fault"]["exitCode"], 17);
+            assert_eq!(history[0]["fault"]["pid"], pid);
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(state);
+        result
     }
 }
