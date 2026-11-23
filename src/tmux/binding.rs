@@ -95,7 +95,23 @@ pub(super) fn valid_launch_id(id: &str) -> bool {
             .all(|c| c.is_ascii_digit() || matches!(c, b'a'..=b'f'))
 }
 
-fn host_launch_id(pid: u32, state: &Path) -> Option<String> {
+fn host_launch_id(pid: u32, state: &Path, dispatch: &str, target: &Target) -> Option<String> {
+    // A pane can move. The R1 supervisor inherited its original dispatch and
+    // tmux server/session at startup, independently of its current window.
+    let environment = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let field = |prefix: &[u8]| {
+        environment
+            .split(|b| *b == 0)
+            .find_map(|v| v.strip_prefix(prefix))
+    };
+    let session = target.session.strip_prefix('$')?;
+    let endpoint = format!(",{},{session}", target.server_pid);
+    if field(b"WFC_STATE=")? != state.as_os_str().as_encoded_bytes()
+        || field(b"WFC_DISPATCH=")? != dispatch.as_bytes()
+        || !field(b"TMUX=")?.ends_with(endpoint.as_bytes())
+    {
+        return None;
+    }
     let cmd = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     let args: Vec<_> = cmd.strip_suffix(&[0])?.split(|c| *c == 0).collect();
     let [_, b"--tmux-host", id] = args.as_slice() else {
@@ -598,7 +614,7 @@ impl Tmux<'_> {
                 continue;
             }
             let pid: u32 = pid.parse().map_err(|_| unknown())?;
-            let Some(id) = host_launch_id(pid, self.state) else {
+            let Some(id) = host_launch_id(pid, self.state, self.dispatch, t) else {
                 continue;
             };
             if expected.is_some_and(|wanted| wanted != id) {
