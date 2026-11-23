@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [workspace]
-members = ["crates/ghostty-vt"]
+members = ["crates/ghostty-vt", "crates/herdr"]
 
 [dependencies]
 anyhow = "1"
