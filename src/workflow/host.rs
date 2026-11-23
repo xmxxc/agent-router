@@ -9,6 +9,9 @@ use std::{
 };
 use uuid::Uuid;
 
+#[cfg(target_os = "linux")]
+mod opencode;
+
 #[derive(Default)]
 pub struct Options<'a> {
     pub name: &'a str,
@@ -220,6 +223,49 @@ fn claude_trust(cwd: &Path) -> Result<Option<PathBuf>> {
 
 impl Options<'_> {
     pub fn prepare(&self, state: &Path, record: &mut Value) -> Result<Launch> {
+        self.prepare_launch(state, record, None)
+    }
+
+    // The resume transaction owns publication and the subsequent terminal input.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)] // Called when the shared resume transaction admits OpenCode.
+    pub fn prepare_opencode_resume(
+        state: &Path,
+        original: &Value,
+        next: &mut Value,
+    ) -> Result<Launch> {
+        ensure!(
+            original["host"] == "opencode" && original["backend"] == "tmux",
+            "expected an OpenCode tmux assignment"
+        );
+        ensure!(
+            original["dispatch"].is_string()
+                && original["dispatch"] == next["dispatch"]
+                && original["cwd"] == next["cwd"]
+                && next["attempt"]
+                    .as_str()
+                    .is_some_and(|id| super::valid_identity(id, "a-"))
+                && original["attempt"] != next["attempt"],
+            "OpenCode resume requires the original dispatch and directory"
+        );
+        Options {
+            name: "opencode",
+            backend: "tmux",
+            config: original["launchConfig"].as_str(),
+            model: original["model"].as_str(),
+            effort: original["effort"].as_str(),
+            git: original["git"] == true,
+            ..Options::default()
+        }
+        .prepare_launch(state, next, Some(original))
+    }
+
+    fn prepare_launch(
+        &self,
+        state: &Path,
+        record: &mut Value,
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] original: Option<&Value>,
+    ) -> Result<Launch> {
         let cwd = Path::new(record["cwd"].as_str().context("missing cwd")?);
         let report = Path::new(record["report"].as_str().context("missing report")?);
         let mut writable = vec![
@@ -234,7 +280,7 @@ impl Options<'_> {
             "You are a worker dispatched by the controller (dispatch {}). Read and do the task in {}. Stop any server or background process you started before reporting. Write the report to {}. Run \"$WFC_BIN\" done --report \"$WFC_REPORT\" --attempt \"$WFC_ATTEMPT\". If you need a decision, run \"$WFC_BIN\" ask \"<question>\" [--options a,b] --attempt \"$WFC_ATTEMPT\" and end your turn. The answer arrives as your next message.",
             record["dispatch"].as_str().context("missing dispatch")?, task, report.display()
         );
-        if self.name == "opencode" && self.backend == "herdr" {
+        if self.name == "opencode" {
             brief.push_str(&format!(
                 " Current attempt {}.",
                 record["attempt"].as_str().context("missing attempt")?
@@ -265,6 +311,12 @@ impl Options<'_> {
                 env: Map::new(),
             },
         };
+        if let Some(original) = original {
+            ensure!(
+                original["launchConfig"] == json!(selected_config),
+                "configured OpenCode launch config differs from the original dispatch"
+            );
+        }
         let a = &mut launch.argv;
         let mut ignored = Vec::new();
         match self.name {
@@ -300,14 +352,30 @@ impl Options<'_> {
                 a.push(brief);
             }
             "opencode" => {
-                a.push(cwd.to_str().unwrap().into());
+                #[cfg(target_os = "linux")]
+                let session = opencode::prepare(&mut launch.env, record, original, &brief)?;
+                #[cfg(not(target_os = "linux"))]
+                let session: Option<String> = None;
+                let cwd = record["cwd"].as_str().context("missing cwd")?;
+                ensure!(
+                    Path::new(cwd).is_absolute(),
+                    "OpenCode requires an absolute cwd"
+                );
+                a.push(cwd.into());
+                if let Some(effort) = self.effort {
+                    record["effort"] = json!(effort);
+                }
                 if let Some(m) = self.model {
                     a.extend(["-m".into(), m.into()]);
                 }
                 if let Some(e) = self.effort {
                     a.extend(["--variant".into(), e.into()]);
                 }
-                a.extend(["--prompt".into(), brief]);
+                if let Some(session) = session {
+                    a.extend(["-s".into(), session]);
+                } else {
+                    a.extend(["--prompt".into(), brief]);
+                }
                 launch.env.insert("OPENCODE_CONFIG_CONTENT".into(),json!(json!({"permission":{"external_directory":{"*":"allow"},"read":{"*.env":"allow","*.env.*":"allow"}}}).to_string()));
             }
             "claude" => {
@@ -368,7 +436,10 @@ impl Options<'_> {
                 record[key].clone(),
             );
         }
-        launch.env.insert("WFC_ROUND".into(), json!("1"));
+        let round = record["round"].as_u64().unwrap_or(1);
+        launch
+            .env
+            .insert("WFC_ROUND".into(), json!(round.to_string()));
         launch.env.insert("WFC_STATE".into(), json!(state));
         launch
             .env

@@ -850,6 +850,7 @@ dependencies = [
  "http",
  "libc",
  "portable-pty",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
