@@ -41,20 +41,33 @@ run_suite() {
         tee -a "$EVIDENCE/results.log"
 }
 
-case "${1:-all}" in
-  all)
+run_opencode_suites() {
     run_suite opencode tests/opencode_relay.py OpenCodeRelay 6
     run_suite managed-opencode "$ci_dir/managed_owner.py" ManagedOpenCode.test_current_owner_delivers_and_old_owner_cannot_claim 1
+}
+
+run_owner_suites() {
+    run_suite owner-takeover tests/owner.py Owner.test_takeover_waits_for_scoped_delivery_and_unregisters_detached_relay 1
+    run_suite owner-expiry tests/owner.py Owner.test_relay_settles_its_claim_after_lease_expires 1
+}
+
+case "${1:-all}" in
+  all)
+    run_opencode_suites
     run_suite codex tests/relay.py Relay 17
+    run_owner_suites
     ;;
   owner-only)
+    run_owner_suites
+    ;;
+  target-validation)
+    run_opencode_suites
+    run_suite codex-envelope tests/relay.py Relay.test_question_envelope_matches_python_json_separators 1
     ;;
   *)
-    printf 'expected all or owner-only\n' >&2
+    printf 'expected all, owner-only or target-validation\n' >&2
     exit 2
     ;;
 esac
-run_suite owner-takeover tests/owner.py Owner.test_takeover_waits_for_scoped_delivery_and_unregisters_detached_relay 1
-run_suite owner-expiry tests/owner.py Owner.test_relay_settles_its_claim_after_lease_expires 1
 printf 'firstFailedSuite=%s\n' "$first_failure" | tee -a "$EVIDENCE/results.log"
 test "$first_failure" = none

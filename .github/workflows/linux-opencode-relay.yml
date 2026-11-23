@@ -1,7 +1,7 @@
-name: Linux OpenCode combination and package
+name: Linux OpenCode target validation
 on:
   push:
-    branches: [rust-router/38-opencode-jammy-ci]
+    branches: [rust-router/38-opencode-target-jammy-ci]
 
 permissions:
   contents: read
@@ -14,9 +14,9 @@ jobs:
       run:
         shell: bash
     env:
-      PRODUCT_SHA: 453fe04cd18dfccd525c8070ebfe33e659146a1a
-      PRODUCT_TREE: a30c73e0c4fdb8bab531079edcbf622e9f59d560
-      PRODUCT_PARENTS: '3578eebb0aa13e7470ef72a088d5fa074546e268 3abcd84e8e6e98e56ed4b655daf950c1ac6d82e1'
+      PRODUCT_SHA: d69868d0e66478c85dcaac7a8e00db326aca8724
+      PRODUCT_TREE: 19cc8b6e844ae45de27139c197cbd6c1b7e2d047
+      PRODUCT_PARENTS: '3578eebb0aa13e7470ef72a088d5fa074546e268 d18ce9add97c9296c3e55c6f7330349e984f7de7'
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TARGET: x86_64-unknown-linux-gnu
       CARGO_BUILD_JOBS: '2'
@@ -170,18 +170,12 @@ jobs:
         working-directory: product
         run: |
           bash ../ci/tools/ci/opencode-relay/libraries.sh 2>&1 | tee "$EVIDENCE/libraries-step.log"
-      - name: Package and verify the unpacked ELF and libcurl notices
-        id: package
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: product
-        run: |
-          bash ../ci/tools/ci/opencode-relay/package.sh 2>&1 | tee "$EVIDENCE/package.log"
-      - name: Run the OpenCode, Codex and scope owner regressions
+      - name: Run the OpenCode target and delivery regressions
         id: suites
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: product
         run: |
-          bash ../ci/tools/ci/opencode-relay/verify.sh 2>&1 | tee "$EVIDENCE/suites-step.log"
+          bash ../ci/tools/ci/opencode-relay/verify.sh target-validation 2>&1 | tee "$EVIDENCE/suites-step.log"
       - name: Record step outcomes and checksum the evidence
         if: ${{ always() }}
         env:
@@ -196,14 +190,13 @@ jobs:
           WUFFS_OUTCOME: ${{ steps.wuffs.outcome }}
           BUILD_OUTCOME: ${{ steps.build.outcome }}
           LIBRARIES_OUTCOME: ${{ steps.libraries.outcome }}
-          PACKAGE_OUTCOME: ${{ steps.package.outcome }}
           SUITES_OUTCOME: ${{ steps.suites.outcome }}
         run: |
           mkdir -p "$EVIDENCE"
           cd "$EVIDENCE"
           first_failure=none
           {
-            for step in CI PRODUCT NATIVE SOURCES PYTHON ZIG TOOLCHAIN GHOSTTY WUFFS BUILD LIBRARIES PACKAGE SUITES; do
+            for step in CI PRODUCT NATIVE SOURCES PYTHON ZIG TOOLCHAIN GHOSTTY WUFFS BUILD LIBRARIES SUITES; do
               name="${step}_OUTCOME"
               result=${!name}
               printf '%s=%s\n' "$step" "$result"
@@ -214,13 +207,13 @@ jobs:
             printf 'firstFailedStep=%s\n' "$first_failure"
           } | tee outcomes.log
           shopt -s nullglob
-          sha256sum -- *.log *.sha256 *.tar.gz > SHA256SUMS
+          sha256sum -- *.log *.sha256 > SHA256SUMS
           sha256sum --check --strict SHA256SUMS
       - name: Upload Linux relay evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: linux-opencode-jammy-${{ github.run_id }}-${{ github.run_attempt }}
+          name: linux-opencode-target-jammy-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14
