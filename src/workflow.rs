@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 #[cfg(not(target_os = "linux"))]
 use std::process::Command;
@@ -15,6 +15,7 @@ use uuid::Uuid;
 #[cfg(target_os = "linux")]
 pub mod worker_owner;
 
+mod assignment;
 mod backend;
 pub mod host;
 mod view;
@@ -240,19 +241,9 @@ impl<'a> Dispatch<'a> {
             record["worker"] = json!({"state":"running"});
         }
 
-        // Reserve and write the record before starting the worker. Status sees it
-        // only after a successful handoff, when the rename publishes it in one step.
-        let pending = records.join(format!("{dispatch}.pending"));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut file = options.open(&pending).context("reserve dispatch record")?;
+        let pending = assignment::reserve(&records, &dispatch, &record)?;
         let mut preserve_binding = false;
         let result = (|| -> Result<()> {
-            writeln!(file, "{record}")?;
-            file.sync_all()?;
-            drop(file);
             if let Some(launch) = launch {
                 let answer = backend::create(&state, &record, launch)?;
                 let accepted = answer["result"] == "accepted";
@@ -437,6 +428,10 @@ fn valid_identity(id: &str, prefix: &str) -> bool {
 fn read_record(path: &Path) -> Result<Value> {
     let file =
         File::open(path).with_context(|| format!("open dispatch record {}", path.display()))?;
+    decode_record(file, path)
+}
+
+fn decode_record(file: File, path: &Path) -> Result<Value> {
     let mut record: Value = serde_json::from_reader(file)
         .with_context(|| format!("read dispatch record {}", path.display()))?;
     ensure!(
@@ -466,63 +461,44 @@ fn status_with_history(
     let state = state_dir()?;
     let dir = state.join("dispatches");
     let mut dispatches = Vec::new();
-    let mut named_history = None;
     if let Some(id) = id {
         let id = id
             .to_str()
             .filter(|s| valid_id(s))
             .context("invalid dispatch ID")?;
-        let messages = history(&state, id)?;
-        let not_found = |err: &anyhow::Error| {
-            err.downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == ErrorKind::NotFound)
-        };
-        let row = match read_record(&dir.join(format!("{id}.json"))) {
-            Ok(r) => r,
-            Err(e) if not_found(&e) && !messages.is_empty() => {
-                // A worker can report before its launcher publishes the assignment.
-                match read_record(&dir.join(format!("{id}.pending"))) {
-                    Ok(r) => r,
-                    Err(e) if not_found(&e) => {
-                        let last = messages.last().unwrap();
-                        json!({"dispatch":id,"round":last["round"],"attempt":last["attempt"],"scope":last["scope"],"role":last["role"],"report":last["report"]})
-                    }
-                    Err(e) => return Err(e),
-                }
+        let row = match assignment::public_record(&dir, id)? {
+            Some(row) => row,
+            None => {
+                let messages = history(&state, id)?;
+                let last = messages
+                    .last()
+                    .with_context(|| format!("unknown dispatch {id}"))?;
+                json!({"dispatch":id,"round":last["round"],"attempt":last["attempt"],"scope":last["scope"],"role":last["role"],"report":last["report"]})
             }
-            Err(e) => return Err(e),
         };
         dispatches.push(row);
-        named_history = Some(messages);
     } else {
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => Some(entries),
-            Err(err) if err.kind() == ErrorKind::NotFound => None,
-            Err(err) => return Err(err).context("list dispatch records"),
-        };
-        let mut paths = Vec::new();
-        for entry in entries.into_iter().flatten() {
-            let path = entry?.path();
-            if path.extension() == Some(OsStr::new("json"))
-                && path
-                    .file_stem()
-                    .and_then(OsStr::to_str)
-                    .is_some_and(valid_id)
-            {
-                paths.push(path);
+        for id in assignment::ids(&dir)? {
+            if let Some(row) = assignment::public_record(&dir, &id)? {
+                dispatches.push(row);
             }
-        }
-        paths.sort();
-        for path in paths {
-            dispatches.push(read_record(&path)?);
         }
     }
     let mut undelivered = Vec::new();
     let mut reclaimable = Vec::new();
     for record in &mut dispatches {
-        if record["host"].is_string() {
+        if record["createPending"] == true && record["publicationDiagnostic"].is_string() {
+            record["worker"] = json!({"state":"unknown"});
+            record["backendResult"] = json!("uncertain");
+            record["backendAlive"] = Value::Null;
+        } else if record["host"].is_string() {
             let (worker, inspection) = backend::observe(&state, record)?;
             if record["backend"] == "bundled" {
+                // Older publishers sometimes promoted the reservation alone
+                // after failing to save the backend's create response.
+                if record["create"].is_null() {
+                    record["createPending"] = json!(true);
+                }
                 record["backendHandle"] = inspection["ticket"].clone();
                 record["backendObservation"] = inspection.clone();
             }
@@ -536,7 +512,11 @@ fn status_with_history(
         } else {
             #[cfg(target_os = "linux")]
             if record.get("worker").is_some() {
-                record["worker"] = worker_owner::status(&dir, record)?;
+                record["worker"] = match worker_owner::status(&dir, record) {
+                    Ok(worker) => worker,
+                    Err(_) if record["createPending"] == true => json!({"state":"unknown"}),
+                    Err(e) => return Err(e),
+                };
             }
             record["backendAlive"] = match record["worker"]["state"].as_str() {
                 Some("running") => json!(true),
@@ -544,18 +524,12 @@ fn status_with_history(
                 _ => json!(false),
             };
         }
-        let messages = match named_history.take() {
-            Some(messages) => messages,
-            None => history(
-                &state,
-                record["dispatch"].as_str().context("missing dispatch")?,
-            )?,
-        };
-        let messages = if messages.is_empty() {
-            record["messages"].as_array().cloned().unwrap_or_default()
-        } else {
-            messages
-        };
+        // Sample done after the observation that can reveal a terminal exit.
+        let messages = history(
+            &state,
+            record["dispatch"].as_str().context("missing dispatch")?,
+        )?;
+        let messages = view::merged_history(record, messages)?;
         undelivered.extend(
             messages
                 .iter()
@@ -563,14 +537,30 @@ fn status_with_history(
                 .cloned(),
         );
         let alive = record["backendAlive"].as_bool();
-        view::project(record, &messages, alive, id.is_some())?;
-        if active && record["state"] == "done" && alive == Some(true) {
+        if record["createPending"] == true && !assignment::identified(record) {
+            for field in ["state", "status", "lifecycle"] {
+                record[field] = json!("unknown");
+            }
+            record["rounds"] = json!([]);
+            if id.is_some() {
+                record["messages"] = json!(messages);
+            }
+        } else {
+            view::project(record, &messages, alive, id.is_some())?;
+        }
+        if active
+            && record["state"] == "done"
+            && alive == Some(true)
+            && record["createPending"] != true
+        {
             reclaimable.push(json!({"dispatch":record["dispatch"],"label":record["label"],"tmux":record["tmux"]}));
         }
     }
     if active {
         dispatches.retain(|r| {
-            r["state"] != "done" || (r["backend"] == "bundled" && r["backendAlive"].is_null())
+            r["state"] != "done"
+                || r["createPending"] == true
+                || (r["backend"] == "bundled" && r["backendAlive"].is_null())
         });
     }
     undelivered.sort_by_key(|v| v["id"].as_u64());

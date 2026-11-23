@@ -116,6 +116,10 @@ fn closed_path(state: &Path, row: &Value) -> Result<PathBuf> {
     )))
 }
 
+pub(super) fn bundled_close_path(state: &Path, row: &Value) -> Result<PathBuf> {
+    Ok(closed_path(state, row)?.with_extension("closing"))
+}
+
 fn closed(state: &Path, row: &Value) -> Result<Option<Value>> {
     match File::open(closed_path(state, row)?) {
         Ok(f) => {
@@ -141,6 +145,14 @@ pub fn observe(state: &Path, row: &Value) -> Result<(Value, Value)> {
     if let Some(result) = closed(state, row)? {
         return Ok((result, json!({"result":"completed","alive":false})));
     }
+    // This tmux adapter predates #42's attempt-bound launch lookup. A bare
+    // reservation alone cannot authorize acting on a live pane.
+    if row["createPending"] == true && row["create"]["receipt"].is_null() {
+        return Ok((
+            json!({"state":"unknown"}),
+            json!({"result":"uncertain","diagnostic":"missing verified tmux launch receipt"}),
+        ));
+    }
     let evidence = private_receipt(state, &row["create"])?;
     let mut inspection = call(state, row, json!({"op":"inspect"}))
         .unwrap_or_else(|e| json!({"result":"uncertain","diagnostic":e.to_string()}));
@@ -163,14 +175,16 @@ pub fn observe(state: &Path, row: &Value) -> Result<(Value, Value)> {
 
 pub fn close(state: &Path, row: &Value) -> Result<Value> {
     let id = row["dispatch"].as_str().context("missing dispatch")?;
-    // This immutable assignment file serializes competing closes, including
-    // across a restart. Completed archives need only read access.
-    let lock = File::open(state.join("dispatches").join(format!("{id}.json")))?;
-    lock.lock()?;
     #[cfg(target_os = "linux")]
     if row["backend"] == "bundled" {
         return bundled::close(state, row);
     }
+    // Completed archives can replay on read-only state.
+    let _lock = if closed(state, row)?.is_none() {
+        Some(super::assignment::close_lock(state, row)?)
+    } else {
+        None
+    };
     let mut receipt = json!({"dispatch":id,"operation":"close","result":"completed","round":row["round"],"attempt":row["attempt"]});
     if closed(state, row)?.is_some() {
         receipt["diagnostic"] = json!("session was already gone");

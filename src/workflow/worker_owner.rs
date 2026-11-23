@@ -135,7 +135,13 @@ pub fn close(id: &OsStr) -> Result<Value> {
         .filter(|id| valid_id(id))
         .context("invalid dispatch ID")?;
     let dir = state_dir()?.join("dispatches");
-    let record = read_record(&dir.join(format!("{id}.json")))?;
+    let record = super::assignment::public_record(&dir, id)?
+        .with_context(|| format!("unknown dispatch {id}"))?;
+    ensure!(
+        record["publicationDiagnostic"].is_null(),
+        "close uncertain: {}",
+        record["publicationDiagnostic"]
+    );
     ensure!(
         record.get("controllerOwner").is_none_or(Value::is_null),
         "controller owner authorization required"

@@ -130,7 +130,7 @@ sibling_unit="$WFC_STATE/bundled/$sibling"
 original_row="$WFC_STATE/dispatches/$sibling.json"
 cp "$original_row" saved-row
 jq 'del(.create)' saved-row > "$original_row"
-public_row "$sibling" | jq -e --slurpfile r saved-row '.backendAlive and .backendHandle==$r[0].create.ticket' >/dev/null
+public_row "$sibling" | jq -e --slurpfile r saved-row '.createPending and .backendAlive and .backendHandle==$r[0].create.ticket' >/dev/null
 mv "$sibling_unit" saved-unit
 public_row "$sibling" | jq -e '.backendAlive==null' >/dev/null
 test ! -e "$sibling_unit"
