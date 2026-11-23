@@ -10,6 +10,7 @@ import tempfile
 import unittest
 
 BINARY = str(Path(sys.argv.pop(1)).resolve())
+LEGACY_FIELDS = ("id", "messageId", "dispatch", "role", "round", "attempt", "report", "request_key")
 
 
 class Receipts(unittest.TestCase):
@@ -112,8 +113,7 @@ class Receipts(unittest.TestCase):
         path = self.state / "messages.json"
         row = json.loads(path.read_bytes())[0]
         # Exact storage fields written by the #6 baseline.
-        legacy = {k: row[k] for k in ("id", "messageId", "dispatch", "role", "round",
-                                      "attempt", "report", "request_key")}
+        legacy = {k: row[k] for k in LEGACY_FIELDS}
         rows = [dict(legacy, received=True),
                 dict(legacy, id=2, messageId="m-old2", received=False)]
         path.write_text(json.dumps(rows), encoding="utf-8")
@@ -148,11 +148,20 @@ class Receipts(unittest.TestCase):
             self.run_cli("ack", msg["messageId"], "--body", canonical)
         self.assertEqual([self.body(msg) for msg in self.history()], [canonical, canonical])
 
+    def test_first_wait_binds_the_delivered_legacy_body(self):
+        path = self.state / "messages.json"
+        row, = json.loads(path.read_bytes())
+        legacy = {k: row[k] for k in LEGACY_FIELDS}
+        path.write_text(json.dumps([dict(legacy, received=False)]), encoding="utf-8")
+        claimed, = self.run_cli("wait", "--timeout", "0")["messages"]
+        self.run_cli("ack", self.mid, "--body", self.body(legacy), code=1)
+        self.assertEqual(self.history()[0]["statusVersion"], 2)
+        self.assertEqual(self.run_cli("ack", self.mid, "--body", self.body(claimed))["statusVersion"], 3)
+
     def test_original_body_after_unscoped_null_snapshot_rewrite(self):
         path = self.state / "messages.json"
         first, = json.loads(path.read_bytes())
-        row = {k: first[k] for k in ("id", "messageId", "dispatch", "role", "round",
-                                     "attempt", "report", "request_key")}
+        row = {k: first[k] for k in LEGACY_FIELDS}
         original = self.body(row)
         row.update(received=True, head=None, dirty=None)
         path.write_text(json.dumps([row]), encoding="utf-8")
@@ -224,6 +233,25 @@ class Receipts(unittest.TestCase):
         after, = self.history()
         self.assertEqual(self.body(after), self.body(stored))
         self.assertEqual(after["state"], "processed")
+
+    def test_only_first_receipt_for_legacy_attempt_accepts_original_body(self):
+        path = self.state / "messages.json"
+        new, = json.loads(path.read_bytes())
+        row = {k: new[k] for k in LEGACY_FIELDS}
+        original = self.body(row)
+        row.update(received=True, head=None, dirty=None)
+        rows = [dict(row, id=1, messageId="m-other-dispatch", dispatch="d-other"),
+                dict(row, id=2, messageId="m-other-attempt", attempt="a-earlier"),
+                dict(row, id=3, messageId="m-first"),
+                dict(row, id=4, messageId="m-second", request_key="second")]
+        path.write_text(json.dumps(rows), encoding="utf-8")
+        self.run_cli("ack", "m-second", "--body", original, code=1)
+        _, first, second = self.history()
+        self.assertEqual((first["statusVersion"], second["statusVersion"]), (2, 2))
+        self.assertEqual(self.run_cli("ack", "m-second", "--body", self.body(second))["statusVersion"], 3)
+        self.assertEqual(self.run_cli("ack", "m-first", "--body", original)["statusVersion"], 3)
+        self.assertTrue(self.run_cli("ack", "m-first", "--body", original)["duplicate"])
+        self.run_cli("ack", "m-second", "--body", original, code=1)
 
 
 if __name__ == "__main__":

@@ -79,7 +79,9 @@ wfc resolve MESSAGE --actor reviewer --reason "核对外部送达记录" \
 
 `--source` 默认为 `operator`。成功裁决后状态为 `received`，之后仍可单独 `ack`。同一声明可重试，改动证据或哈希会报冲突。`--body-hash` 是消息正文的 SHA-256。当前完成消息的正文字段为 `attempt`、`report`、`role`、`round`，带 `scope`、`head`、`dirty` 的快照还要保留这些字段及其原值。按键排序，以 UTF-8 编码 JSON，在冒号和逗号后各留一个空格，相当于 Python 的 `json.dumps(body, ensure_ascii=False, sort_keys=True).encode("utf-8")`。如需确认处理的是同一份正文，`ack --body BODY` 接受这段 JSON 原文。
 
-旧收件箱可能在消息已领取后才被补上两个值为 null 的 Git 字段。若旧记录带有请求键，缺少创建时间、显式 scope 和正文哈希，且两个 Git 字段均为 null，`ack --body` 也接受领取时的四字段原文。已保存哈希的消息始终同时核对该哈希和当前记录的正文。在 Unix 上，确认或裁决因目录同步失败而报错时，可重试同一命令；重试会补做同步，并保留已有版本与裁决证据。
+本版首次领取缺少正文哈希的旧消息时，会将实际交付正文的 SHA-256 和 `received` 状态一起保存。升级前已领取的旧消息可能在后来写入收件箱时被补上两个值为 null 的 Git 字段。同一派发、同一 attempt 的第一条记录若带有请求键，缺少创建时间、显式 scope 和正文哈希，且两个 Git 字段均为 null，`ack --body` 也接受旧版领取时的四字段原文。
+
+提供正文的 `ack --body` 和提供摘要的 `resolve --body-hash` 都核对当前记录的正文；若记录已有正文哈希，还会核对已存哈希。省略正文的 `ack MESSAGE` 按消息编号和交付状态确认。在 Unix 上，确认或裁决因目录同步失败而报错时，可重试同一命令。重试会补做同步，并保留已有版本与裁决证据。
 
 Rust 默认使用用户主目录下的 `.local/state/agent-router`，可用 `WFC_STATE` 指定独立状态目录。帮助、版本和内核入口都不会读写调度状态。与 Python 版并排使用时，把两份 `wfc` 放在不同目录，分别使用显式路径，并为每次调用指定各自的 `WFC_STATE`。
 

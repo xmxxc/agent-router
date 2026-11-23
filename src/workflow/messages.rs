@@ -196,14 +196,15 @@ impl Completion {
             && self.computed_hash() == hash
     }
 
-    fn matches_ack_body(&self, body: &str) -> bool {
+    fn matches_ack_body(&self, body: &str, earlier: &[Self]) -> bool {
         if self.matches_hash(&body_hash(body)) {
             return true;
         }
         // A pre-scope message could already have been received when a later
         // publisher rewrote the inbox, adding the two null Git fields. That
         // row is indistinguishable from one claimed after the rewrite. The
-        // original publisher always stored a request key and no timestamp.
+        // original publisher always stored a request key and no timestamp,
+        // and accepted only one completion per dispatch and attempt.
         self.body_hash.is_none()
             && self.worker.scope.is_none()
             && self.request_key.is_some()
@@ -211,6 +212,9 @@ impl Completion {
             && self.additional_fields.get("head") == Some(&Value::Null)
             && self.additional_fields.get("dirty") == Some(&Value::Null)
             && body == canonical_body(self.original_body())
+            && !earlier.iter().any(|m| {
+                m.worker.dispatch == self.worker.dispatch && m.worker.attempt == self.worker.attempt
+            })
     }
 
     fn receipt(&self, duplicate: bool) -> Value {
@@ -237,6 +241,9 @@ impl Completion {
 
     fn receive(&mut self) -> Result<Value> {
         self.delivery.advance(State::Received)?;
+        if self.body_hash.is_none() {
+            self.body_hash = Some(self.computed_hash());
+        }
         Ok(self.view())
     }
 }
