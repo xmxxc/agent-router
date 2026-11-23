@@ -1,4 +1,4 @@
-//! A worker can retry a keyed completion. A controller claims a batch
+//! A worker can retry a keyed message. A controller claims a batch
 //! before printing it, so another waiter cannot deliver the same messages.
 mod receipt;
 #[cfg(target_os = "linux")]
@@ -21,43 +21,86 @@ use uuid::Uuid;
 
 pub const DONE_USAGE: &str =
     "wfc done --report FILE [--attempt ID] [--message-id KEY] [--owner-token TOKEN]";
+pub const ASK_USAGE: &str =
+    "wfc ask QUESTION [--options CSV] [--attempt ID] [--callback-ref REF] [--message-id KEY] [--owner-token TOKEN]";
 pub const WAIT_USAGE: &str =
     "wfc wait [--timeout SECONDS] [--scope NAME] [--dispatch ID] [--owner-token TOKEN]";
 
 pub(super) fn options<'a, const N: usize>(
     args: &'a [OsString],
     names: [&str; N],
-    mut positional: Option<&mut Option<&'a str>>,
+    positional: Option<(&mut Option<&'a str>, &str)>,
 ) -> Result<[Option<&'a str>; N]> {
+    parse_options(args, names, positional)?.context("unexpected help")
+}
+
+// None indicates an ask help request.
+fn parse_options<'a, const N: usize>(
+    args: &'a [OsString],
+    names: [&str; N],
+    mut positional: Option<(&mut Option<&'a str>, &str)>,
+) -> Result<Option<[Option<&'a str>; N]>> {
     let mut values = [None; N];
     let mut tokens = args.iter();
+    let question = positional
+        .as_ref()
+        .is_some_and(|(_, name)| *name == "question");
+    let mut positional_only = false;
     while let Some(token) = tokens.next() {
         let flag = token.to_str().context("expected UTF-8 argument")?;
-        if let Some(slot) = positional.as_deref_mut() {
-            if !flag.starts_with('-') {
+        if let Some((slot, name)) = positional.as_mut() {
+            if flag == "--" && !positional_only {
+                positional_only = true;
+                continue;
+            }
+            if question && !positional_only && flag.starts_with("-h") {
+                ensure!(!flag.starts_with("-h="), "help does not take a value");
+                return Ok(None);
+            }
+            if positional_only
+                || !flag.starts_with('-')
+                || (question && literal_question_argument(flag, &names))
+            {
                 ensure!(
-                    !flag.is_empty() && slot.replace(flag).is_none(),
-                    "expected one message id"
+                    (!flag.is_empty() || question) && slot.replace(flag).is_none(),
+                    "expected one {name}"
                 );
                 continue;
             }
         }
+        let (flag, inline) = flag
+            .split_once('=')
+            .map_or((flag, None), |(flag, value)| (flag, Some(value)));
         let index = names
             .iter()
             .position(|name| flag == *name)
             .with_context(|| format!("unknown option {flag:?}"))?;
-        let value = tokens
-            .next()
-            .context("option requires a value")?
-            .to_str()
-            .context("expected UTF-8 option value")?;
+        let value = match inline {
+            Some(value) => value,
+            None => tokens
+                .next()
+                .context("option requires a value")?
+                .to_str()
+                .context("expected UTF-8 option value")?,
+        };
         ensure!(
-            !value.is_empty() || matches!(flag, "--body" | "--token" | "--owner-token" | "--owner"),
+            !value.is_empty()
+                || matches!(flag, "--body" | "--token" | "--owner-token" | "--owner")
+                || (question
+                    && matches!(
+                        flag,
+                        "--options" | "--attempt" | "--message-id" | "--callback-ref"
+                    )),
             "empty option value"
         );
+        let looks_like_option = if question {
+            !literal_question_argument(value, &names)
+        } else {
+            value.starts_with("--")
+                && !(positional.is_none() && matches!(flag, "--report" | "--message-id"))
+        };
         ensure!(
-            !value.starts_with("--")
-                || (positional.is_none() && matches!(flag, "--report" | "--message-id")),
+            inline.is_some() || !looks_like_option,
             "option requires a value"
         );
         ensure!(
@@ -65,10 +108,51 @@ pub(super) fn options<'a, const N: usize>(
             "duplicate option {flag:?}"
         );
     }
-    Ok(values)
+    Ok(Some(values))
 }
 
-#[derive(Serialize, Deserialize)]
+fn literal_question_argument(text: &str, names: &[&str]) -> bool {
+    // Argparse recognizes attached short help and named options before
+    // applying its literal-space rule.
+    let option = text.split_once('=').map_or(text, |(name, _)| name);
+    !text.starts_with('-')
+        || short_question(text)
+        || (text.contains(' ')
+            && !text.starts_with("-h")
+            && option != "--help"
+            && !names.contains(&option))
+}
+
+// Argparse accepts "-" and negative integer or decimal text as positionals.
+fn short_question(text: &str) -> bool {
+    let Some(number) = text.strip_prefix('-') else {
+        return false;
+    };
+    let digits = |part: &str| part.chars().all(decimal_digit);
+    match number.split_once('.') {
+        Some((whole, fraction)) => digits(whole) && !fraction.is_empty() && digits(fraction),
+        None => digits(number),
+    }
+}
+
+fn decimal_digit(c: char) -> bool {
+    // Unicode 15.0 Nd, as used by Python 3.12's argparse negative-number
+    // matcher. Each start begins a run of exactly ten consecutive digits.
+    const STARTS: &[u32] = &[
+        0x0030, 0x0660, 0x06f0, 0x07c0, 0x0966, 0x09e6, 0x0a66, 0x0ae6, 0x0b66, 0x0be6, 0x0c66,
+        0x0ce6, 0x0d66, 0x0de6, 0x0e50, 0x0ed0, 0x0f20, 0x1040, 0x1090, 0x17e0, 0x1810, 0x1946,
+        0x19d0, 0x1a80, 0x1a90, 0x1b50, 0x1bb0, 0x1c40, 0x1c50, 0xa620, 0xa8d0, 0xa900, 0xa9d0,
+        0xa9f0, 0xaa50, 0xabf0, 0xff10, 0x104a0, 0x10d30, 0x11066, 0x110f0, 0x11136, 0x111d0,
+        0x112f0, 0x11450, 0x114d0, 0x11650, 0x116c0, 0x11730, 0x118e0, 0x11950, 0x11c50, 0x11d50,
+        0x11da0, 0x11f50, 0x16a60, 0x16ac0, 0x16b50, 0x1d7ce, 0x1d7d8, 0x1d7e2, 0x1d7ec, 0x1d7f6,
+        0x1e140, 0x1e2f0, 0x1e4f0, 0x1e950, 0x1fbf0,
+    ];
+    let point = u32::from(c);
+    let next = STARTS.partition_point(|start| *start <= point);
+    next.checked_sub(1).is_some_and(|i| point - STARTS[i] < 10)
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
 struct Identity {
     dispatch: String,
     round: u64,
@@ -82,6 +166,14 @@ impl Identity {
     fn scope(&self) -> &str {
         // Pre-scope receipts still have a stable, per-dispatch scope.
         self.scope.as_deref().unwrap_or(&self.dispatch)
+    }
+
+    fn fields(&self) -> Map<String, Value> {
+        Map::from_iter([
+            ("attempt".into(), json!(self.attempt)),
+            ("role".into(), json!(self.role)),
+            ("round".into(), json!(self.round)),
+        ])
     }
 }
 
@@ -104,22 +196,14 @@ impl Assignment {
         expected_attempt: Option<&str>,
     ) -> Result<(Self, Value)> {
         let dir = state.join("dispatches");
-        // Foreground dispatch writes and syncs .pending before launching us,
-        // then renames it to .json. This order of opens also covers the rename.
-        let file = match File::open(dir.join(format!("{dispatch}.pending"))) {
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                File::open(dir.join(format!("{dispatch}.json")))
-            }
-            result => result,
+        let (file, path) = super::assignment::open_assignment(&dir, dispatch)
+            .with_context(|| format!("open dispatch {dispatch}"))?;
+        let mut row = super::decode_record(file, &path)?;
+        if path.extension().is_some_and(|ext| ext == "pending") {
+            row["createPending"] = json!(true);
         }
-        .with_context(|| format!("open dispatch {dispatch}"))?;
-        let row: Value = serde_json::from_reader(file).context("read worker assignment")?;
         let assignment = Self::deserialize(&row).context("read worker assignment identity")?;
         let worker = &assignment.worker;
-        ensure!(
-            worker.dispatch == dispatch,
-            "dispatch mismatch for {dispatch}"
-        );
         ensure!(
             assignment.controller_owner.is_none(),
             "controller owner authorization required for {dispatch}"
@@ -139,28 +223,31 @@ impl Assignment {
     }
 
     // Call with the ledger lock held while checking the current assignment.
-    fn authorize_done(&self, state: &Path, token: Option<&str>) -> Result<()> {
+    fn authorize_callback(&self, state: &Path, token: Option<&str>, operation: &str) -> Result<()> {
         if let Some(secret) = controller::worker_callback() {
             if secret.to_str().is_some_and(|secret| {
                 self.callback_hash.as_deref() == Some(body_hash(secret).as_str())
             }) {
                 return Ok(());
             }
-            return Err(controller::invalid_worker_callback("done").into());
+            return Err(controller::invalid_worker_callback(operation).into());
         }
-        controller::Owners::read(state)?.require(self.worker.scope(), token, "done")?;
+        controller::Owners::read(state)?.require(self.worker.scope(), token, operation)?;
         Ok(())
     }
 }
 
 #[derive(Serialize, Deserialize)]
-struct Completion {
+struct Message {
     id: u64,
     #[serde(rename = "messageId")]
     message_id: String,
     #[serde(flatten)]
     worker: Identity,
-    report: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    report: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    question_payload: Option<Question>,
     request_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     body_hash: Option<String>,
@@ -175,31 +262,114 @@ struct Completion {
     additional_fields: Map<String, Value>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct Question {
+    text: String,
+    options: Vec<String>,
+}
+
 pub(super) fn body_hash(body: &str) -> String {
     format!("{:x}", Sha256::digest(body.as_bytes()))
 }
 
 fn canonical_body(body: Map<String, Value>) -> String {
-    // Python #40 uses sorted keys, UTF-8, and a space after each separator.
-    // All done payload fields are scalar. Map iterates in sorted key order.
-    let fields: Vec<_> = body
-        .into_iter()
-        .map(|(key, value)| format!("{}: {value}", json!(key)))
-        .collect();
-    format!("{{{}}}", fields.join(", "))
+    // Map iterates in sorted key order, as required when hashing a body.
+    spaced_json(&Value::Object(body))
 }
 
-impl Completion {
-    fn original_body(&self) -> Map<String, Value> {
+fn spaced_json(value: &Value) -> String {
+    use serde_json::ser::Formatter;
+    use std::io::Result as IoResult;
+
+    struct PythonSeparators;
+    impl Formatter for PythonSeparators {
+        fn begin_array_value<W: Write + ?Sized>(&mut self, w: &mut W, first: bool) -> IoResult<()> {
+            if !first {
+                w.write_all(b", ")?;
+            }
+            Ok(())
+        }
+
+        fn begin_object_key<W: Write + ?Sized>(&mut self, w: &mut W, first: bool) -> IoResult<()> {
+            self.begin_array_value(w, first)
+        }
+
+        fn begin_object_value<W: Write + ?Sized>(&mut self, w: &mut W) -> IoResult<()> {
+            w.write_all(b": ")
+        }
+    }
+
+    let mut bytes = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut bytes, PythonSeparators);
+    value
+        .serialize(&mut serializer)
+        .expect("serialize JSON value");
+    String::from_utf8(bytes).expect("JSON is UTF-8")
+}
+
+impl Question {
+    fn fields(&self) -> Map<String, Value> {
         Map::from_iter([
-            ("attempt".into(), json!(self.worker.attempt)),
-            ("report".into(), json!(self.report)),
-            ("role".into(), json!(self.worker.role)),
-            ("round".into(), json!(self.worker.round)),
+            ("question".into(), json!(self.text)),
+            ("options".into(), json!(self.options)),
         ])
     }
 
+    fn body(&self, worker: &Identity) -> Map<String, Value> {
+        let mut body = worker.fields();
+        body.extend(self.fields());
+        body.insert("scope".into(), json!(worker.scope()));
+        body
+    }
+
+    fn key_suffix(&self) -> String {
+        use std::fmt::Write as _;
+
+        // The request key uses Python's default ASCII escaping, including
+        // surrogate pairs. The separately stored body digest uses UTF-8.
+        let mut ascii = String::new();
+        for c in canonical_body(self.fields()).chars() {
+            if c < '\u{7f}' {
+                ascii.push(c);
+            } else {
+                for &unit in c.encode_utf16(&mut [0; 2]).iter() {
+                    write!(ascii, "\\u{unit:04x}").unwrap();
+                }
+            }
+        }
+        body_hash(&ascii)[..16].to_owned()
+    }
+}
+
+impl Message {
+    fn new(id: u64, worker: Identity, request_key: Option<String>) -> Self {
+        Self {
+            id,
+            message_id: format!("m-{}", Uuid::new_v4().simple()),
+            worker,
+            report: None,
+            question_payload: None,
+            request_key,
+            body_hash: None,
+            delivery: Delivery::unsent(),
+            resolution: None,
+            created_at: Some(receipt::timestamp()),
+            additional_fields: Map::new(),
+        }
+    }
+
+    fn original_body(&self) -> Map<String, Value> {
+        let mut body = self.worker.fields();
+        if let Some(report) = &self.report {
+            body.insert("report".into(), json!(report));
+        }
+        body
+    }
+
     fn body(&self) -> Map<String, Value> {
+        if let Some(question) = &self.question_payload {
+            return question.body(&self.worker);
+        }
         let mut body = self.original_body();
         for key in ["head", "dirty"] {
             if let Some(value) = self.additional_fields.get(key) {
@@ -230,7 +400,8 @@ impl Completion {
         // request key on every row. Its rewrite dropped newer fields. Only
         // publication-time values count: later claims can bind a digest or
         // add null Git fields even on a genuine legacy row.
-        self.request_key.is_some()
+        self.report.is_some()
+            && self.request_key.is_some()
             && self.worker.scope.is_none()
             && self.created_at.is_none()
             && self
@@ -283,7 +454,14 @@ impl Completion {
             ("id".into(), json!(self.id)),
             ("messageId".into(), json!(self.message_id)),
             ("dispatch".into(), json!(self.worker.dispatch)),
-            ("type".into(), json!("done")),
+            (
+                "type".into(),
+                json!(if self.question_payload.is_some() {
+                    "question"
+                } else {
+                    "done"
+                }),
+            ),
             ("state".into(), json!(state)),
             ("statusVersion".into(), json!(version)),
         ]);
@@ -309,7 +487,7 @@ pub(super) fn private_file() -> OpenOptions {
 
 struct Inbox {
     dir: PathBuf,
-    messages: Vec<Completion>,
+    messages: Vec<Message>,
     // The lock lives on a stable file because save replaces the data file.
     _lock: File,
 }
@@ -335,17 +513,22 @@ pub(super) fn sync_directory(_dir: &Path) -> Result<()> {
 }
 
 impl Inbox {
-    fn snapshot(dir: &Path) -> Result<Vec<Completion>> {
+    fn snapshot(dir: &Path) -> Result<Vec<Message>> {
         let path = dir.join("messages.json");
         match File::open(&path) {
             Ok(file) => {
-                let mut messages: Vec<Completion> = serde_json::from_reader(BufReader::new(file))
+                let mut messages: Vec<Message> = serde_json::from_reader(BufReader::new(file))
                     .context("read controller messages")?;
                 // The first scoped wait on an unclaimed pre-snapshot completion
                 // supplies an unknown Git snapshot. Preserve an already bound
                 // body (including the earlier four-field form) byte for byte.
                 for m in &mut messages {
-                    if m.delivery.legacy_unclaimed
+                    ensure!(
+                        m.report.is_some() != m.question_payload.is_some(),
+                        "invalid controller message payload"
+                    );
+                    if m.report.is_some()
+                        && m.delivery.legacy_unclaimed
                         && m.body_hash.is_none()
                         && m.worker.scope.is_none()
                         && !m.additional_fields.contains_key("head")
@@ -421,14 +604,14 @@ impl Inbox {
         let history = || {
             self.messages
                 .iter()
-                .filter(|m| m.worker.dispatch == worker.dispatch)
+                .filter(|m| m.worker.dispatch == worker.dispatch && m.report.is_some())
         };
-        let prior = key.and_then(|key| history().find(|m| m.request_key.as_deref() == Some(key)));
+        let prior = key.and_then(|key| self.prior(&worker.dispatch, key));
         if let (Some(key), Some(prior)) = (key, prior) {
             ensure!(
                 prior.worker.attempt == worker.attempt
                     && prior.worker.round == worker.round
-                    && prior.report == report,
+                    && prior.report.as_deref() == Some(report),
                 "message request {key} conflicts with an existing receipt"
             );
         }
@@ -437,7 +620,7 @@ impl Inbox {
         if let Some(bound) = assignment
             .report
             .as_deref()
-            .or_else(|| previous.map(|m| m.report.as_path()))
+            .or_else(|| previous.and_then(|m| m.report.as_deref()))
         {
             ensure!(
                 report == bound,
@@ -459,7 +642,7 @@ impl Inbox {
             ensure!(
                 !history().any(|m| (m.worker.round != worker.round
                     || m.worker.attempt != worker.attempt)
-                    && m.report == report),
+                    && m.report.as_deref() == Some(report)),
                 "ambiguous report for {}; supply --attempt",
                 worker.dispatch
             );
@@ -474,6 +657,66 @@ impl Inbox {
             );
         }
         Ok(None)
+    }
+
+    fn prior(&self, dispatch: &str, key: &str) -> Option<&Message> {
+        self.messages
+            .iter()
+            .find(|m| m.worker.dispatch == dispatch && m.request_key.as_deref() == Some(key))
+    }
+
+    fn require_question_round(
+        &self,
+        assignment: &Assignment,
+        row: &Value,
+        attempt: Option<&str>,
+    ) -> Result<()> {
+        let worker = &assignment.worker;
+        let dispatch = worker.dispatch.as_str();
+        let messages = || {
+            self.messages
+                .iter()
+                .filter(|m| m.worker.dispatch == dispatch)
+        };
+        let rounds = row["rounds"].as_array().into_iter().flatten();
+        ensure!(
+            attempt.is_some()
+                || (worker.round == 1
+                    && !rounds.clone().any(|r| {
+                        !r["attempt"].is_null()
+                            && r["attempt"] != worker.attempt
+                            && r["report"] == json!(assignment.report)
+                    })
+                    && !messages()
+                        .any(|m| { m.worker.round == 1 && m.worker.attempt != worker.attempt })),
+            "attempt is no longer accepted for {dispatch}; supply --attempt"
+        );
+        let current_round = rounds
+            .filter(|r| r["round"] == worker.round && r["attempt"] == worker.attempt)
+            .last();
+        let confirmed_done = messages().any(|m| {
+            m.worker.round == worker.round
+                && m.worker.attempt == worker.attempt
+                && m.report.is_some()
+        }) || row["messages"].as_array().into_iter().flatten().any(|m| {
+            m["type"] == "done"
+                && m["dispatch"] == dispatch
+                && m["round"] == worker.round
+                && m["attempt"] == worker.attempt
+        });
+        ensure!(
+            !confirmed_done && current_round.map_or(worker.round == 1, |r| r["state"] == "running"),
+            "attempt is no longer accepted for {dispatch}; its round is not running"
+        );
+        Ok(())
+    }
+
+    fn publish(&mut self, mut message: Message) -> Result<Value> {
+        message.body_hash = Some(message.computed_hash());
+        let receipt = message.receipt(false);
+        self.messages.push(message);
+        self.save()?;
+        Ok(receipt)
     }
 
     fn save(&self) -> Result<()> {
@@ -555,7 +798,7 @@ impl<'a> Done<'a> {
         let check = || {
             let inbox = Inbox::open(&state)?;
             let (assignment, row) = Assignment::current(&state, &dispatch, self.attempt)?;
-            assignment.authorize_done(&state, token.as_deref())?;
+            assignment.authorize_callback(&state, token.as_deref(), "done")?;
             // R1 dispatches had neither field and derived the default key from
             // the worker's launch environment. Assignment::current checked it.
             let r1_worker = assignment.report.is_none()
@@ -573,7 +816,7 @@ impl<'a> Done<'a> {
                 inbox.validate_done(&assignment, &report, key.as_deref(), self.attempt)?;
             if receipt.is_none() && row["backend"] == "herdr" {
                 ensure!(
-                    !super::backend::herdr_close_blocks_done(&state, &row)?,
+                    !super::backend::herdr_close_blocks_callback(&state, &row)?,
                     "attempt {} is no longer accepted for {dispatch}; its execution resources are closing or closed",
                     assignment.worker.attempt
                 );
@@ -598,25 +841,165 @@ impl<'a> Done<'a> {
         if let Some(receipt) = duplicate {
             return Ok(receipt);
         }
-        let mut message = Completion {
-            id: inbox.messages.len() as u64 + 1,
-            message_id: format!("m-{}", Uuid::new_v4().simple()),
-            worker: current.worker,
-            report,
-            request_key: key,
-            body_hash: None,
-            delivery: Delivery::unsent(),
-            resolution: None,
-            created_at: Some(receipt::timestamp()),
-            additional_fields: Map::from_iter([
-                ("head".into(), json!(snapshot.head)),
-                ("dirty".into(), json!(snapshot.dirty)),
-            ]),
+        let mut message = Message::new(inbox.messages.len() as u64 + 1, current.worker, key);
+        message.report = Some(report);
+        message.additional_fields = Map::from_iter([
+            ("head".into(), json!(snapshot.head)),
+            ("dirty".into(), json!(snapshot.dirty)),
+        ]);
+        inbox.publish(message).context("publish completion")
+    }
+}
+
+pub struct Ask<'a> {
+    question: &'a str,
+    csv: Option<&'a str>,
+    attempt: Option<&'a str>,
+    reference: Option<&'a str>,
+    key: Option<&'a str>,
+    owner_token: Option<&'a str>,
+}
+
+impl<'a> Ask<'a> {
+    pub fn parse(args: &'a [OsString]) -> Result<Option<Self>> {
+        let mut question = None;
+        let Some([csv, attempt, reference, key, owner_token]) = parse_options(
+            args,
+            [
+                "--options",
+                "--attempt",
+                "--callback-ref",
+                "--message-id",
+                "--owner-token",
+            ],
+            Some((&mut question, "question")),
+        )?
+        else {
+            return Ok(None);
         };
-        message.body_hash = Some(message.computed_hash());
-        let receipt = message.receipt(false);
-        inbox.messages.push(message);
-        inbox.save().context("publish completion")?;
+        Ok(Some(Self {
+            question: question.context("missing question")?,
+            csv,
+            attempt,
+            reference: reference.filter(|reference| !reference.is_empty()),
+            key: key.filter(|key| !key.is_empty()),
+            owner_token,
+        }))
+    }
+
+    pub fn run(self) -> Result<Value> {
+        let state = state_dir()?;
+        let dispatch = env::var("WFC_DISPATCH")
+            .context("run ask inside a dispatched worker (WFC_DISPATCH)")?;
+        ensure!(valid_id(&dispatch), "invalid dispatch ID");
+        let payload = Question {
+            text: self.question.to_owned(),
+            options: self
+                .csv
+                .unwrap_or_default()
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        };
+        let attempt = self.attempt.filter(|id| !id.is_empty());
+        let key = self
+            .key
+            .map(str::to_owned)
+            .or_else(|| attempt.map(|id| format!("ask:{dispatch}:{id}:{}", payload.key_suffix())));
+        let token = controller::token(self.owner_token);
+        let check = || -> Result<_> {
+            let inbox = Inbox::open(&state)?;
+            let (assignment, row) = Assignment::current(&state, &dispatch, attempt)?;
+            // A reference is for a later assignment in the same live session.
+            if self.reference.is_some()
+                || (self.attempt == Some("") && controller::worker_callback().is_some())
+            {
+                return Err(controller::invalid_worker_callback("ask").into());
+            }
+            assignment.authorize_callback(&state, token.as_deref(), "ask")?;
+            ensure!(
+                env::var_os("WFC_SCOPE")
+                    .is_none_or(|v| v.to_str() == Some(assignment.worker.scope())),
+                "scope mismatch for {dispatch}"
+            );
+            let replay = if let Some((key, prior)) = key
+                .as_deref()
+                .and_then(|key| inbox.prior(&dispatch, key).map(|prior| (key, prior)))
+            {
+                ensure!(
+                    prior.question_payload.is_some()
+                        && prior.matches_hash(&body_hash(&canonical_body(
+                            payload.body(&assignment.worker)
+                        ))),
+                    "message request {key} conflicts with an existing receipt"
+                );
+                inbox.sync_directory().context("sync question receipt")?;
+                Some(prior.receipt(true))
+            } else {
+                inbox.require_question_round(&assignment, &row, attempt)?;
+                // The Herdr close intent is saved under the inbox lock.
+                if row["backend"] == "herdr" {
+                    ensure!(
+                        !super::backend::herdr_close_blocks_callback(&state, &row)?,
+                        "attempt is no longer accepted for {dispatch}; its execution resources are closing or closed"
+                    );
+                }
+                None
+            };
+            Ok((inbox, assignment, row, replay))
+        };
+        let (inbox, initial, row, replay) = check()?;
+        if let Some(replay) = replay {
+            return Ok(replay);
+        }
+        // A new tmux or controlled-worker question holds the same attempt lock
+        // as close from observation through publication. Acquire it outside
+        // the inbox so a slow backend or close cannot block other scopes.
+        drop(inbox);
+        let hosted = row["host"].is_string();
+        let controlled = cfg!(target_os = "linux") && !hosted && row["worker"].is_object();
+        let _close_lock = (row["backend"] == "tmux" || controlled)
+            .then(|| super::assignment::close_lock(&state, &row))
+            .transpose()?;
+        let blocked = if hosted {
+            let mut inspected = row.clone();
+            super::backend::observe(&state, &mut inspected).map(|(worker, _)| {
+                matches!(
+                    worker["state"].as_str(),
+                    Some("exited" | "cancelled" | "not_started")
+                )
+            })
+        } else {
+            #[cfg(target_os = "linux")]
+            let blocked = if controlled {
+                super::worker_owner::question_blocked(&state.join("dispatches"), &row)
+            } else {
+                Ok(false)
+            };
+            #[cfg(not(target_os = "linux"))]
+            let blocked = Ok(false);
+            blocked
+        };
+        let (mut inbox, assignment, current, replay) = check()?;
+        if let Some(replay) = replay {
+            return Ok(replay);
+        }
+        ensure!(
+            initial.worker == assignment.worker
+                && ["host", "backend", "tmuxSocket", "endpoint", "executionId"]
+                    .iter()
+                    .all(|key| row[*key] == current[*key]),
+            "assignment changed while inspecting {dispatch}"
+        );
+        ensure!(
+            !blocked?,
+            "attempt is no longer accepted for {dispatch}; its round is not running"
+        );
+        let mut message = Message::new(inbox.messages.len() as u64 + 1, assignment.worker, key);
+        message.question_payload = Some(payload);
+        let mut receipt = inbox.publish(message).context("publish question")?;
+        receipt["next"] = json!("End your turn now; the answer arrives as your next message.");
         Ok(receipt)
     }
 }

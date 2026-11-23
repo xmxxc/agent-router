@@ -219,6 +219,23 @@ for line in sys.stdin:
         self.assertEqual(self.status()['messages'], [])
         self.assertEqual(len(calls), 1)
 
+    def test_question_replays_after_herdr_close_intent(self):
+        calls = []
+        self.dispatch(endpoint=self.drop_close(calls))
+        self.assertNotIn('workerCallbackHash', self.row)
+        self.assertNotIn('workerCallbackHash', self.status())
+        self.env['WFC_DISPATCH'] = self.dispatch_id
+        first = ('ask', 'First question?', '--attempt', self.row['attempt'], '--message-id', 'first')
+        receipt = self.cli(*first)
+        self.unconfirmed_close('incomplete')
+        self.cli('ask', 'Late question?', '--attempt', self.row['attempt'],
+                 error='closing or closed')
+        message, = self.cli('wait', '--scope', self.row['scope'], '--timeout', '0')['messages']
+        self.assertEqual(message['messageId'], receipt['messageId'])
+        confirmed = self.cli('ack', receipt['messageId'])
+        self.assertEqual(self.cli(*first), {**confirmed, 'duplicate': True})
+        self.assertEqual(len(calls), 1)
+
     def test_done_receipt_and_active_list_through_close(self):
         calls = []
         self.dispatch(endpoint=self.drop_close(calls))

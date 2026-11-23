@@ -10,10 +10,11 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::process::ExitCode;
 use workflow::controller::{self, ControllerError, Owner};
-use workflow::messages::{Confirm, Done, Wait, ACK_USAGE, DONE_USAGE, RESOLVE_USAGE, WAIT_USAGE};
+use workflow::messages::{
+    Ask, Confirm, Done, Wait, ACK_USAGE, ASK_USAGE, DONE_USAGE, RESOLVE_USAGE, WAIT_USAGE,
+};
 
 const RESERVED_COMMANDS: &[&str] = &[
-    "ask",
     "reply",
     "continue",
     "nudge",
@@ -67,6 +68,7 @@ fn run() -> anyhow::Result<ExitCode> {
             #[cfg(target_os = "linux")]
             println!("{}", workflow::herdr::USAGE);
             println!("{DONE_USAGE}");
+            println!("{ASK_USAGE}");
             println!("{WAIT_USAGE}");
             #[cfg(target_os = "linux")]
             println!("{}", workflow::messages::relay::USAGE);
@@ -142,14 +144,16 @@ fn run() -> anyhow::Result<ExitCode> {
             return tmux::launch::run_host(Path::new(&args[0]));
         }
         Some("--kernel") if args.is_empty() => kernel::run()?,
-        Some(name @ ("dispatch" | "status" | "done" | "wait" | "ack" | "resolve"))
+        Some(name @ ("dispatch" | "status" | "done" | "ask" | "wait" | "ack" | "resolve"))
             if args == ["--help"]
-                || (matches!(name, "done" | "wait" | "ack" | "resolve") && args == ["-h"]) =>
+                || (matches!(name, "done" | "ask" | "wait" | "ack" | "resolve")
+                    && args == ["-h"]) =>
         {
             let usage = match name {
                 "dispatch" => workflow::DISPATCH_USAGE,
                 "status" => workflow::STATUS_USAGE,
                 "done" => DONE_USAGE,
+                "ask" => ASK_USAGE,
                 "wait" => WAIT_USAGE,
                 "ack" => ACK_USAGE,
                 _ => RESOLVE_USAGE,
@@ -268,6 +272,20 @@ fn run() -> anyhow::Result<ExitCode> {
                 Ok(request) => request,
                 Err(err) => {
                     eprintln!("wfc: {err}. {DONE_USAGE}");
+                    return Ok(ExitCode::from(2));
+                }
+            };
+            println!("{}", request.run()?);
+        }
+        Some("ask") => {
+            let request = match Ask::parse(&args) {
+                Ok(Some(request)) => request,
+                Ok(None) => {
+                    println!("{ASK_USAGE}");
+                    return Ok(ExitCode::SUCCESS);
+                }
+                Err(err) => {
+                    eprintln!("wfc: {err}. {ASK_USAGE}");
                     return Ok(ExitCode::from(2));
                 }
             };

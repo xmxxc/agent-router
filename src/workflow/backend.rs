@@ -500,7 +500,7 @@ fn same_execution(row: &Value, event: &Value) -> bool {
         .all(|&k| event[k] == row[k])
 }
 
-pub(super) fn herdr_close_blocks_done(state: &Path, row: &Value) -> Result<bool> {
+pub(super) fn herdr_close_blocks_callback(state: &Path, row: &Value) -> Result<bool> {
     let latest = herdr_closes(row).rfind(|event| same_execution(row, event));
     Ok(
         latest.is_some_and(|e| close_is_pending(e) || e["result"] == "completed")

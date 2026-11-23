@@ -305,6 +305,187 @@ time.sleep(10)
 
 #[cfg(target_os = "linux")]
 #[test]
+fn controlled_close_replays_from_a_read_only_archive() {
+    use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+
+    let f = Fixture::new();
+    fs::set_permissions(&f.0, fs::Permissions::from_mode(0o755)).unwrap();
+    let receipt =
+        run(f
+            .dispatch("work", "worker", "task.md")
+            .args([PYTHON, "-c", "raise SystemExit(7)"]));
+    let record = completed(&f, receipt, 7);
+    let id = record["dispatch"].as_str().unwrap();
+    let attempt = record["attempt"].as_str().unwrap();
+    let archive = f.0.join("archive");
+    let dispatches = archive.join("dispatches");
+    fs::create_dir_all(&dispatches).unwrap();
+    let original = f.0.join("state/dispatches");
+    for name in [format!("{id}.json"), format!("{id}.{attempt}.owner")] {
+        let archived = dispatches.join(&name);
+        fs::copy(original.join(name), &archived).unwrap();
+        fs::set_permissions(archived, fs::Permissions::from_mode(0o444)).unwrap();
+    }
+
+    // A root test runner would otherwise bypass the archive's permissions.
+    let root = unsafe { libc::geteuid() } == 0;
+    let copy = f.0.join("wfc");
+    if root {
+        fs::copy(env!("CARGO_BIN_EXE_wfc"), &copy).unwrap();
+        fs::set_permissions(&copy, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let command = || {
+        let mut command = if root {
+            let mut command = Command::new(&copy);
+            command.current_dir(&f.0).gid(65534).uid(65534);
+            command
+        } else {
+            f.wfc()
+        };
+        command.env("WFC_STATE", &archive);
+        command
+    };
+    for dir in [&dispatches, &archive] {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+    }
+    let before = command().args(["status", "--dispatch", id]).output();
+    let first = command().args(["close", id]).output();
+    let replay = command().args(["close", id]).output();
+    let after = command().args(["status", "--dispatch", id]).output();
+    let lock_created = archive.join("close-locks").exists();
+    for dir in [&archive, &dispatches] {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let json = |output: std::io::Result<std::process::Output>| {
+        let output = output.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    for status in [json(before), json(after)] {
+        assert_eq!(status["dispatches"][0]["worker"], record["worker"]);
+        assert_eq!(status["dispatches"][0]["worker"]["exit_code"], 7);
+    }
+    let first = json(first);
+    assert_eq!(
+        first,
+        json!({"operation":"close","result":"completed","dispatch":id,"round":1,
+               "attempt":attempt,"diagnostic":"session was already gone"})
+    );
+    assert_eq!(json(replay), first);
+    assert!(!lock_created);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn controlled_pending_close_rejects_new_question_and_replays_original() {
+    use std::time::{Duration, Instant};
+
+    let f = Fixture::new();
+    let initial = run(f.dispatch("work", "worker", "task.md").args([
+        PYTHON,
+        "-c",
+        r#"
+import os, subprocess, sys, time
+from pathlib import Path
+attempt = os.environ['WFC_ATTEMPT']
+receipt = subprocess.check_output([sys.argv[1], 'ask', 'First question?', '--attempt', attempt,
+                                   '--message-id', 'original'])
+Path('question').write_bytes(receipt)
+Path('owner.tmp').write_text(str(os.getppid()))
+Path('owner.tmp').rename('owner')
+deadline = time.monotonic() + 30
+while not Path('release').exists() and time.monotonic() < deadline:
+    time.sleep(.02)
+"#,
+        env!("CARGO_BIN_EXE_wfc"),
+    ]));
+    let id = initial["dispatch"].as_str().unwrap();
+    let attempt = initial["attempt"].as_str().unwrap();
+    let scope = initial["scope"].as_str().unwrap();
+    let work = f.0.join("work");
+    let until = |check: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !check() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for controlled worker"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    until(&|| work.join("owner").exists());
+    let pid: i32 = fs::read_to_string(work.join("owner"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let first: Value = serde_json::from_slice(&fs::read(work.join("question")).unwrap()).unwrap();
+
+    struct PausedOwner(i32, PathBuf);
+    impl Drop for PausedOwner {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.1, b"");
+            // SAFETY: this is the test worker's own supervisor PID.
+            unsafe { libc::kill(self.0, libc::SIGCONT) };
+        }
+    }
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let paused = PausedOwner(pid, work.join("release"));
+    until(&|| {
+        fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|status| {
+            status.lines().any(|line| {
+                line.strip_prefix("State:")
+                    .and_then(|value| value.split_whitespace().next())
+                    == Some("T")
+            })
+        })
+    });
+
+    let close = f.wfc().args(["close", id]).output().unwrap();
+    assert_eq!(close.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&close.stderr).contains("worker close still pending"));
+    let owner =
+        f.0.join("state/dispatches")
+            .join(format!("{id}.{attempt}.owner"));
+    assert_eq!(fs::read(owner).unwrap().first(), Some(&b'1'));
+
+    let ask = |text: &str, key: &str| {
+        let mut command = f.wfc();
+        command
+            .env("WFC_DISPATCH", id)
+            .env("WFC_ATTEMPT", attempt)
+            .env("WFC_ROUND", "1")
+            .env("WFC_SCOPE", scope)
+            .args(["ask", text, "--attempt", attempt, "--message-id", key]);
+        command
+    };
+    let late = ask("Too late?", "late").output().unwrap();
+    assert_eq!(late.status.code(), Some(1));
+    assert!(late.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&late.stderr).contains("round is not running"));
+    let batch = run(f.wfc().args(["wait", "--scope", scope, "--timeout", "0"]));
+    let [original] = batch["messages"].as_array().unwrap().as_slice() else {
+        panic!("expected only the original question: {batch}");
+    };
+    let stable_id = first["messageId"].as_str().unwrap();
+    let ack = run(f.wfc().args(["ack", stable_id]));
+    let replay = run(&mut ask("First question?", "original"));
+    assert_eq!(replay["messageId"], original["messageId"]);
+    assert_eq!(replay["messageId"], stable_id);
+    assert_eq!(replay["message"], first["message"]);
+    assert_eq!(replay["duplicate"], true);
+    assert_eq!(replay["state"], "processed");
+    assert_eq!(replay["statusVersion"], ack["statusVersion"]);
+    drop(paused);
+    assert_eq!(run(f.wfc().args(["close", id]))["result"], "completed");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn archived_short_id_keeps_rounds_and_completed_result() {
     let f = Fixture::new();
     let dir = f.0.join("state/dispatches");
@@ -539,6 +720,399 @@ fn invalid_callbacks_leave_the_queue_empty_and_parallel_retries_share_one_receip
     assert_eq!(replay["state"], "received");
     assert_eq!(replay["statusVersion"], 2);
     assert_eq!(replay["messageId"], a["messageId"]);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn parallel_questions_keep_their_scope_and_original_receipt() {
+    let f = Fixture::new();
+    let worker = r#"
+import json, os, subprocess, sys, time
+from pathlib import Path
+scope = sys.argv[2]
+args = [sys.argv[1], "ask", f"Ready for {scope}?", "--attempt", os.environ["WFC_ATTEMPT"],
+        "--options", "先,," + scope + ",", "--message-id", "review"]
+first = json.loads(subprocess.check_output(args))
+assert first["state"] == "unsent" and first["statusVersion"] == 1 and not first["duplicate"]
+assert first["next"] == "End your turn now; the answer arrives as your next message."
+path = Path("question.tmp")
+path.write_text(json.dumps(first))
+path.replace("question.json")
+deadline = time.monotonic() + 15
+while not Path("release").exists():
+    if time.monotonic() > deadline:
+        raise RuntimeError("controller did not finish")
+    time.sleep(.02)
+"#;
+    let launch = |scope: &str| {
+        fs::create_dir(f.0.join(scope)).unwrap();
+        fs::write(f.0.join(scope).join("task"), "").unwrap();
+        run(f.wfc().args([
+            "dispatch",
+            "--cwd",
+            scope,
+            "--task",
+            &format!("{scope}/task"),
+            "--role",
+            scope,
+            "--scope",
+            scope,
+            "--",
+            PYTHON,
+            "-c",
+            worker,
+            env!("CARGO_BIN_EXE_wfc"),
+            scope,
+        ]))
+    };
+    let (alpha, beta) = std::thread::scope(|threads| {
+        let other = threads.spawn(|| launch("beta"));
+        (launch("alpha"), other.join().unwrap())
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let view = run(f.wfc().arg("status"));
+        if view["undelivered"].as_array().unwrap().len() == 2 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{view}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let exercise = |scope: &str, record: &Value| {
+        let id = record["dispatch"].as_str().unwrap();
+        let attempt = record["attempt"].as_str().unwrap();
+        let text = format!("Ready for {scope}?");
+        let csv = format!("先,{scope}");
+        let describe = || run(f.wfc().args(["status", "--dispatch", id]));
+        let ask = |question: &str| {
+            let mut command = f.wfc();
+            command
+                .env("WFC_DISPATCH", id)
+                .env("WFC_ROUND", "1")
+                .env("WFC_ATTEMPT", attempt)
+                .env("WFC_SCOPE", scope)
+                .args([
+                    "ask",
+                    question,
+                    "--options",
+                    &csv,
+                    "--attempt",
+                    attempt,
+                    "--message-id",
+                    "review",
+                ]);
+            command
+        };
+        let batch = run(f.wfc().args(["wait", "--scope", scope, "--timeout", "5"]));
+        let [message] = batch["messages"].as_array().unwrap().as_slice() else {
+            panic!("expected one question in {scope}: {batch}");
+        };
+        let uid = message["messageId"].as_str().unwrap();
+        for field in ["dispatch", "scope", "role", "round", "attempt"] {
+            assert_eq!(message[field], record[field]);
+        }
+        assert_eq!(message["type"], "question");
+        assert_eq!(message["question"], text);
+        assert_eq!(message["options"], json!(["先", scope]));
+        assert_eq!(message["state"], "received");
+        assert_eq!(message["statusVersion"], 2);
+        assert!(message.get("report").is_none());
+        let received = describe();
+        let row = &received["dispatches"][0];
+        assert_eq!(row["state"], "asking");
+        assert_eq!(row["status"], "waiting-human");
+        assert_eq!(row["rounds"][0]["state"], "running");
+        assert_eq!(row["messages"][0]["messageId"], uid);
+        assert_eq!(row["messages"][0]["state"], "received");
+        for mut invalid in [
+            ask("changed question"),
+            {
+                let mut command = ask(&text);
+                command.env("WFC_SCOPE", "unrelated");
+                command
+            },
+            {
+                let mut command = ask(&text);
+                command.env("WFC_ATTEMPT", "a-0123456789ab");
+                command
+            },
+            {
+                let mut command = ask(&text);
+                command.args(["--callback-ref", &"a".repeat(64)]);
+                command
+            },
+        ] {
+            let result = invalid.output().unwrap();
+            assert_eq!(result.status.code(), Some(1), "{result:?}");
+            assert!(result.stdout.is_empty());
+        }
+        let body = format!(
+            r#"{{"attempt": "{attempt}", "options": ["先", "{scope}"], "question": "{text}", "role": "{scope}", "round": 1, "scope": "{scope}"}}"#
+        );
+        let confirmed = run(f.wfc().args(["ack", uid, "--body", &body]));
+        assert_eq!(confirmed["state"], "processed");
+        assert_eq!(confirmed["statusVersion"], 3);
+        let replay = run(&mut ask(&text));
+        assert_eq!(replay["messageId"], uid);
+        assert_eq!(replay["message"], message["id"]);
+        assert_eq!(replay["duplicate"], true);
+        assert_eq!(replay["state"], "processed");
+        assert_eq!(replay["statusVersion"], 3);
+        assert!(replay.get("next").is_none());
+        assert_eq!(describe()["dispatches"][0]["status"], "waiting-human");
+        let timeout = f
+            .wfc()
+            .args(["wait", "--scope", scope, "--timeout", "0"])
+            .output()
+            .unwrap();
+        assert_eq!(timeout.status.code(), Some(3));
+        fs::write(f.0.join(scope).join("release"), "").unwrap();
+        completed(&f, record.clone(), 0);
+        let original: Value =
+            serde_json::from_slice(&fs::read(f.0.join(scope).join("question.json")).unwrap())
+                .unwrap();
+        assert_eq!(original["messageId"], uid);
+        assert_eq!(original["message"], message["id"]);
+        message["messageId"].clone()
+    };
+    assert_ne!(exercise("alpha", &alpha), exercise("beta", &beta));
+}
+
+#[test]
+fn question_callback_checks_ownership_and_shares_the_completion_ledger() {
+    use sha2::{Digest, Sha256};
+
+    let f = Fixture::new();
+    let id = "d-12345678";
+    let attempt = "a-0123456789ab";
+    let dir = f.0.join("state/dispatches");
+    let report = f.0.join("report");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(&report, "completed").unwrap();
+    let report = report.canonicalize().unwrap();
+    let secret = "fixture callback value";
+    let row = json!({
+        "dispatch": id, "attempt": attempt, "round": 1, "scope": "test", "role": "tester",
+        "cwd": f.0, "report": report,
+        "workerCallbackHash": format!("{:x}", Sha256::digest(secret.as_bytes())),
+    });
+    fs::write(dir.join(format!("{id}.json")), row.to_string()).unwrap();
+    let callback = || {
+        let mut command = f.wfc();
+        command
+            .env("WFC_DISPATCH", id)
+            .env("WFC_ATTEMPT", attempt)
+            .env_remove("WFC_ROUND")
+            .env_remove("WFC_SCOPE")
+            .env("WFC_WORKER_CALLBACK", secret);
+        command
+    };
+    let ask = || {
+        let mut command = callback();
+        command.args(["ask", "颜色 🦀?", "--attempt", attempt, "--options=红,,蓝"]);
+        command
+    };
+    for mut command in [
+        {
+            let mut command = ask();
+            command.env("WFC_WORKER_CALLBACK", "different worker's secret");
+            command
+        },
+        {
+            let mut command = ask();
+            command.args(["--callback-ref", &"a".repeat(64)]);
+            command
+        },
+        {
+            let mut command = callback();
+            command.args(["wait", "--timeout", "0"]);
+            command
+        },
+    ] {
+        let failure = command.output().unwrap();
+        assert_eq!(failure.status.code(), Some(1));
+        assert!(failure.stdout.is_empty());
+    }
+    assert!(
+        run(f.wfc().args(["status", "--dispatch", id]))["undelivered"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        run(f.wfc().args(["status", "--dispatch", id]))["dispatches"][0]
+            .get("workerCallbackHash")
+            .is_none()
+    );
+
+    let shorthand = run(callback().args(["ask", "Need a decision"]));
+    assert_eq!(shorthand["duplicate"], false);
+    let (first, other) = std::thread::scope(|threads| {
+        let concurrent = threads.spawn(|| run(&mut ask()));
+        (run(&mut ask()), concurrent.join().unwrap())
+    });
+    assert_eq!(first["messageId"], other["messageId"]);
+    assert_ne!(first["duplicate"], other["duplicate"]);
+    let key = format!("ask:{id}:{attempt}:e40e82451f0800c7");
+    let replay = run(ask().args(["--message-id", &key]));
+    assert_eq!(replay["messageId"], first["messageId"]);
+    assert_eq!(replay["duplicate"], true);
+    assert_eq!(
+        run(ask().args(["--message-id=", "--callback-ref="]))["messageId"],
+        first["messageId"]
+    );
+    let empty_attempt = callback()
+        .args(["ask", "need an answer", "--attempt", ""])
+        .output()
+        .unwrap();
+    assert_eq!(empty_attempt.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&empty_attempt.stderr).contains("invalid_worker_callback"));
+
+    let done = |key| {
+        let mut command = callback();
+        command.args([
+            "done",
+            "--report",
+            report.to_str().unwrap(),
+            "--attempt",
+            attempt,
+            "--message-id",
+            key,
+        ]);
+        command
+    };
+    let conflict = done(&key).output().unwrap();
+    assert_eq!(conflict.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&conflict.stderr).contains("conflicts"));
+    let completion = run(&mut done("finish"));
+    let conflict = ask().args(["--message-id", "finish"]).output().unwrap();
+    assert_eq!(conflict.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&conflict.stderr).contains("conflicts"));
+    let late = callback()
+        .args(["ask", "too late", "--attempt", attempt])
+        .output()
+        .unwrap();
+    assert_eq!(late.status.code(), Some(1));
+    assert_eq!(run(&mut ask())["messageId"], first["messageId"]);
+
+    let batch = run(f.wfc().args(["wait", "--scope", "test", "--timeout", "0"]));
+    let [bare, question, done] = batch["messages"].as_array().unwrap().as_slice() else {
+        panic!("expected two questions and a completion: {batch}");
+    };
+    assert_eq!(bare["messageId"], shorthand["messageId"]);
+    assert_eq!(bare["options"], json!([]));
+    assert_eq!(question["messageId"], first["messageId"]);
+    assert_eq!(question["options"], json!(["红", "蓝"]));
+    assert_eq!(done["messageId"], completion["messageId"]);
+    assert_eq!(done["type"], "done");
+    assert_eq!(done["report"], json!(report.canonicalize().unwrap()));
+    assert_eq!(
+        run(f.wfc().args(["status", "--dispatch", id]))["dispatches"][0]["state"],
+        "done"
+    );
+}
+
+#[test]
+fn question_shorthand_accepts_frozen_unowned_argument_shapes() {
+    let f = Fixture::new();
+    let id = "d-12345678";
+    let dir = f.0.join("state/dispatches");
+    fs::create_dir_all(&dir).unwrap();
+    let row = json!({
+        "dispatch": id, "attempt": "a-0123456789ab", "round": 1, "scope": "test", "role": "tester",
+        "cwd": f.0,
+    });
+    fs::write(dir.join(format!("{id}.json")), row.to_string()).unwrap();
+    let questions = ["-", "-1", "-.1", "-１", "-.١", ""];
+    let ask = || {
+        let mut command = f.wfc();
+        command
+            .env("WFC_DISPATCH", id)
+            .env_remove("WFC_ATTEMPT")
+            .env_remove("WFC_ROUND")
+            .env_remove("WFC_SCOPE")
+            .env_remove("WFC_WORKER_CALLBACK")
+            .arg("ask");
+        command
+    };
+    for text in questions {
+        let fresh = run(ask().args([text, "--attempt", "", "--message-id=", "--options", ""]));
+        assert_eq!(fresh["duplicate"], false);
+    }
+    for args in [&["choices", "--options", "-why"][..], &["-²"][..]] {
+        let rejected = ask().args(args).output().unwrap();
+        assert_eq!(rejected.status.code(), Some(2));
+        assert!(rejected.stdout.is_empty());
+    }
+    run(ask().args(["choices", "--options=-why"]));
+    run(ask().args(["- 先跑构建？", "--options", "- leave alone,reset"]));
+    run(ask().args(["- 先跑测试？", "--options=- leave alone,reset"]));
+    let batch = run(f.wfc().args(["wait", "--scope", "test", "--timeout", "0"]));
+    let messages = batch["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), questions.len() + 3);
+    for (message, question) in messages.iter().zip(&questions) {
+        assert_eq!(message["question"], *question);
+        assert_eq!(message["options"], json!([]));
+    }
+    assert_eq!(messages[questions.len()]["options"], json!(["-why"]));
+    for (message, question) in messages[questions.len() + 1..]
+        .iter()
+        .zip(["- 先跑构建？", "- 先跑测试？"])
+    {
+        assert_eq!(message["question"], question);
+        assert_eq!(message["options"], json!(["- leave alone", "reset"]));
+    }
+}
+
+#[test]
+fn question_short_help_prefixes_do_not_publish() {
+    let f = Fixture::new();
+    let id = "d-12345678";
+    let dir = f.0.join("state/dispatches");
+    fs::create_dir_all(&dir).unwrap();
+    let row = json!({
+        "dispatch": id, "attempt": "a-0123456789ab", "round": 1, "scope": "test", "role": "tester",
+        "cwd": f.0,
+    });
+    fs::write(dir.join(format!("{id}.json")), row.to_string()).unwrap();
+    let ask = || {
+        let mut command = f.wfc();
+        command
+            .env("WFC_DISPATCH", id)
+            .env_remove("WFC_ATTEMPT")
+            .env_remove("WFC_ROUND")
+            .env_remove("WFC_SCOPE")
+            .env_remove("WFC_WORKER_CALLBACK")
+            .arg("ask");
+        command
+    };
+
+    let help = ask().arg("-h answer").output().unwrap();
+    assert_eq!(help.status.code(), Some(0));
+    assert!(help.stderr.is_empty());
+    assert!(String::from_utf8_lossy(&help.stdout).starts_with("wfc ask QUESTION "));
+    let missing = ask()
+        .args(["题文", "--options", "-help later,reset"])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(missing.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("option requires a value"));
+    let attached_value = ask().arg("-h=answer").output().unwrap();
+    assert_eq!(attached_value.status.code(), Some(2));
+    assert!(attached_value.stdout.is_empty());
+    assert!(!f.0.join("state/messages.json").exists());
+
+    run(ask().args(["--", "-h answer"]));
+    run(ask().args(["题文", "--options=-help later,reset"]));
+    let batch = run(f.wfc().args(["wait", "--scope", "test", "--timeout", "0"]));
+    let [literal, options] = batch["messages"].as_array().unwrap().as_slice() else {
+        panic!("expected only the two literal questions: {batch}");
+    };
+    assert_eq!(literal["question"], "-h answer");
+    assert_eq!(literal["options"], json!([]));
+    assert_eq!(options["question"], "题文");
+    assert_eq!(options["options"], json!(["-help later", "reset"]));
 }
 
 #[test]

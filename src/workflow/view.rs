@@ -21,7 +21,8 @@ pub fn merged_history(row: &Value, ledger: Vec<Value>) -> Result<Vec<Value>> {
         if let Some(key) = message["messageId"].as_str() {
             if let Some(&pos) = positions.get(key) {
                 let original = &mut history[pos];
-                for field in ["round", "attempt", "report", "type"] {
+                let identity_fields = ["round", "attempt", "report", "type", "question", "options"];
+                for field in identity_fields {
                     ensure!(
                         original[field].is_null()
                             || message[field].is_null()
@@ -51,8 +52,7 @@ pub fn merged_history(row: &Value, ledger: Vec<Value>) -> Result<Vec<Value>> {
                 for (k, v) in message.as_object().unwrap() {
                     if !delivery_fields.contains(&k.as_str())
                         && (original.get(k).is_none()
-                            || (original[k].is_null()
-                                && matches!(k.as_str(), "round" | "attempt" | "type" | "report"))
+                            || (original[k].is_null() && identity_fields.contains(&k.as_str()))
                             || k == "id")
                     {
                         original[k] = v.clone();
@@ -161,8 +161,15 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
             current = round["state"].as_str().unwrap_or("unknown").to_owned();
         }
     }
+    let awaiting_answer = history.iter().any(|m| {
+        m["type"] == "question"
+            && m["dispatch"] == row["dispatch"]
+            && m["round"] == row["round"]
+            && m["attempt"] == row["attempt"]
+    });
     let (state, status) = match current.as_str() {
         "completed" => ("done", "completed"),
+        "running" if alive == Some(true) && awaiting_answer => ("asking", "waiting-human"),
         "running" if alive == Some(true) => ("working", "online"),
         "failed" => ("exited", "failed"),
         "cancelled" => ("cancelled", "cancelled"),

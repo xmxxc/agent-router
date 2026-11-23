@@ -125,6 +125,12 @@ fn outcome(file: &File) -> Result<Value> {
     serde_json::from_str(&result).context("invalid worker outcome")
 }
 
+fn close_requested(file: &File) -> Result<bool> {
+    let mut flag = [0];
+    file.read_exact_at(&mut flag, 0)?;
+    Ok(&flag == b"1")
+}
+
 pub fn status(dir: &Path, record: &Value) -> Result<Value> {
     let (file, unlocked) = open_owner(dir, record, false)?;
     if unlocked {
@@ -133,9 +139,22 @@ pub fn status(dir: &Path, record: &Value) -> Result<Value> {
     Ok(json!({"state":"running"}))
 }
 
+// The publisher holds the attempt lock shared with close while reading this flag.
+pub(super) fn question_blocked(dir: &Path, record: &Value) -> Result<bool> {
+    let (file, unlocked) = open_owner(dir, record, false)?;
+    Ok(close_requested(&file)?
+        || (unlocked
+            && outcome(&file).is_ok_and(|worker| {
+                matches!(
+                    worker["state"].as_str(),
+                    Some("exited" | "cancelled" | "not_started")
+                )
+            })))
+}
+
 pub fn parse_close(args: &[OsString]) -> Result<(&str, Option<&str>)> {
     let mut id = None;
-    let [token] = messages::options(args, ["--owner-token"], Some(&mut id))?;
+    let [token] = messages::options(args, ["--owner-token"], Some((&mut id, "dispatch ID")))?;
     Ok((id.context("missing dispatch ID")?, token))
 }
 
@@ -157,10 +176,33 @@ pub fn close(id: &str, explicit_token: Option<&str>) -> Result<Value> {
     let scope = record_scope(&record).context("invalid dispatch scope")?;
     let token = controller::token(explicit_token);
     let authorize = || controller::Owners::read(&state)?.require(scope, token.as_deref(), "close");
-    if !authorize()? && record["host"].is_string() {
+    let hosted = record["host"].is_string();
+    let controlled = record.get("worker").is_some();
+    let receipt = |already_gone| {
+        let mut receipt = json!({"operation":"close","result":"completed","dispatch":id,
+            "round":record["round"],"attempt":record["attempt"]});
+        if already_gone {
+            receipt["diagnostic"] = json!("session was already gone");
+        }
+        receipt
+    };
+    if !authorize()? {
         // A confirmed archive can be read before taking a write lock. Any
         // inconclusive or failed read goes through the usual locked path.
-        if let Ok(Some(receipt)) = super::backend::read_only_close(&state, &record) {
+        let archived = if hosted {
+            super::backend::read_only_close(&state, &record)
+        } else if controlled {
+            open_owner(&dir, &record, false).and_then(|(owner, finished)| {
+                if !finished {
+                    return Ok(None);
+                }
+                outcome(&owner)?;
+                Ok(Some(receipt(true)))
+            })
+        } else {
+            Ok(None)
+        };
+        if let Ok(Some(receipt)) = archived {
             if !authorize()? {
                 return Ok(receipt);
             }
@@ -168,17 +210,26 @@ pub fn close(id: &str, explicit_token: Option<&str>) -> Result<Value> {
     }
     let _scope_lock = controller::lock_scope(&state, scope)?;
     authorize()?;
-    if record["host"].is_string() {
+    if hosted {
         return super::backend::close(&state, &record);
     }
     // Older foreground records were only published after successful exit.
     let mut already_gone = true;
-    if record.get("worker").is_some() {
+    if controlled {
         let (reader, unlocked) = open_owner(&dir, &record, false)?;
+        let _lock;
         let (owner, unlocked) = if unlocked {
             (reader, true)
         } else {
-            open_owner(&dir, &record, true)?
+            // A verified finished archive can be replayed read-only. Only
+            // a live attempt needs the write lock and a fresh owner check.
+            _lock = super::assignment::close_lock(&state, &record)?;
+            let (reader, unlocked) = open_owner(&dir, &record, false)?;
+            if unlocked {
+                (reader, true)
+            } else {
+                open_owner(&dir, &record, true)?
+            }
         };
         already_gone = unlocked;
         if !already_gone {
@@ -196,12 +247,7 @@ pub fn close(id: &str, explicit_token: Option<&str>) -> Result<Value> {
         }
         outcome(&owner)?;
     }
-    let mut receipt = json!({"operation":"close","result":"completed","dispatch":id,
-        "round":record["round"],"attempt":record["attempt"]});
-    if already_gone {
-        receipt["diagnostic"] = json!("session was already gone");
-    }
-    Ok(receipt)
+    Ok(receipt(already_gone))
 }
 
 pub fn run(args: &[OsString]) -> Result<()> {
@@ -313,9 +359,7 @@ fn watch_tree(file: &File, root: i32, mut closing: bool) -> Result<Value> {
             return Err(err.into());
         }
         if !closing {
-            let mut flag = [0];
-            file.read_exact_at(&mut flag, 0)?;
-            closing = &flag == b"1";
+            closing = close_requested(file)?;
         }
         if closing || root_exit.is_some() {
             // Children remain pinned until our next waitpid. An independent

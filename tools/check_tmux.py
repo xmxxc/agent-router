@@ -1,4 +1,4 @@
-"""Exercise the private backend interface with a fresh tmux server and state roots."""
+"""Exercise the public CLI and private backend with a fresh tmux server and state roots."""
 from contextlib import contextmanager
 import fcntl
 import json
@@ -1994,6 +1994,259 @@ os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
             os.rename(held, self.socket)
         self.assertEqual(self.call("inspect", executionId="A").get("receipt"), str(receipt))
         self.assertTrue(self.call("inspect", dispatch="other", executionId="B")["workerBound"])
+
+    def test_public_question_reuses_terminal_evidence(self):
+        env = {**self.env, "WFC_STATE": str(self.state)}
+        for key in ("WFC_WORKER_CALLBACK", "WFC_OWNER_TOKEN"):
+            env.pop(key)
+
+        def cli(*args, expected=0, **overrides):
+            result = subprocess.run([WFC, *args], env={**env, **overrides}, cwd=self.work,
+                                    text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, expected, (args, result.stdout, result.stderr))
+            if expected != 0:
+                self.assertFalse(result.stdout)
+                return result.stderr
+            return json.loads(result.stdout)
+
+        worker = self.work / "worker.py"
+        worker.write_text("""import os, subprocess, sys, time
+from pathlib import Path
+secret = os.environ.get("WFC_WORKER_CALLBACK")
+assert secret and all(secret not in arg for arg in sys.argv)
+first = subprocess.check_output([os.environ["WFC_BIN"], "ask", "First question?",
+                                 "--attempt", os.environ["WFC_ATTEMPT"],
+                                 "--message-id", "first"])
+Path("question.tmp").write_bytes(first)
+Path("question.tmp").rename("question.json")
+deadline = time.monotonic() + 20
+while not Path("exit-now").exists():
+    if time.monotonic() >= deadline:
+        sys.exit(2)
+    time.sleep(.02)
+sys.exit(41)
+""")
+        (self.work / "task").write_text("ask the controller")
+        config = self.work / "launch.json"
+        config.write_text(json.dumps({"hosts": {"codex": {"command": [sys.executable, str(worker)]}}}))
+        record = cli("dispatch", "--host", "codex", "--task", "task", "--cwd", ".",
+                     "--report", "report", "--scope", "approval", "--launch-config", str(config))
+        dispatch, attempt = record["dispatch"], record["attempt"]
+        self.assertNotIn("workerCallbackHash", record)
+
+        def status():
+            return cli("status", "--dispatch", dispatch)["dispatches"][0]
+
+        def ask(text, key, expected=0):
+            return cli("ask", text, "--attempt", attempt, "--message-id", key,
+                       expected=expected, WFC_DISPATCH=dispatch)
+
+        question = self.work / "question.json"
+        deadline = time.monotonic() + 5
+        while not question.exists():
+            self.assertLess(time.monotonic(), deadline, "public worker did not publish its question")
+            time.sleep(.025)
+        first = json.loads(question.read_bytes())
+        self.assertEqual(first["state"], "unsent")
+        live = status()
+        self.assertNotIn("workerCallbackHash", live)
+        self.assertEqual(live["status"], "waiting-human")
+        archive = self.state / "dispatches" / f"{dispatch}.{attempt}.closed"
+        archive.write_text(json.dumps({"dispatch": dispatch, "attempt": attempt, "round": 1,
+                                       "worker": {"state": "cancelled", "exit_code": None, "signal": None}}))
+        self.assertEqual(status()["worker"]["state"], "running")
+        second = ask("Question while online?", "second")
+        self.assertNotEqual(second["messageId"], first["messageId"])
+        archive.unlink()
+
+        (self.work / "exit-now").touch()
+        deadline = time.monotonic() + 5
+        while status()["worker"].get("exit_code") != 41:
+            self.assertLess(time.monotonic(), deadline, "same-launch exit receipt was not observed")
+            time.sleep(.025)
+        self.assertFalse(archive.exists())
+        self.assertIn("round is not running", ask("Too late?", "late", expected=1))
+        messages = cli("wait", "--scope", "approval", "--timeout", "0")["messages"]
+        self.assertEqual([m["messageId"] for m in messages], [first["messageId"], second["messageId"]])
+        confirmed = cli("ack", first["messageId"])
+        self.assertEqual(ask("First question?", "first"), {**confirmed, "duplicate": True})
+        self.assertEqual(status()["state"], "exited")
+
+    def test_public_question_and_close_share_attempt_lock(self):
+        env = {**self.env, "WFC_STATE": str(self.state)}
+        for key in ("WFC_WORKER_CALLBACK", "WFC_OWNER_TOKEN"):
+            env.pop(key)
+        shim = self.work / "tmux"
+        shim.write_text(f"""#!{sys.executable}
+import os, subprocess, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+mode = os.environ.get("QUESTION_TEST_GATE")
+root = Path({str(self.root)!r})
+ready = root / (str(mode) + "-ready")
+closing = mode == "close" and any("kill-session -t " in arg for arg in args)
+probe = ["list-panes", "-t", os.environ.get("QUESTION_TEST_TARGET")]
+inspecting = mode == "ask" and any(args[i:i + len(probe)] == probe for i in range(len(args)))
+if (closing or inspecting) and not ready.exists():
+    result = subprocess.run([{TMUX!r}, *args], capture_output=True) if inspecting else None
+    ready.touch()
+    deadline = time.monotonic() + 10
+    while not (root / (mode + "-release")).exists():
+        if time.monotonic() >= deadline:
+            sys.exit(2)
+        time.sleep(.02)
+    if result is not None:
+        sys.stdout.buffer.write(result.stdout)
+        sys.stderr.buffer.write(result.stderr)
+        sys.exit(result.returncode)
+os.execv({TMUX!r}, [{TMUX!r}, *args])
+""")
+        shim.chmod(0o700)
+        worker = self.work / "worker.py"
+        worker.write_text("""import os, subprocess, time
+from pathlib import Path
+assert os.environ.get("WFC_WORKER_CALLBACK")
+first = subprocess.check_output([os.environ["WFC_BIN"], "ask", "First question?",
+                                 "--attempt", os.environ["WFC_ATTEMPT"], "--message-id", "original"])
+Path("question.tmp").write_bytes(first)
+Path("question.tmp").rename("question.json")
+time.sleep(45)
+""")
+        (self.work / "task").write_text("ask the controller")
+        config = self.work / "launch.json"
+        config.write_text(json.dumps({"hosts": {"codex": {"command": [sys.executable, str(worker)]}}}))
+
+        processes = []
+
+        def cleanup():
+            for mode in ("ask", "close"):
+                (self.root / (mode + "-release")).touch()
+            for proc in processes:
+                if proc.poll() is None:
+                    try:
+                        proc.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.communicate(timeout=5)
+
+        self.addCleanup(cleanup)
+
+        def start(*args, cwd=None, dispatch=None, gate=None):
+            child_env = env.copy()
+            if dispatch:
+                child_env["WFC_DISPATCH"] = dispatch
+            if gate:
+                child_env.update(PATH=str(self.work) + ":" + env["PATH"], QUESTION_TEST_GATE=gate)
+            if gate == "ask":
+                child_env["QUESTION_TEST_TARGET"] = f"=wfc-{dispatch}:"
+            proc = subprocess.Popen([WFC, *args], cwd=cwd or self.work, env=child_env,
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            processes.append(proc)
+            return proc
+
+        def finish(proc, expected=0):
+            out, err = proc.communicate(timeout=10)
+            self.assertEqual(proc.returncode, expected, (proc.args, out, err))
+            if expected:
+                self.assertFalse(out)
+                return err
+            return json.loads(out)
+
+        def until(predicate, message):
+            deadline = time.monotonic() + 5
+            while not predicate():
+                self.assertLess(time.monotonic(), deadline, message)
+                time.sleep(.02)
+
+        def opened_by(proc, path):
+            for fd in Path(f"/proc/{proc.pid}/fd").glob("*"):
+                try:
+                    if os.readlink(fd) == str(path):
+                        return True
+                except FileNotFoundError:
+                    pass
+            return False
+
+        def locked(path):
+            with path.open("rb") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return False
+                except BlockingIOError:
+                    return True
+
+        def dispatch(scope):
+            cwd = self.work / scope
+            cwd.mkdir()
+            row = finish(start("dispatch", "--host", "codex", "--task", str(self.work / "task"),
+                               "--cwd", ".", "--report", "report", "--scope", scope,
+                               "--launch-config", str(config), cwd=cwd))
+            question = cwd / "question.json"
+            until(question.exists, "public worker did not ask")
+            return row, json.loads(question.read_bytes())
+
+        other, other_question = dispatch("unrelated")
+        for order in ("close", "ask"):
+            with self.subTest(first=order):
+                row, first = dispatch(order)
+                dispatch_id, attempt = row["dispatch"], row["attempt"]
+                lock = self.state / "close-locks" / f"{dispatch_id}.{attempt}"
+                archive = self.state / "dispatches" / f"{dispatch_id}.{attempt}.closed"
+
+                def ask(text, key, gate=None):
+                    return start("ask", text, "--attempt", attempt, "--message-id", key,
+                                 dispatch=dispatch_id, gate=gate)
+
+                if order == "close":
+                    close = start("close", dispatch_id, gate="close")
+                    until((self.root / "close-ready").exists, "close did not reach the original session")
+                    self.assertTrue(locked(lock))
+                    pending = ask("Second question?", "second")
+                    until(lambda: opened_by(pending, lock), "ask did not wait on the attempt lock")
+                    self.assertEqual(finish(ask("First question?", "original"))["messageId"], first["messageId"])
+                    self.assertFalse(archive.exists())
+                    (self.root / "close-release").touch()
+                    closed = finish(close)
+                    self.assertIn("round is not running", finish(pending, expected=1))
+                    accepted = []
+                else:
+                    pending = ask("Second question?", "second", gate="ask")
+                    until((self.root / "ask-ready").exists, "ask did not sample the real tmux session")
+                    self.assertTrue(locked(lock))
+                    # The blocked tmux inspection leaves other scopes free to take messages.
+                    answer = finish(start("wait", "--scope", "unrelated", "--timeout", "0.5"))
+                    self.assertEqual([m["messageId"] for m in answer["messages"]],
+                                     [other_question["messageId"]])
+                    with (self.state / "messages.lock").open("rb") as inbox:
+                        fcntl.flock(inbox, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        close = start("close", dispatch_id)
+                        until(lambda: opened_by(close, lock), "close did not wait on the attempt lock")
+                        (self.root / "ask-release").touch()
+                        native = self.state / "tmux" / f"{dispatch_id}.lock"
+                        until(lambda: not locked(native), "tmux inspection did not finish")
+                        self.assertTrue(locked(lock))
+                        self.assertIsNone(close.poll())
+                        self.assertFalse(archive.exists())
+                    accepted = [finish(pending)["messageId"]]
+                    closed = finish(close)
+
+                saved = json.loads(archive.read_bytes())
+                self.assertEqual((saved["dispatch"], saved["attempt"], saved["round"]),
+                                 (dispatch_id, attempt, row["round"]))
+                self.assertEqual(saved["executionId"], attempt)
+                self.assertEqual(saved["launchId"], Path(row["create"]["receipt"]).stem)
+                self.assertEqual(closed["result"], "completed")
+                for result in (saved, closed):
+                    self.assertEqual(result["closeOperationId"], "close:" + attempt)
+                    self.assertEqual(result["closeEffect"], "session_closed")
+                    self.assertEqual(result["resourceCleanup"], "confirmed")
+                batch = finish(start("wait", "--scope", order, "--timeout", "0"))
+                self.assertEqual([m["messageId"] for m in batch["messages"]],
+                                 [first["messageId"], *accepted])
+                confirmed = finish(start("ack", first["messageId"]))
+                self.assertEqual(finish(ask("First question?", "original")), {**confirmed, "duplicate": True})
+                owner = self.call("inspect", dispatch=other["dispatch"], executionId=other["attempt"])
+                self.assertTrue(owner["alive"] and owner["owned"] and owner["workerBound"], owner)
 
     def test_lifecycle(self):
         # Keep the worker alive across Ctrl-C so close tests the active-session path.

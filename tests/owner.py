@@ -165,6 +165,61 @@ assert retry["messageId"] == receipt["messageId"] and retry["duplicate"]
         print(json.dumps({"callbackReceipt": receipt, "workerAttempt": worker["attempt"],
                           "ownerGeneration": 2, "unownedReceipt": unowned["messageId"]}), flush=True)
 
+    def test_question_requires_current_owner_or_original_worker_callback(self):
+        first = self.data("owner", "acquire", "--scope", "ours", "--owner", "A")
+        a = {"WFC_CONTROLLER_TOKEN": first["token"]}
+        script = """
+import json, os, subprocess, sys, time
+from pathlib import Path
+
+assert os.environ["WFC_WORKER_CALLBACK"]
+assert "WFC_CONTROLLER_TOKEN" not in os.environ and "WFC_OWNER_TOKEN" not in os.environ
+Path("ask-ready").touch()
+deadline = time.monotonic() + 20
+while not Path("ask-go").exists():
+    assert time.monotonic() < deadline
+    time.sleep(.02)
+args = [sys.argv[1], "ask", "Worker question?", "--attempt", os.environ["WFC_ATTEMPT"],
+        "--message-id", "worker-question"]
+first = json.loads(subprocess.check_output(args, timeout=8))
+replay = json.loads(subprocess.check_output(args, timeout=8))
+assert replay["duplicate"] and replay["messageId"] == first["messageId"]
+Path("ask-result.tmp").write_text(json.dumps(first))
+Path("ask-result.tmp").rename("ask-result")
+while not Path("ask-exit").exists() and time.monotonic() < deadline:
+    time.sleep(.02)
+"""
+        worker = self.dispatch("ours", sys.executable, "-c", script, relay.WFC, **a)
+        self.addCleanup((self.root / "ask-exit").touch, exist_ok=True)
+        self.addCleanup((self.root / "ask-go").touch, exist_ok=True)
+        self.until(lambda: (self.root / "ask-ready").exists())
+        second = self.data("owner", "takeover", "--scope", "ours", "--owner", "B")
+        b = {"WFC_CONTROLLER_TOKEN": second["token"]}
+        worker_env = {"WFC_DISPATCH": worker["dispatch"]}
+        request = ("ask", "Controller question?", "--attempt", worker["attempt"],
+                   "--message-id", "controller-question")
+        stale = self.error("stale_controller_owner", *request, **worker_env, **a)
+        self.assertEqual((stale["scope"], stale["operation"]), ("ours", "ask"))
+        invalid = self.error("invalid_worker_callback", *request, **worker_env, **b,
+                             WFC_WORKER_CALLBACK=worker["attempt"])
+        self.assertEqual(invalid["operation"], "ask")
+        self.error("invalid_worker_callback", *request, "--callback-ref", "0" * 64, **worker_env, **b)
+        controller = self.data(*request, "--owner-token", second["token"], **worker_env, **a)
+        (self.root / "ask-go").touch()
+        result = self.root / "ask-result"
+        self.until(result.exists)
+        question = json.loads(result.read_bytes())
+        messages = self.data("wait", "--scope", "ours", "--timeout", "0", **b)["messages"]
+        self.assertEqual([(m["messageId"], m["type"], m["attempt"]) for m in messages],
+                         [(r["messageId"], "question", worker["attempt"]) for r in (controller, question)])
+        self.error("stale_controller_owner", "ask", "Worker question?",
+                   "--attempt", worker["attempt"], "--message-id", "worker-question",
+                   **worker_env, **a)
+        self.error("stale_controller_owner", "ack", question["messageId"], **a)
+        self.assertEqual(self.data("ack", question["messageId"], **b)["state"], "processed")
+        self.assertNotIn("workerCallbackHash", self.record(worker))
+        self.assertEqual(self.data("close", worker["dispatch"], **b)["result"], "completed")
+
     def test_takeover_waits_for_scoped_delivery_and_unregisters_detached_relay(self):
         first = self.data("owner", "acquire", "--scope", "ours")
         a = {"WFC_CONTROLLER_TOKEN": first["token"]}
