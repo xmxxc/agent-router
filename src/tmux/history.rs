@@ -2,6 +2,7 @@
 use super::binding::{save, unknown, valid_launch_id, Claim};
 use super::{failure, Reply, Tmux};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
@@ -36,12 +37,16 @@ struct Registry {
 }
 
 impl Tmux<'_> {
-    fn registry(&self) -> Reply<Registry> {
+    fn saved_registry(&self) -> Reply<Option<Registry>> {
         match File::open(self.claim_path().with_extension("executions.json")) {
-            Ok(f) => serde_json::from_reader(f).map_err(|_| unknown()),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(Registry::default()),
+            Ok(f) => serde_json::from_reader(f).map(Some).map_err(|_| unknown()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
             Err(_) => Err(unknown()),
         }
+    }
+
+    fn registry(&self) -> Reply<Registry> {
+        Ok(self.saved_registry()?.unwrap_or_default())
     }
 
     fn save_registry(&self, registry: &Registry) -> Reply<()> {
@@ -76,6 +81,78 @@ impl Tmux<'_> {
             .filter(|id| valid_launch_id(id) && registry.closed.contains(*id))
             .cloned()
             .ok_or_else(unknown)
+    }
+
+    // Called under the same dispatch lock as reserve, replacement and close.
+    // A missing lookup alone cannot distinguish an unregistered attempt from
+    // damaged state. Require a surviving, keyed predecessor as the anchor.
+    pub(super) fn resume_registration(&self, execution: &str, predecessor: &str) -> Reply<Value> {
+        let claim = self.claim()?;
+        let registry = self.saved_registry()?.ok_or_else(unknown)?;
+        let current = match &claim {
+            Some(Claim::Registered { id, execution }) => {
+                if !valid_launch_id(id) {
+                    return Err(unknown());
+                }
+                Some((execution.as_str(), id.as_str()))
+            }
+            Some(Claim::Released(Some(id)))
+                if valid_launch_id(id) && registry.closed.contains(id) =>
+            {
+                registry
+                    .launches
+                    .get(predecessor)
+                    .filter(|known| *known == id)
+                    .map(|known| (predecessor, known.as_str()))
+            }
+            _ => None,
+        };
+        let mut evidence =
+            json!({"result":"accepted","executionId":execution,"fromExecutionId":predecessor});
+        let archived = registry.launches.get(execution);
+        if archived.is_some_and(|id| !valid_launch_id(id) || !registry.closed.contains(id)) {
+            return Err(unknown());
+        }
+        let active = current
+            .filter(|(key, _)| *key == execution)
+            .map(|(_, id)| id);
+        if active
+            .zip(archived)
+            .is_some_and(|(active, old)| active != old.as_str())
+        {
+            return Err(unknown());
+        }
+        if let Some(id) = active.or_else(|| archived.map(String::as_str)) {
+            self.submission(id, Some(execution))?;
+            let not_started = self.cancellation(id, Some(execution))?.is_some()
+                || super::launch::read_receipt(&self.launch_path(id, "json")).is_some_and(
+                    |receipt| {
+                        receipt["launchId"] == id
+                            && receipt
+                                .get("dispatch")
+                                .is_none_or(|dispatch| dispatch.as_str() == Some(self.dispatch))
+                            && receipt
+                                .get("executionId")
+                                .is_none_or(|key| key.as_str() == Some(execution))
+                            && matches!(
+                                receipt["category"].as_str(),
+                                Some("executable_missing" | "permission_denied" | "spawn_failed")
+                            )
+                    },
+                );
+            evidence["registration"] = json!(if not_started {
+                "not_started"
+            } else {
+                "registered"
+            });
+            evidence["launchId"] = json!(id);
+        } else if let Some((key, id)) = current.filter(|(key, _)| *key == predecessor) {
+            self.submission(id, Some(key))?;
+            evidence["registration"] = json!("unregistered");
+        } else {
+            return Err(unknown());
+        }
+        Ok(evidence)
     }
 
     pub(super) fn archived_execution(&self, launch_id: &str) -> Reply<Option<String>> {
@@ -222,6 +299,17 @@ impl Tmux<'_> {
             },
             None => Claim::Launch(id.to_owned()),
         };
-        self.replace_claim(&claim)
+        self.replace_claim(&claim)?;
+        if self.new_execution_id.is_some() && self.saved_registry()?.is_none() {
+            self.save_registry(&Registry::default())?;
+        }
+        // Persist the registration before launching the worker. A later
+        // reconciliation may use the surviving predecessor as absence proof.
+        File::open(self.state.join("tmux"))
+            .and_then(|dir| dir.sync_all())
+            .map_err(|_| unknown())?;
+        File::open(self.state)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|_| unknown())
     }
 }

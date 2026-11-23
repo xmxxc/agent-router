@@ -41,6 +41,11 @@ pub struct Request {
 enum Operation {
     Create(launch::Launch),
     Inspect,
+    #[serde(rename = "inspect-resume-registration")]
+    InspectResumeRegistration {
+        #[serde(rename = "fromExecutionId")]
+        from_execution_id: String,
+    },
     Read,
     Submit {
         text: String,
@@ -519,6 +524,9 @@ impl Tmux<'_> {
         }
         match op {
             Operation::Inspect => self.inspect(),
+            Operation::InspectResumeRegistration { .. } => {
+                unreachable!("handled under the dispatch lock")
+            }
             Operation::Read => {
                 let t = self.owned()?;
                 Ok(json!({"result":"accepted","screen":self.capture(&t,&t.pane)?}))
@@ -950,6 +958,19 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
         Err(result) => return Ok(result),
     };
     let inspect = matches!(request.op, Operation::Inspect);
+    if let Operation::InspectResumeRegistration { from_execution_id } = &request.op {
+        let execution = request
+            .execution_id
+            .as_deref()
+            .context("missing resume execution key")?;
+        ensure!(
+            !from_execution_id.is_empty() && execution != from_execution_id.as_str(),
+            "missing or repeated predecessor execution key"
+        );
+        return Ok(backend
+            .resume_registration(execution, from_execution_id)
+            .unwrap_or_else(|error| error));
+    }
     if let Some(execution) = request.execution_id.as_deref().filter(|_| !launching) {
         native_id = match backend.registered_launch(execution) {
             Ok(id) => id,

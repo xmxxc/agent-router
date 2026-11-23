@@ -51,7 +51,7 @@ Linux 上，Codex 的 tmux worker 退出后可用 `wfc resume DISPATCH` 回到�
 
 恢复需要核实旧执行已离线，并在 Codex 记录中找到原派发的开场消息。恢复会重新读取原启动配置。启动前先写入审计，启动后记录结果。若执行或会话身份有疑问，先核对 `status`。有待确认的启动审计时，重复运行 `resume` 会保留原证据。
 
-Linux 的 `wfc reconcile DISPATCH AUDIT --result RESULT --actor NAME --evidence TEXT [--owner-token TOKEN]` 可裁决 tmux Codex 恢复审计。`wfc status --dispatch DISPATCH` 的 `reconcileRequired` 给出待裁决编号，`audit` 保留原观察和裁决证据。可选结果为 `accepted`、`definitely-not-sent`、`unknown` 或 `refused`。已认领的 scope 需要当前 owner 凭据。用完全相同的结论、经办人和证据重试可取回原裁决。裁决只查证并记账。核实会话位置空闲的 `accepted` 裁决可供同一 owner 代的下一次显式恢复消费一次，恢复时仍核对会话位置和原对话。
+Linux 的 `wfc reconcile DISPATCH AUDIT --result RESULT --actor NAME --evidence TEXT [--owner-token TOKEN]` 可裁决 tmux Codex 恢复审计。`wfc status --dispatch DISPATCH` 的 `reconcileRequired` 给出待裁决编号，`audit` 保留原观察和裁决证据。可选结果为 `accepted`、`definitely-not-sent`、`unknown` 或 `refused`。已认领的 scope 需要当前 owner 凭据。用完全相同的结论、经办人和证据重试可在同步记录目录后取回原裁决。裁决只查证并记账。`definitely-not-sent` 要求同一执行键确有未登记或未启动证据，回执丢失或损坏时仍可保留待对账。核实空闲的 `accepted` 证明与本次审计、执行、原会话位置和 owner 代绑定，可供下一次显式恢复消费一次。恢复时再次核对证据、会话位置和原对话。
 
 Linux 也支持 Herdr 0.9.5（协议 22）。先启动自己的 Herdr 服务，再把仅当前用户可访问的 socket 绝对路径交给派发命令。也可用 `WFC_HERDR_ENDPOINT` 指定，命令行优先。
 

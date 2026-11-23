@@ -136,26 +136,37 @@ pub(super) fn resume(state: &Path, row: &Value, launch: Launch, scope_lock: &Fil
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn observe_for_resume(state: &Path, row: &Value, operator_absence: bool) -> Result<(Value, Value)> {
-    if super::assignment::resume_audit(row)
-        .is_some_and(|event| event["launchResult"] == "definitely-not-sent" || event["result"] == "definitely-not-sent")
-    {
-        // A proven spawn refusal may have no keyed worker receipt. Still
-        // require the backend to confirm the protected session slot is absent.
-        let inspection = call(state, row, json!({"op":"inspect"}))?;
-        let worker_state = if inspection["result"] == "accepted" && inspection["alive"] == false {
-            "not_started"
+pub(super) fn observe_for_resume(
+    state: &Path,
+    row: &Value,
+    operator_absence: bool,
+    not_sent: bool,
+) -> Result<(Value, Value)> {
+    if not_sent || operator_absence {
+        let event = super::assignment::resume_audit(row).context("missing resume audit")?;
+        let facts = reconcile_resume(state, row, event)?;
+        ensure!(
+            facts.absent
+                && if not_sent {
+                    facts.not_sent
+                } else {
+                    facts.idle_proof
+                },
+            "cannot revalidate the original execution's idle proof"
+        );
+        let worker = if not_sent {
+            json!({"state":"not_started"})
         } else {
-            "unknown"
+            exited(&facts.inspection["receipt"]).unwrap_or_else(|| json!({"state":"unknown"}))
         };
-        return Ok((json!({"state":worker_state}), inspection));
+        return Ok((worker, facts.inspection["slot"].clone()));
     }
     let (worker, inspection) = observe(state, &mut row.clone())?;
-    if inspection["alive"] == false || operator_absence {
+    if inspection["alive"] == false {
         // An archived execution can be absent while its original name is
         // occupied. Check the slot before recording a new attempt.
         let slot = call(state, row, json!({"op":"inspect"}))?;
-        if slot["result"] != "accepted" || slot["alive"] != false || operator_absence {
+        if slot["result"] != "accepted" || slot["alive"] != false {
             return Ok((worker, slot));
         }
     }
@@ -166,8 +177,8 @@ pub(super) fn observe_for_resume(state: &Path, row: &Value, operator_absence: bo
 pub(super) struct ResumeEvidence {
     pub live: bool,
     pub absent: bool,
-    pub started: bool,
-    pub never_started: bool,
+    pub not_sent: bool,
+    pub idle_proof: bool,
     pub inspection: Value,
 }
 
@@ -178,7 +189,9 @@ pub(super) fn reconcile_resume(state: &Path, row: &Value, event: &Value) -> Resu
     ensure!(
         row["executionId"] == row["attempt"]
             && supports_session_confirmation(row)
-            && row["tmuxSocket"].as_str().is_some_and(|s| Path::new(s).is_absolute()),
+            && row["tmuxSocket"]
+                .as_str()
+                .is_some_and(|s| Path::new(s).is_absolute()),
         "missing original tmux execution identity"
     );
     ensure!(
@@ -187,62 +200,137 @@ pub(super) fn reconcile_resume(state: &Path, row: &Value, event: &Value) -> Resu
         "resume audit and launch evidence disagree"
     );
     let keyed = existing(state, row, "inspect")?;
+    let registration = if event["scopeFence"] == true {
+        call(
+            state,
+            row,
+            json!({"op":"inspect-resume-registration",
+            "executionId":row["executionId"],"fromExecutionId":event["fromAttempt"]}),
+        )?
+    } else {
+        Value::Null
+    };
+    let registration_bound = registration["result"] == "accepted"
+        && registration["executionId"] == row["executionId"]
+        && registration["fromExecutionId"] == event["fromAttempt"];
+    let unregistered = registration_bound
+        && registration["registration"] == "unregistered"
+        && event["registrationFence"] == true
+        && event["launchResult"] != "accepted"
+        && row["create"]["receipt"].is_null()
+        && keyed["launchId"].is_null();
     let launch = inspect_launch(state, row, &keyed)?;
     let receipt = if let Some(id) = launch {
-        let path = state.canonicalize()?.join("launches").join(format!("{id}.json"));
+        let path = state
+            .canonicalize()?
+            .join("launches")
+            .join(format!("{id}.json"));
         ensure!(
-            row["create"]["receipt"].is_null() || row["create"]["receipt"].as_str().map(Path::new) == Some(path.as_path()),
+            row["create"]["receipt"].is_null()
+                || row["create"]["receipt"].as_str().map(Path::new) == Some(path.as_path()),
             "unexpected saved launch receipt path"
         );
-        let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
             .context("open verified resume receipt")?;
         ensure!(file.metadata()?.is_file(), "invalid launch receipt file");
         let receipt: Value = serde_json::from_reader(file).context("read resume receipt")?;
         ensure!(
-            receipt.get("launchId").is_none_or(|value| value.as_str() == Some(id))
-                && receipt.get("dispatch").is_none_or(|value| value == &row["dispatch"])
-                && receipt.get("executionId").is_none_or(|value| value == &row["executionId"]),
+            receipt
+                .get("launchId")
+                .is_none_or(|value| value.as_str() == Some(id))
+                && receipt
+                    .get("dispatch")
+                    .is_none_or(|value| value == &row["dispatch"])
+                && receipt
+                    .get("executionId")
+                    .is_none_or(|value| value == &row["executionId"]),
             "resume receipt belongs to another execution"
         );
         match receipt["category"].as_str() {
-            Some("started") => ensure!(receipt["launchId"].as_str() == Some(id)
-                && receipt["pid"].as_u64().is_some_and(|pid| pid > 0 && pid <= u32::MAX as u64), "invalid start receipt"),
-            Some("process_exited") => ensure!(receipt["launchId"].as_str() == Some(id)
-                && exited(&receipt).is_some(), "invalid exit receipt"),
-            Some("unknown" | "not_started" | "executable_missing" | "permission_denied" | "spawn_failed") => (),
+            Some("started") => ensure!(
+                receipt["launchId"].as_str() == Some(id)
+                    && receipt["pid"]
+                        .as_u64()
+                        .is_some_and(|pid| pid > 0 && pid <= u32::MAX as u64),
+                "invalid start receipt"
+            ),
+            Some("process_exited") => ensure!(
+                receipt["launchId"].as_str() == Some(id) && exited(&receipt).is_some(),
+                "invalid exit receipt"
+            ),
+            Some(
+                "unknown" | "not_started" | "executable_missing" | "permission_denied"
+                | "spawn_failed",
+            ) => (),
             _ => bail!("invalid resume launch receipt"),
         }
         receipt
     } else {
-        ensure!(row["create"]["receipt"].is_null(), "invalid saved launch receipt");
+        ensure!(
+            row["create"]["receipt"].is_null(),
+            "invalid saved launch receipt"
+        );
         Value::Null
     };
     // A released attempt can still have a historical receipt while a
     // different writer occupies the name. Check both the attempt and slot.
     let slot = call(state, row, json!({"op":"inspect"}))?;
-    let live = keyed["result"] == "accepted" && keyed["alive"] == true
-        && keyed["owned"] == true && keyed["workerBound"] == true
-        && keyed["executionId"] == row["attempt"] && slot["result"] == "accepted"
-        && slot["alive"] == true && slot["owned"] == true;
+    let live = keyed["result"] == "accepted"
+        && keyed["alive"] == true
+        && keyed["owned"] == true
+        && keyed["workerBound"] == true
+        && keyed["executionId"] == row["attempt"]
+        && slot["result"] == "accepted"
+        && slot["alive"] == true
+        && slot["owned"] == true;
     ensure!(
-        keyed["result"] != "refused" && slot["result"] != "refused" && (slot["alive"] != true || live),
+        keyed["result"] != "refused"
+            && slot["result"] != "refused"
+            && (slot["alive"] != true || live),
         "tmux session is not bound to this attempt"
     );
     let absent = slot["result"] == "accepted" && slot["alive"] == false && keyed["alive"] != true;
-    let started = live || event["launchResult"] == "accepted"
-        || matches!(receipt["category"].as_str(), Some("started" | "process_exited"));
-    let never_started = event["launchResult"] == "definitely-not-sent"
-        || matches!(receipt["category"].as_str(), Some("not_started" | "executable_missing" | "permission_denied" | "spawn_failed"));
-    ensure!(!(started && never_started), "conflicting resume launch evidence");
+    let started = live
+        || event["launchResult"] == "accepted"
+        || matches!(
+            receipt["category"].as_str(),
+            Some("started" | "process_exited")
+        );
+    let backend_not_started = registration_bound
+        && registration["registration"] == "not_started"
+        && registration["launchId"].as_str().is_some_and(valid_launch)
+        && launch.is_none_or(|id| registration["launchId"] == id);
+    let not_sent = unregistered || backend_not_started || direct_resume_not_sent(row, event);
+    ensure!(!(started && not_sent), "conflicting resume launch evidence");
+    let exited = keyed["executionId"] == row["executionId"] && exited(&receipt).is_some();
     // Pre-fence pending rows can be recovered only once a keyed observation
     // confirms the old backend command has obtained and released its lock.
     ensure!(
-        event["result"] != "pending" || event["scopeFence"] == true
-            || live || (keyed["executionId"] == row["attempt"] && exited(&receipt).is_some()),
+        event["result"] != "pending" || event["scopeFence"] == true || live || exited,
         "cannot verify that the old resume backend finished"
     );
-    Ok(ResumeEvidence { live, absent, started, never_started,
-        inspection: json!({"attempt":keyed,"slot":slot,"receipt":receipt}) })
+    Ok(ResumeEvidence {
+        live,
+        absent,
+        not_sent,
+        idle_proof: unregistered || exited,
+        inspection: json!({"attempt":keyed,"slot":slot,"receipt":receipt,"registration":registration}),
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn direct_resume_not_sent(row: &Value, event: &Value) -> bool {
+    event["launchResult"] == "definitely-not-sent"
+        && row["create"]["launchResult"] == event["launchResult"]
+        && matches!(
+            row["create"]["result"].as_str(),
+            Some("refused" | "definitely-not-sent")
+        )
+        && event["receipt"] == row["create"]["receipt"]
+        && receipt_id(row).is_ok()
 }
 
 fn close_operation(row: &Value) -> Result<String> {

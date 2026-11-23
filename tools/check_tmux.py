@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import signal
 import shutil
@@ -555,6 +556,169 @@ os.execv({TMUX!r}, [{TMUX!r}, *args])
         self.assertEqual(row["audit"][0]["resolution"]["previousResult"], "uncertain")
         self.assertEqual(len(list(self.work.glob("a-*.json"))), 2)
 
+    def test_public_reconcile_offline_missing_or_broken_receipt_is_not_no_send(self):
+        for mode in ("missing", "malformed"):
+            with self.subTest(mode=mode):
+                self.state = self.root / mode
+                existing_launches = set(self.work.glob("a-*.json"))
+                initial, first = self.resume_fixture()
+                dispatch, attempt = initial["dispatch"], initial["attempt"]
+                self.rollout("11111111-2222-4333-8444-555555555555", first["argv"][-1])
+                self.end_resume_host(dispatch, attempt)
+                self.lose_resume_launch(dispatch, "uncertain")
+                current = self.resume_status(dispatch)["attempt"]
+                new = self.resumed_host(current)
+                self.end_resume_host(dispatch, current)
+                observed = self.call("inspect", dispatch=dispatch, executionId=current)
+                receipt = Path(observed["receipt"])
+                self.assertEqual(json.loads(receipt.read_bytes())["category"], "process_exited")
+                if mode == "missing":
+                    receipt.unlink()
+                else:
+                    receipt.write_text("{")
+                path = self.state / "dispatches" / f"{dispatch}.json"
+                stored = path.read_bytes()
+                self.assertIsNone(json.loads(stored)["create"].get("receipt"))
+                keyed = self.call("inspect", dispatch=dispatch, executionId=current)
+                self.assertEqual(keyed["result"], "uncertain")
+                self.assertNotIn("launchId", keyed)
+                self.assertFalse(self.call("inspect", dispatch=dispatch)["alive"])
+                claim = json.loads((self.state / "tmux" / f"{dispatch}.json").read_bytes())
+                self.assertEqual(claim["Registered"]["execution"], current)
+                for result, reason in (("definitely-not-sent", "did not start"),
+                                       ("accepted", "safe absence")):
+                    args = self.reconcile_args(dispatch, result, "socket and pane no longer present")
+                    self.assertIn(reason, self.resume_cli(*args, code=1, WFC_OWNER_TOKEN="owner-one"))
+                blocked = self.resume_cli("resume", dispatch, code=1, WFC_OWNER_TOKEN="owner-one")
+                self.assertIn("lifecycle_reconcile_required", blocked)
+                self.assertEqual(path.read_bytes(), stored)
+                report = Path(new["WFC_REPORT"])
+                report.write_text("late completion from the original attempt")
+                args = ("--report", str(report), "--message-id", "fixture-late-done")
+                done = self.resume_callback(new, "done", *args)
+                duplicate = self.resume_callback(new, "done", *args)
+                self.assertEqual((done["state"], done["duplicate"], duplicate["duplicate"]),
+                                 ("unsent", False, True))
+                self.assertEqual(duplicate["messageId"], done["messageId"])
+                row = self.resume_status(dispatch)
+                self.assertEqual((row["attempt"], row["rounds"][-1]["result"]["messageId"]),
+                                 (current, done["messageId"]))
+                self.assertEqual([e["result"] for e in row["audit"]], ["uncertain"])
+                self.assertEqual(len(set(self.work.glob("a-*.json")) - existing_launches), 2)
+
+    def persist_resume_before_registration(self, dispatch, session, pending):
+        path = self.state / "dispatches" / f"{dispatch}.json"
+        row = json.loads(path.read_bytes())
+        previous, round = row["attempt"], row["round"]
+        if not row.get("rounds"):
+            row["rounds"] = [dict(round=round, attempt=previous, task=row["task"],
+                                  report=row["report"], state="failed")]
+        row["rounds"].append(dict(round=round, attempt=pending, task=row["task"],
+                                  report=row["report"], state="unknown"))
+        events = row.setdefault("audit", [])
+        audit = len(events) + 1
+        events.append(dict(id=audit, dispatch=dispatch, operation="resume", round=round,
+                           attempt=pending, toAttempt=pending, fromAttempt=previous,
+                           fromHost="codex", toHost="codex", session=session, ownerGeneration=1,
+                           scopeFence=True, registrationFence=True, result="pending"))
+        row.update(attempt=pending, executionId=pending, hostSession=session)
+        row.pop("create", None)
+        path.write_text(json.dumps(row))
+        return path, audit
+
+    def test_public_reconcile_requires_unique_immediate_predecessor(self):
+        original, host = self.resume_fixture()
+        dispatch, first = original["dispatch"], original["attempt"]
+        session = "11111111-2222-4333-8444-555555555555"
+        owner = {"WFC_OWNER_TOKEN": "owner-one"}
+        self.rollout(session, host["argv"][-1])
+        self.end_resume_host(dispatch, first)
+        second = self.resume_cli("resume", dispatch, **owner)["attempt"]
+        self.end_resume_host(dispatch, second)
+        path, audit = self.persist_resume_before_registration(dispatch, session, "a-" + "e3" * 16)
+        good = path.read_bytes()
+        args = self.reconcile_args(dispatch, "accepted", "verified pending registration", audit)
+        for damage in ("skipped-predecessor", "duplicate-predecessor", "duplicate-target"):
+            with self.subTest(damage=damage):
+                row = json.loads(good)
+                if damage == "skipped-predecessor":
+                    row["audit"][-1]["fromAttempt"] = first
+                elif damage == "duplicate-predecessor":
+                    row["rounds"].insert(0, row["rounds"][-2])
+                else:
+                    row["rounds"].insert(0, {**row["rounds"][-1], "round": 2})
+                path.write_text(json.dumps(row))
+                self.assertIn("invalid or foreign resume audit", self.resume_cli(*args, code=1, **owner))
+                self.assertEqual(json.loads(path.read_bytes()), row)
+        path.write_bytes(good)
+        self.assertFalse(self.resume_cli(*args, **owner)["duplicate"])
+
+    def test_public_reconcile_same_owner_cannot_consume_another_audits_idle_proof(self):
+        original, host = self.resume_fixture()
+        dispatch, first = original["dispatch"], original["attempt"]
+        session = "11111111-2222-4333-8444-555555555555"
+        owner = {"WFC_OWNER_TOKEN": "owner-one"}
+        self.rollout(session, host["argv"][-1])
+        self.end_resume_host(dispatch, first)
+        path, audit = self.persist_resume_before_registration(dispatch, session, "a-" + "e4" * 16)
+        self.resume_cli(*self.reconcile_args(dispatch, "accepted", "first idle proof", audit), **owner)
+        foreign = json.loads(path.read_bytes())["audit"][-1]["resolution"]
+        second = self.resume_cli("resume", dispatch, **owner)["attempt"]
+        self.end_resume_host(dispatch, second)
+        path, audit = self.persist_resume_before_registration(dispatch, session, "a-" + "e5" * 16)
+        self.resume_cli(*self.reconcile_args(dispatch, "accepted", "second idle proof", audit), **owner)
+        good = path.read_bytes()
+        for repair_binding in (False, True):
+            with self.subTest(repair_binding=repair_binding):
+                row = json.loads(good)
+                target = row["audit"][-1]["resolution"]
+                self.assertEqual(foreign["ownerGeneration"], target["ownerGeneration"])
+                copied = dict(foreign)
+                if repair_binding:
+                    copied["binding"] = target["binding"]
+                row["audit"][-1]["resolution"] = copied
+                path.write_text(json.dumps(row))
+                blocked = self.resume_cli("resume", dispatch, code=1, **owner)
+                self.assertIn("lifecycle_reconcile_required", blocked)
+                self.assertEqual(json.loads(path.read_bytes()), row)
+        path.write_bytes(good)
+        newest = self.resume_cli("resume", dispatch, **owner)
+        self.assertEqual(newest["session"], session)
+        self.assertIn("consumedAt", json.loads(path.read_bytes())["audit"][audit - 1]["resolution"])
+        self.end_resume_host(dispatch, newest["attempt"])
+
+    def test_public_reconcile_duplicate_requires_dispatch_directory_sync(self):
+        tracer = shutil.which("strace")
+        self.assertIsNotNone(tracer, "reconcile durability fixture requires strace")
+        original, _ = self.resume_fixture()
+        dispatch, first = original["dispatch"], original["attempt"]
+        self.end_resume_host(dispatch, first)
+        session = "11111111-2222-4333-8444-555555555555"
+        path, audit = self.persist_resume_before_registration(dispatch, session, "a-" + "e6" * 16)
+        args = self.reconcile_args(dispatch, "accepted", "same durable proof", audit)
+        trace = self.work / "reconcile-fsync.log"
+        def run(inject):
+            fault = ["-e", f"inject=fsync:error=EIO:when={inject}"] if inject else []
+            return subprocess.run([tracer, "-yy", "-o", trace, "-e", "trace=fsync", *fault, WFC, *args],
+                                  cwd=self.work, text=True, capture_output=True, timeout=20,
+                                  env={**self.env, "WFC_STATE": str(self.state), "WFC_OWNER_TOKEN": "owner-one"})
+
+        dir_sync = rf"fsync\(\d+<{re.escape(str(path.parent))}>\)\s+=\s+"
+        first = run(2)  # The first fsync is the assignment file, the second its directory.
+        self.assertEqual((first.returncode, first.stdout), (1, ""), first.stderr)
+        self.assertRegex(trace.read_text(), dir_sync + r"-1 EIO.*INJECTED")
+        visible = path.read_bytes()
+        self.assertEqual(json.loads(visible)["audit"][-1]["result"], "accepted")
+        duplicate = run(1)
+        self.assertEqual((duplicate.returncode, duplicate.stdout), (1, ""), duplicate.stderr)
+        self.assertRegex(trace.read_text(), dir_sync + r"-1 EIO.*INJECTED")
+        self.assertEqual(path.read_bytes(), visible)
+        duplicate = run(None)
+        self.assertEqual(duplicate.returncode, 0, duplicate.stderr)
+        self.assertTrue(json.loads(duplicate.stdout)["duplicate"])
+        self.assertRegex(trace.read_text(), dir_sync + r"0")
+        self.assertEqual(path.read_bytes(), visible)
+
     def test_public_reconcile_resume_absence_proof_is_owner_bound_and_consumed(self):
         for mode in ("consume", "takeover", "not-sent", "refused"):
             with self.subTest(mode=mode):
@@ -564,23 +728,34 @@ os.execv({TMUX!r}, [{TMUX!r}, *args])
                 session = "11111111-2222-4333-8444-555555555555"
                 self.rollout(session, host["argv"][-1])
                 self.end_resume_host(dispatch, original)
-                path = self.state / "dispatches" / f"{dispatch}.json"
-                row = json.loads(path.read_bytes())
                 # Model the persisted cut after the intent and before the backend runs.
                 pending = "a-" + "f1" * 16
-                row["rounds"] = [dict(round=1, attempt=a, task=row["task"], report=row["report"], state=s)
-                                 for a, s in [(original, "failed"), (pending, "unknown")]]
-                row["audit"] = [dict(id=1, dispatch=dispatch, operation="resume", round=1,
-                                     attempt=pending, toAttempt=pending, fromAttempt=original,
-                                     fromHost="codex", toHost="codex", session=session,
-                                     ownerGeneration=1, scopeFence=True, result="pending")]
-                row.update(attempt=pending, executionId=pending, hostSession=session)
-                row.pop("create")
-                path.write_text(json.dumps(row))
+                path, _ = self.persist_resume_before_registration(dispatch, session, pending)
                 result = {"not-sent": "definitely-not-sent", "refused": "refused"}.get(mode, "accepted")
                 args = self.reconcile_args(dispatch, result, "operator verified the protected slot")
+                if mode == "not-sent":
+                    fenced = path.read_bytes()
+                    older = json.loads(fenced)
+                    older["audit"][0].pop("registrationFence")
+                    path.write_text(json.dumps(older))
+                    self.assertIn("did not start", self.resume_cli(*args, code=1, WFC_OWNER_TOKEN="owner-one"))
+                    self.assertEqual(json.loads(path.read_bytes()), older)
+                    path.write_bytes(fenced)
+                    registry = self.state / "tmux" / f"{dispatch}.executions.json"
+                    original_registry = registry.read_bytes()
+                    for damage in (None, b"{"):
+                        if damage is None:
+                            registry.unlink()
+                        else:
+                            registry.write_bytes(damage)
+                        self.assertIn("did not start", self.resume_cli(*args, code=1, WFC_OWNER_TOKEN="owner-one"))
+                        self.assertEqual(path.read_bytes(), fenced)
+                        registry.write_bytes(original_registry)
                 receipt = self.resume_cli(*args, WFC_OWNER_TOKEN="owner-one")
                 self.assertFalse(receipt["duplicate"])
+                registration = json.loads(path.read_bytes())["audit"][0]["resolution"]["observation"]["registration"]
+                self.assertEqual((registration["registration"], registration["executionId"], registration["fromExecutionId"]),
+                                 ("unregistered", pending, original))
                 if mode == "takeover":
                     self.resume_cli("owner", "takeover", "--scope", "resume", "--owner", "two",
                                     "--token", "owner-two", "--lease", "180")

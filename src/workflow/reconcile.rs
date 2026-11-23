@@ -118,6 +118,9 @@ impl<'a> Reconcile<'a> {
                 self.audit
             );
             authorize()?;
+            // The previous publisher may have renamed the file but failed
+            // to sync the directory. Finish that durability step on retry.
+            messages::sync_directory(&dir)?;
             return Ok(response(&event["attempt"], true));
         }
         ensure!(
@@ -142,11 +145,11 @@ impl<'a> Reconcile<'a> {
         let facts = backend::reconcile_resume(&state, &row, event)?;
         match self.result {
             "accepted" => ensure!(
-                facts.live || (facts.absent && !facts.never_started),
+                facts.live || (facts.absent && facts.idle_proof),
                 "cannot confirm the resumed execution or its safe absence"
             ),
             "definitely-not-sent" => ensure!(
-                facts.absent && !facts.started,
+                facts.absent && facts.not_sent,
                 "cannot confirm that the resumed execution did not start"
             ),
             _ => (),
@@ -189,7 +192,7 @@ impl<'a> Reconcile<'a> {
         let resolution = json!({"actor":self.actor,"evidence":self.evidence,"at":now,
             "ownerGeneration":generation,"previousResult":event["result"],
             "verifiedAbsent":self.result == "accepted" && facts.absent,
-            "observation":facts.inspection});
+            "observation":facts.inspection,"binding":resolution_binding(&row,event,&generation)});
         row["rounds"] = projected["rounds"].clone();
         row["audit"][index]["result"] = json!(self.result);
         row["audit"][index]["resolution"] = resolution;
@@ -227,6 +230,19 @@ fn validate_resume_audit(row: &Value, event: &Value) -> Result<()> {
             .is_some_and(|s| super::valid_identity(s, "a-"))
     };
     let rounds = row["rounds"].as_array().context("missing round history")?;
+    let mut targets = rounds
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r["attempt"] == event["attempt"]);
+    let direct_predecessor = targets.next().and_then(|(index, target)| {
+        let previous = rounds.get(index.checked_sub(1)?)?;
+        (target["round"] == round
+            && previous["attempt"] == event["fromAttempt"]
+            && previous["round"]
+                .as_u64()
+                .is_some_and(|n| n > 0 && (n == round || n.checked_add(1) == Some(round))))
+        .then_some(())
+    });
     ensure!(
         event["dispatch"] == row["dispatch"]
             && valid_attempt(&event["attempt"])
@@ -240,37 +256,93 @@ fn validate_resume_audit(row: &Value, event: &Value) -> Result<()> {
                 .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok())
             && (event["ownerGeneration"].is_null()
                 || event["ownerGeneration"].as_u64().is_some_and(|n| n > 0))
+            && direct_predecessor.is_some()
+            && targets.next().is_none()
             && rounds
                 .iter()
-                .filter(|r| r["round"] == round && r["attempt"] == event["attempt"])
+                .filter(|r| r["attempt"] == event["fromAttempt"])
                 .count()
-                == 1
-            && rounds.iter().any(|r| r["attempt"] == event["fromAttempt"]
-                && r["round"]
-                    .as_u64()
-                    .is_some_and(|n| n == round || n.checked_add(1) == Some(round))),
+                == 1,
         "invalid or foreign resume audit evidence"
     );
     Ok(())
+}
+
+fn resolution_binding(row: &Value, event: &Value, generation: &Value) -> Value {
+    json!({"dispatch":row["dispatch"],"audit":event["id"],"round":event["round"],
+        "executionId":row["executionId"],"fromAttempt":event["fromAttempt"],
+        "scope":super::record_scope(row),"session":event["session"],
+        "tmuxSession":format!("wfc-{}",row["dispatch"].as_str().unwrap_or_default()),
+        "tmuxSocket":row["tmuxSocket"],"ownerGeneration":generation})
+}
+
+fn bound_resolution(row: &Value, event: &Value, generation: &Value) -> bool {
+    let resolution = &event["resolution"];
+    row["executionId"] == row["attempt"]
+        && row["tmuxSocket"]
+            .as_str()
+            .is_some_and(|s| std::path::Path::new(s).is_absolute())
+        && event["session"] == row["hostSession"]
+        && resolution["binding"] == resolution_binding(row, event, generation)
+        && resolution.get("ownerGeneration") == Some(generation)
+        && resolution["observation"]["slot"]["result"] == "accepted"
+        && resolution["observation"]["slot"]["alive"] == false
+        && resolution["consumedAt"].is_null()
+        && ["actor", "evidence"].iter().all(|field| {
+            resolution[*field]
+                .as_str()
+                .is_some_and(|s| !s.trim().is_empty())
+        })
+}
+
+fn observed_registration(row: &Value, event: &Value, expected: &str) -> bool {
+    let registration = &event["resolution"]["observation"]["registration"];
+    registration["result"] == "accepted"
+        && registration["executionId"] == row["executionId"]
+        && registration["fromExecutionId"] == event["fromAttempt"]
+        && registration["registration"] == expected
+        && if expected == "unregistered" {
+            event["scopeFence"] == true
+                && event["registrationFence"] == true
+                && event["launchResult"] != "accepted"
+                && row["create"]["receipt"].is_null()
+                && registration["launchId"].is_null()
+        } else {
+            registration["launchId"]
+                .as_str()
+                .is_some_and(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        }
 }
 
 pub(super) fn resume_absence_proof(row: &Value, generation: &Value) -> Option<usize> {
     let event = assignment::resume_audit(row)?;
     let index = audit_index(row, event["id"].as_u64()?).ok()?;
     let resolution = &event["resolution"];
+    let observation = &resolution["observation"];
     (event["result"] == "accepted"
-        && event["session"] == row["hostSession"]
         && resolution["verifiedAbsent"] == true
-        && resolution["observation"]["slot"]["result"] == "accepted"
-        && resolution["observation"]["slot"]["alive"] == false
-        && resolution["actor"]
-            .as_str()
-            .is_some_and(|s| !s.trim().is_empty())
-        && resolution["evidence"]
-            .as_str()
-            .is_some_and(|s| !s.trim().is_empty())
-        && resolution["consumedAt"].is_null()
-        && resolution.get("ownerGeneration") == Some(generation)
+        && bound_resolution(row, event, generation)
+        && (observed_registration(row, event, "unregistered")
+            || (observation["attempt"]["executionId"] == row["executionId"]
+                && observation["attempt"]["launchId"].is_string()
+                && observation["attempt"]["launchId"] == observation["receipt"]["launchId"]
+                && observation["receipt"]["category"] == "process_exited"
+                && observation["receipt"]["exitCode"]
+                    .as_u64()
+                    .is_some_and(|code| code <= 255)))
         && validate_resume_audit(row, event).is_ok())
     .then_some(index)
+}
+
+pub(super) fn resume_not_sent(row: &Value, generation: &Value) -> bool {
+    let Some(event) = assignment::resume_audit(row) else {
+        return false;
+    };
+    audit_index(row, event["id"].as_u64().unwrap_or(0)).is_ok()
+        && validate_resume_audit(row, event).is_ok()
+        && (backend::direct_resume_not_sent(row, event)
+            || (event["result"] == "definitely-not-sent"
+                && bound_resolution(row, event, generation)
+                && (observed_registration(row, event, "unregistered")
+                    || observed_registration(row, event, "not_started"))))
 }

@@ -696,7 +696,7 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
                 ErrorKind::PermissionDenied => "permission_denied",
                 _ => "spawn_failed",
             };
-            super::binding::save(&receipt, &json!({"category":category}))?;
+            super::binding::save(&receipt, &json!({"category":category,"launchId":id}))?;
             return Ok(ExitCode::FAILURE);
         }
     };

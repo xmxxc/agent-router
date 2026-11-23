@@ -641,9 +641,14 @@ impl Inbox {
         }
         let resume = super::assignment::resume_audit(row);
         if let Some(event) = resume {
+            #[cfg(target_os = "linux")]
+            let not_sent =
+                super::reconcile::resume_not_sent(row, &event["resolution"]["ownerGeneration"]);
+            #[cfg(not(target_os = "linux"))]
+            let not_sent = event["launchResult"] == "definitely-not-sent"
+                || event["result"] == "definitely-not-sent";
             ensure!(
-                event["launchResult"] != "definitely-not-sent"
-                    && event["result"] != "definitely-not-sent"
+                !not_sent
                     && (event["result"] == "accepted"
                         || (attempt.is_some() && controller::worker_callback().is_some())),
                 "attempt is no longer accepted for {}; its launch is unconfirmed",

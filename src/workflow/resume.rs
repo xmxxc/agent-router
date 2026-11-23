@@ -92,17 +92,18 @@ impl<'a> Resume<'a> {
         }
         let _execution = assignment::close_lock(&state, &row)?;
         let proof = super::reconcile::resume_absence_proof(&row, &generation);
-        let (worker, inspection) = match backend::observe_for_resume(&state, &row, proof.is_some())
-        {
-            Ok(observation) => observation,
-            Err(e) => {
-                return Ok(reconcile(
-                    &row,
-                    Value::Null,
-                    &format!("cannot inspect the original execution: {e}"),
-                ));
-            }
-        };
+        let not_sent = super::reconcile::resume_not_sent(&row, &generation);
+        let (worker, inspection) =
+            match backend::observe_for_resume(&state, &row, proof.is_some(), not_sent) {
+                Ok(observation) => observation,
+                Err(e) => {
+                    return Ok(reconcile(
+                        &row,
+                        Value::Null,
+                        &format!("cannot inspect the original execution: {e}"),
+                    ));
+                }
+            };
         if inspection["alive"] == true && inspection["owned"] == true {
             anyhow::bail!("original tmux session is still running; inspect status or attach to it");
         }
@@ -283,7 +284,7 @@ impl<'a> Resume<'a> {
                 json!({"id":event,"operation":"resume","dispatch":self.dispatch,
                 "round":round,"attempt":attempt,"fromAttempt":row["attempt"],"toAttempt":attempt,
                 "fromHost":row["host"],"toHost":row["host"],"session":session.to_string(),
-                "at":now.to_rfc3339(),"ownerGeneration":generation,"result":"pending","scopeFence":true,
+                "at":now.to_rfc3339(),"ownerGeneration":generation,"result":"pending","scopeFence":true,"registrationFence":true,
                 "priorInspection":inspection,"priorWorker":worker,"priorCreate":row["create"]}),
             );
             super::write_json(&path, &next, None)?;
