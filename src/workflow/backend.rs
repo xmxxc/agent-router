@@ -294,9 +294,12 @@ pub(super) fn publish_unconfirmed_zero(state: &Path, row: &Value) -> Result<()> 
     Ok(())
 }
 
-fn script_missing(row: &Value) -> bool {
+fn script_preflight_failed(row: &Value) -> bool {
     row["create"]["result"] == "definitely-not-sent"
-        && row["create"]["category"] == "configured_script_missing"
+        && matches!(
+            row["create"]["category"].as_str(),
+            Some("configured_script_missing" | "configured_script_permission_denied")
+        )
         && row["worker"]["state"] == "not_started"
 }
 
@@ -589,7 +592,7 @@ pub(super) fn herdr_worker(evidence: &Value, inspection: &Value) -> Value {
 }
 
 pub fn observe(state: &Path, row: &mut Value) -> Result<(Value, Value)> {
-    if script_missing(row) {
+    if script_preflight_failed(row) {
         return Ok((
             row["worker"].clone(),
             json!({"result":"definitely-not-sent","alive":false}),
@@ -674,7 +677,7 @@ fn inspect_worker(state: &Path, row: &Value, saved: &Value) -> Result<(Value, Va
 }
 
 pub fn close(state: &Path, row: &Value) -> Result<Value> {
-    if script_missing(row) {
+    if script_preflight_failed(row) {
         return Ok(
             json!({"dispatch":row["dispatch"],"operation":"close","result":"completed",
             "round":row["round"],"attempt":row["attempt"],"worker":row["worker"],

@@ -728,7 +728,7 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
     let mut terminal = json!({"category":"process_exited","exitCode":code,"launchId":id});
-    if let Some(zero) = watching.and_then(|watching| watching.host_exited(status, observed)) {
+    if let Some(zero) = watching.and_then(|watching| watching.tmux_exited(status, observed)) {
         terminal["startupZero"] = zero;
     }
     super::binding::save(&receipt, &terminal)?;

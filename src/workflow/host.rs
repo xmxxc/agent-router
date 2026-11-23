@@ -109,28 +109,48 @@ fn argv(object: &Value, key: &str) -> Result<Vec<String>> {
         .collect()
 }
 
-#[derive(Debug)]
-pub(super) struct MissingScript;
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ScriptUnavailable {
+    Missing,
+    PermissionDenied,
+}
 
-impl std::fmt::Display for MissingScript {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("invalid launch config or missing configured script")
+impl ScriptUnavailable {
+    pub(super) fn category(self) -> &'static str {
+        match self {
+            Self::Missing => "configured_script_missing",
+            Self::PermissionDenied => "configured_script_permission_denied",
+        }
     }
 }
 
-impl std::error::Error for MissingScript {}
+impl std::fmt::Display for ScriptUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Missing => "invalid launch config or missing configured script",
+            Self::PermissionDenied => "permission denied while resolving configured script",
+        })
+    }
+}
+
+impl std::error::Error for ScriptUnavailable {}
 
 fn resolve_script(paths: impl IntoIterator<Item = PathBuf>) -> Result<PathBuf> {
     let mut uncertain = false;
+    let mut denied = false;
     for path in paths {
         match path.metadata() {
             Ok(meta) if meta.is_file() => return Ok(path),
             Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => (),
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => denied = true,
             _ => uncertain = true,
         }
     }
+    if denied {
+        return Err(ScriptUnavailable::PermissionDenied.into());
+    }
     ensure!(!uncertain, "configured script could not be resolved");
-    Err(MissingScript.into())
+    Err(ScriptUnavailable::Missing.into())
 }
 
 fn configured(path: &Path, name: &str, cwd: &Path) -> Result<Launch> {
@@ -280,7 +300,7 @@ impl Options<'_> {
                 let path = path.canonicalize().context("invalid launch config path")?;
                 selected_config = Some(path.clone());
                 configured(&path, self.name, cwd).map_err(|err| {
-                    if err.is::<MissingScript>() {
+                    if err.is::<ScriptUnavailable>() {
                         err
                     } else {
                         anyhow::anyhow!("invalid launch config or missing configured script")

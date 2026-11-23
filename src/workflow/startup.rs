@@ -87,11 +87,18 @@ impl Startup {
         self.not_started(category, diagnostic);
     }
 
-    pub(super) fn script_missing(&self) {
-        self.not_started(
-            "executable_missing",
-            "Configured worker script was not found",
-        );
+    pub(super) fn script_unavailable(&self, error: super::host::ScriptUnavailable) {
+        let (category, diagnostic) = match error {
+            super::host::ScriptUnavailable::Missing => (
+                "executable_missing",
+                "Configured worker script was not found",
+            ),
+            super::host::ScriptUnavailable::PermissionDenied => (
+                "permission_denied",
+                "Permission denied while resolving the configured worker script",
+            ),
+        };
+        self.not_started(category, diagnostic);
     }
 
     fn not_started(&self, category: &'static str, diagnostic: &'static str) {
@@ -206,10 +213,24 @@ impl Running<'_> {
             return None;
         }
         if status.success() {
-            return Some(json!({"pid":self.pid,"processStart":self.process_start}));
+            return Some(self.zero_evidence());
         }
         self.publish_exit(status);
         None
+    }
+
+    pub(crate) fn tmux_exited(self, status: ExitStatus, observed: Instant) -> Option<Value> {
+        if status.success() {
+            // The create operation decides whether this launch passed its
+            // final session confirmation. Preserve the evidence until then.
+            return Some(self.zero_evidence());
+        }
+        self.exited(status, observed);
+        None
+    }
+
+    fn zero_evidence(&self) -> Value {
+        json!({"pid":self.pid,"processStart":self.process_start})
     }
 
     fn publish_exit(&self, status: ExitStatus) {
