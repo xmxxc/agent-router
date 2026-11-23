@@ -71,3 +71,7 @@ timeout 240s python3 tools/check_wfc.py /path/to/workflow-core target/wfc-kernel
 ```
 
 脚本运行 WFC 已有的六个真实进程用例，并检查每个用例都实际执行。首次候选的 Linux x64 独立编译、终端测试和 stdio 往返已实测。Windows 原生和 Linux 委派进程树的验收由总控在冻结候选上执行。[来源、补丁与复建方法](SOURCES.md)
+
+## Linux 工作流兼容进度
+
+[Linux 行为对照清单](docs/parity/README.md)列出了固定 Python 版本的公开命令、宿主和后端、旧状态兼容边界，以及各项对应的 Rust 工单、验证条件和复查方法。
