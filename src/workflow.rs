@@ -21,6 +21,8 @@ mod backend;
 #[cfg(target_os = "linux")]
 pub mod herdr;
 pub mod host;
+#[cfg(target_os = "linux")]
+pub mod input;
 mod view;
 
 pub const DISPATCH_USAGE: &str =
@@ -676,6 +678,10 @@ fn status_with_history(
             .as_object_mut()
             .unwrap()
             .remove(controller::CALLBACK_HASH);
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove(controller::CALLBACK_REF_HASH);
         if let Some(scope) = record_scope(record) {
             if let Some(owner) = owners.public(scope)? {
                 record["controllerOwner"] = owner;

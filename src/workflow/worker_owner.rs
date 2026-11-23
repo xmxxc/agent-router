@@ -211,7 +211,14 @@ pub fn close(id: &str, explicit_token: Option<&str>) -> Result<Value> {
     let _scope_lock = controller::lock_scope(&state, scope)?;
     authorize()?;
     if hosted {
-        return super::backend::close(&state, &record);
+        let current = super::assignment::public_record(&dir, id)?.context("missing dispatch")?;
+        ensure!(
+            record_scope(&current) == Some(scope)
+                && current["round"] == record["round"]
+                && current["attempt"] == record["attempt"],
+            "assignment changed while waiting to close"
+        );
+        return super::backend::close(&state, &current);
     }
     // Older foreground records were only published after successful exit.
     let mut already_gone = true;

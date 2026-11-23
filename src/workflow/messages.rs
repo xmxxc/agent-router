@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub const DONE_USAGE: &str =
-    "wfc done --report FILE [--attempt ID] [--message-id KEY] [--owner-token TOKEN]";
+    "wfc done --report FILE [--attempt ID] [--callback-ref REF] [--message-id KEY] [--owner-token TOKEN]";
 pub const ASK_USAGE: &str =
     "wfc ask QUESTION [--options CSV] [--attempt ID] [--callback-ref REF] [--message-id KEY] [--owner-token TOKEN]";
 pub const WAIT_USAGE: &str =
@@ -187,6 +187,8 @@ struct Assignment {
     controller_owner: Option<Value>,
     #[serde(rename = "workerCallbackHash")]
     callback_hash: Option<String>,
+    #[serde(rename = "workerCallbackRefHash")]
+    callback_ref_hash: Option<String>,
 }
 
 impl Assignment {
@@ -194,6 +196,7 @@ impl Assignment {
         state: &Path,
         dispatch: &str,
         expected_attempt: Option<&str>,
+        reference: Option<&str>,
     ) -> Result<(Self, Value)> {
         let dir = state.join("dispatches");
         let (file, path) = super::assignment::open_assignment(&dir, dispatch)
@@ -208,28 +211,51 @@ impl Assignment {
             assignment.controller_owner.is_none(),
             "controller owner authorization required for {dispatch}"
         );
-        if let Some(round) = env::var_os("WFC_ROUND") {
+        // A continued task has the original host's environment. Selection
+        // by explicit attempt is provisional until the callback is verified.
+        if reference.is_none() {
+            if let Some(round) = env::var_os("WFC_ROUND") {
+                ensure!(
+                    round.to_str().and_then(|s| s.parse::<u64>().ok()) == Some(worker.round),
+                    "round mismatch for {dispatch}"
+                );
+            }
             ensure!(
-                round.to_str().and_then(|s| s.parse::<u64>().ok()) == Some(worker.round),
-                "round mismatch for {dispatch}"
+                env::var_os("WFC_ATTEMPT")
+                    .is_none_or(|v| v.to_str() == Some(worker.attempt.as_str())),
+                "attempt is no longer accepted for {dispatch}"
             );
         }
         ensure!(
-            env::var_os("WFC_ATTEMPT").is_none_or(|v| v.to_str() == Some(worker.attempt.as_str()))
-                && expected_attempt.is_none_or(|id| id == worker.attempt),
+            expected_attempt.is_none_or(|id| id == worker.attempt),
             "attempt is no longer accepted for {dispatch}"
         );
         Ok((assignment, row))
     }
 
     // Call with the ledger lock held while checking the current assignment.
-    fn authorize_callback(&self, state: &Path, token: Option<&str>, operation: &str) -> Result<()> {
+    fn authorize_callback(
+        &self,
+        state: &Path,
+        token: Option<&str>,
+        operation: &str,
+        attempt: Option<&str>,
+        reference: Option<&str>,
+    ) -> Result<()> {
+        if reference.is_some() && attempt.is_none() {
+            return Err(controller::invalid_worker_callback(operation).into());
+        }
         if let Some(secret) = controller::worker_callback() {
-            if secret.to_str().is_some_and(|secret| {
-                self.callback_hash.as_deref() == Some(body_hash(secret).as_str())
-            }) {
+            if self.callback_ref_hash == reference.map(body_hash)
+                && secret.to_str().is_some_and(|secret| {
+                    self.callback_hash.as_deref() == Some(body_hash(secret).as_str())
+                })
+            {
                 return Ok(());
             }
+            return Err(controller::invalid_worker_callback(operation).into());
+        }
+        if reference.is_some() {
             return Err(controller::invalid_worker_callback(operation).into());
         }
         controller::Owners::read(state)?.require(self.worker.scope(), token, operation)?;
@@ -765,20 +791,28 @@ pub(super) fn history(state: &Path, dispatch: &str) -> Result<Vec<Value>> {
 pub struct Done<'a> {
     report: &'a Path,
     attempt: Option<&'a str>,
+    reference: Option<&'a str>,
     key: Option<&'a str>,
     owner_token: Option<&'a str>,
 }
 
 impl<'a> Done<'a> {
     pub fn parse(args: &'a [OsString]) -> Result<Self> {
-        let [report, attempt, key, owner_token] = options(
+        let [report, attempt, reference, key, owner_token] = options(
             args,
-            ["--report", "--attempt", "--message-id", "--owner-token"],
+            [
+                "--report",
+                "--attempt",
+                "--callback-ref",
+                "--message-id",
+                "--owner-token",
+            ],
             None,
         )?;
         Ok(Self {
             report: Path::new(report.context("missing --report")?),
             attempt,
+            reference,
             key,
             owner_token,
         })
@@ -797,8 +831,15 @@ impl<'a> Done<'a> {
         let token = controller::token(self.owner_token);
         let check = || {
             let inbox = Inbox::open(&state)?;
-            let (assignment, row) = Assignment::current(&state, &dispatch, self.attempt)?;
-            assignment.authorize_callback(&state, token.as_deref(), "done")?;
+            let (assignment, row) =
+                Assignment::current(&state, &dispatch, self.attempt, self.reference)?;
+            assignment.authorize_callback(
+                &state,
+                token.as_deref(),
+                "done",
+                self.attempt,
+                self.reference,
+            )?;
             // R1 dispatches had neither field and derived the default key from
             // the worker's launch environment. Assignment::current checked it.
             let r1_worker = assignment.report.is_none()
@@ -910,14 +951,18 @@ impl<'a> Ask<'a> {
         let token = controller::token(self.owner_token);
         let check = || -> Result<_> {
             let inbox = Inbox::open(&state)?;
-            let (assignment, row) = Assignment::current(&state, &dispatch, attempt)?;
-            // A reference is for a later assignment in the same live session.
-            if self.reference.is_some()
-                || (self.attempt == Some("") && controller::worker_callback().is_some())
-            {
+            let (assignment, row) =
+                Assignment::current(&state, &dispatch, attempt, self.reference)?;
+            if self.attempt == Some("") && controller::worker_callback().is_some() {
                 return Err(controller::invalid_worker_callback("ask").into());
             }
-            assignment.authorize_callback(&state, token.as_deref(), "ask")?;
+            assignment.authorize_callback(
+                &state,
+                token.as_deref(),
+                "ask",
+                attempt,
+                self.reference,
+            )?;
             ensure!(
                 env::var_os("WFC_SCOPE")
                     .is_none_or(|v| v.to_str() == Some(assignment.worker.scope())),

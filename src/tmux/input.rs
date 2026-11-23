@@ -85,7 +85,7 @@ fn codex_draft(screen: &str) -> Option<Draft> {
         } else {
             line
         };
-        scrolled |= line.ends_with('↑');
+        scrolled |= line.ends_with(['↑', '↓']);
         let line = line.strip_suffix(['↑', '↓']).unwrap_or(line);
         if n > 0 {
             text.push(' ');
@@ -93,6 +93,12 @@ fn codex_draft(screen: &str) -> Option<Draft> {
         text.push_str(line.trim());
     }
     Some(Draft { text, scrolled })
+}
+
+fn empty_codex_composer(screen: &str) -> bool {
+    // The plain screen cannot tell a placeholder from an identical draft.
+    // Require a bare prompt in the recognized composer layout.
+    codex_draft(screen).is_some_and(|draft| !draft.scrolled && draft.text.is_empty())
 }
 
 fn matches_input(draft: &Draft, text: &str) -> bool {
@@ -170,11 +176,17 @@ impl Tmux<'_> {
         }
     }
 
-    pub(super) fn submit(&self, t: &Target, text: &str, host: Option<&str>) -> Reply<Value> {
+    pub(super) fn submit(
+        &self,
+        t: &Target,
+        text: &str,
+        host: Option<&str>,
+        confirm_reply: bool,
+    ) -> Reply<Value> {
         if text.contains('\0') {
             return Err(failure("definitely-not-sent", "tmux input contains NUL"));
         }
-        let before = notices(&self.worker_screen(t).map_err(|e| {
+        let screen = self.worker_screen(t).map_err(|e| {
             if e["result"] == "refused" {
                 e
             } else {
@@ -183,9 +195,16 @@ impl Tmux<'_> {
                     "could not observe the session before input",
                 )
             }
-        })?);
+        })?;
+        let before = notices(&screen);
         if let Some(message) = before.state {
             return Err(refused(&message));
+        }
+        if confirm_reply && (host != Some("codex") || !empty_codex_composer(&screen)) {
+            return Err(failure(
+                "definitely-not-sent",
+                "could not verify an empty Codex composer",
+            ));
         }
         // Single-quote for the tmux command parser inside if-shell. No shell is invoked.
         let literal = text.replace('\'', "'\\''");
@@ -201,6 +220,22 @@ impl Tmux<'_> {
         })?;
         sleep(Duration::from_millis(500));
         let window = setting("WFC_TYPED_CHECK_SECONDS", 1.5);
+        if confirm_reply {
+            let after_text =
+                |_| uncertain("input was attempted but submission could not be confirmed");
+            self.worker_command(t, &format!("send-keys -t {} Enter", t.worker_pane()?))
+                .map_err(after_text)?;
+            self.observe(t, before.refusals, window)
+                .map_err(after_text)?;
+            let after = self.worker_screen(t).map_err(after_text)?;
+            check_notice(&after, before.refusals).map_err(after_text)?;
+            if !empty_codex_composer(&after) {
+                return Err(uncertain(
+                    "Codex composer did not return to a verified empty state",
+                ));
+            }
+            return Ok(json!({"result":"accepted"}));
+        }
         let mut earlier_refusals = before.refusals;
         for retry in 0..=2 {
             self.worker_command(t, &format!("send-keys -t {} Enter", t.worker_pane()?))
@@ -253,7 +288,7 @@ impl Tmux<'_> {
                     )
                 })?;
                 if !screen.trim().is_empty() && screen == last {
-                    return self.submit(t, text.unwrap_or_default(), Some("opencode"));
+                    return self.submit(t, text.unwrap_or_default(), Some("opencode"), false);
                 }
                 last = screen;
                 sleep(Duration::from_secs(1));

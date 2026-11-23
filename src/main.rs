@@ -16,7 +16,9 @@ use workflow::messages::{
 
 const RESERVED_COMMANDS: &[&str] = &[
     "reply",
+    #[cfg(not(target_os = "linux"))]
     "continue",
+    #[cfg(not(target_os = "linux"))]
     "nudge",
     "resume",
     #[cfg(not(target_os = "linux"))]
@@ -65,6 +67,13 @@ fn run() -> anyhow::Result<ExitCode> {
             println!("{RECLAIM_USAGE}");
             #[cfg(target_os = "linux")]
             println!("{}", workflow::worker_owner::CLOSE_USAGE);
+            #[cfg(target_os = "linux")]
+            for usage in [
+                workflow::input::CONTINUE_USAGE,
+                workflow::input::NUDGE_USAGE,
+            ] {
+                println!("{usage}");
+            }
             #[cfg(target_os = "linux")]
             println!("{}", workflow::herdr::USAGE);
             println!("{DONE_USAGE}");
@@ -168,6 +177,23 @@ fn run() -> anyhow::Result<ExitCode> {
         }
         #[cfg(target_os = "linux")]
         Some("--worker-owner") => workflow::worker_owner::run(&args)?,
+        #[cfg(target_os = "linux")]
+        Some(name @ ("continue" | "nudge")) => {
+            let usage = workflow::input::usage(name);
+            if args == ["--help"] || args == ["-h"] {
+                println!("{usage}");
+            } else {
+                let request = match workflow::input::Request::parse(name, &args) {
+                    Ok(request) => request,
+                    Err(err) => {
+                        eprintln!("wfc: {err}. {usage}");
+                        return Ok(ExitCode::from(2));
+                    }
+                };
+                controller::require_controller(name)?;
+                println!("{}", request.run()?);
+            }
+        }
         #[cfg(target_os = "linux")]
         Some("close") => {
             use workflow::worker_owner::{close, parse_close, CLOSE_USAGE};

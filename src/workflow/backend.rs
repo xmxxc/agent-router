@@ -3,6 +3,7 @@ use super::{host::Launch, valid_identity, write_json};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
+    borrow::Cow,
     env,
     fs::File,
     io::ErrorKind,
@@ -12,6 +13,40 @@ use std::{
 
 // Public assignments published with the session-aware tmux protocol.
 pub(super) const LAUNCH_PROTOCOL: u64 = 8;
+
+// Continue changes the public round without changing the tmux writer or its
+// launch receipt. All native lifecycle operations still name that execution.
+pub(super) fn execution_row(row: &Value) -> Result<Cow<'_, Value>> {
+    let execution = &row["executionId"];
+    if row["backend"] != "tmux" || execution.is_null() || execution == &row["attempt"] {
+        return Ok(Cow::Borrowed(row));
+    }
+    let create = &row["create"];
+    ensure!(
+        execution
+            .as_str()
+            .is_some_and(|id| valid_identity(id, "a-"))
+            && create["attempt"] == *execution
+            && create["result"] == "accepted"
+            && create["dispatch"] == row["dispatch"]
+            && create["round"]
+                .as_u64()
+                .zip(row["round"].as_u64())
+                .is_some_and(|(old, new)| old < new)
+            && row["rounds"]
+                .as_array()
+                .is_some_and(|rounds| rounds.iter().any(|round| {
+                    round["attempt"] == *execution
+                        && round["round"] == create["round"]
+                        && round["state"] == "completed"
+                })),
+        "execution identity does not match this attempt or its original launch"
+    );
+    let mut physical = row.clone();
+    physical["attempt"] = execution.clone();
+    physical["round"] = create["round"].clone();
+    Ok(Cow::Owned(physical))
+}
 
 #[cfg(target_os = "linux")]
 pub fn tmux_socket() -> Result<PathBuf> {
@@ -44,11 +79,20 @@ fn call(state: &Path, row: &Value, mut request: Value) -> Result<Value> {
     if let Some(socket) = row["tmuxSocket"].as_str() {
         command.env("WFC_TMUX_SOCKET", socket);
     }
-    let mut child = command
+    let child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn();
+    let mut child = match child {
+        Err(error) if request["op"] == "submit" => {
+            return Ok(
+                json!({"result":"definitely-not-sent","category":"input_not_delivered",
+                "diagnostic":format!("could not start tmux backend: {error}")}),
+            );
+        }
+        other => other?,
+    };
     let sent = serde_json::to_writer(
         child.stdin.take().context("missing backend input")?,
         &request,
@@ -141,11 +185,24 @@ fn legacy_launch_hint(row: &Value) -> Result<Option<&str>> {
 }
 
 fn existing(state: &Path, row: &Value, op: &str) -> Result<Value> {
+    existing_request(state, row, json!({"op":op}))
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn submit(state: &Path, row: &Value, text: &str) -> Result<Value> {
+    let row = execution_row(row)?;
+    existing_request(
+        state,
+        &row,
+        json!({"op":"submit","text":text,"host":row["host"],"confirm_reply":true}),
+    )
+}
+
+fn existing_request(state: &Path, row: &Value, mut request: Value) -> Result<Value> {
     let attempt = row["attempt"]
         .as_str()
         .filter(|v| valid_identity(v, "a-"))
         .context("missing existing execution identity")?;
-    let mut request = json!({"op":op});
     if !row["executionId"].is_null() {
         ensure!(
             row["executionId"] == attempt,
@@ -161,7 +218,7 @@ fn existing(state: &Path, row: &Value, op: &str) -> Result<Value> {
             request["legacyLaunchId"] = json!(hint);
         }
     }
-    if matches!(op, "close" | "revoke") {
+    if matches!(request["op"].as_str(), Some("close" | "revoke")) {
         request["closeOperationId"] = json!(close_operation(row)?);
     }
     call(state, row, request)
@@ -288,7 +345,8 @@ fn closed_path(state: &Path, row: &Value) -> Result<PathBuf> {
 }
 
 pub(super) fn archive(state: &Path, row: &Value) -> Result<Option<Value>> {
-    match File::open(closed_path(state, row)?) {
+    let row = execution_row(row)?;
+    match File::open(closed_path(state, &row)?) {
         Ok(f) => {
             let saved: Value = serde_json::from_reader(f)?;
             ensure!(
@@ -577,6 +635,10 @@ pub fn observe(state: &Path, row: &mut Value) -> Result<(Value, Value)> {
     if row["backend"] == "herdr" {
         return super::herdr::observe(state, row);
     }
+    observe_tmux(state, &execution_row(row)?)
+}
+
+fn observe_tmux(state: &Path, row: &Value) -> Result<(Value, Value)> {
     let saved = archive(state, row)?.unwrap_or(Value::Null);
     if confirmed(row, &saved) {
         let mut observation = json!({"result":"completed","alive":false});
@@ -673,8 +735,12 @@ pub(super) fn read_only_close(state: &Path, row: &Value) -> Result<Option<Value>
         return super::herdr::read_only_close(state, row);
     }
     if row["backend"] == "tmux" {
-        if let Some(saved) = archive(state, row)?.filter(|saved| confirmed(row, saved)) {
-            return replay(state, row, &saved, false);
+        let physical = execution_row(row)?;
+        if let Some(saved) = archive(state, &physical)?.filter(|saved| confirmed(&physical, saved))
+        {
+            return Ok(
+                replay(state, &physical, &saved, false)?.map(|result| public_close(result, row))
+            );
         }
     }
     Ok(None)
@@ -685,6 +751,17 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
     if row["backend"] == "herdr" {
         return super::herdr::close(state, row);
     }
+    let result = close_tmux(state, &execution_row(row)?)?;
+    Ok(public_close(result, row))
+}
+
+fn public_close(mut result: Value, row: &Value) -> Value {
+    result["round"] = row["round"].clone();
+    result["attempt"] = row["attempt"].clone();
+    result
+}
+
+fn close_tmux(state: &Path, row: &Value) -> Result<Value> {
     let id = row["dispatch"].as_str().context("missing dispatch")?;
     // Archived replay works on read-only state. A first close serializes on a
     // stable per-attempt file regardless of which publication the reader saw.

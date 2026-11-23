@@ -2248,6 +2248,225 @@ time.sleep(45)
                 owner = self.call("inspect", dispatch=other["dispatch"], executionId=other["attempt"])
                 self.assertTrue(owner["alive"] and owner["owned"] and owner["workerBound"], owner)
 
+    def public_input_worker(self):
+        worker = self.work / "round-worker.py"
+        worker.write_text(r"""import json, os, select, shlex, subprocess, time, tty
+from pathlib import Path
+
+tty.setraw(0)
+assert os.environ["WFC_WORKER_CALLBACK"]
+assert not any(os.environ.get(key) for key in ("WFC_CONTROLLER_TOKEN", "WFC_OWNER_TOKEN"))
+binary = os.environ["WFC_BIN"]
+original = os.environ["WFC_ATTEMPT"]
+report = os.environ["WFC_REPORT"]
+draft = b""
+local_draft = False
+assignment = None
+
+def write_json(name, value):
+    tmp = Path(name + ".tmp")
+    tmp.write_text(json.dumps(value))
+    tmp.replace(name)
+
+def draw():
+    shown = "Ask Codex to do anything" if local_draft else draft.decode(errors="replace")
+    print(f"\x1b[2J\x1b[H› {shown}\r\n\r\n  model · cwd", end="", flush=True)
+    Path("screen").write_text("draft" if local_draft else "ready")
+
+def callback(*args):
+    return subprocess.run([binary, *args], text=True, capture_output=True, timeout=10)
+
+def done(path, attempt, *extra):
+    return callback("done", "--report", path, "--attempt", attempt, *extra)
+
+draw()
+Path("worker-pid").write_text(str(os.getpid()))
+deadline = time.monotonic() + 45
+while time.monotonic() < deadline:
+    if Path("draft").exists() != local_draft:
+        local_draft = not local_draft
+        draw()
+    if assignment and Path("finish-next").exists():
+        Path("finish-next").unlink()
+        target, attempt, reference = assignment
+        Path(target).write_text("second report")
+        late = done(report, original, "--message-id", "late-first")
+        wrong = done(target, attempt, "--callback-ref", "0" * 64)
+        no_ref = done(target, attempt)
+        question = callback("ask", "What next?", "--attempt", attempt, "--callback-ref", reference)
+        complete = done(target, attempt, "--callback-ref", reference)
+        write_json("callbacks", {
+            "late": late.returncode, "wrong": wrong.returncode, "no_ref": no_ref.returncode,
+            "ask": json.loads(question.stdout), "done": json.loads(complete.stdout),
+        })
+    if not select.select([0], [], [], .02)[0]:
+        continue
+    data = os.read(0, 4096)
+    if not data:
+        break
+    with open("input-bytes", "ab") as log:
+        log.write(data)
+    for byte in data:
+        if byte != 13:
+            draft += bytes([byte])
+            continue
+        line = draft.decode()
+        with open("typed", "a") as log:
+            print(json.dumps(line), file=log)
+        if Path("hold-input").exists():
+            draw()
+            continue
+        draft = b""
+        draw()
+        if line == "[router] Message from the controller: finish first":
+            Path(report).write_text("first report")
+            result = done(report, original)
+            write_json("first-done", json.loads(result.stdout))
+        elif line.startswith("[router] New task for you"):
+            args = shlex.split(line)
+            assignment = tuple(args[args.index(flag) + 1].rstrip(".")
+                               for flag in ("--report", "--attempt", "--callback-ref"))
+            write_json("accepted-round", assignment)
+""")
+        config = self.work / "launch.json"
+        config.write_text(json.dumps({"hosts": {"codex": {"command": [sys.executable, str(worker)]}}}))
+        for name in ("task", "next-task"):
+            (self.work / name).write_text(name)
+        env = {**self.env, "WFC_STATE": str(self.state)}
+        env.pop("WFC_OWNER_TOKEN", None)
+
+        def cli(*args, token=None, expected=0, **overrides):
+            argv = [WFC, *args, *(["--owner-token", token] if token else [])]
+            proc = subprocess.run(argv, cwd=self.work, env={**env, **overrides},
+                                  capture_output=True, text=True, timeout=15)
+            self.assertEqual(proc.returncode, expected, (args, proc.stdout, proc.stderr))
+            return json.loads(proc.stdout) if expected == 0 else proc.stderr
+
+        owner = cli("acquire", "--scope", "rounds", "--owner", "A")["token"]
+        first = cli("dispatch", "--host", "codex", "--scope", "rounds", "--task", "task",
+                    "--cwd", ".", "--report", "report1", "--launch-config", str(config), token=owner)
+        self.await_input_value(lambda: (self.work / "worker-pid").exists())
+        return cli, first, owner, env
+
+    def await_input_value(self, predicate):
+        deadline = time.monotonic() + 8
+        while not (value := predicate()):
+            self.assertLess(time.monotonic(), deadline, "timed out waiting for the input fixture")
+            time.sleep(.02)
+        return value
+
+    def test_public_continue_and_nudge_share_live_worker(self):
+        cli, first, token, env = self.public_input_worker()
+        dispatch, attempt = first["dispatch"], first["attempt"]
+        pane = self.active_pane(dispatch)
+        pid = (self.work / "worker-pid").read_text()
+
+        def status():
+            return cli("status", "--dispatch", dispatch)["dispatches"][0]
+
+        def advance(report):
+            return ("continue", dispatch, "--task", "next-task", "--report", report)
+
+        self.assertIn("has not done", cli(*advance("report2"), token=token, expected=1))
+        lock = self.state / "close-locks" / f"{dispatch}.{attempt}"
+        with lock.open("a+") as execution:
+            fcntl.flock(execution, fcntl.LOCK_EX)
+            stale = subprocess.Popen([WFC, "nudge", dispatch, "--text", "stale",
+                                      "--owner-token", token], cwd=self.work, env=env,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.addCleanup(stale.wait, timeout=15)
+            time.sleep(.15)
+            self.assertIsNone(stale.poll(), "input did not wait for the execution lock")
+            token = cli("takeover", "--scope", "rounds", "--owner", "B")["token"]
+        out, error = stale.communicate(timeout=15)
+        self.assertEqual((stale.returncode, out), (1, ""))
+        self.assertEqual(json.loads(error)["error"], "stale_controller_owner")
+        self.assertFalse((self.work / "typed").exists())
+
+        nudged = cli("nudge", dispatch, "--text", "finish\r\nfirst", token=token)
+        self.assertEqual((nudged["round"], nudged["attempt"]), (1, attempt))
+        self.await_input_value(lambda: (self.work / "first-done").exists())
+        finished = status()
+        self.assertEqual(finished["state"], "done")
+        self.assertEqual(finished["audit"][-1]["text"], "finish first")
+        self.assertIn("with continue", cli("nudge", dispatch, "--text", "late", token=token, expected=1))
+        self.assertIn("already used", cli(*advance("report1"), token=token, expected=1))
+        (self.root / "other-report").mkdir()
+        self.assertIn("original report directory",
+                      cli(*advance("../other-report/report2"), token=token, expected=1))
+
+        (self.work / "draft").touch()
+        screen = self.work / "screen"
+        received = self.work / "input-bytes"
+        before = received.read_bytes()
+        self.await_input_value(lambda: screen.read_text() == "draft")
+        self.assertIn("definitely-not-sent", cli(*advance("report2"), token=token, expected=1))
+        rollback = status()
+        self.assertEqual((rollback["state"], rollback["round"], rollback["attempt"]), ("done", 1, attempt))
+        self.assertEqual(rollback["audit"][-1]["result"], "definitely-not-sent")
+        self.assertEqual(received.read_bytes(), before)
+        typed = self.work / "typed"
+        self.assertEqual(typed.read_text().splitlines(), [json.dumps("[router] Message from the controller: finish first")])
+
+        (self.work / "draft").unlink()
+        self.await_input_value(lambda: screen.read_text() == "ready")
+        advances = []
+        for report in ("report2", "report3"):
+            proc = subprocess.Popen([WFC, *advance(report), "--owner-token", token],
+                                    cwd=self.work, env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+            self.addCleanup(proc.wait, timeout=15)
+            advances.append(proc)
+        outputs = [proc.communicate(timeout=15) for proc in advances]
+        self.assertEqual(sorted(proc.returncode for proc in advances), [0, 1], outputs)
+        result = json.loads(next(out for out, _ in outputs if out))
+        current = status()
+        self.assertEqual((result["round"], current["attempt"]), (2, result["attempt"]))
+        self.assertNotEqual(result["attempt"], attempt)
+        self.assertEqual(current["executionId"], first["executionId"])
+        self.assertEqual(current["create"]["receipt"], first["create"]["receipt"])
+        self.assertEqual((self.active_pane(dispatch), (self.work / "worker-pid").read_text()), (pane, pid))
+        self.assertEqual(len(typed.read_text().splitlines()), 2)
+        self.assertEqual([r["state"] for r in current["rounds"]], ["completed", "running"])
+        self.assertNotIn("workerCallbackRefHash", current)
+        self.assertNotIn("workerCallbackHash", current)
+        self.await_input_value(lambda: (self.work / "accepted-round").exists())
+        report, identity, reference = json.loads((self.work / "accepted-round").read_text())
+        self.assertEqual((report, identity), (current["report"], result["attempt"]))
+        invalid = cli("ask", "No secret", "--attempt", identity, "--callback-ref", reference,
+                      token=token, expected=1, WFC_DISPATCH=dispatch)
+        self.assertEqual(json.loads(invalid)["error"], "invalid_worker_callback")
+        (self.work / "finish-next").touch()
+        self.await_input_value(lambda: (self.work / "callbacks").exists())
+        callbacks = json.loads((self.work / "callbacks").read_text())
+        self.assertEqual([callbacks["late"], callbacks["wrong"], callbacks["no_ref"]], [1, 1, 1])
+        completed = status()
+        self.assertEqual([r["state"] for r in completed["rounds"]], ["completed", "completed"])
+        self.assertEqual([r["result"]["attempt"] for r in completed["rounds"]], [attempt, identity])
+        self.assertEqual([m["messageId"] for m in completed["messages"]][-2:],
+                         [callbacks["ask"]["messageId"], callbacks["done"]["messageId"]])
+        closed = cli("close", dispatch, token=token)
+        self.assertEqual((closed["attempt"], closed["resourceCleanup"]), (identity, "confirmed"))
+        self.assertFalse(status()["backendAlive"])
+        self.assertIn("resume", cli(*advance("report4"), token=token, expected=1))
+
+    def test_public_continue_preserves_uncertain_round(self):
+        cli, first, token, _ = self.public_input_worker()
+        dispatch = first["dispatch"]
+        cli("nudge", dispatch, "--text", "finish first", token=token)
+        self.await_input_value(lambda: (self.work / "first-done").exists())
+        (self.work / "hold-input").touch()
+        args = ("continue", dispatch, "--task", "next-task", "--report", "report2")
+        self.assertIn("continue uncertain", cli(*args, token=token, expected=1))
+        row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((row["state"], row["round"], row["audit"][-1]["result"]), ("unknown", 2, "uncertain"))
+        self.assertNotEqual(row["attempt"], first["attempt"])
+        self.assertEqual(row["executionId"], first["executionId"])
+        self.assertIn("pending or uncertain", cli(*args, token=token, expected=1))
+        self.assertIn("pending or uncertain", cli("nudge", dispatch, "--text", "retry", token=token, expected=1))
+        self.assertEqual(len((self.work / "typed").read_text().splitlines()), 2)
+        self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
+
     def test_lifecycle(self):
         # Keep the worker alive across Ctrl-C so close tests the active-session path.
         argv = ["/bin/sh", "-c", "trap '' INT; exec /bin/cat"]
