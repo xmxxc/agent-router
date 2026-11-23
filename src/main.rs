@@ -100,6 +100,12 @@ fn main() -> anyhow::Result<ExitCode> {
             println!("{usage}");
         }
         #[cfg(target_os = "linux")]
+        Some("--relay-queue") if args.len() == 4 => {
+            return workflow::messages::relay::queue_owner::run(
+                &args[0], &args[1], &args[2], &args[3],
+            );
+        }
+        #[cfg(target_os = "linux")]
         Some("--worker-owner") => workflow::worker_owner::run(&args)?,
         #[cfg(target_os = "linux")]
         Some("close") => match args.as_slice() {

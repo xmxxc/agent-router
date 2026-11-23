@@ -1,6 +1,7 @@
 //! Persist the claim before crossing the Codex queue boundary. Only the exact
 //! still-outstanding claim can be settled when the external command returns.
 mod codex;
+pub(crate) mod queue_owner;
 mod registration;
 pub use registration::waiters;
 

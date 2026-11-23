@@ -3,6 +3,8 @@ import fcntl
 import hashlib
 import json
 import os
+import select
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -40,7 +42,7 @@ while Path('gate').exists():
 mode = os.environ.get('OUTCOME')
 if mode == 'missing':
     print('x' * 70000, flush=True)
-    print('Error: no rollout found for thread ' + sys.argv[3], file=sys.stderr)
+    print('codex queue: Error: no rollout found for thread id ' + sys.argv[3], file=sys.stderr)
 sys.exit(1 if mode else 0)
 """)
         self.queue.chmod(0o700)
@@ -169,6 +171,33 @@ sys.exit(1 if mode else 0)
         self.assertEqual(self.data(*claim), dict(ack, duplicate=True))
         self.assertEqual(self.data("ack", second["messageId"])["statusVersion"], 4)
 
+    def test_late_rejection_settles_only_its_original_attempts(self):
+        first, second = [self.publish("ours") for _ in range(2)]
+        (self.root / "gate").touch()
+        proc = self.foreground(8, OUTCOME="missing")
+        self.until(self.calls)
+        call, = self.calls()
+        m, other = json.loads(call[4][len(PREFIX):])["messages"]
+        self.assertEqual([m["deliveryAttempt"], other["deliveryAttempt"]],
+                         ["relay:" + r["messageId"] + ":2" for r in (first, second)])
+        body = {k: m[k] for k in ("attempt", "head", "dirty", "report", "role", "round", "scope")}
+        digest = hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        self.data("resolve", first["messageId"], "--actor", "reviewer", "--reason", "observed",
+                  "--evidence", "private queue record", "--body-hash", digest)
+        self.data("ack", first["messageId"])
+        later = self.publish("ours")
+        (self.root / "gate").unlink()
+        out = proc.communicate(timeout=5)
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertEqual(self.data("ack", first["messageId"])["statusVersion"], 4)
+        remaining = self.data("status")["undelivered"]
+        self.assertEqual([(r["messageId"], r["state"], r["statusVersion"]) for r in remaining],
+                         [(second["messageId"], "unsent", 3), (later["messageId"], "unsent", 1)])
+        self.cli("relay", "--codex", "--for", ".6")
+        replay = json.loads(self.calls()[1][4][len(PREFIX):])["messages"]
+        self.assertEqual([r["deliveryAttempt"] for r in replay],
+                         ["relay:" + second["messageId"] + ":4", "relay:" + later["messageId"] + ":2"])
+
     def test_queue_outcomes_and_restart(self):
         args = ["relay", "--codex-thread", self.thread.upper(), "--scope", "ours", "--for", ".8"]
         for mode in ("missing", "error", "timeout", "absent"):
@@ -196,6 +225,87 @@ sys.exit(1 if mode else 0)
                     self.data("wait", "--timeout", "0", code=3)
                 else:
                     self.assertEqual(self.data("ack", m["messageId"])["state"], "processed")
+
+    def test_ambiguous_queue_diagnostics_stay_unknown(self):
+        self.queue.write_text(f"#!{sys.executable}\n" + """
+import sys
+print('codex queue: no rollout found for thread 00000000-0000-0000-0000-000000000000')
+print('previous diagnostic: no rollout found for thread ' + sys.argv[3])
+print('no rollout found for thread ' + sys.argv[3] + ' ' * 600 + 'might occur if offline')
+sys.exit(1)
+""")
+        m = self.publish("ours")
+        self.cli("relay", "--codex", "--for", ".5")
+        row, = self.data("status")["undelivered"]
+        self.assertEqual((row["messageId"], row["state"], row["statusVersion"]), (m["messageId"], "unknown", 2))
+
+    def test_shorthand_home_validates_and_launches_in_the_same_home(self):
+        self.queue.write_text(f"#!{sys.executable}\n" + """
+import os, sys
+from pathlib import Path
+assert Path(os.environ['CODEX_HOME']) == Path.home() / '.codex'
+assert list((Path(os.environ['CODEX_HOME']) / 'sessions').rglob('*-' + sys.argv[3] + '.jsonl'))
+""")
+        for home in ("~/.codex", str(self.root / ".codex")):
+            m = self.publish("ours")
+            self.cli("relay", "--codex", "--for", ".5", CODEX_HOME=home)
+            self.assertEqual(self.data("ack", m["messageId"])["state"], "processed")
+        self.meta(self.thread, {"subagent": {}})
+        self.cli("relay", "--codex", "--for", ".1", CODEX_HOME="~/.codex", code=1)
+
+    def test_queue_group_cleanup_preserves_detached_host(self):
+        # Hold all three identities live until their pidfds are open. The host
+        # represents a service which starts a new session for its own lifetime.
+        self.queue.write_text(f"#!{sys.executable}\n" + """
+import json, os, subprocess, sys, time
+from pathlib import Path
+helper = subprocess.Popen(['/bin/sleep', '12'])
+host = subprocess.Popen(['/bin/sleep', '12'], start_new_session=True, stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+Path('pids.tmp').write_text(json.dumps([os.getpid(), helper.pid, host.pid]))
+Path('pids.tmp').rename('pids')
+while not Path('release').exists():
+    time.sleep(.01)
+""")
+        def exited(fd, millis):
+            poller = select.poll()
+            poller.register(fd, select.POLLIN)
+            return bool(poller.poll(millis))
+
+        def cleanup(fd):
+            try:
+                if not exited(fd, 0):
+                    signal.pidfd_send_signal(fd, signal.SIGKILL)
+                self.assertTrue(exited(fd, 2000))
+            finally:
+                os.close(fd)
+
+        for outcome in ("success", "timeout", "relay-killed"):
+            with self.subTest(outcome=outcome):
+                self.publish("ours")
+                proc = self.foreground(1.5 if outcome == "timeout" else 4)
+                pids_path = self.root / "pids"
+                self.until(pids_path.exists)
+                queue, helper, host = json.loads(pids_path.read_text())
+                fds = []
+                for pid in (queue, helper, host):
+                    fd = os.pidfd_open(pid)
+                    self.addCleanup(cleanup, fd)
+                    fds.append(fd)
+                self.assertEqual(os.getpgid(helper), queue)
+                self.assertEqual(os.getsid(host), host)
+                if outcome == "relay-killed":
+                    proc.kill()
+                elif outcome == "success":
+                    (self.root / "release").touch()
+                out = proc.communicate(timeout=6)
+                self.assertEqual(proc.returncode, -signal.SIGKILL if outcome == "relay-killed" else 0, out)
+                self.assertTrue(exited(fds[0], 1000))
+                self.assertTrue(exited(fds[1], 1000))
+                self.assertFalse(exited(fds[2], 0))
+                self.assertEqual(self.data("status")["waiters"], [])
+                pids_path.unlink()
+                (self.root / "release").unlink(missing_ok=True)
 
     def test_thread_and_owner_preflight(self):
         args = ["relay", "--codex-thread", self.thread, "--scope", "ours", "--detach", "--for", ".1"]

@@ -148,3 +148,5 @@ wfc status
 `status.waiters` 显示正在运行的 relay、scope 和目标线程。也可以用 `--codex-thread UUID` 指定线程。wfc 在 Codex 的 sessions 目录读取该 UUID 的会话记录，验证它属于顶层聊天；有 `CODEX_THREAD_ID` 时还会与当前会话核对。省略 `--for` 或设为 0 时持续运行。无人认领的 scope 可直接使用。省略 scope 时，当前状态目录内的 scope 须全部无人认领，relay 才会领取各 scope 的回执。
 
 同一批完成回执会随一次 `codex queue --thread … --message … --resume` 发送。聊天收到后按原 `messageId` 执行 `wfc ack MESSAGE`。队列返回成功后回执为 `received`。程序启动失败会恢复为 `unsent`，下次轮询可重试。队列明确报告找不到目标时恢复为 `unsent` 并退出。超时或其他非零退出保留 `unknown`；重启 relay 后仍可查询原消息，核对聊天后使用上述 `resolve` 和 `ack`。队列确认和聊天处理结果分别记录为 `received` 和 `processed`。
+
+每次队列调用都有独立的进程组。队列程序和继承该组的临时辅助进程由同一监督进程清理；队列返回、调用超时、relay 意外退出都会触发清理。已有 Desktop 服务保有自己的进程组。需要在调用结束后继续运行的宿主，应在独立会话或进程组中启动。

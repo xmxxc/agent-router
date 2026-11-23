@@ -1,15 +1,32 @@
-use super::super::private_file;
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     io::{self, BufRead, BufReader, Read, Seek},
-    os::unix::{fs::OpenOptionsExt, process::CommandExt},
+    os::unix::fs::OpenOptionsExt,
     path::PathBuf,
-    process::{Child, Command, Stdio},
-    time::{Duration, Instant},
+    process::{Command, Stdio},
+    time::Duration,
 };
 use uuid::Uuid;
+
+pub(super) fn codex_home() -> io::Result<PathBuf> {
+    let home = || {
+        env::home_dir().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing Codex home"))
+    };
+    let Some(path) = env::var_os("CODEX_HOME")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+    else {
+        return Ok(home()?.join(".codex"));
+    };
+    match path.strip_prefix("~") {
+        Ok(rest) => Ok(home()?.join(rest)),
+        Err(_) => Ok(path),
+    }
+}
 
 pub(super) fn controller(thread: &str) -> Result<String> {
     let thread = Uuid::parse_str(thread)
@@ -21,12 +38,7 @@ pub(super) fn controller(thread: &str) -> Result<String> {
             "Codex thread {thread} differs from CODEX_THREAD_ID={current}"
         );
     }
-    let home = env::var_os("CODEX_HOME")
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| env::home_dir().map(|p| p.join(".codex")))
-        .context("missing Codex home")?;
-    let root = home.join("sessions");
+    let root = codex_home()?.join("sessions");
     let mut dirs = vec![root.clone()];
     let suffix = format!("-{thread}.jsonl");
     while let Some(dir) = dirs.pop() {
@@ -116,108 +128,83 @@ fn queue_text(messages: &[Value]) -> String {
     )
 }
 
+// Exit codes used only between wfc relay and its queue supervisor. An unexpected
+// status after launch (including a signal or an internal error) stays uncertain.
 #[derive(PartialEq, Eq)]
+#[repr(u8)]
 pub(super) enum Outcome {
-    Delivered,
-    Failed,
-    Missing,
-    Uncertain,
+    Delivered = 0,
+    Failed = 20,
+    Missing = 21,
+    Uncertain = 22,
 }
 
-fn start_queue(thread: &str, messages: &[Value]) -> io::Result<(Child, fs::File)> {
-    let path = env::temp_dir().join(format!("wfc-queue-{}", Uuid::new_v4()));
-    let output = private_file().create_new(true).open(&path)?;
-    fs::remove_file(path)?;
-    let mut cmd = Command::new("codex");
-    cmd.args([
-        "queue",
-        "--thread",
-        thread,
-        "--message",
-        &queue_text(messages),
-        "--resume",
-    ])
-    .stdin(Stdio::null())
-    .stdout(output.try_clone()?)
-    .stderr(output.try_clone()?)
-    .process_group(0);
-    for (name, _) in env::vars_os() {
-        if crate::tmux::launch::router_credential(&name.to_string_lossy()) {
-            cmd.env_remove(name);
-        }
-    }
-    let parent = std::process::id();
-    // SAFETY: these Linux syscalls use only scalar arguments after fork.
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::getppid() as u32 != parent {
-                return Err(io::Error::from_raw_os_error(libc::ESRCH));
-            }
-            Ok(())
-        });
-    }
-    Ok((cmd.spawn()?, output))
-}
-
-fn missing_rollout(output: &mut fs::File) -> io::Result<bool> {
+pub(super) fn missing_rollout(output: &mut fs::File, thread: &OsStr) -> io::Result<bool> {
     output.rewind()?;
     let length = output.metadata()?.len();
     let mut lines = BufReader::new(output.take(length));
     let mut prefix = Vec::new();
     loop {
         prefix.clear();
-        if lines.by_ref().take(512).read_until(b'\n', &mut prefix)? == 0 {
+        let n = lines.by_ref().take(512).read_until(b'\n', &mut prefix)?;
+        if n == 0 {
             return Ok(false);
         }
+        if n == 512 && prefix.last() != Some(&b'\n') {
+            // A truncated prefix cannot establish a definitive rejection.
+            lines.skip_until(b'\n')?;
+            continue;
+        }
         let line = String::from_utf8_lossy(&prefix);
-        let diagnostic = line.trim().strip_prefix("Error: ").unwrap_or(line.trim());
-        if diagnostic == "no rollout found for thread"
-            || diagnostic.starts_with("no rollout found for thread ")
+        let mut diagnostic = line.trim();
+        while let Some(rest) = ["Error: ", "error: ", "codex queue: "]
+            .iter()
+            .find_map(|prefix| diagnostic.strip_prefix(prefix))
         {
+            diagnostic = rest;
+        }
+        const MISSING: &str = "no rollout found for thread";
+        if diagnostic == MISSING {
             return Ok(true);
         }
-        if prefix.last() != Some(&b'\n') {
-            lines.skip_until(b'\n')?;
+        if let Some(id) = diagnostic
+            .strip_prefix(MISSING)
+            .and_then(|rest| rest.strip_prefix(' '))
+        {
+            let id = id.strip_prefix("id ").unwrap_or(id);
+            if id.eq_ignore_ascii_case(&thread.to_string_lossy()) {
+                return Ok(true);
+            }
         }
     }
 }
 
 pub(super) fn queue(thread: &str, messages: &[Value], limit: Duration) -> Result<Outcome> {
     let ids: Vec<_> = messages.iter().map(|m| m["id"].as_u64().unwrap()).collect();
-    let start = Instant::now();
-    let (mut child, mut output) = match start_queue(thread, messages) {
-        Ok(started) => started,
+    let mut supervisor = Command::new(env::current_exe()?);
+    supervisor
+        .arg("--relay-queue")
+        .arg(std::process::id().to_string())
+        .arg(limit.as_secs_f64().to_string())
+        .arg(thread)
+        .arg(queue_text(messages))
+        .stdin(Stdio::null());
+    crate::workflow::worker_owner::new_session(&mut supervisor);
+    let mut child = match supervisor.spawn() {
+        Ok(child) => child,
         Err(e) => {
-            println!("router relay: codex queue could not start for messages {ids:?}: {e}");
+            println!("router relay: queue supervisor could not start for messages {ids:?}: {e}");
             return Ok(Outcome::Failed);
         }
     };
-    loop {
-        if let Some(status) = child.try_wait()? {
-            if status.success() {
-                return Ok(Outcome::Delivered);
-            }
-            if missing_rollout(&mut output)? {
-                return Ok(Outcome::Missing);
-            }
-            println!("router relay: codex queue exited {status}; delivery of messages {ids:?} is uncertain");
-            return Ok(Outcome::Uncertain);
+    let outcome = match child.wait()?.code() {
+        Some(0) => Outcome::Delivered,
+        Some(code) if code == Outcome::Failed as i32 => Outcome::Failed,
+        Some(code) if code == Outcome::Missing as i32 => Outcome::Missing,
+        _ => {
+            println!("router relay: delivery of messages {ids:?} is uncertain");
+            Outcome::Uncertain
         }
-        let left = limit.saturating_sub(start.elapsed());
-        if left.is_zero() {
-            // SAFETY: the unreaped child owns this process group.
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGKILL);
-            }
-            child.wait()?;
-            println!(
-                "router relay: codex queue timed out; delivery of messages {ids:?} is uncertain"
-            );
-            return Ok(Outcome::Uncertain);
-        }
-        std::thread::sleep(left.min(Duration::from_millis(10)));
-    }
+    };
+    Ok(outcome)
 }
