@@ -55,6 +55,9 @@ def collect(prepared, target, out):
             paths = notices(source)
             if package['license_file']:
                 paths.append(source / package['license_file'])
+            if name == 'curl-sys':
+                # The static libcurl source has its own license alongside the bindings.
+                paths.append(source / 'curl' / 'COPYING')
             if not paths:
                 raise ValueError(f'Inspect missing notices for {name} {version}')
             files = copy_files(paths, source, dest)

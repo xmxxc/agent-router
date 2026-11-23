@@ -1499,3 +1499,17 @@ fn codex_relay_contracts() {
         .unwrap();
     assert!(status.success());
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn opencode_relay_contracts() {
+    let status = Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/opencode_relay.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_wfc"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
