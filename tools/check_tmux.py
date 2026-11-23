@@ -1589,10 +1589,18 @@ os.execv(argv[0], argv)
 
     def test_public_reply_rechecks_first_enter_after_inbox_wait(self):
         self.setup_reply("empty")
+        pane = self.active_pane(self.reply_dispatch)
         answer = "intended reply"
         text = f"[router] Answer to question {self.number}: {answer}".encode()
         gate = self.public_input_gate(self.reply_env, "reply-before-enter")
         argv = [WFC, "reply", self.number, answer]
+
+        def draft_replaced():
+            # The public reply holds the dispatch's native lock while waiting for Inbox.
+            screen = subprocess.check_output(self.tmux + ["capture-pane", "-p", "-t", pane],
+                                             env=self.env, text=True, timeout=2)
+            return "› different draft" in screen
+
         with subprocess.Popen(argv, cwd=self.work, env={**self.reply_env, **gate}, text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE) as pending:
             try:
@@ -1603,8 +1611,10 @@ os.execv(argv[0], argv)
                     self.await_input_value(
                         lambda: "lock_inode_wait" in Path(f"/proc/{pending.pid}/wchan").read_text())
                     self.assert_reply_bytes(text)
-                    (self.work / "replace-reply-draft").write_text("different draft")
-                    self.await_input_value(lambda: "different draft" in self.reply_screen())
+                    replacement = self.work / "replacement-draft"
+                    replacement.write_text("different draft")
+                    replacement.replace(self.work / "replace-reply-draft")
+                    self.await_input_value(draft_replaced)
             finally:
                 (self.work / "release-input-boundary").touch()
                 out, error = pending.communicate(timeout=15)
@@ -4389,16 +4399,46 @@ os.execv(real, [real, *args])
         (self.work / "hold-input").unlink()
         (self.work / "styled-reply").unlink()
         (self.work / "exit-worker").touch()
+
         def original_exited():
             row = cli("status", "--dispatch", dispatch)["dispatches"][0]
             return row["worker"]["state"] == "exited" and row["backendAlive"] is False
+
         self.await_input_value(original_exited)
         resumed = cli("resume", dispatch, token=token, WFC_RESUME_CHECK_SECONDS="0.25")
         self.assertEqual((resumed["round"], resumed["launchResult"]), (1, "accepted"))
         self.assertNotEqual(resumed["attempt"], first["attempt"])
-        cli("nudge", dispatch, "--text", "finish first", token=token)
-        self.await_input_value(lambda: (self.work / "first-done").exists())
-        continued = cli("continue", dispatch, "--task", "next-task", "--report", "report2", token=token)
+        live = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((live["executionId"], live["round"], live["attempt"], live["state"]),
+                         (resumed["attempt"], 1, resumed["attempt"], "working"))
+        self.assertFalse(any(m["type"] == "done" for m in live["messages"]))
+
+        received = self.work / "input-bytes"
+        before = received.read_bytes()
+        advance = ("continue", dispatch, "--task", "next-task", "--report", "report2")
+        self.assertIn("has not done", cli(*advance, token=token, expected=1))
+        self.assertEqual(received.read_bytes(), before)
+        nudge = cli("nudge", dispatch, "--text", "resumed execution is running", token=token)
+        self.assertEqual((nudge["round"], nudge["attempt"]), (1, resumed["attempt"]))
+        line = "[router] Message from the controller: resumed execution is running"
+        nudged = before + line.encode() + b"\r"
+        self.assertEqual(received.read_bytes(), nudged)
+        self.assertEqual((self.work / "formal-input").read_text().splitlines(), [json.dumps(line)])
+
+        # Release the completion callback only after verifying input on the resumed worker.
+        done_path = self.work / "first-done"
+        self.assertFalse(done_path.exists())
+        (self.work / "finish-first-externally").touch()
+        self.await_input_value(done_path.exists)
+        completed = json.loads(done_path.read_bytes())
+        finished = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((finished["state"], finished["round"], finished["attempt"]),
+                         ("done", 1, resumed["attempt"]))
+        self.assertEqual(finished["rounds"][-1]["result"]["id"], completed["message"])
+        self.assertIn("with continue", cli("nudge", dispatch, "--text", "late", token=token, expected=1))
+        self.assertEqual(received.read_bytes(), nudged)
+
+        continued = cli(*advance, token=token)
         self.await_input_value(lambda: (self.work / "accepted-round").exists())
         fresh = cli("nudge", dispatch, "--text", "new execution running", token=token)
         self.assertEqual((fresh["round"], fresh["attempt"]), (2, continued["attempt"]))

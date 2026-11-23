@@ -216,6 +216,7 @@ impl<'a> Request<'a> {
             let history =
                 view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
             let mut projected = current.clone();
+            projected["worker"] = worker.clone();
             view::project(&mut projected, &history, Some(true), false)?;
             let mut next = current.clone();
             let mut event = json!({"id":format!("i-{}", Uuid::new_v4().simple()),
@@ -314,6 +315,7 @@ impl<'a> Request<'a> {
                     let history =
                         view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
                     let mut projected = current.clone();
+                    projected["worker"] = worker.clone();
                     view::project(&mut projected, &history, Some(true), false)?;
                     if operation == "nudge" {
                         ensure!(
