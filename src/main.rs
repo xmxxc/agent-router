@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+mod bundled;
 mod kernel;
 mod workflow;
 
@@ -47,6 +49,12 @@ fn main() -> anyhow::Result<ExitCode> {
                     .filter(|id| !id.trim().is_empty())
                     .unwrap_or(env!("WFC_BUILT_AT"))
             );
+        }
+        #[cfg(target_os = "linux")]
+        Some(stage @ ("--bundled" | "--bundled-guardian" | "--bundled-runtime"))
+            if args.is_empty() =>
+        {
+            return Ok(ExitCode::from(bundled::run(stage)?));
         }
         Some("--kernel") if args.is_empty() => kernel::run()?,
         Some("dispatch" | "status") if args == ["--help"] => {
