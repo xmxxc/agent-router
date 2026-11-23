@@ -54,6 +54,7 @@ enum Operation {
         probe_read_only: bool,
     },
     Close,
+    Revoke,
 }
 
 type Reply<T> = std::result::Result<T, Value>;
@@ -402,6 +403,11 @@ impl Tmux<'_> {
     }
 
     fn operate(&self, op: Operation, fresh: bool) -> Reply<Value> {
+        if matches!(op, Operation::Revoke) {
+            return self
+                .revoke_only()?
+                .ok_or_else(|| failure("uncertain", "no verified unconsumed reservation"));
+        }
         self.check_new_execution()?;
         if fresh {
             self.clear_anonymous_preflight()?;
@@ -466,6 +472,7 @@ impl Tmux<'_> {
                 Ok(json!({"result":"accepted"}))
             }
             Operation::Close => self.close(),
+            Operation::Revoke => unreachable!("handled before session operations"),
             Operation::Create(launch) => self
                 .create(launch)
                 .map(|(_, receipt)| json!({"result":"accepted","receipt":receipt})),
@@ -530,15 +537,32 @@ impl Tmux<'_> {
         }
     }
 
-    fn close(&self) -> Reply<Value> {
-        self.revoke_pending_launch()?;
-        if self
-            .legacy_execution_id
-            .is_some_and(|id| self.cancellation_proof(id).is_some())
-        {
+    fn revoke_only(&self) -> Reply<Option<Value>> {
+        let Some(id) = self.legacy_execution_id else {
+            return Ok(None);
+        };
+        if !self.was_released(id)? {
+            self.revoke_pending_launch()?;
+        }
+        if self.cancellation_proof(id).is_none() {
+            return Ok(None);
+        }
+        if !self.was_released(id)? {
             self.release()?;
-            self.record_close(CloseOperation::Confirmed(CloseEffect::AlreadyAbsent))?;
-            return Ok(json!({"result":"completed", "closeEffect":CloseEffect::AlreadyAbsent}));
+        }
+        self.record_close(CloseOperation::Confirmed(CloseEffect::AlreadyAbsent))?;
+        Ok(Some(
+            json!({"result":"completed", "closeEffect":CloseEffect::AlreadyAbsent}),
+        ))
+    }
+
+    fn close(&self) -> Reply<Value> {
+        if self.close_execution.is_some() {
+            if let Some(revoked) = self.revoke_only()? {
+                return Ok(revoked);
+            }
+        } else {
+            self.revoke_pending_launch()?;
         }
         let effect = if let Some(t) = self.target()? {
             if !t.owned {
@@ -727,9 +751,14 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
             .close_operation_id
             .as_deref()
             .is_none_or(|id| !id.is_empty()
-                && matches!(request.op, Operation::Close)
+                && matches!(request.op, Operation::Close | Operation::Revoke)
                 && (request.execution_id.is_some() || request.legacy_execution_id.is_some())),
         "close operation requires an execution selector"
+    );
+    ensure!(
+        !matches!(request.op, Operation::Revoke)
+            || (request.execution_id.is_some() && request.close_operation_id.is_some()),
+        "revoke requires the native execution and close operation IDs"
     );
     let native_id;
     let mut backend = Tmux {
