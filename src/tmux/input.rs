@@ -189,17 +189,20 @@ impl Tmux<'_> {
     ) -> Reply<bool> {
         let (screen, first) = self.reply_snapshot(t, host)?;
         check_notice(&screen, *earlier_refusals)?;
-        match first {
-            ReplyBox::Empty => return Ok(false),
-            ReplyBox::Draft(Some(shown)) if matches_single_line_draft(&shown, text) => {}
+        let first_was_draft = match first {
+            ReplyBox::Empty => false,
+            ReplyBox::Draft(Some(shown)) if matches_single_line_draft(&shown, text) => true,
             _ => return Err(uncertain("chat composer did not confirm the reply")),
-        }
+        };
         sleep(Duration::from_millis(300));
         let (screen, second) = self.reply_snapshot(t, host)?;
         check_notice(&screen, *earlier_refusals)?;
         match second {
             ReplyBox::Empty => Ok(false),
             ReplyBox::Draft(Some(shown)) if matches_single_line_draft(&shown, text) => {
+                if !first_was_draft {
+                    return Err(uncertain("reply draft reappeared after an empty composer"));
+                }
                 *earlier_refusals = notices(&screen).refusals;
                 Ok(true)
             }

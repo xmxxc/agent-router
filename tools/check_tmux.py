@@ -1442,6 +1442,61 @@ os.execv(argv[0], argv)
         self.assert_reply_bytes(f"[router] Answer to question {self.number}: a b\r".encode())
         self.assertFalse((self.work / "accepted").exists())
 
+    def test_public_reply_keeps_claim_when_tmux_draft_reappears(self):
+        self.setup_reply("always-drop")
+        answer = "one controlled reply"
+        text = f"[router] Answer to question {self.number}: {answer}".encode()
+        trace = self.root / "reply-captures"
+        empty = self.root / "empty-composer"
+        shim = self.work / "tmux"
+        shim.write_text(f"""#!{sys.executable}
+import os, subprocess, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+argv = [{TMUX!r}, *args]
+trace = Path({str(trace)!r})
+empty = Path({str(empty)!r})
+if any("send-keys -t " in arg and " Enter ; " in arg for arg in args):
+    subprocess.run(argv, check=True)
+    with trace.open("a") as log:
+        print("enter", file=log)
+    sys.exit(0)
+if any("capture-pane -p -e -t " in arg for arg in args):
+    result = subprocess.run(argv, check=True, capture_output=True)
+    owner, newline, screen = result.stdout.partition(b"\\n")
+    confirmed = b"wfc-tmux-confirmed\\n"
+    assert owner.startswith(b"WFC_STATE=") and screen.endswith(confirmed), result.stdout
+    screen = screen.removesuffix(confirmed)
+    if trace.exists():
+        assert {text!r} in screen, screen
+        # Only the first styled read after Enter shows the transient empty frame.
+        first_read = trace.read_text() == "enter\\n"
+        if first_read:
+            screen = empty.read_bytes()
+        with trace.open("a") as log:
+            print("empty" if first_read else "draft", file=log)
+    else:
+        assert b"Ask Codex to do anything" in screen, screen
+        empty.write_bytes(screen)
+    sys.stdout.buffer.write(owner + newline + screen + confirmed)
+    sys.exit(0)
+os.execv(argv[0], argv)
+""")
+        shim.chmod(0o700)
+        path = f"{self.work}:{self.reply_env['PATH']}"
+        diagnostic = self.reply_cli("reply", self.number, answer, expected=1, PATH=path)
+        self.assertIn("reply draft reappeared after an empty composer", diagnostic)
+        self.assertIn("already answered", self.reply_cli("reply", self.number, "again", expected=1, PATH=path))
+        self.assertEqual(trace.read_text().splitlines(), ["enter", "empty", "draft"])
+        self.assert_reply_bytes(text + b"\r")
+        self.assertIn(text.decode(), self.reply_screen())
+        self.assertFalse((self.work / "accepted").exists())
+        reply, = self.reply_attempts()
+        self.assertEqual((reply["inputResult"], reply["category"]), ("uncertain", "input_uncertain"))
+        question, = self.reply_cli("wait", "--dispatch", self.reply_dispatch, "--timeout", "0")["messages"]
+        self.assertEqual((question["type"], question["messageId"]), ("question", self.question["messageId"]))
+
     def test_public_reply_requires_confirmed_tmux_chat_composer(self):
         self.setup_reply("upstream-reply")
         pane = f"={self.reply_row['tmux']}:"

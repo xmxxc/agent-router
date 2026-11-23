@@ -72,6 +72,8 @@ Herdr 首轮派发、底层输入测试和补绑使用独立 Rust 状态目录�
 
 总控用 `wfc reply MESSAGE "回答"` 将回复送入原 worker 的 tmux 或 Herdr 会话。`MESSAGE` 是原生 Rust 问题的数字编号。受管 scope 可用 `--owner-token` 或控制器环境中的当前凭据。用 `wfc status --dispatch ID` 查看回复及其诊断。回复明确未送时可重试。输入可能已送达时，账本会保留回复占用，后续调用会拒绝再次发送。
 
+tmux 回复先在绑定窗格确认可写空框。每次 Enter 后，两次带样式读屏都为空，或从本次完整单行草稿变为空，才记为已接受。只有两次都看到本次逐字相同的完整单行，才可补按 Enter。先空后重现草稿或无法确认画面时，状态保留为未确认。
+
 Herdr 公开回复要求先从原 pane 核实当前宿主的聊天输入框可写且为空。可识别的布局包括 Codex、OpenCode 默认会话输入框和 Claude Code 经典输入栏。已有草稿或无法核实的布局会给出明确未送的诊断。
 
 `--launch-config` 优先于 `WFC_LAUNCH_CONFIG`。启动参数依次为宿主的 `runtime` 数组、`command` 数组、wfc 为本次任务生成的 Codex 参数。路径含空格时直接写在同一个 JSON 字符串中。例如 npm 安装的 Codex 可以指定 Node 和脚本各自的绝对路径。
