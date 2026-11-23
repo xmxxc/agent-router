@@ -323,6 +323,78 @@ class PublicHostResume(unittest.TestCase):
         self.assertFalse(self.status(dispatch).get("audit"))
         self.assertEqual(len(list(self.work.glob("a-*.json"))), 1)
 
+    def test_claude_retries_when_initial_launch_receipt_could_not_be_created(self):
+        self.assertNotEqual(os.geteuid(), 0, "fixture requires an unprivileged runner")
+        original = self.dispatch("claude")
+        dispatch, attempt, uuid = original["dispatch"], original["attempt"], original["hostSession"]
+        first = self.trace(attempt)
+        self.terminate_worker(dispatch, attempt)
+
+        launches = self.state / "launches"
+        before = set(launches.iterdir())
+        mode = launches.stat().st_mode & 0o777
+        launches.chmod(0o500)
+        try:
+            with self.assertRaises(PermissionError):
+                (launches / "write-probe").touch(exist_ok=False)
+            result = self.command("resume", dispatch)
+            self.assertEqual(result.returncode, 1, (result.stdout, result.stderr))
+            self.assertFalse(result.stdout)
+            error = json.loads(result.stderr)
+            self.assertEqual((error["result"], error["launchResult"], error["session"], error["round"]),
+                             ("definitely-not-sent", "definitely-not-sent", uuid, 1))
+            self.assertIn("could not write private launch files", error["diagnostic"])
+            self.assertNotIn("receipt", error)
+            self.assertNotIn("cancellationEvidence", error)
+            self.assertEqual(set(launches.iterdir()), before)
+        finally:
+            launches.chmod(mode)
+
+        failed = error["attempt"]
+        self.assertNotEqual(failed, attempt)
+        row = self.status(dispatch)
+        self.assertEqual(row["attempt"], failed)
+        sessions = subprocess.run(
+            ["tmux", "-f", "/dev/null", "-S", self.env["WFC_TMUX_SOCKET"],
+             "list-sessions", "-F", "#{session_name}"],
+            env=self.env, text=True, capture_output=True, check=True, timeout=5,
+        )
+        self.assertNotIn(f"wfc-{dispatch}", sessions.stdout.splitlines())
+        self.assertFalse(row.get("messages"))
+        audit, = row["audit"]
+        self.assertEqual((audit["toAttempt"], audit["launchResult"]), (failed, "definitely-not-sent"))
+        for evidence in (row["create"], audit):
+            self.assertNotIn("receipt", evidence)
+            self.assertNotIn("cancellationEvidence", evidence)
+        tmux_state = self.state / "tmux"
+        claim = tmux_state / f"{dispatch}.json"
+        if claim.exists():
+            self.assertNotEqual(json.loads(claim.read_bytes()).get("Registered", {}).get("execution"), failed)
+        registry = tmux_state / f"{dispatch}.executions.json"
+        if registry.exists():
+            self.assertNotIn(failed, json.loads(registry.read_bytes())["launches"])
+        self.assertEqual((self.work / "claude-starts").read_text().splitlines(), [attempt])
+
+        resumed = self.ok("resume", dispatch)
+        current_attempt = resumed["attempt"]
+        self.assertNotIn(current_attempt, (attempt, failed))
+        self.assertEqual((resumed["session"], resumed["round"], resumed["adoptionResult"]),
+                         (uuid, 1, "accepted"))
+        worker = self.trace(current_attempt)
+        argv = worker["argv"]
+        self.assertEqual(argv[argv.index("--resume") + 1], uuid)
+        self.assertEqual(worker["task"], first["task"])
+        self.assertNotEqual(worker["callback"]["WFC_WORKER_CALLBACK"],
+                            first["callback"]["WFC_WORKER_CALLBACK"])
+        stale = {**worker["callback"], "WFC_WORKER_CALLBACK": first["callback"]["WFC_WORKER_CALLBACK"]}
+        refused = self.command("ask", "old callback", "--attempt", current_attempt, callback=stale)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("invalid_worker_callback", refused.stderr)
+        self.ok("ask", "current attempt", "--attempt", current_attempt, callback=worker["callback"])
+        self.assertEqual(self.status(dispatch)["audit"][-1]["fromAttempt"], failed)
+        self.terminate_worker(dispatch, current_attempt)
+        self.assertEqual((self.work / "claude-starts").read_text().splitlines(), [attempt, current_attempt])
+
     def test_claude_retries_definite_spawn_failures_with_the_original_uuid(self):
         launcher = self.claude_launcher()
         original = self.dispatch("claude", launcher=launcher)

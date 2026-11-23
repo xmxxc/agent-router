@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::env;
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::ExitStatusExt;
@@ -32,14 +32,17 @@ struct Spec {
     env: BTreeMap<String, String>,
 }
 
-fn private_file(path: &Path, value: &impl Serialize) -> Result<()> {
-    let mut f = OpenOptions::new()
+fn create_private_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
         .create_new(true)
         .write(true)
         .mode(0o600)
-        .open(path)?;
-    serde_json::to_writer(&mut f, value)?;
-    f.flush()?;
+        .open(path)
+}
+
+fn write_private_json(mut file: File, value: &impl Serialize) -> Result<()> {
+    serde_json::to_writer(&mut file, value)?;
+    file.flush()?;
     Ok(())
 }
 
@@ -636,15 +639,29 @@ impl Tmux<'_> {
         let hook_target = format!("={}:", self.session);
         let hook = self.creation_hook(&launcher, &id)?;
         let tail = ["run-shell", "-t", &hook_target, &hook];
+        let file_error = || {
+            failure(
+                "definitely-not-sent",
+                "could not write private launch files",
+            )
+        };
+        let initial = match create_private_file(&receipt) {
+            Ok(file) => file,
+            // This exclusive open precedes the descriptor, reservation and
+            // submission. A path that never existed is not a receipt.
+            Err(err) if err.kind() != ErrorKind::AlreadyExists && missing(&receipt) => {
+                return Err(file_error());
+            }
+            Err(_) => {
+                let mut reply = unknown();
+                reply["receipt"] = json!(receipt);
+                return Err(reply);
+            }
+        };
         let started = (|| {
-            private_file(&receipt, &json!({"category":"unknown","launchId":id}))
-                .and_then(|_| private_file(&spec_path, &spec))
-                .map_err(|_| {
-                    failure(
-                        "definitely-not-sent",
-                        "could not write private launch files",
-                    )
-                })?;
+            write_private_json(initial, &json!({"category":"unknown","launchId":id}))
+                .and_then(|_| write_private_json(create_private_file(&spec_path)?, &spec))
+                .map_err(|_| file_error())?;
             let path = self.launch_path(&id, "submission");
             let mut submission = Submission {
                 launch_id: id.clone(),
