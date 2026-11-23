@@ -313,11 +313,13 @@ fn archived_short_id_keeps_rounds_and_completed_result() {
     let attempt = "a-abcdef012345";
     let first = json!({"round":1,"attempt":"a-012345abcdef","state":"completed","result":{"report":"first"}});
     let message = json!({"id":3,"messageId":"m-original","dispatch":id,"type":"done","attempt":attempt,"round":2,"report":"second","at":"yesterday","head":"original","dirty":false,"to":"controller","state":"received"});
-    let row = json!({"dispatch":id,"round":2,"attempt":attempt,"task":"task","report":"second","rounds":[first],"messages":[message]});
+    let created = 1_795_433_296.589_775_3_f64;
+    let row = json!({"created":created,"dispatch":id,"round":2,"attempt":attempt,"task":"task","report":"second","rounds":[first],"messages":[message]});
     fs::write(dir.join(format!("{id}.json")), row.to_string()).unwrap();
     for _ in 0..2 {
         let status = run(f.wfc().args(["status", "--dispatch", id]));
         let record = &status["dispatches"][0];
+        assert_eq!(record["created"].as_f64(), Some(created));
         assert_eq!(record["state"], "done");
         assert_eq!(record["rounds"][0], first);
         assert_eq!(record["rounds"][1]["result"]["messageId"], "m-original");
