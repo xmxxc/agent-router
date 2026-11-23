@@ -98,13 +98,49 @@ fn audit(db: &Connection, id: &str) -> Result<Vec<Value>> {
     Ok(events)
 }
 
+/// Verify an existing legacy ledger through the same read-only path as preview.
+pub fn verify_router_db(state: &Path) -> Result<()> {
+    let path = state.join("router.db");
+    let (db, _) = reader(state)
+        .with_context(|| format!("verify {}", path.display()))?
+        .with_context(|| format!("{} disappeared during verification", path.display()))?;
+    // Check the original tables. Preview projects missing columns in TEMP
+    // views, which are useful for history but cannot identify a live ledger.
+    let identified: bool = db.query_row(
+        "SELECT EXISTS (
+            SELECT 1 FROM pragma_table_info('dispatch', 'main') WHERE name='id' AND pk > 0
+         ) AND (
+            SELECT count(*) FROM pragma_table_info('message', 'main')
+            WHERE name IN ('id', 'dispatch', 'recipient', 'type', 'body')
+              AND (name <> 'id' OR pk > 0)
+         ) = 5",
+        [],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        identified,
+        "unrecognized router.db schema in {}",
+        path.display()
+    );
+    Ok(())
+}
+
 fn reader(state: &Path) -> Result<Option<(Connection, bool)>> {
     let path = state.join("router.db");
-    let file = match File::open(&path) {
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, nix::libc::O_NONBLOCK);
+    let file = match options.open(&path) {
         Ok(file) => file,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
+    ensure!(
+        file.metadata()?.is_file(),
+        "{} is not a regular file",
+        path.display()
+    );
     // A read-only SQLite connection can still create WAL sidecars in a writable
     // directory. Python uses rollback journaling. Diagnose WAL before opening it.
     let mut header = Vec::new();

@@ -1,6 +1,6 @@
 use super::{
-    assignment, controller, legacy_status_state, messages, observe_dispatch, project_dispatch,
-    record_scope, state_dir, valid_id, view, worker_owner,
+    assignment, controller, legacy_view_state, messages, observe_dispatch, project_dispatch,
+    record_scope, state_dir, valid_id, view, worker_owner, StateView,
 };
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
@@ -55,7 +55,13 @@ impl<'a> Reclaim<'a> {
     }
 
     pub fn run(self) -> Result<ExitCode> {
-        if let Some(state) = legacy_status_state(self.dispatches.first().map(OsStr::new))? {
+        let state_view = if self.yes {
+            StateView::ReclaimConfirm
+        } else {
+            StateView::ReclaimPreview
+        };
+        if let Some(state) = legacy_view_state(self.dispatches.first().map(OsStr::new), state_view)?
+        {
             if self.yes {
                 eprintln!("wfc: reclaim supports only read-only preview of Python history");
                 return Ok(ExitCode::from(2));

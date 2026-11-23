@@ -533,7 +533,7 @@ fn decode_record(file: File, path: &Path) -> Result<Value> {
 
 pub fn status(id: Option<&OsStr>, active: bool) -> Result<Value> {
     #[cfg(target_os = "linux")]
-    if let Some(state) = legacy_status_state(id)? {
+    if let Some(state) = legacy_view_state(id, StateView::Status)? {
         let dispatch = id
             .map(|id| id.to_str().context("invalid dispatch ID"))
             .transpose()?;
@@ -543,29 +543,91 @@ pub fn status(id: Option<&OsStr>, active: bool) -> Result<Value> {
 }
 
 #[cfg(target_os = "linux")]
-fn legacy_status_state(id: Option<&OsStr>) -> Result<Option<PathBuf>> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StateView {
+    Status,
+    ReclaimPreview,
+    ReclaimConfirm,
+}
+
+#[cfg(target_os = "linux")]
+fn ledger_metadata(path: &Path, view: StateView) -> Result<Option<fs::Metadata>> {
+    let inspect = || format!("inspect {}", path.display());
+    let metadata = if view == StateView::ReclaimConfirm {
+        fs::symlink_metadata(path)
+    } else {
+        fs::metadata(path)
+    };
+    match metadata {
+        // Distinguish a missing entry from a link whose target cannot be verified.
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::metadata(path).map(Some).with_context(inspect)
+        }
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(inspect),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verified_legacy_path(state: &Path) -> Result<bool> {
+    let path = state.join("router.db");
+    let Some(metadata) = ledger_metadata(&path, StateView::ReclaimConfirm)? else {
+        return Ok(false);
+    };
+    ensure!(
+        metadata.is_file(),
+        "{} is not a regular file",
+        path.display()
+    );
+    wfc_legacy_state::verify_router_db(state)?;
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_view_state(id: Option<&OsStr>, view: StateView) -> Result<Option<PathBuf>> {
     let configured = env::var_os("WFC_STATE");
     if configured.as_ref().is_some_and(|value| value.is_empty()) {
         return Ok(Some(wfc_legacy_state::state_dir()?));
     }
-    let legacy = wfc_legacy_state::state_dir()
-        .and_then(|state| Ok(state.join("router.db").try_exists()?.then_some(state)));
-    if matches!(legacy, Ok(None)) {
+    let legacy = wfc_legacy_state::state_dir().and_then(|state| {
+        let database = state.join("router.db");
+        let exists = if view == StateView::ReclaimConfirm {
+            verified_legacy_path(&state)?
+        } else {
+            database.try_exists()?
+        };
+        Ok(exists.then_some(state))
+    });
+    // A native assignment does not resolve an ambiguous legacy path.
+    let legacy = match legacy {
+        Err(error) if view == StateView::ReclaimConfirm => return Err(error),
+        legacy => legacy,
+    };
+    let no_legacy = matches!(legacy, Ok(None));
+    if no_legacy && view != StateView::ReclaimConfirm {
         return Ok(None);
     }
     let native = state_dir()?;
     let ledger = native.join("messages.json");
-    match fs::metadata(&ledger) {
-        Ok(metadata) => {
-            ensure!(
-                metadata.is_file(),
-                "{} is not a regular file",
-                ledger.display()
-            );
-            return Ok(None);
+    if let Some(metadata) = ledger_metadata(&ledger, view)? {
+        if metadata.is_dir()
+            && view == StateView::ReclaimPreview
+            && matches!(&legacy, Ok(Some(state)) if state.join("router.db").is_file())
+        {
+            // The offline preview reads only router.db and makes no native
+            // ownership claim. Confirmation must reject this ledger path.
+            return legacy;
         }
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(error).with_context(|| format!("inspect {}", ledger.display())),
+        ensure!(
+            metadata.is_file(),
+            "{} is not a regular file",
+            ledger.display()
+        );
+        return Ok(None);
+    }
+    if no_legacy {
+        return Ok(None);
     }
     let dispatches = native.join("dispatches");
     // Opening a known assignment only requires traversal permission. A list

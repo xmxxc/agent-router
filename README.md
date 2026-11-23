@@ -177,7 +177,7 @@ Linux 的 `status` 优先使用原 Rust 目录中的派工、消息账本或仍�
 
 通过编号查询原生派工时，目录可遍历且该记录可读即可。列表查询缺少目录读取权限时会报告错误。发现旧库时，若原生 `messages.json` 路径指向目录等非普通文件，`status` 会报告路径类型错误。
 
-Python 状态目录在 `WFC_STATE` 缺省或为空字符串时为 `~/.local/state/workflow-core`，字面值 `~/custom` 按用户主目录展开。空字符串让 Linux `status` 直接选择 Python 目录。缺省或非空设置在两处都没有记录时，`status` 返回原 Rust 路径的空视图。带账号的路径无法展开时，`status` 保留原 Rust 字面路径。选中旧目录时，循环链接等文件系统错误会显示诊断。`reclaim` 优先使用原生记录，选中旧库时提供只读预览。旧库的会话存活情况显示为未知。旧 schema 缺项会提示，WAL 模式需先用 SQLite 导出私有副本再查看。
+Python 状态目录在 `WFC_STATE` 缺省或为空字符串时为 `~/.local/state/workflow-core`，字面值 `~/custom` 按用户主目录展开。空字符串让 Linux `status` 直接选择 Python 目录。缺省或非空设置在两处都没有记录时，`status` 返回原 Rust 路径的空视图。带账号的路径无法展开时，`status` 保留原 Rust 字面路径。选中旧目录时，循环链接等文件系统错误会显示诊断。`reclaim` 优先使用原生记录，选中旧库时提供只读预览。旧库的会话存活情况显示为未知。若找得到旧库而原生消息账本路径是目录，仍可查看旧库预览。`status` 和 `reclaim --yes` 会报告路径类型错误。旧 schema 缺项会提示，WAL 模式需先用 SQLite 导出私有副本再查看。
 
 Linux 组合验证可用 `python3 -B tests/legacy_public.py target/release/wfc`。停写、核对原回执、后端查证和副本还原见 [Python 状态组件](crates/legacy-state/README.md)。
 
