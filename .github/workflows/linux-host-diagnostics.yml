@@ -1,0 +1,183 @@
+name: Linux host diagnostics
+on:
+  push:
+    branches: [rust-router/13-host-diagnostics-r7-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  linux-host-diagnostics:
+    name: '#14 with #16, #36 and #38'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      PRODUCT_SHA: 5b347c4582ff99a515a08f0c0344b4f93bf66683
+      PRODUCT_TREE: 8a8ca29b9b5b8a4b10f010ca5622dbb2c696bfa1
+      PRODUCT_PARENTS: 'f8d5e713d3e5e41cf4eff94b7583c875034092c0 197f3d14a24d1fbd545453c7ac08a5c06c125585'
+      REFERENCE_RUNS: '45246627284/2 45250815210/1'
+      NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+      TARGET: x86_64-unknown-linux-gnu
+      HERDR_RELEASE_URL: https://github.com/herdrdev/herdr/releases/download/v0.9.5/herdr-linux-x86_64
+      HERDR_RELEASE_SHA: 14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d
+      CARGO_BUILD_JOBS: '2'
+      PYTHONUTF8: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      EVIDENCE: ${{ github.workspace }}/linux-host-diagnostics-evidence
+    steps:
+      - name: Record workflow run
+        run: |
+          mkdir -p "$EVIDENCE"
+          printf '%s\n' "workflow=$GITHUB_SHA" "run=$GITHUB_RUN_ID" "attempt=$GITHUB_RUN_ATTEMPT" \
+            "expectedProduct=$PRODUCT_SHA" "expectedTree=$PRODUCT_TREE" "expectedParents=$PRODUCT_PARENTS" \
+            "referenceRuns=$REFERENCE_RUNS" |
+            tee "$EVIDENCE/run.log"
+      - name: Check out the CI scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: ci
+          persist-credentials: false
+      - name: Check out the frozen first-parent combination
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          persist-credentials: false
+      - name: Check out the verified native CI zlib input
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.NATIVE_INPUT_SHA }}
+          path: native-input
+          sparse-checkout: vendor/zlib-1.3.1.tar.gz
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Verify fixed source and native inputs
+        working-directory: product
+        run: |
+          {
+            test "$(git -C ../ci rev-parse HEAD)" = "$GITHUB_SHA"
+            test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+            test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+            test -z "$(git status --porcelain)"
+            parents=$(git cat-file -p HEAD | sed -n '/^$/q; s/^parent //p' | paste -sd' ' -)
+            test "$parents" = "$PRODUCT_PARENTS"
+            printf 'product=%s tree=%s parents=%s\n' "$(git rev-parse HEAD)" "$(git rev-parse 'HEAD^{tree}')" "$parents"
+            test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
+            git -C ../native-input show -s --format='native-input=%H tree=%T'
+            printf '%s  %s\n' 17e88863f3600672ab49182f217281b6fc4d3c762bde361935e436a95214d05c \
+              ../native-input/vendor/zlib-1.3.1.tar.gz | sha256sum --check --strict
+            printf '%s  %s\n' 58d287fe1006ad58e4a74d75718a2ece32064bda4577f2d8bd6b2ee73440490b vendor/INPUTS.sha256 | sha256sum --check --strict
+            sha256sum vendor/INPUTS.sha256
+            sha256sum --check --strict vendor/INPUTS.sha256
+          } 2>&1 | tee "$EVIDENCE/sources.log"
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - name: Install pinned Linux x86-64 Zig
+        run: |
+          {
+            package=zig-x86_64-linux-0.16.0
+            archive="$RUNNER_TEMP/$package.tar.xz"
+            digest=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+            verified=0
+            for base in https://ziglang.org/download/0.16.0 https://zig.bcr.ist; do
+              url="$base/$package.tar.xz"
+              printf 'Downloading %s\n' "$url"
+              if curl --fail --silent --show-error --location --retry 2 --retry-max-time 180 \
+                --connect-timeout 15 --max-time 120 --output "$archive" "$url" &&
+                printf '%s  %s\n' "$digest" "$archive" | sha256sum --check --strict; then
+                verified=1
+                break
+              fi
+            done
+            test "$verified" = 1
+            tar -xJf "$archive" -C "$RUNNER_TEMP"
+            zig_dir="$RUNNER_TEMP/$package"
+            version=$("$zig_dir/zig" version)
+            printf 'Zig %s\n' "$version"
+            test "$version" = 0.16.0
+            printf '%s\n' "$zig_dir" >> "$GITHUB_PATH"
+          } 2>&1 | tee "$EVIDENCE/zig-install.log"
+      - name: Prepare the Linux toolchain
+        run: |
+          {
+            rustup toolchain install 1.96.1 --profile minimal --component rustfmt
+            if ! command -v tmux >/dev/null; then
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends tmux
+            fi
+            uname -srm
+            rustc +1.96.1 -vV
+            cargo +1.96.1 --version
+            zig version
+            python3 --version
+            tmux -V
+            cc --version
+          } 2>&1 | tee "$EVIDENCE/toolchain.log"
+      - name: Build the frozen release
+        id: build
+        working-directory: product
+        env:
+          WFC_BUILD_ID: ${{ env.PRODUCT_SHA }}
+        run: |
+          {
+            cargo fmt --all -- --check
+            python3 tools/prepare.py --zlib-archive ../native-input/vendor/zlib-1.3.1.tar.gz
+            cargo build --locked --release --target "$TARGET" --bin wfc
+            binary="target/$TARGET/release/wfc"
+            version=$("$binary" --version)
+            printf '%s\n' "$version"
+            [[ "$version" == *"(Rust, $TARGET, release, build $PRODUCT_SHA)" ]]
+            sha256sum "$binary"
+            readelf -hW "$binary"
+          } 2>&1 | tee "$EVIDENCE/build.log"
+      - name: Verify tmux observation, current scope, reclaim and both targets
+        working-directory: product
+        env:
+          WFC_BUILD_ID: ${{ env.PRODUCT_SHA }}
+        run: |
+          id -u | tee "$EVIDENCE/runner-uid.log"
+          test "$(id -u)" -ne 0
+          bash ../ci/tools/ci/host-diagnostics/verify.sh combination
+      - name: Download and verify pinned Herdr
+        id: herdr-download
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          {
+            asset="$RUNNER_TEMP/host-diagnostics-herdr"
+            printf 'Herdr source %s\n' "$HERDR_RELEASE_URL"
+            curl --fail --silent --show-error --location --retry 2 --retry-max-time 150 \
+              --connect-timeout 15 --max-time 100 --output "$asset" "$HERDR_RELEASE_URL"
+            printf '%s  %s\n' "$HERDR_RELEASE_SHA" "$asset" | sha256sum --check --strict
+            sha256sum "$asset"
+            chmod 700 "$asset"
+            version=$("$asset" --version)
+            printf '%s\n' "$version"
+            test "$version" = 'herdr 0.9.5'
+            printf 'HERDR_BIN=%s\n' "$asset" >> "$GITHUB_ENV"
+          } 2>&1 | tee "$EVIDENCE/herdr-download.log"
+      - name: Verify read evidence and recovery through the private Herdr service
+        if: ${{ !cancelled() && steps.herdr-download.outcome == 'success' }}
+        working-directory: product
+        run: bash ../ci/tools/ci/host-diagnostics/verify.sh herdr
+      - name: Record missing Herdr input
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.herdr-download.outcome != 'success' }}
+        run: printf 'herdr blocked (pinned asset unavailable)\n' | tee -a "$EVIDENCE/results.log"
+      - name: Checksum the evidence logs
+        if: ${{ always() }}
+        run: |
+          cd "$EVIDENCE"
+          sha256sum -- *.log > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+      - name: Upload Linux host diagnostics evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-host-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 14
