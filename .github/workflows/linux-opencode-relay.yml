@@ -44,7 +44,7 @@ jobs:
           persist-credentials: false
       - name: Check out the verified native CI zlib input
         id: native
-        uses: actions/checkout@3d3c42e5aac5ba805da76410c181273ba90b1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.NATIVE_INPUT_SHA }}
           path: native-input
