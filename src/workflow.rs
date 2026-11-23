@@ -553,7 +553,7 @@ enum StateView {
 #[cfg(target_os = "linux")]
 fn ledger_metadata(path: &Path, view: StateView) -> Result<Option<fs::Metadata>> {
     let inspect = || format!("inspect {}", path.display());
-    let metadata = if view == StateView::ReclaimConfirm {
+    let metadata = if view != StateView::Status {
         fs::symlink_metadata(path)
     } else {
         fs::metadata(path)
@@ -567,6 +567,38 @@ fn ledger_metadata(path: &Path, view: StateView) -> Result<Option<fs::Metadata>>
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(inspect),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn native_ledger_exists(path: &Path, view: StateView, no_legacy: bool) -> Result<bool> {
+    let Some(metadata) = ledger_metadata(path, view)? else {
+        return Ok(false);
+    };
+    // With no legacy store, a known directory type leaves named previews on
+    // the original native path (including its unknown-dispatch diagnostics).
+    if metadata.is_dir() && view == StateView::ReclaimPreview && no_legacy {
+        return Ok(false);
+    }
+    ensure!(
+        metadata.is_file(),
+        "{} is not a regular file",
+        path.display()
+    );
+    if view != StateView::Status {
+        // A regular file can still be unreadable to this caller.
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = File::options()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .with_context(|| format!("open {}", path.display()))?;
+        ensure!(
+            file.metadata()?.is_file(),
+            "{} is not a regular file",
+            path.display()
+        );
+    }
+    Ok(true)
 }
 
 #[cfg(target_os = "linux")]
@@ -605,26 +637,23 @@ fn legacy_view_state(id: Option<&OsStr>, view: StateView) -> Result<Option<PathB
         legacy => legacy,
     };
     let no_legacy = matches!(legacy, Ok(None));
-    if no_legacy && view != StateView::ReclaimConfirm {
+    if no_legacy && view == StateView::Status {
         return Ok(None);
     }
     let native = state_dir()?;
     let ledger = native.join("messages.json");
-    if let Some(metadata) = ledger_metadata(&ledger, view)? {
-        if metadata.is_dir()
-            && view == StateView::ReclaimPreview
-            && matches!(&legacy, Ok(Some(state)) if state.join("router.db").is_file())
-        {
-            // The offline preview reads only router.db and makes no native
-            // ownership claim. Confirmation must reject this ledger path.
-            return legacy;
+    match native_ledger_exists(&ledger, view, no_legacy) {
+        Ok(true) => return Ok(None),
+        Ok(false) => {}
+        Err(error) => {
+            if view == StateView::ReclaimPreview
+                && matches!(&legacy, Ok(Some(state)) if wfc_legacy_state::can_preview_router_db(state))
+            {
+                // The offline preview makes no native ownership claim.
+                return legacy;
+            }
+            return Err(error);
         }
-        ensure!(
-            metadata.is_file(),
-            "{} is not a regular file",
-            ledger.display()
-        );
-        return Ok(None);
     }
     if no_legacy {
         return Ok(None);

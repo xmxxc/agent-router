@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import resource
 import select
 import signal
 import shutil
@@ -235,8 +236,12 @@ subprocess.run([os.environ["WFC_BIN"], "done", "--report", "report", "--attempt"
         self.assertEqual(wfc("close", dispatch["dispatch"], "--owner-token", b["token"])["result"], "completed")
         print(json.dumps({"tmuxCallbackReceipt": ack, "attempt": message["attempt"]}), flush=True)
 
-    def reclaim_cli(self, *args, code=0, **env):
+    def reclaim_cli(self, *args, code=0, file_size_limit=None, **env):
+        def limit_file_size():
+            resource.setrlimit(resource.RLIMIT_FSIZE, (file_size_limit, file_size_limit))
+
         result = subprocess.run([WFC, *args], cwd=self.work, text=True, capture_output=True,
+                                preexec_fn=limit_file_size if file_size_limit is not None else None,
                                 env={**self.env, "WFC_STATE": str(self.state), **env}, timeout=25)
         self.assertEqual(result.returncode, code, result)
         return result
@@ -340,6 +345,97 @@ time.sleep(120)
         print(json.dumps({"reclaimPreview": json.loads(preview.stdout),
                           "reclaimMixed": json.loads(mixed.stdout),
                           "mixedStderr": mixed.stderr.splitlines(), "exit": mixed.returncode}), flush=True)
+
+    def test_public_reclaim_checks_history_before_closing(self):
+        self.assertNotEqual(os.geteuid(), 0, "permission cases require an ordinary user")
+        target = self.reclaim_dispatch("preflight", finished=True)
+        neighbor = self.reclaim_dispatch("neighbor")
+        selected = ("--dispatch", target["dispatch"])
+        lock = self.state / "messages.lock"
+        parked_lock = self.state / "fixture-original-message-lock"
+        pending = self.state / "messages.pending"
+        ledger = self.state / "messages.json"
+        scope = hashlib.sha256(target["scope"].encode()).hexdigest()
+        (self.state / ("relay-" + scope + ".lock")).touch()
+        original_ledger = ledger.read_bytes()
+        checks = []
+
+        def refuses(case, path, **options):
+            rejected = self.reclaim_cli("reclaim", "--yes", *selected, code=1, **options)
+            item, = json.loads(rejected.stdout)["sessions"]
+            self.assertEqual((item["dispatch"], item["result"]), (target["dispatch"], "failed"))
+            self.assertNotIn("message", item)
+            self.assertIn("preflight reclaim history", item["error"])
+            self.assertIn(path.name, rejected.stderr)
+            self.assertEqual(ledger.read_bytes(), original_ledger)
+            for name in (target["tmux"], neighbor["tmux"], "sibling"):
+                subprocess.run(self.tmux + ["has-session", "-t", "=" + name], env=self.env, check=True)
+            checks.append({"case": case, "result": item, "stderr": rejected.stderr,
+                           "exit": rejected.returncode, "targetAndNeighborsAlive": True})
+
+        lock.rename(parked_lock)
+        try:
+            lock.mkdir()
+            try:
+                refuses("lock directory", lock)
+            finally:
+                lock.rmdir()
+            for destination in ("missing-lock-target", lock.name):
+                lock.symlink_to(destination)
+                try:
+                    refuses("lock symlink to " + destination, lock)
+                    self.assertTrue(lock.is_symlink())
+                    self.assertFalse((self.state / "missing-lock-target").exists())
+                finally:
+                    lock.unlink()
+            os.mkfifo(lock)
+            try:
+                refuses("lock FIFO", lock)
+            finally:
+                lock.unlink()
+        finally:
+            parked_lock.rename(lock)
+
+        pending.mkdir()
+        try:
+            refuses("pending directory", pending)
+        finally:
+            pending.rmdir()
+        lock_mode = stat.S_IMODE(lock.stat().st_mode)
+        lock.chmod(0o400)
+        try:
+            refuses("lock permission", lock)
+        finally:
+            lock.chmod(lock_mode)
+        state_mode = stat.S_IMODE(self.state.stat().st_mode)
+        self.state.chmod(0o500)
+        try:
+            refuses("scratch creation permission", pending)
+        finally:
+            self.state.chmod(state_mode)
+        refuses("exact snapshot exceeds RLIMIT_FSIZE", pending, file_size_limit=len(original_ledger))
+
+        # Publishing replaces a removable scratch link without following it.
+        pending.symlink_to("missing-scratch-target")
+        ledger.chmod(0o400)
+        lock.rename(parked_lock)
+        lock.symlink_to(parked_lock.name)
+        try:
+            success = self.reclaim_cli("reclaim", "--yes", *selected)
+            self.assertTrue(lock.is_symlink())
+        finally:
+            lock.unlink()
+            parked_lock.rename(lock)
+        item, = json.loads(success.stdout)["sessions"]
+        self.assertEqual(item["result"], "reclaimed")
+        self.assertFalse(pending.is_symlink())
+        self.assertFalse((self.state / "missing-scratch-target").exists())
+        status = self.reclaim_status(target)
+        self.assertEqual([m["type"] for m in status["messages"]], ["done", "reclaimed"])
+        self.assertFalse(status["backendAlive"])
+        for name in (neighbor["tmux"], "sibling"):
+            subprocess.run(self.tmux + ["has-session", "-t", "=" + name], env=self.env, check=True)
+        print(json.dumps({"historyPreflight": checks, "reclaimedAfterRepair": item}), flush=True)
 
     def test_public_reclaim_stops_on_scope_authority_loss(self):
         first = self.reclaim_dispatch("first")

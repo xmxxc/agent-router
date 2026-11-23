@@ -329,7 +329,12 @@ fn confirm(
     }
     let event = match worker_owner::validate_close(&current)
         .and_then(|()| messages::Reclaimed::prepare(&current))
-    {
+        .and_then(|event| {
+            event
+                .preflight(state)
+                .context("preflight reclaim history")?;
+            Ok(event)
+        }) {
         Ok(event) => event,
         Err(error) => {
             failure(&mut item, "failed", format!("{error:#}"));

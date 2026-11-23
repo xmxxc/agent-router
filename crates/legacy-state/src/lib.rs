@@ -6,7 +6,7 @@ mod recovery;
 mod schema;
 
 pub use migrate::open_offline_copy;
-pub use preview::{reclaim_preview, status, verify_router_db};
+pub use preview::{can_preview_router_db, reclaim_preview, status, verify_router_db};
 
 use anyhow::{ensure, Context, Result};
 use rusqlite::{Connection, OpenFlags};

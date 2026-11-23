@@ -68,7 +68,7 @@ pub(super) fn options<'a, const N: usize>(
     Ok(values)
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Identity {
     dispatch: String,
     round: u64,
@@ -332,10 +332,34 @@ struct Inbox {
 
 fn lock_file(dir: &Path) -> Result<File> {
     fs::create_dir_all(dir).context("create message directory")?;
-    private_file()
-        .create(true)
-        .open(dir.join("messages.lock"))
-        .context("open message lock")
+    let path = dir.join("messages.lock");
+    let mut options = private_file();
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // A stable link may use an existing lock, but must not create its target.
+        let linked = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata.file_type().is_symlink(),
+            Err(error) if error.kind() == ErrorKind::NotFound => false,
+            Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+        };
+        options
+            .create(!linked)
+            .custom_flags(libc::O_NONBLOCK | if linked { 0 } else { libc::O_NOFOLLOW });
+    }
+    #[cfg(not(target_os = "linux"))]
+    options.create(true);
+    let lock = options
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    ensure!(
+        lock.metadata()?.is_file(),
+        "{} is not a regular file",
+        path.display()
+    );
+    Ok(lock)
 }
 
 pub(super) fn lock_for_publish(dir: &Path) -> Result<File> {
@@ -347,6 +371,94 @@ pub(super) fn lock_for_publish(dir: &Path) -> Result<File> {
 pub(super) fn sync_directory(_dir: &Path) -> Result<()> {
     #[cfg(unix)]
     File::open(_dir)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn check_ledger_replacement(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let path = dir.join("messages.json");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    };
+    ensure!(
+        metadata.is_file() || (metadata.file_type().is_symlink() && fs::metadata(&path)?.is_file()),
+        "{} is not a regular file",
+        path.display()
+    );
+    let parent = fs::metadata(dir)?;
+    if parent.mode() & libc::S_ISVTX != 0 {
+        // Sticky directories restrict only the name being replaced. Creating
+        // and removing our own scratch entry cannot test that restriction.
+        let credentials =
+            fs::read_to_string("/proc/self/status").context("read file credentials")?;
+        let uid: u32 = credentials
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .and_then(|uids| uids.split_whitespace().nth(3))
+            .context("missing filesystem UID")?
+            .parse()?;
+        if uid != parent.uid() && uid != metadata.uid() {
+            const CAP_FOWNER: u64 = 1 << 3;
+            let capabilities = credentials
+                .lines()
+                .find_map(|line| line.strip_prefix("CapEff:"))
+                .context("missing effective file capability")?;
+            ensure!(
+                u64::from_str_radix(capabilities.trim(), 16)? & CAP_FOWNER != 0,
+                "sticky directory prevents replacing {}",
+                path.display()
+            );
+        }
+    }
+
+    // A named mount root or immutable/append-only entry cannot be replaced.
+    // The kernel may not expose these attributes on older filesystems.
+    let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+    let mut info = std::mem::MaybeUninit::<libc::statx>::uninit();
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            libc::AT_FDCWD,
+            name.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_BASIC_STATS,
+            info.as_mut_ptr(),
+        )
+    };
+    if rc == 0 {
+        let attrs = unsafe { info.assume_init() }.stx_attributes;
+        let protected =
+            libc::STATX_ATTR_IMMUTABLE | libc::STATX_ATTR_APPEND | libc::STATX_ATTR_MOUNT_ROOT;
+        ensure!(
+            attrs & protected as u64 == 0,
+            "cannot replace protected {}",
+            path.display()
+        );
+    } else {
+        let error = std::io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EOPNOTSUPP)) {
+            return Err(error)
+                .with_context(|| format!("inspect replacement of {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn check_snapshot_size(size: usize) -> Result<()> {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, limit.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("read message file size limit");
+    }
+    let limit = unsafe { limit.assume_init() };
+    ensure!(
+        size as u128 <= limit.rlim_cur as u128,
+        "messages.pending snapshot of {size} bytes exceeds the file size limit"
+    );
     Ok(())
 }
 
@@ -494,18 +606,32 @@ impl Inbox {
         Ok(None)
     }
 
-    fn save(&self) -> Result<()> {
-        let tmp = self.dir.join("messages.pending");
+    fn open_pending(path: &Path) -> Result<File> {
         // A crash before rename can only leave a scratch file. The next writer
         // holds the same lock and rewrites it from the committed snapshot.
-        match fs::remove_file(&tmp) {
+        match fs::remove_file(path) {
             Ok(()) => (),
             Err(e) if e.kind() == ErrorKind::NotFound => (),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e).with_context(|| format!("remove {}", path.display())),
         }
-        let file = private_file().create_new(true).open(&tmp)?;
+        private_file()
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("create {}", path.display()))
+    }
+
+    fn save(&self) -> Result<()> {
+        self.save_with(|writer| Ok(serde_json::to_writer(writer, &self.messages)?))
+    }
+
+    fn save_with(
+        &self,
+        write_contents: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
+    ) -> Result<()> {
+        let tmp = self.dir.join("messages.pending");
+        let file = Self::open_pending(&tmp)?;
         let mut writer = BufWriter::new(file);
-        serde_json::to_writer(&mut writer, &self.messages)?;
+        write_contents(&mut writer)?;
         writer.flush()?;
         writer.get_ref().sync_all()?;
         drop(writer);
@@ -542,6 +668,7 @@ pub(super) struct Reclaimed {
     worker: Identity,
     tmux: Value,
     report: PathBuf,
+    message_id: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -552,17 +679,51 @@ impl Reclaimed {
             worker: Identity::deserialize(row).context("read reclaim assignment identity")?,
             tmux: row["tmux"].clone(),
             report: Option::<PathBuf>::deserialize(&row["report"])?.unwrap_or_default(),
+            message_id: format!("m-{}", Uuid::new_v4().simple()),
         })
+    }
+
+    pub(super) fn preflight(&self, state: &Path) -> Result<()> {
+        // Use the actual publisher's lock, snapshot and scratch permissions.
+        // The lock is released before the caller enters the backend.
+        let mut inbox = Inbox::open(state)?;
+        check_ledger_replacement(state)?;
+        self.append(&mut inbox);
+        let bytes = serde_json::to_vec(&inbox.messages)?;
+        check_snapshot_size(bytes.len())?;
+        let pending = inbox.dir.join("messages.pending");
+        let mut file = Inbox::open_pending(&pending)?;
+        let probe = file
+            .write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .with_context(|| format!("verify write to {}", pending.display()));
+        drop(file);
+        let cleanup =
+            fs::remove_file(&pending).with_context(|| format!("remove {}", pending.display()));
+        probe.and(cleanup)?;
+        inbox
+            .sync_directory()
+            .context("verify message directory sync")
     }
 
     pub(super) fn publish(self, state: &Path) -> Result<u64> {
         let mut inbox = Inbox::open(state)?;
+        let id = self.append(&mut inbox);
+        let bytes = serde_json::to_vec(&inbox.messages)?;
+        check_snapshot_size(bytes.len())?;
+        inbox
+            .save_with(|writer| Ok(writer.write_all(&bytes)?))
+            .context("publish reclaim history")?;
+        Ok(id)
+    }
+
+    fn append(&self, inbox: &mut Inbox) -> u64 {
         let id = inbox.messages.len() as u64 + 1;
         inbox.messages.push(Completion {
             id,
-            message_id: format!("m-{}", Uuid::new_v4().simple()),
-            worker: self.worker,
-            report: self.report,
+            message_id: self.message_id.clone(),
+            worker: self.worker.clone(),
+            report: self.report.clone(),
             request_key: None,
             body_hash: None,
             delivery: Delivery::unsent(),
@@ -570,11 +731,10 @@ impl Reclaimed {
             created_at: Some(receipt::timestamp()),
             additional_fields: Map::from_iter([
                 ("type".into(), json!("reclaimed")),
-                ("tmux".into(), self.tmux),
+                ("tmux".into(), self.tmux.clone()),
             ]),
         });
-        inbox.save().context("publish reclaim history")?;
-        Ok(id)
+        id
     }
 }
 

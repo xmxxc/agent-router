@@ -104,25 +104,91 @@ pub fn verify_router_db(state: &Path) -> Result<()> {
     let (db, _) = reader(state)
         .with_context(|| format!("verify {}", path.display()))?
         .with_context(|| format!("{} disappeared during verification", path.display()))?;
+    let (dispatch, message) = original_ledger_identity(&db)?;
+    ensure!(
+        dispatch && message,
+        "unrecognized router.db schema in {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn original_ledger_identity(db: &Connection) -> Result<(bool, bool)> {
     // Check the original tables. Preview projects missing columns in TEMP
     // views, which are useful for history but cannot identify a live ledger.
-    let identified: bool = db.query_row(
+    Ok(db.query_row(
         "SELECT EXISTS (
             SELECT 1 FROM pragma_table_info('dispatch', 'main') WHERE name='id' AND pk > 0
-         ) AND (
+         ), (
             SELECT count(*) FROM pragma_table_info('message', 'main')
             WHERE name IN ('id', 'dispatch', 'recipient', 'type', 'body')
               AND (name <> 'id' OR pk > 0)
          ) = 5",
         [],
-        |row| row.get(0),
-    )?;
-    ensure!(
-        identified,
-        "unrecognized router.db schema in {}",
-        path.display()
-    );
-    Ok(())
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?)
+}
+
+/// Confirm that the offline preview can read a recognizable older schema.
+pub fn can_preview_router_db(state: &Path) -> bool {
+    reader(state).is_ok_and(|ledger| {
+        ledger.is_some_and(|(db, _)| {
+            original_ledger_identity(&db).is_ok_and(|(dispatch, message)| {
+                dispatch || message || original_history_identity(&db).unwrap_or(false)
+            })
+        })
+    })
+}
+
+fn original_history_identity(db: &Connection) -> Result<bool> {
+    // An old copy can contain only one of the evidence tables in offline_dispatch.
+    // Match both the real keys and characteristic columns before choosing it.
+    let shapes: &[(&str, &[&str], &[&str])] = &[
+        (
+            "dispatch_round",
+            &["dispatch", "round", "attempt"],
+            &["state"],
+        ),
+        ("message", &["id"], &["dispatch", "type", "body"]),
+        ("fault_event", &["dispatch"], &["operation", "outcome"]),
+        ("fault_event", &["dispatch"], &["operation", "diagnostic"]),
+        (
+            "lifecycle_event",
+            &["id"],
+            &["dispatch", "operation", "result"],
+        ),
+        (
+            "lifecycle_event",
+            &["id"],
+            &["dispatch", "operation", "attempt"],
+        ),
+        (
+            "lifecycle_event",
+            &["id"],
+            &["dispatch", "round", "attempt", "to_attempt"],
+        ),
+        (
+            "watchdog_fault",
+            &["dispatch", "round", "attempt", "kind", "fingerprint"],
+            &[],
+        ),
+        ("host_error", &["dispatch"], &["turn"]),
+        ("screen_watch", &["dispatch"], &["screen", "since"]),
+    ];
+    let mut columns = db.prepare("SELECT name, pk != 0 FROM pragma_table_info(?1, 'main')")?;
+    for &(table, keys, evidence) in shapes {
+        let actual = columns
+            .query_map([table], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })?
+            .collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()?;
+        if keys.iter().all(|key| actual.get(*key) == Some(&true))
+            && evidence.iter().all(|field| actual.contains_key(*field))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn reader(state: &Path) -> Result<Option<(Connection, bool)>> {
