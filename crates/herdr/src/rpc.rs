@@ -132,9 +132,18 @@ impl Session {
     }
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
-        let (socket, peer) = connect(&self.endpoint)?;
+        let before_send = |e: Failure| {
+            if method == "pane.close" {
+                e.before_effect()
+            } else {
+                e
+            }
+        };
+        let (socket, peer) = connect(&self.endpoint).map_err(before_send)?;
         if peer != self.service {
-            return Err(Failure::unknown("Herdr service identity changed"));
+            return Err(before_send(Failure::unknown(
+                "Herdr service identity changed",
+            )));
         }
         self.exchange(socket, method, params)
     }
@@ -156,12 +165,17 @@ impl Session {
         };
         let mut bytes = frame.as_slice();
         while !bytes.is_empty() {
+            let write_failure = if method == "pane.close" && bytes.len() == frame.len() {
+                Failure::unsent("Herdr close was not sent")
+            } else {
+                unknown
+            };
             socket
-                .set_write_timeout(Some(remaining()?))
-                .map_err(|_| unknown)?;
-            let n = socket.write(bytes).map_err(|_| unknown)?;
+                .set_write_timeout(Some(remaining().map_err(|_| write_failure)?))
+                .map_err(|_| write_failure)?;
+            let n = socket.write(bytes).map_err(|_| write_failure)?;
             if n == 0 {
-                return Err(unknown);
+                return Err(write_failure);
             }
             bytes = &bytes[n..];
         }

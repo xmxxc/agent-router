@@ -241,7 +241,8 @@ impl<'a> Dispatch<'a> {
                     endpoint.is_absolute(),
                     "Herdr requires an absolute socket path"
                 );
-                record["endpoint"] = json!(endpoint);
+                record["endpoint"] =
+                    json!(endpoint.to_str().context("Herdr endpoint must be UTF-8")?);
             } else {
                 record["tmuxSocket"] = json!(backend::tmux_socket()?);
             }
@@ -488,20 +489,22 @@ fn status_with_history(
     let state = state_dir()?;
     let dir = state.join("dispatches");
     let mut dispatches = Vec::new();
-    let mut named_history = None;
     if let Some(id) = id {
         let id = id
             .to_str()
             .filter(|s| valid_id(s))
             .context("invalid dispatch ID")?;
-        let messages = history(&state, id)?;
         let not_found = |err: &anyhow::Error| {
             err.downcast_ref::<std::io::Error>()
                 .is_some_and(|e| e.kind() == ErrorKind::NotFound)
         };
         let row = match read_record(&dir.join(format!("{id}.json"))) {
             Ok(r) => r,
-            Err(e) if not_found(&e) && !messages.is_empty() => {
+            Err(e) if not_found(&e) => {
+                let messages = history(&state, id)?;
+                if messages.is_empty() {
+                    return Err(e);
+                }
                 // A worker can report before its launcher publishes the assignment.
                 match read_record(&dir.join(format!("{id}.pending"))) {
                     Ok(r) => r,
@@ -515,7 +518,6 @@ fn status_with_history(
             Err(e) => return Err(e),
         };
         dispatches.push(row);
-        named_history = Some(messages);
     } else {
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => Some(entries),
@@ -562,13 +564,12 @@ fn status_with_history(
                 _ => json!(false),
             };
         }
-        let messages = match named_history.take() {
-            Some(messages) => messages,
-            None => history(
-                &state,
-                record["dispatch"].as_str().context("missing dispatch")?,
-            )?,
-        };
+        // A worker can publish done and then exit during backend observation.
+        // Read the ledger after the process evidence used by this projection.
+        let messages = history(
+            &state,
+            record["dispatch"].as_str().context("missing dispatch")?,
+        )?;
         let messages = if messages.is_empty() {
             record["messages"].as_array().cloned().unwrap_or_default()
         } else {

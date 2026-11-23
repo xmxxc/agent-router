@@ -130,7 +130,8 @@ pub fn observe(state: &Path, row: &mut Value) -> Result<(Value, Value)> {
         return Ok((result, json!({"result":"completed","alive":false})));
     }
     let inspection = inspect_tmux(state, row);
-    Ok((worker(state, row, &inspection)?, inspection))
+    let launch = private_receipt(state, &row["create"])?;
+    Ok((worker(&launch, &inspection), inspection))
 }
 
 fn inspect_tmux(state: &Path, row: &Value) -> Value {
@@ -144,9 +145,8 @@ fn inspect_tmux(state: &Path, row: &Value) -> Value {
     inspection
 }
 
-pub(super) fn worker(state: &Path, row: &Value, inspection: &Value) -> Result<Value> {
-    let evidence = private_receipt(state, &row["create"])?;
-    Ok(match evidence["category"].as_str() {
+pub(super) fn worker(evidence: &Value, inspection: &Value) -> Value {
+    match evidence["category"].as_str() {
         Some("process_exited") => {
             json!({"state":"exited","exit_code":evidence["exitCode"],"signal":null})
         }
@@ -154,7 +154,7 @@ pub(super) fn worker(state: &Path, row: &Value, inspection: &Value) -> Result<Va
             json!({"state":"running"})
         }
         _ => json!({"state":"unknown"}),
-    })
+    }
 }
 
 pub fn close(state: &Path, row: &Value) -> Result<Value> {
@@ -205,7 +205,7 @@ pub(super) fn close_locked(
         receipt["diagnostic"] = json!("session is not owned by this dispatch");
         return Ok(receipt);
     }
-    let before = worker(state, row, &observed)?;
+    let before = worker(&private_receipt(state, &row["create"])?, &observed);
     let outcome = operation("close")?;
     if outcome["result"] != "completed" {
         receipt["result"] = outcome["result"].clone();

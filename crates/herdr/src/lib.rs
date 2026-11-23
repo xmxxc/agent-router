@@ -49,6 +49,13 @@ impl Failure {
             diagnostic,
         }
     }
+    fn before_effect(self) -> Self {
+        if self.kind == FailureKind::Uncertain {
+            Self::unsent(self.diagnostic)
+        } else {
+            self
+        }
+    }
     fn after_effect(self) -> Self {
         Self::unknown(self.diagnostic)
     }
@@ -428,25 +435,42 @@ impl Handle {
     /// Close only the bound pane. Persist all observed writers before closing,
     /// so a lost response cannot erase the evidence needed by a later close.
     pub fn close(&mut self, mut save: impl FnMut(&Self) -> std::io::Result<()>) -> Result<()> {
+        self.prepare_close(&mut save)?.finish()
+    }
+
+    /// Validate the target and checkpoint its writers before the caller commits
+    /// its close intent. No mutating RPC is issued until finish.
+    pub fn prepare_close(
+        &mut self,
+        mut save: impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<PreparedClose<'_>> {
+        let rpc = self.session()?;
+        let present = self.pane(&rpc.snapshot()?)?.is_some();
+        if present {
+            self.checkpoint_writers(&rpc, &mut save)?;
+        }
+        Ok(PreparedClose {
+            handle: self,
+            rpc,
+            present,
+        })
+    }
+
+    /// Observe a previously issued close without sending another pane.close.
+    pub fn confirm_closed(
+        &mut self,
+        mut save: impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<bool> {
         let rpc = self.session()?;
         if self.pane(&rpc.snapshot()?)?.is_some() {
             self.checkpoint_writers(&rpc, &mut save)?;
-            self.guarded(&rpc, false)?;
-            rpc.call("pane.close", json!({"pane_id":self.pane}))?;
+            return Ok(false);
         }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if !self.writers_alive()? {
-                let snap = rpc.snapshot().map_err(Failure::after_effect)?;
-                if self.pane(&snap).map_err(Failure::after_effect)?.is_none() {
-                    return Ok(());
-                }
-            }
-            if Instant::now() >= deadline {
-                return Err(Failure::unknown("Herdr pane or old writer still present"));
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        Ok(!self.writers_alive()?)
+    }
+
+    fn gone(&self, rpc: &Session) -> Result<bool> {
+        Ok(!self.writers_alive()? && self.pane(&rpc.snapshot()?)?.is_none())
     }
 
     /// Observe an explicit proposed mapping. Caller verifies current owner and
@@ -557,5 +581,33 @@ impl Handle {
             handle: next,
             audit,
         })
+    }
+}
+
+pub struct PreparedClose<'a> {
+    handle: &'a Handle,
+    rpc: Session,
+    present: bool,
+}
+
+impl PreparedClose<'_> {
+    pub fn finish(self) -> Result<()> {
+        if self.present {
+            self.handle
+                .guarded(&self.rpc, false)
+                .map_err(Failure::before_effect)?;
+            self.rpc
+                .call("pane.close", json!({"pane_id":self.handle.pane}))?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if self.handle.gone(&self.rpc).map_err(Failure::after_effect)? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(Failure::unknown("Herdr pane or old writer still present"));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }

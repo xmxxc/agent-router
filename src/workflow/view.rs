@@ -59,6 +59,7 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
             let unconfirmed_create =
                 row["backend"] == "herdr" && row["create"]["result"] != "accepted";
             let state = match row["worker"]["state"].as_str() {
+                _ if row["closePending"] == true => "unknown",
                 _ if unconfirmed_create && row["worker"]["state"] != "cancelled" => {
                     round["result"] = row["create"].clone();
                     "unknown"

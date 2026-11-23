@@ -289,15 +289,24 @@ pub(super) fn observe(state: &Path, row: &mut Value) -> Result<(Value, Value)> {
     let observed = (|| -> Result<_> {
         let id = row["dispatch"].as_str().context("missing dispatch")?;
         let mut unit = Assignment::lock(state, id, None)?;
-        unit.handle()?;
-        let (worker, inspection) = if let Some(worker) = backend::closed(state, &unit.row)? {
-            (worker, json!({"result":"completed","alive":false}))
-        } else {
-            let inspection = unit.inspect()?;
-            (backend::worker(state, &unit.row, &inspection)?, inspection)
-        };
+        let observed = (|| -> Result<_> {
+            unit.handle()?;
+            let archive = unit.closed_worker()?;
+            let inspection = if archive.is_some() {
+                json!({"result":"completed","alive":false})
+            } else {
+                unit.inspect()?
+            };
+            Ok((archive, inspection))
+        })();
+        // Preserve the locked assignment even if launch or process evidence
+        // is unavailable. A missing receipt cannot erase a durable close.
+        let close_pending = unit.pending_close();
         *row = unit.row;
+        row["closePending"] = json!(close_pending);
         row["launch"] = backend::private_receipt(state, &row["create"])?;
+        let (archived, inspection) = observed?;
+        let worker = archived.unwrap_or_else(|| backend::worker(&row["launch"], &inspection));
         Ok((worker, inspection))
     })();
     Ok(observed.unwrap_or_else(|e| {
@@ -306,6 +315,89 @@ pub(super) fn observe(state: &Path, row: &mut Value) -> Result<(Value, Value)> {
             json!({"result":"uncertain","diagnostic":e.to_string()}),
         )
     }))
+}
+
+impl Assignment<'_> {
+    fn last_close(&self) -> Option<&Value> {
+        self.row["audit"]
+            .as_array()?
+            .iter()
+            .rfind(|event| event["operation"] == "close")
+    }
+
+    fn pending_close(&self) -> bool {
+        self.last_close()
+            .is_some_and(|e| matches!(e["result"].as_str(), Some("uncertain" | "pending")))
+    }
+
+    fn closed_worker(&self) -> Result<Option<Value>> {
+        if let Some(event) = self.last_close().filter(|e| e["result"] == "completed") {
+            self.verify_close_target(event)?;
+            ensure!(
+                matches!(
+                    event["workerOnClose"]["state"].as_str(),
+                    Some("cancelled" | "exited")
+                ),
+                "invalid closed worker outcome"
+            );
+            return Ok(Some(event["workerOnClose"].clone()));
+        }
+        backend::closed(self.state, &self.row)
+    }
+
+    fn close_receipt(&self, outcome: Value) -> Value {
+        let mut receipt = outcome;
+        for key in ["dispatch", "round", "attempt"] {
+            receipt[key] = self.row[key].clone();
+        }
+        receipt["operation"] = json!("close");
+        receipt
+    }
+
+    fn finish_close(&mut self, outcome: Value) -> Result<Value> {
+        let mut next = self.row.clone();
+        let event = next["audit"]
+            .as_array_mut()
+            .and_then(|a| a.last_mut())
+            .context("missing close intent")?;
+        ensure!(
+            event["operation"] == "close" && event["attempt"] == self.row["attempt"],
+            "close intent changed"
+        );
+        event["result"] = outcome["result"].clone();
+        event["diagnostic"] = outcome["diagnostic"].clone();
+        self.save(next)?;
+        Ok(self.close_receipt(outcome))
+    }
+
+    fn verify_close_target(&self, event: &Value) -> Result<()> {
+        let current = &self.row["backendHandle"];
+        let target = &event["target"];
+        ensure!(
+            [
+                "dispatch",
+                "round",
+                "attempt",
+                "endpoint",
+                "service",
+                "workspace",
+                "pane",
+                "terminal",
+                "nonce"
+            ]
+            .iter()
+            .all(|&k| target[k] == current[k])
+                && ["dispatch", "round", "attempt"]
+                    .iter()
+                    .all(|&k| event[k] == self.row[k])
+                && target["writerProcesses"]
+                    .as_array()
+                    .zip(current["writerProcesses"].as_array())
+                    .is_some_and(|(old, known)| old.iter().all(|w| known.contains(w))),
+            "close intent target changed"
+        );
+        Ok(())
+    }
 }
 
 pub(super) fn close(state: &Path, row: &Value) -> Result<Value> {
@@ -318,28 +410,67 @@ pub(super) fn close(state: &Path, row: &Value) -> Result<Value> {
         unit.row["attempt"] == row["attempt"],
         "Herdr attempt changed"
     );
-    unit.handle()?;
-    backend::close_locked(state, &unit.row.clone(), |op| {
-        if unit.row["create"]["result"] != "accepted" && unit.handle()?.stopped_evidence.is_none() {
-            return Ok(
-                json!({"result":"uncertain","diagnostic":"unresolved Herdr create requires lifecycle resolution"}),
-            );
-        }
-        if op == "inspect" {
-            return Ok(unit
-                .inspect()
-                .unwrap_or_else(|e| json!({"result":"uncertain","diagnostic":e.to_string()})));
-        }
-        unit.current()?;
-        let mut h = unit.handle()?;
-        if h.stopped_evidence.is_none() {
-            if let Err(e) = h.close(|h| unit.checkpoint(h)) {
-                return Ok(json!(e));
+    let mut handle = unit.handle()?;
+    if unit.closed_worker()?.is_some() {
+        return Ok(unit
+            .close_receipt(json!({"result":"completed","diagnostic":"session was already gone"})));
+    }
+    if unit.pending_close() {
+        unit.verify_close_target(unit.last_close().context("missing close intent")?)?;
+        let outcome = match handle.confirm_closed(|h| unit.checkpoint(h)) {
+            Ok(true) => return unit.finish_close(json!({"result":"completed"})),
+            Ok(false) => {
+                json!({"result":"uncertain","diagnostic":"pending close: pane or known writer still present"})
             }
+            Err(e) => json!({"result":"uncertain","diagnostic":e.diagnostic}),
+        };
+        return Ok(unit.close_receipt(outcome));
+    }
+    if unit.row["create"]["result"] != "accepted" && handle.stopped_evidence.is_none() {
+        return Ok(unit.close_receipt(json!({"result":"uncertain","diagnostic":"unresolved Herdr create requires lifecycle resolution"})));
+    }
+    let mut handle = match unit.tracked_handle() {
+        Ok(h) => h,
+        Err(e) => {
+            return Ok(unit.close_receipt(json!({"result":"uncertain","diagnostic":e.to_string()})))
         }
-        unit.current()?;
-        Ok(json!({"result":"completed"}))
-    })
+    };
+    let prepared = if handle.stopped_evidence.is_some() {
+        None
+    } else {
+        match handle.prepare_close(|h| unit.checkpoint(h)) {
+            Ok(close) => Some(close),
+            Err(e) => return Ok(unit.close_receipt(json!(e))),
+        }
+    };
+    let launch = backend::private_receipt(state, &unit.row["create"])?;
+    let worker = if launch["category"] == "process_exited" {
+        backend::worker(&launch, &Value::Null)
+    } else {
+        json!({"state":"cancelled","exit_code":null,"signal":null})
+    };
+    let mut next = unit.row.clone();
+    let receipt =
+        unit.close_receipt(json!({"result": if prepared.is_some() {"pending"} else {"completed"}}));
+    let mut event = receipt.clone();
+    event["at"] = json!(chrono::Utc::now().to_rfc3339());
+    event["target"] = unit.row["backendHandle"].clone();
+    event["workerOnClose"] = worker;
+    let audit = next["audit"]
+        .as_array_mut()
+        .context("invalid lifecycle audit")?;
+    event["id"] = json!(audit.len() + 1);
+    audit.push(event);
+    unit.save(next)?;
+    let Some(close) = prepared else {
+        // Explicit stopped evidence already confirms this unit, even offline.
+        return Ok(receipt);
+    };
+    let outcome = match close.finish() {
+        Ok(()) => json!({"result":"completed"}),
+        Err(e) => json!(e),
+    };
+    unit.finish_close(outcome)
 }
 
 #[derive(Deserialize)]
@@ -360,10 +491,8 @@ pub fn submit(input: Input) -> Result<Value> {
         unit.row["round"] == input.round && unit.row["attempt"] == input.attempt,
         "stale Herdr input assignment"
     );
-    ensure!(
-        backend::closed(&state, &unit.row)?.is_none(),
-        "Herdr dispatch closed"
-    );
+    ensure!(unit.closed_worker()?.is_none(), "Herdr dispatch closed");
+    ensure!(!unit.pending_close(), "Herdr close still pending");
     ensure!(
         unit.row["create"]["result"] == "accepted",
         "Herdr launch is not active"
@@ -409,7 +538,10 @@ impl Reconcile {
             let value = args
                 .next()
                 .and_then(|v| v.to_str())
-                .filter(|v| !v.trim().is_empty() && !v.starts_with("--"))
+                .filter(|v| {
+                    !v.starts_with("--")
+                        && (matches!(key, "--actor" | "--evidence") || !v.trim().is_empty())
+                })
                 .context("missing option value")?;
             ensure!(
                 options.insert(key, value.to_owned()).is_none(),
@@ -432,15 +564,17 @@ impl Reconcile {
 
     pub fn run(self) -> Result<Value> {
         ensure!(
+            !self.mapping.actor.trim().is_empty() && !self.mapping.evidence.trim().is_empty(),
+            "herdr-reconcile requires nonempty actor and evidence"
+        );
+        ensure!(
             !self.owner_token,
             "controller owner authorization is unavailable"
         );
         let state = state_dir()?;
         let mut unit = Assignment::lock(&state, &self.dispatch, None)?;
-        ensure!(
-            backend::closed(&state, &unit.row)?.is_none(),
-            "Herdr dispatch closed"
-        );
+        ensure!(unit.closed_worker()?.is_none(), "Herdr dispatch closed");
+        ensure!(!unit.pending_close(), "Herdr close still pending");
         let receipt = backend::private_receipt(&state, &unit.row["create"])?;
         let missing_launch = !unit.row["create"]["receipt"].is_null()
             && (receipt.is_null() || receipt["category"] == "unknown");

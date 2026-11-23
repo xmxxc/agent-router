@@ -142,6 +142,192 @@ for line in sys.stdin:
             self.assertEqual((self.root/'events').read_text().splitlines(), ['unique'])
             self.cli('close', self.dispatch_id)
 
+    def test_close_request_not_forwarded(self):
+        self.check_uncertain_close(forward=False)
+
+    def test_close_executed_without_reply(self):
+        self.check_uncertain_close(forward=True)
+
+    def check_uncertain_close(self, forward):
+        requested, executed = [], []
+        def read(stream):
+            frame = stream.readline()
+            req = json.loads(frame)
+            if req['method'] == 'pane.close':
+                # See the durable intent while the client is still inside the RPC.
+                assignment = Path(self.env['WFC_STATE'])/'dispatches'/(self.dispatch_id+'.json')
+                intent = json.loads(assignment.read_bytes())['audit'][-1]
+                self.assertEqual(intent['result'], 'pending')
+                for key in ('dispatch','round','attempt'):
+                    self.assertEqual(intent[key], self.row[key])
+                for key in ('workspace','terminal','pane','service','nonce'):
+                    self.assertEqual(intent['target'][key], self.h[key])
+                requested.append(req['id'])
+                if not forward:
+                    return None
+            return frame
+        def reply(req, response):
+            if req['method'] == 'pane.close':
+                self.assertEqual(response['result']['type'], 'ok')
+                executed.append(req['id'])
+                return None
+            return response
+
+        with self.service.fault_proxy(reply, read_frame=read) as proxy:
+            self.dispatch(endpoint=proxy)
+            other, sibling_pid = self.sibling()
+            first = self.cli('close', self.dispatch_id)
+            self.assertEqual(first['result'], 'uncertain')
+            view = self.status()
+            self.assertTrue(view['closePending'])
+            self.assertEqual(view['status'], 'unknown')
+            self.assertEqual(view['audit'][0]['result'], 'uncertain')
+            self.submit('must not arrive', error='close still pending')
+            self.reconcile(error='close still pending')
+            if not forward:
+                self.assertTrue(view['backendAlive'])
+                Path(self.h['receipt']).unlink()
+                missing = self.status()
+                self.assertIsNone(missing['launch'])
+                self.assertTrue(missing['closePending'])
+                self.assertEqual(missing['audit'][0]['result'], 'uncertain')
+                self.unconfirmed_close('pending close')
+                self.assertFalse((self.root/'events').exists())
+                # An independent operator removes this pane on the real service.
+                self.service.api('pane.close', pane_id=self.h['pane'])
+            live.wait_for(lambda: self.cli('close', self.dispatch_id)['result'] == 'completed')
+            self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+            end = self.status()
+            self.assertFalse(end['closePending'])
+            self.assertEqual(end['worker']['state'], 'cancelled')
+            event, = end['audit']
+            self.assertEqual(event['result'], 'completed')
+            self.assertEqual(len(requested), 1)
+            self.assertEqual(executed, requested if forward else [])
+            self.assertEqual(self.service.api('pane.process_info', pane_id=other)['process_info']['shell_pid'], sibling_pid)
+            print(json.dumps(dict(dispatch=self.dispatch_id, forward=forward, requests=requested,
+                                  executed=executed, first=first['result'], confirmed=event['result'])))
+
+    def test_killed_close_client_leaves_queryable_intent(self):
+        from threading import Event
+        arrived, release = Event(), Event()
+        requests = []
+        def hold(stream):
+            frame = stream.readline()
+            req = json.loads(frame)
+            if req['method'] == 'pane.close':
+                requests.append(req['id'])
+                arrived.set()
+                self.assertTrue(release.wait(15))
+                return None
+            return frame
+        with self.service.fault_proxy(lambda req, reply: reply, read_frame=hold) as proxy:
+            self.dispatch(endpoint=proxy)
+            with subprocess.Popen([live.DRIVER, 'close', self.dispatch_id], env=self.env) as client:
+                try:
+                    self.assertTrue(arrived.wait(10))
+                finally:
+                    client.kill()
+                    client.wait(timeout=5)
+                    release.set()
+            view = self.status()
+            self.assertTrue(view['closePending'])
+            self.assertEqual(view['audit'][0]['result'], 'pending')
+            self.submit('blocked', error='close still pending')
+            self.unconfirmed_close('pending close')
+            self.assertEqual(len(requests), 1)
+            self.service.api('pane.close', pane_id=self.h['pane'])
+            live.wait_for(lambda: self.status()['backendAlive'] is False)
+            self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+            self.assertEqual(len(requests), 1)
+
+    def test_close_definitely_not_sent_allows_new_attempt(self):
+        hidden = self.root/'temporarily-offline.sock'
+        calls = []
+        armed = False
+        def intercept(req, reply):
+            nonlocal armed
+            if req['method'] == 'pane.close':
+                calls.append(req['id'])
+            if armed and req['method'] == 'session.snapshot':
+                path = Path(self.env['WFC_STATE'])/'dispatches'/(self.dispatch_id+'.json')
+                if json.loads(path.read_bytes())['audit']:
+                    # The final ownership guard has a real reply. The mutating
+                    # connection cannot be opened while the socket is absent.
+                    armed = False
+                    proxy.rename(hidden)
+            return reply
+        with self.service.fault_proxy(intercept) as proxy:
+            self.dispatch(endpoint=proxy)
+            armed = True
+            try:
+                self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'definitely-not-sent')
+            finally:
+                if hidden.exists():
+                    hidden.rename(proxy)
+            self.assertEqual(calls, [])
+            self.assertFalse(self.status()['closePending'])
+            self.submit('still active')
+            self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+            self.assertEqual(len(calls), 1)
+            self.assertEqual([e['result'] for e in self.status()['audit']], ['definitely-not-sent','completed'])
+            self.assertEqual((self.root/'events').read_text().splitlines(), ['still active'])
+            print(json.dumps(dict(dispatch=self.dispatch_id, initialRequests=0, retryRequests=calls)))
+
+    def test_named_status_during_done_then_exit(self):
+        self.worker.write_text("""import os, time, subprocess
+from pathlib import Path
+while not Path('finish-now').exists():
+    time.sleep(.02)
+Path(os.environ['WFC_REPORT']).write_text('finished')
+reply = subprocess.check_output([os.environ['WFC_BIN'], 'done', '--attempt', os.environ['WFC_ATTEMPT'],
+                                 '--report', os.environ['WFC_REPORT']])
+Path('done-received').write_bytes(reply)
+""")
+        armed = False
+        def gate(req, reply):
+            nonlocal armed
+            if armed and req['method'] == 'ping':
+                armed = False
+                (self.root/'finish-now').touch()
+                live.wait_for(lambda: (self.root/'done-received').exists())
+                live.wait_for(lambda: json.loads(Path(self.h['receipt']).read_bytes())['category']=='process_exited')
+            return reply
+        with self.service.fault_proxy(gate) as proxy:
+            self.dispatch(endpoint=proxy)
+            armed = True
+            v = self.status()
+            self.assertEqual(v['status'], 'completed')
+            done, = v['messages']
+            self.assertEqual(done['messageId'], json.loads((self.root/'done-received').read_bytes())['messageId'])
+            self.assertEqual(v['launch']['category'], 'process_exited')
+            self.assertEqual(v['launch']['exitCode'], 0)
+            self.assertEqual(v['worker']['exit_code'], v['launch']['exitCode'])
+            self.cli('close', self.dispatch_id)
+
+    def test_invalid_audit_fields_and_endpoint(self):
+        self.dispatch()
+        base = [live.DRIVER, 'herdr-reconcile', self.dispatch_id, '--pane', self.h['pane'],
+                '--terminal', self.h['terminal']]
+        for fields, expected in [
+            (['--actor','  ','--evidence','checked'], 1),
+            (['--actor','tester','--evidence',''], 1),
+            (['--actor','--evidence','checked'], 2),
+            (['--actor','tester','--evidence'], 2),
+            (['--evidence','checked'], 2),
+        ]:
+            p = subprocess.run(base+fields, env=self.env, capture_output=True)
+            self.assertEqual(p.returncode, expected, p.stderr)
+        self.assertEqual(self.status()['audit'], [])
+        self.cli('close', self.dispatch_id)
+        state = self.root/'invalid-endpoint-state'
+        env = self.env | {'WFC_HERDR_ENDPOINT':b'/tmp/\xff','WFC_STATE':str(state)}
+        p = subprocess.run([live.DRIVER,'dispatch','--backend','herdr','--host','codex','--cwd',self.root,
+                            '--task',self.task,'--report',self.root/'report.md'],env=env,capture_output=True)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn(b'UTF-8', p.stderr)
+        self.assertFalse(any(p.is_file() for p in state.rglob('*')))
+
     def test_writer_survives_pane_close(self):
         self.dispatch(script=Path(live.__file__).with_name('job_control.py'))
         other, pid = self.sibling()
