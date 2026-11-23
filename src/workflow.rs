@@ -231,6 +231,7 @@ impl<'a> Dispatch<'a> {
             {
                 record["tmuxSocket"] = json!(backend::tmux_socket()?);
             }
+            record["executionId"] = record["attempt"].clone();
             Some(host.prepare(&state, &mut record)?)
         } else {
             None
@@ -523,6 +524,9 @@ fn status_with_history(
     for record in &mut dispatches {
         if record["host"].is_string() {
             let (worker, inspection) = backend::observe(&state, record)?;
+            if let Some(effect) = inspection.get("closeEffect") {
+                record["closeEffect"] = effect.clone();
+            }
             record["worker"] = worker;
             record["backendResult"] = inspection["result"].clone();
             record["backendAlive"] = if inspection["alive"] == true && inspection["owned"] != true {

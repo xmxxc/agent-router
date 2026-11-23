@@ -88,8 +88,51 @@ pub fn create(state: &Path, row: &Value, launch: Launch) -> Result<Value> {
     call(
         state,
         row,
-        json!({"op":"create","cwd":row["cwd"],"label":row["label"],"argv":launch.argv,"env":launch.env}),
+        json!({"op":"create","executionId":row["executionId"],"freshDispatch":true,"cwd":row["cwd"],"label":row["label"],"argv":launch.argv,"env":launch.env}),
     )
+}
+
+fn close_operation(row: &Value) -> Result<String> {
+    let attempt = row["attempt"]
+        .as_str()
+        .filter(|v| valid_identity(v, "a-"))
+        .context("invalid close attempt")?;
+    Ok(format!("close:{attempt}"))
+}
+
+fn legacy_selector(row: &Value) -> Result<&str> {
+    if let Some(id) = receipt_id(row)? {
+        return Ok(id);
+    }
+    ensure!(
+        row["create"].is_null(),
+        "missing confirmation of the original native launch"
+    );
+    let attempt = row["attempt"]
+        .as_str()
+        .filter(|s| valid_identity(s, "a-"))
+        .context("missing legacy attempt")?;
+    // An external ID in an old row can identify a launch, but cannot prove
+    // which public attempt owns it. Register the attempt itself with #31.
+    if let Some(external) = row["legacyExecutionId"].as_str() {
+        ensure!(
+            !valid_identity(external, "a-") || external == attempt,
+            "legacy execution does not match this attempt"
+        );
+    }
+    Ok(attempt)
+}
+
+fn legacy_launch_hint(row: &Value) -> Result<Option<&str>> {
+    let id = row["legacyExecutionId"]
+        .as_str()
+        .filter(|id| valid_launch(id));
+    let hint = row["legacyLaunchId"].as_str();
+    ensure!(
+        hint.is_none_or(valid_launch) && id.zip(hint).is_none_or(|(a, b)| a == b),
+        "conflicting legacy launch hints"
+    );
+    Ok(hint.or(id))
 }
 
 fn existing(state: &Path, row: &Value, op: &str) -> Result<Value> {
@@ -97,19 +140,24 @@ fn existing(state: &Path, row: &Value, op: &str) -> Result<Value> {
         .as_str()
         .filter(|v| valid_identity(v, "a-"))
         .context("missing existing execution identity")?;
-    let launch = receipt_id(row)?;
     let mut request = json!({"op":op});
-    // A new native create with a lost response already reserved this unique
-    // dispatch in #31. Let the provider look up that registration. Supplying
-    // the outer attempt as a legacy ID would select a different execution.
-    let legacy = row["create"]
-        .is_null()
-        .then(|| row["legacyExecutionId"].as_str().unwrap_or(attempt));
-    if let Some(id) = launch.or(legacy) {
-        request["legacyExecutionId"] = json!(id);
+    if !row["executionId"].is_null() {
+        ensure!(
+            row["executionId"] == attempt,
+            "execution identity does not match this attempt"
+        );
+        request["executionId"] = json!(attempt);
+    } else {
+        request["legacyExecutionId"] = json!(legacy_selector(row)?);
+        if let Some(pane) = row.get("legacyWorkerPane") {
+            request["legacyWorkerPane"] = pane.clone();
+        }
+        if let Some(hint) = legacy_launch_hint(row)? {
+            request["legacyLaunchId"] = json!(hint);
+        }
     }
-    if let Some(pane) = row.get("legacyWorkerPane") {
-        request["legacyWorkerPane"] = pane.clone();
+    if op == "close" {
+        request["closeOperationId"] = json!(close_operation(row)?);
     }
     call(state, row, request)
 }
@@ -118,7 +166,8 @@ fn receipt_id(row: &Value) -> Result<Option<&str>> {
     let create = &row["create"];
     if !create.is_null() {
         // R2 only created first-round assignments and stored the reply inline.
-        let r2 = row["round"] == 1
+        let r2 = row["executionId"].is_null()
+            && row["round"] == 1
             && ["dispatch", "attempt", "round"]
                 .iter()
                 .all(|k| create.get(k).is_none());
@@ -146,8 +195,65 @@ fn receipt_id(row: &Value) -> Result<Option<&str>> {
     Ok(Some(stem))
 }
 
-fn private_receipt(state: &Path, row: &Value) -> Result<Value> {
-    let Some(stem) = receipt_id(row)? else {
+fn valid_launch(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+// The service resolves a lost create response using the execution registered
+// before launch. Only read the receipt under this state for that exact launch.
+fn inspect_launch<'a>(
+    state: &Path,
+    row: &'a Value,
+    inspection: &'a Value,
+) -> Result<Option<&'a str>> {
+    let known = receipt_id(row)?;
+    if inspection["result"] != "accepted" {
+        return Ok(known);
+    }
+    if row["executionId"].is_null() {
+        let selector = legacy_selector(row)?;
+        if inspection["launchId"].is_null() {
+            ensure!(
+                legacy_launch_hint(row)?.is_none() || known.is_some(),
+                "unconfirmed legacy launch hint"
+            );
+            return Ok(known);
+        }
+        ensure!(
+            inspection["legacyExecutionId"] == selector,
+            "inspection identifies another legacy execution"
+        );
+    } else {
+        ensure!(
+            inspection["executionId"] == row["attempt"] && row["executionId"] == row["attempt"],
+            "inspection identifies another attempt"
+        );
+    }
+    let id = inspection["launchId"]
+        .as_str()
+        .filter(|id| valid_launch(id))
+        .context("missing original launch identity")?;
+    ensure!(
+        known.is_none_or(|known| known == id)
+            && legacy_launch_hint(row)?.is_none_or(|hint| hint == id),
+        "inspection identifies another launch"
+    );
+    let path = state
+        .canonicalize()?
+        .join("launches")
+        .join(format!("{id}.json"));
+    ensure!(
+        inspection["receipt"].as_str().map(Path::new) == Some(path.as_path()),
+        "unexpected launch receipt path"
+    );
+    Ok(Some(id))
+}
+
+fn private_receipt(state: &Path, launch: Option<&str>) -> Result<Value> {
+    let Some(stem) = launch else {
         return Ok(Value::Null);
     };
     match File::open(state.join("launches").join(format!("{stem}.json"))) {
@@ -206,27 +312,71 @@ fn exited(evidence: &Value) -> Option<Value> {
         .then(|| json!({"state":"exited", "exit_code":code, "signal":null}))
 }
 
+// The close effect describes the session. Its supervisor can still publish
+// a process exit later. Both archived reads and close replays use this view.
+fn closed_worker(state: &Path, row: &Value, saved: &Value) -> Result<Value> {
+    let worker = &saved["worker"];
+    if saved["closeEffect"] == "session_closed" && worker["state"] == "cancelled" {
+        let known = receipt_id(row)?;
+        let id = match saved.get("launchId") {
+            Some(launch) => launch.as_str().filter(|id| {
+                valid_launch(id)
+                    && match known {
+                        Some(known) => *id == known,
+                        None if row["executionId"].is_null() => {
+                            let bound = saved["legacyExecutionId"].as_str();
+                            bound.is_some()
+                                && legacy_selector(row).ok() == bound
+                                && legacy_launch_hint(row)
+                                    .is_ok_and(|hint| hint.is_none_or(|hint| hint == *id))
+                        }
+                        None => {
+                            saved["executionId"] == row["attempt"]
+                                && row["executionId"] == row["attempt"]
+                        }
+                    }
+            }),
+            // R3 kept the launch binding only in the immutable create reply.
+            None if ["dispatch", "round", "attempt"]
+                .iter()
+                .all(|k| !row[*k].is_null() && row["create"][*k] == row[*k]) =>
+            {
+                known
+            }
+            // R2 embedded the original, unscoped create reply in the assignment.
+            // Verify its selector with the backend before enriching an R3 archive.
+            None if known.is_some() && row["round"] == 1 && row["executionId"].is_null() => {
+                match existing(state, row, "inspect") {
+                    Ok(reply) if reply["result"] == "accepted" && reply["alive"] == false => known,
+                    _ => None,
+                }
+            }
+            None => None,
+        };
+        if let Some(exit) = exited(&private_receipt(state, id)?) {
+            return Ok(exit);
+        }
+    }
+    Ok(worker.clone())
+}
+
 pub fn observe(state: &Path, row: &Value) -> Result<(Value, Value)> {
     let saved = archive(state, row)?.unwrap_or(Value::Null);
     if confirmed(&saved) {
         return Ok((
-            saved["worker"].clone(),
-            json!({"result":"completed","alive":false}),
+            closed_worker(state, row, &saved)?,
+            json!({"result":"completed","alive":false,"closeEffect":saved["closeEffect"]}),
         ));
     }
     let mut inspection = existing(state, row, "inspect")
         .unwrap_or_else(|e| json!({"result":"uncertain","diagnostic":e.to_string()}));
-    // With a lost create reply, an empty lookup alone does not prove that
-    // the native request has finished. It may still be reserving its launch.
-    if row["create"]["result"] == "uncertain"
-        && row["create"]["receipt"].is_null()
-        && inspection["alive"] == false
-    {
-        inspection = json!({"result":"uncertain","diagnostic":"missing confirmation of the original native launch"});
-    }
-    // inspect may take long enough for the host to exit. Sample the receipt
-    // belonging to this assignment after that observation and before any kill.
-    let evidence = private_receipt(state, row)?;
+    let evidence = match inspect_launch(state, row, &inspection) {
+        Ok(id) => private_receipt(state, id)?,
+        Err(e) => {
+            inspection = json!({"result":"uncertain","diagnostic":e.to_string()});
+            Value::Null
+        }
+    };
     let worker = if let Some(exit) = exited(&evidence) {
         exit
     } else if archived_exit(&saved) {
@@ -234,6 +384,7 @@ pub fn observe(state: &Path, row: &Value) -> Result<(Value, Value)> {
     } else if matches!(evidence["category"].as_str(), Some("started") | None)
         && inspection["alive"] == true
         && inspection["owned"] == true
+        && inspection["workerBound"] == true
     {
         json!({"state":"running"})
     } else {
@@ -250,8 +401,11 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
     lock.lock()?;
     let mut receipt = json!({"dispatch":id,"operation":"close","result":"completed","round":row["round"],"attempt":row["attempt"]});
     if let Some(saved) = archive(state, row)?.filter(confirmed) {
-        if let Some(effect) = saved.get("closeEffect") {
-            receipt["closeEffect"] = effect.clone();
+        receipt["worker"] = closed_worker(state, row, &saved)?;
+        for field in ["closeOperationId", "closeEffect"] {
+            if let Some(value) = saved.get(field) {
+                receipt[field] = value.clone();
+            }
         }
         receipt["diagnostic"] = json!("session was already gone");
         return Ok(receipt);
@@ -269,6 +423,7 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
             "tmux session is not owned by this dispatch"
         );
     }
+    let launch = inspect_launch(state, row, &observed)?;
     let answer = existing(state, row, "close")?;
     ensure!(
         answer["result"] == "completed",
@@ -283,7 +438,7 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
             if before["state"] == "exited" {
                 before
             } else {
-                exited(&private_receipt(state, row)?)
+                exited(&private_receipt(state, launch)?)
                     .context("close uncertain: missing same-attempt worker exit evidence")?
             }
         }
@@ -291,11 +446,17 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
         Some("session_closed") => json!({"state":"cancelled","exit_code":null,"signal":null}),
         _ => bail!("close uncertain: backend did not confirm the close effect"),
     };
+    ensure!(
+        answer["closeOperationId"] == close_operation(row)?,
+        "close uncertain: backend did not confirm the close operation"
+    );
+    receipt["closeOperationId"] = answer["closeOperationId"].clone();
     if answer["closeEffect"] == "already_absent" {
         receipt["diagnostic"] = json!("session was already gone");
     }
     receipt["closeEffect"] = answer["closeEffect"].clone();
-    let snapshot = json!({"dispatch":id,"round":row["round"],"attempt":row["attempt"],
+    receipt["worker"] = worker.clone();
+    let snapshot = json!({"launchId":launch, "executionId":row["executionId"], "legacyExecutionId":observed["legacyExecutionId"], "closeOperationId":answer["closeOperationId"], "dispatch":id,"round":row["round"],"attempt":row["attempt"],
         "worker":worker,"closeEffect":answer["closeEffect"]});
     let path = closed_path(state, row)?;
     write_json(&path, &snapshot, None)?;
@@ -305,6 +466,24 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovered_launch_requires_the_registered_attempt_and_receipt_path() -> Result<()> {
+        let state = std::env::temp_dir().canonicalize()?;
+        let launch = "0123456789abcdef0123456789abcdef";
+        let row = json!({"dispatch":"d-12345678","attempt":"a-123456789abc","round":2,
+            "executionId":"a-123456789abc",
+            "create":{"result":"uncertain","dispatch":"d-12345678","attempt":"a-123456789abc","round":2}});
+        let mut answer = json!({"result":"accepted","executionId":row["attempt"],"launchId":launch,
+            "receipt":state.join("launches").join(format!("{launch}.json"))});
+        assert_eq!(inspect_launch(&state, &row, &answer)?, Some(launch));
+        answer["executionId"] = json!("a-23456789abcd");
+        assert!(inspect_launch(&state, &row, &answer).is_err());
+        answer["executionId"] = row["attempt"].clone();
+        answer["launchId"] = json!("ffffffffffffffffffffffffffffffff");
+        assert!(inspect_launch(&state, &row, &answer).is_err());
+        Ok(())
+    }
 
     #[test]
     fn terminal_evidence_belongs_to_the_current_attempt() {
