@@ -584,7 +584,7 @@ struct Inbox {
     dir: PathBuf,
     messages: Vec<Message>,
     // The lock lives on a stable file because save replaces the data file.
-    _lock: File,
+    lock: PublishLock,
 }
 
 fn lock_file(dir: &Path) -> Result<File> {
@@ -619,10 +619,33 @@ fn lock_file(dir: &Path) -> Result<File> {
     Ok(lock)
 }
 
-pub(super) fn lock_for_publish(dir: &Path) -> Result<File> {
+pub(super) struct PublishLock {
+    _file: File,
+    #[cfg(target_os = "linux")]
+    dir: PathBuf,
+}
+
+impl PublishLock {
+    fn held(dir: &Path, file: File) -> Self {
+        #[cfg(not(target_os = "linux"))]
+        let _ = dir;
+        Self {
+            _file: file,
+            #[cfg(target_os = "linux")]
+            dir: dir.to_owned(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn dir(&self) -> &Path {
+        &self.dir
+    }
+}
+
+pub(super) fn lock_for_publish(dir: &Path) -> Result<PublishLock> {
     let lock = lock_file(dir)?;
     lock.lock().context("lock controller messages")?;
-    Ok(lock)
+    Ok(PublishLock::held(dir, lock))
 }
 
 pub(super) fn sync_directory(_dir: &Path) -> Result<()> {
@@ -757,12 +780,12 @@ impl Inbox {
         Self::read_locked(dir, lock_for_publish(dir)?)
     }
 
-    fn read_locked(dir: &Path, lock: File) -> Result<Self> {
+    fn read_locked(dir: &Path, lock: PublishLock) -> Result<Self> {
         let messages = Self::snapshot(dir)?;
         Ok(Self {
             dir: dir.to_owned(),
             messages,
-            _lock: lock,
+            lock,
         })
     }
 
@@ -773,7 +796,10 @@ impl Inbox {
             Err(TryLockError::WouldBlock) => return Ok(None),
             Err(TryLockError::Error(e)) => return Err(e).context("lock controller messages"),
         }
-        Ok(Some(Self::read_locked(state, lock)?))
+        Ok(Some(Self::read_locked(
+            state,
+            PublishLock::held(state, lock),
+        )?))
     }
 
     fn claim(
@@ -849,6 +875,7 @@ impl Inbox {
         if let Some(prior) = prior {
             return Ok(Some(prior.receipt(true)));
         }
+        self.require_claude_resume_adoption(row)?;
         let resume = super::assignment::resume_audit(row);
         if let Some(event) = resume {
             ensure!(
@@ -866,9 +893,10 @@ impl Inbox {
                         && r["report"].as_str().map(Path::new) == Some(report)
                 });
             ensure!(
-                !reused_report && !history().any(|m| (m.worker.round != worker.round
-                    || m.worker.attempt != worker.attempt)
-                    && m.report.as_deref() == Some(report)),
+                !reused_report
+                    && !history().any(|m| (m.worker.round != worker.round
+                        || m.worker.attempt != worker.attempt)
+                        && m.report.as_deref() == Some(report)),
                 "ambiguous report for {}; supply --attempt",
                 worker.dispatch
             );
@@ -893,12 +921,24 @@ impl Inbox {
         })
     }
 
+    fn require_claude_resume_adoption(&self, row: &Value) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if row["host"] == "claude" && super::assignment::resume_audit(row).is_some() {
+            super::host::claude::resume_adopted(&self.lock, row)
+                .context("Claude resume adoption is unconfirmed")?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (row, &self.lock);
+        Ok(())
+    }
+
     fn require_question_round(
         &self,
         assignment: &Assignment,
         row: &Value,
         attempt: Option<&str>,
     ) -> Result<()> {
+        self.require_claude_resume_adoption(row)?;
         let worker = &assignment.worker;
         let dispatch = worker.dispatch.as_str();
         let messages = || {
@@ -932,7 +972,8 @@ impl Inbox {
         });
         let pending_resume = attempt.is_some()
             && controller::worker_callback().is_some()
-            && super::assignment::resume_audit(row).is_some_and(|event| event["result"] == "pending");
+            && super::assignment::resume_audit(row)
+                .is_some_and(|event| event["result"] == "pending");
         ensure!(
             !confirmed_done
                 && (pending_resume
