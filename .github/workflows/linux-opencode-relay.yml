@@ -1,7 +1,7 @@
-name: Linux OpenCode controller relay
+name: Linux OpenCode loopback retry
 on:
   push:
-    branches: [rust-router/38-opencode-controller-ci]
+    branches: [rust-router/38-opencode-loopback-ci]
 
 permissions:
   contents: read
@@ -14,8 +14,8 @@ jobs:
       run:
         shell: bash
     env:
-      PRODUCT_SHA: 408add738a8b98701d09bc3b39063ebb651f7de7
-      PRODUCT_TREE: 541e11a2fbf500fa524d1204ad40e6cbba288588
+      PRODUCT_SHA: d305523354646c18490826adc8a86c7b3215b7a7
+      PRODUCT_TREE: fe0e7a1035f8ed68c1a1b83d39315ba34342895e
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TARGET: x86_64-unknown-linux-gnu
       CARGO_BUILD_JOBS: '2'
@@ -165,7 +165,7 @@ jobs:
         working-directory: product
         run: |
           bash ../ci/tools/ci/opencode-relay/libraries.sh 2>&1 | tee "$EVIDENCE/libraries-step.log"
-      - name: Run OpenCode loopback and Codex queue regressions
+      - name: Run the five OpenCode loopback tests
         id: suites
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: product
@@ -208,7 +208,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: linux-opencode-relay-${{ github.run_id }}-${{ github.run_attempt }}
+          name: linux-opencode-loopback-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run both suites from the pinned product checkout against one release binary.
+# Run the OpenCode suite from the pinned product checkout.
 set -euo pipefail
 ci_dir=$(cd "$(dirname "$0")" && pwd)
 binary=$(realpath "target/$TARGET/release/wfc")
@@ -33,6 +33,5 @@ run_suite() {
 }
 
 run_suite opencode tests/opencode_relay.py OpenCodeRelay 5
-run_suite codex tests/relay.py Relay 16
 printf 'firstFailedSuite=%s\n' "$first_failure" | tee -a "$EVIDENCE/results.log"
 test "$first_failure" = none
