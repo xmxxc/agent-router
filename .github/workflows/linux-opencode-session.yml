@@ -1,7 +1,6 @@
-name: Linux OpenCode worker session identity
+name: Linux OpenCode worker adoption
 on:
-  push:
-    branches: [rust-router/19-opencode-session-jammy-ci]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,9 +13,9 @@ jobs:
       run:
         shell: bash
     env:
-      PRODUCT_SHA: ff727814fc3332f261ef89aafb69b2ca7eeb73b5
-      PRODUCT_TREE: 219fdd04cde1f12136509bbc1545e9c131f2f083
-      PRODUCT_PARENTS: fdfcaec8adebaadd5046ce66603a23849d6e277e
+      PRODUCT_SHA: 502082bbe7c2cb4c18ac7cd3531d243188dee962
+      PRODUCT_TREE: 4725ebdc84fadf075f9d1818200c0f08744744fa
+      PRODUCT_PARENTS: ff727814fc3332f261ef89aafb69b2ca7eeb73b5
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TARGET: x86_64-unknown-linux-gnu
       CARGO_BUILD_JOBS: '2'
@@ -60,7 +59,8 @@ jobs:
             git -C ../native-input show -s --format='native-input=%H tree=%T'
             printf '%s  %s\n' 17e88863f3600672ab49182f217281b6fc4d3c762bde361935e436a95214d05c \
               ../native-input/vendor/zlib-1.3.1.tar.gz | sha256sum --check --strict
-            sha256sum vendor/INPUTS.sha256
+            printf '%s  %s\n' cde34fb936b455b1b461635ee30f9359121dae5df5f350eb9e711618169b6116 \
+              vendor/INPUTS.sha256 | sha256sum --check --strict
             sha256sum --check --strict vendor/INPUTS.sha256
           } 2>&1 | tee "$EVIDENCE/sources.log"
       - name: Set up Python
@@ -146,7 +146,15 @@ jobs:
           cargo fmt --all -- --check
           cargo test --release --locked --target "$TARGET" --bin wfc \
             workflow::host::opencode::tests:: -- --nocapture 2>&1 | tee "$EVIDENCE/identity.log"
-          grep -Eq '^test result: ok\. 4 passed; 0 failed; 0 ignored;' "$EVIDENCE/identity.log"
+          for case in legacy_first_real_user_opening_and_explicit_argv \
+            historical_root_sequence_and_adopted_id_ignore_other_roots \
+            unified_sessions_use_recorded_worktree_and_actual_user_sequence \
+            missing_conflicting_or_unreadable_launch_evidence_stops_resume \
+            lone_unmarked_legacy_fork_cannot_be_adopted_by_lookup \
+            private_launch_and_adoption_identity_are_bound; do
+            grep -F "test workflow::host::opencode::tests::$case ... ok" "$EVIDENCE/identity.log"
+          done
+          grep -Eq '^test result: ok\. 6 passed; 0 failed; 0 ignored;' "$EVIDENCE/identity.log"
       - name: Checksum the evidence
         if: ${{ always() }}
         run: |
