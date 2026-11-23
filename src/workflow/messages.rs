@@ -2,6 +2,8 @@
 //! before printing it, so another waiter cannot deliver the same messages.
 mod receipt;
 #[cfg(target_os = "linux")]
+mod recovery;
+#[cfg(target_os = "linux")]
 pub mod relay;
 pub use receipt::{Confirm, ACK_USAGE, RESOLVE_USAGE};
 use receipt::{Delivery, Resolution, State};
@@ -630,11 +632,7 @@ impl Inbox {
         host: &Value,
         failure: &super::startup::Failure<'_>,
     ) -> bool {
-        let worker = assignment.worker;
-        let key = format!(
-            "startup:{}:{}:{}",
-            worker.dispatch, worker.round, worker.attempt
-        );
+        let worker = &assignment.worker;
         if self.messages.iter().any(|m| {
             m.worker.dispatch == worker.dispatch
                 && m.worker.attempt == worker.attempt
@@ -642,6 +640,22 @@ impl Inbox {
         }) {
             return false;
         }
+        self.push_startup_failure(assignment, host, failure);
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn push_startup_failure(
+        &mut self,
+        assignment: Assignment,
+        host: &Value,
+        failure: &super::startup::Failure<'_>,
+    ) {
+        let worker = assignment.worker;
+        let key = format!(
+            "startup:{}:{}:{}",
+            worker.dispatch, worker.round, worker.attempt
+        );
         let mut message = Message::new(self.messages.len() as u64 + 1, worker, Some(key));
         message.report = assignment.report;
         message.additional_fields = Map::from_iter([
@@ -653,28 +667,6 @@ impl Inbox {
         ]);
         message.body_hash = Some(message.computed_hash());
         self.messages.push(message);
-        true
-    }
-
-    #[cfg(target_os = "linux")]
-    fn recover_startups(&mut self, candidates: Vec<RecoverableStartup>) -> Result<()> {
-        let mut changed = false;
-        for candidate in candidates {
-            if !candidate.current() {
-                continue;
-            }
-            let launch = candidate.receipt["launchId"]
-                .as_str()
-                .context("missing launch ID")?;
-            if let Ok(Some(failure)) = super::startup::tmux_failure(launch, &candidate.receipt) {
-                changed |=
-                    self.append_startup_failure(candidate.assignment, &candidate.host, &failure);
-            }
-        }
-        if changed {
-            self.save().context("recover confirmed startup failure")?;
-        }
-        Ok(())
     }
 
     fn validate_done(
@@ -826,82 +818,6 @@ impl Inbox {
     }
 }
 
-#[cfg(target_os = "linux")]
-struct RecoverableStartup {
-    path: PathBuf,
-    stamp: fs::Metadata,
-    _file: File,
-    assignment: Assignment,
-    host: Value,
-    receipt: Value,
-}
-
-#[cfg(target_os = "linux")]
-impl RecoverableStartup {
-    fn current(&self) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        fs::symlink_metadata(&self.path).is_ok_and(|current| {
-            current.is_file()
-                && current.dev() == self.stamp.dev()
-                && current.ino() == self.stamp.ino()
-                && current.ctime() == self.stamp.ctime()
-                && current.ctime_nsec() == self.stamp.ctime_nsec()
-                && current.len() == self.stamp.len()
-        })
-    }
-}
-
-// Read only published assignments and their verified terminal receipts. The
-// file pins the read generation; the locked publisher only rechecks metadata.
-#[cfg(target_os = "linux")]
-fn discover_startup_recovery(
-    state: &Path,
-    dispatch: Option<&str>,
-    scope: Option<&str>,
-) -> Vec<RecoverableStartup> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let dir = state.join("dispatches");
-    let ids = dispatch.map_or_else(
-        || super::assignment::ids(&dir).unwrap_or_default(),
-        |id| [id.to_owned()].into(),
-    );
-    ids.into_iter()
-        .filter_map(|id| {
-            let path = dir.join(format!("{id}.json"));
-            let file = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(&path)
-                .ok()?;
-            let stamp = file.metadata().ok()?;
-            if !stamp.is_file() {
-                return None;
-            }
-            let row = super::decode_record(file.try_clone().ok()?, &path).ok()?;
-            if !super::assignment::identified(&row)
-                || row["createPending"] == true
-                || !row["publicationDiagnostic"].is_null()
-                || !row["controllerOwner"].is_null()
-                || !row["scope"].as_str().is_some_and(|bound| {
-                    !bound.is_empty() && scope.is_none_or(|scope| scope == bound)
-                })
-            {
-                return None;
-            }
-            let receipt = super::backend::verified_unconfirmed_tmux_receipt(state, &row).ok()??;
-            Some(RecoverableStartup {
-                path,
-                stamp,
-                _file: file,
-                assignment: Assignment::deserialize(&row).ok()?,
-                host: row["host"].clone(),
-                receipt,
-            })
-        })
-        .collect()
-}
-
 #[cfg(all(test, target_os = "linux"))]
 mod startup_recovery_tests {
     use super::*;
@@ -934,20 +850,36 @@ mod startup_recovery_tests {
                 "backend":"tmux","host":"codex","create":{"result":"uncertain","category":"process_exited",
                     "dispatch":dispatch,"round":round,"attempt":attempt,"exitCode":17,"receipt":receipt}});
             super::super::write_json(&path, &row, None)?;
-            assert!(
-                discover_startup_recovery(&state, Some(dispatch), Some("wrong-scope")).is_empty()
-            );
-            let lost = discover_startup_recovery(&state, Some(dispatch), Some(scope));
+            let mut scan = recovery::Scan::default();
+            let mut read = |scope| scan.batch(&state, Some(dispatch), Some(scope), recovery::SLICE);
+            assert!(read("wrong-scope").is_empty());
+            let lost = read(scope);
             assert_eq!(lost.len(), 1);
             let mut replaced = row.clone();
             replaced["attempt"] = json!("a-aaaaaaaaaaaa");
             super::super::write_json(&path, &replaced, None)?;
             let mut inbox = Inbox::open(&state)?;
-            inbox.recover_startups(lost)?;
+            inbox.recover_startups(&mut scan, lost)?;
             assert!(inbox.messages.is_empty());
             drop(inbox);
 
             super::super::write_json(&path, &row, None)?;
+            let lost = scan.batch(&state, Some(dispatch), Some(scope), recovery::SLICE);
+            assert_eq!(lost.len(), 1);
+            let pending = path.with_extension("pending");
+            super::super::write_json(&pending, &replaced, None)?;
+            let mut inbox = Inbox::open(&state)?;
+            inbox.recover_startups(&mut scan, lost)?;
+            assert!(inbox.messages.is_empty());
+            drop(inbox);
+            assert!(scan
+                .batch(&state, Some(dispatch), Some(scope), recovery::SLICE)
+                .is_empty());
+            fs::write(&pending, b"{")?;
+            assert!(scan
+                .batch(&state, Some(dispatch), Some(scope), recovery::SLICE)
+                .is_empty());
+            super::super::write_json(&pending, &row, None)?;
             super::super::write_json(
                 &state.join("messages.json"),
                 &json!([{
@@ -957,9 +889,10 @@ mod startup_recovery_tests {
                 }]),
                 None,
             )?;
-            let recovered = discover_startup_recovery(&state, None, Some(scope));
+            let recovered = scan.batch(&state, Some(dispatch), Some(scope), recovery::SLICE);
+            assert_eq!(recovered.len(), 1);
             let mut inbox = Inbox::open(&state)?;
-            inbox.recover_startups(recovered)?;
+            inbox.recover_startups(&mut scan, recovered)?;
             assert_eq!(inbox.messages.len(), 1);
             assert_eq!(inbox.messages[0].message_id, "m-question");
             assert_eq!(inbox.messages[0].view()["type"], "question");
@@ -1349,18 +1282,27 @@ impl<'a> Wait<'a> {
         let state = state_dir()?;
         let token = controller::token(self.owner_token);
         let start = Instant::now();
+        #[cfg(target_os = "linux")]
+        let (mut scan, mut candidates) = (recovery::Scan::default(), Vec::new());
         loop {
             let preflight = || {
                 controller::Owners::read(&state)?.preflight(self.scope, token.as_deref(), "wait")
             };
             preflight()?;
             #[cfg(target_os = "linux")]
-            let recovery = discover_startup_recovery(&state, self.dispatch, self.scope);
+            if candidates.is_empty() {
+                let allowance = if self.timeout.is_zero() {
+                    recovery::SLICE
+                } else {
+                    self.timeout.saturating_sub(start.elapsed())
+                };
+                candidates = scan.batch(&state, self.dispatch, self.scope, allowance);
+            }
             let batch = match Inbox::try_open(&state)? {
                 Some(mut inbox) => {
                     preflight()?;
                     #[cfg(target_os = "linux")]
-                    inbox.recover_startups(recovery)?;
+                    inbox.recover_startups(&mut scan, std::mem::take(&mut candidates))?;
                     inbox.claim(self.dispatch, self.scope, State::Received)?
                 }
                 None => Vec::new(),
@@ -1368,6 +1310,10 @@ impl<'a> Wait<'a> {
             let remaining = self.timeout.saturating_sub(start.elapsed());
             if !batch.is_empty() || remaining.is_zero() {
                 return Ok(batch);
+            }
+            #[cfg(target_os = "linux")]
+            if candidates.is_empty() && scan.in_progress() {
+                continue;
             }
             std::thread::sleep(remaining.min(Duration::from_millis(100)));
         }

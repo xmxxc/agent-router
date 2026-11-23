@@ -534,6 +534,24 @@ class StartupFailure(unittest.TestCase):
         row = self.cli("status", "--dispatch", completed["dispatch"])["dispatches"][0]
         self.assertEqual([m["messageId"] for m in row["messages"]], [done["messageId"]])
 
+    def codex_capture(self):
+        thread = str(uuid.uuid4())
+        sessions = self.cwd / ".codex/sessions/2026/01/01"
+        sessions.mkdir(parents=True)
+        (sessions / f"rollout-time-{thread}.jsonl").write_text(json.dumps({
+            "type": "session_meta", "payload": {"id": thread, "source": "cli"},
+        }) + "\n")
+        queue = self.cwd / "bin/codex"
+        queue.parent.mkdir(exist_ok=True)
+        queue.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""\
+            import json
+            import sys
+            with open("queue-calls", "a") as log:
+                log.write(json.dumps(sys.argv[1:]) + "\\n")
+        """))
+        queue.chmod(0o700)
+        return self.cwd / "queue-calls", {"CODEX_THREAD_ID": thread, "PATH": f"{queue.parent}:{self.env['PATH']}"}
+
     @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
     def test_startup_notice_recovers_after_ledger_write_failure(self):
         self.start_tmux()
@@ -548,23 +566,9 @@ class StartupFailure(unittest.TestCase):
             self.assertFalse((self.state / "messages.json").exists())
             blocker.rmdir()
         ledger = self.state / "messages.json"
-        thread = str(uuid.uuid4())
-        sessions = self.cwd / ".codex/sessions/2026/01/01"
-        sessions.mkdir(parents=True)
-        (sessions / f"rollout-time-{thread}.jsonl").write_text(json.dumps({
-            "type": "session_meta", "payload": {"id": thread, "source": "cli"},
-        }) + "\n")
-        queue = self.cwd / "bin/codex"
-        queue.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""\
-            import json
-            import sys
-            with open("queue-calls", "a") as log:
-                log.write(json.dumps(sys.argv[1:]) + "\\n")
-        """))
-        queue.chmod(0o700)
-        self.cli("relay", "--scope", scope, "--codex", "--for", "1.5",
-                 extra={"CODEX_THREAD_ID": thread, "PATH": f"{queue.parent}:{self.env['PATH']}"})
-        call, = [json.loads(line) for line in (self.cwd / "queue-calls").read_text().splitlines()]
+        queue, extra = self.codex_capture()
+        self.cli("relay", "--scope", scope, "--codex", "--for", "1.5", extra=extra)
+        call, = [json.loads(line) for line in queue.read_text().splitlines()]
         prefix = "[router] Messages for the controller: "
         self.assertTrue(call[4].startswith(prefix))
         message, = json.loads(call[4][len(prefix):])["messages"]
@@ -605,6 +609,57 @@ class StartupFailure(unittest.TestCase):
         print(json.dumps({"case": scope, "generation": current["generation"], "dispatch": child["dispatch"],
                           "attempt": child["attempt"], "messageId": message["messageId"],
                           "staleOwnerRejected": True, "unscopedWaitRejected": True, "ackVerified": True}), flush=True)
+
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_startup_recovery_ignores_conflicting_reservations_and_keeps_neighbors(self):
+        self.start_tmux()
+        scope, other = "recovery-generations", "other-generation"
+        child, _ = self.stop_after_startup_decision(scope)
+        dispatch = child["dispatch"]
+        pending = self.state / "dispatches" / f"{dispatch}.pending"
+        exact = pending.read_bytes()
+        ledger = self.state / "messages.json"
+        queue, extra = self.codex_capture()
+        ready = []
+        for name in (scope, other):
+            worker = self.deploy(name, ["/bin/true"])
+            ready.append(self.cli("done", "--report", "report", "--attempt", worker["attempt"],
+                                  extra={"WFC_DISPATCH": worker["dispatch"]})["messageId"])
+
+        conflict = json.loads(exact)
+        conflict["attempt"] = "a-000000000001"
+        pending.write_text(json.dumps(conflict))
+        wait = ("wait", "--dispatch", dispatch, "--scope", scope, "--timeout", "0")
+        self.assertFalse(self.cli(*wait, code=3)["messages"])
+        for name in (scope, other):
+            self.cli("relay", "--scope", name, "--codex", "--for", ".8", extra=extra)
+        prefix = "[router] Messages for the controller: "
+        sent = [json.loads(json.loads(line)[4][len(prefix):])["messages"] for line in queue.read_text().splitlines()]
+        self.assertEqual([[message["messageId"] for message in batch] for batch in sent],
+                         [[ready[0]], [ready[1]]])
+        for message_id in ready:
+            self.assertEqual(self.cli("ack", message_id)["state"], "processed")
+
+        pending.write_bytes(b'{"dispatch":')
+        self.assertFalse(self.cli(*wait, code=3)["messages"])
+        self.cli("relay", "--scope", scope, "--codex", "--for", ".3", extra=extra)
+        self.assertEqual(len(queue.read_text().splitlines()), 2)
+        pending.unlink()
+        os.mkfifo(pending, 0o600)
+        self.assertFalse(self.cli(*wait, code=3)["messages"])
+        self.assertEqual(len(json.loads(ledger.read_text())), 2)
+
+        pending.unlink()
+        pending.write_bytes(exact)
+        notice, = self.cli(*wait)["messages"]
+        self.assertEqual((notice["dispatch"], notice["attempt"], notice["fault"]["exitCode"]),
+                         (dispatch, child["attempt"], 17))
+        self.check_ack(notice)
+        self.assertFalse(self.cli(*wait, code=3)["messages"])
+        self.assertEqual(len(json.loads(ledger.read_text())), 3)
+        print(json.dumps({"case": scope, "dispatch": dispatch, "attempt": child["attempt"],
+                          "messageId": notice["messageId"], "neighborAcks": ready,
+                          "conflictOrDamagePublished": False, "ackVerified": True}), flush=True)
 
     @contextmanager
     def read_only_history(self, history):
