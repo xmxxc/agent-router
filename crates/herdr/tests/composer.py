@@ -25,13 +25,27 @@ else:
 draft = {
     'ambiguous-footer': b'original draft',
     'compact-placeholder': b'AskCodextodoanything',
+    'styled-compact-draft': '\n  model · dir'.encode(),
+    'unstyled-compact-draft': '\n  model · dir'.encode(),
 }.get(reply_mode, b'')
 protect_draft = reply_worker
+compact = reply_mode in (
+    'styled-compact-empty', 'styled-compact-draft', 'unstyled-compact-empty', 'unstyled-compact-draft',
+)
 accepted = False
 submit_first = '--submit-first' in sys.argv[2:]
 
 
 def draw():
+    if compact:
+        background = b'\x1b[48;2;20;30;40m' if reply_mode.startswith('styled-') else b''
+        reset = b'\x1b[0m' if background else b''
+        footer = '  keys · help'
+        if reply_mode.endswith('-empty'):
+            footer = '  model · dir\r\n' + footer
+        os.write(1, b'\x1b[2J\x1b[H' + background + '› '.encode() + draft.replace(b'\n', b'\r\n') +
+                 reset + b'\r\n' + footer.encode() + b'\r\n')
+        return
     body = draft.replace(b' tail ', b'\r\n  tail ')
     if protect_draft and reply_mode != 'compact-placeholder':
         body += '\r\n  tail · value'.encode()
@@ -53,6 +67,7 @@ while True:
             Path('clear-draft').unlink()
             draft = b''
             protect_draft = False
+            compact = False
             draw()
         if accepted and Path('finish').exists():
             Path('finish').unlink()
