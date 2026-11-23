@@ -1,4 +1,4 @@
-name: Linux worker question regression
+name: Linux worker question and close regression
 on:
   push:
     branches: [rust-router/linux-ci-ask]
@@ -12,12 +12,15 @@ defaults:
 
 jobs:
   ask:
-    name: '#11 First-round questions and tmux'
+    name: '#11 R3 tmux and Herdr question/close'
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     env:
-      WFC_BUILD_ID: bd71b3771f17e9c8b3078f49462d8d57efb193ca
+      WFC_BUILD_ID: c5d641cafa1cf6700eeb92323933226662cba773
+      PRODUCT_TREE: 8b3b770d26ca0cf6c0c2a73ae5282c866b8d594b
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+      HERDR_SHA256: 14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d
+      TRIPLE: x86_64-unknown-linux-gnu
       EVIDENCE: ${{ github.workspace }}/linux-ask-evidence
       CARGO_BUILD_JOBS: '2'
       PYTHONUTF8: '1'
@@ -53,28 +56,53 @@ jobs:
         run: |
           git log -1 --format='Rust HEAD %H tree %T' | tee "$EVIDENCE/sources.log"
           test "$(git rev-parse HEAD)" = "$WFC_BUILD_ID"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
           git -C ../native-input log -1 --format='zlib source checkout HEAD %H tree %T' | tee -a "$EVIDENCE/sources.log"
           test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
-          sha256sum vendor/INPUTS.sha256 tools/check_tmux.py tests/relay.py | tee "$EVIDENCE/inputs.log"
+          sha256sum vendor/INPUTS.sha256 tests/dispatch.rs tools/check_tmux.py tests/relay.py \
+            tests/herdr_public.py crates/herdr/tests/live.py | tee "$EVIDENCE/inputs.log"
           sha256sum -c vendor/INPUTS.sha256 2>&1 | tee -a "$EVIDENCE/inputs.log"
           rustup toolchain install 1.96.1 --profile minimal 2>&1 | tee "$EVIDENCE/toolchain.log"
           { rustc -vV; cargo --version; zig version; python --version; } 2>&1 | tee -a "$EVIDENCE/toolchain.log"
           zlib=../native-input/vendor/zlib-1.3.1.tar.gz
           sha256sum "$zlib" | tee -a "$EVIDENCE/inputs.log"
           python tools/prepare.py --zlib-archive "$zlib" 2>&1 | tee -a "$EVIDENCE/inputs.log"
-      - name: Build the native wfc CLI
+      - name: Prime the pinned Wuffs package with bounded download retries
+        working-directory: product/vendor/libghostty-vt
+        run: |
+          url=https://deps.files.ghostty.org/wuffs-7411f488fe2e2c205c3d3b3d28638b7356522930.tar.gz
+          archive="$RUNNER_TEMP/wuffs.tar.gz"
+          {
+            printf 'Wuffs source %s\n' "$url"
+            curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+              --retry-max-time 120 --connect-timeout 15 --max-time 60 "$url" -o "$archive"
+            printf '%s  %s\n' 17877d346f7988651d6c62e45b2e3b05c86809a6442c5e34612374b2a9719a1c "$archive" | sha256sum -c
+            package=$(zig fetch "$archive")
+            printf 'Wuffs Zig package %s\n' "$package"
+            test "$package" = 'N-V-__8AAP5JWgCGP_AD0teWpa4krRvE9VPZzvviGdbmN4jI'
+          } 2>&1 | tee "$EVIDENCE/wuffs.log"
+      - name: Build and identify the native wfc ELF
         id: build
         working-directory: product
         run: |
-          cargo build --release --locked --bin wfc 2>&1 | tee "$EVIDENCE/build.log"
-          sha256sum target/release/wfc | tee "$EVIDENCE/binaries.log"
-          version=$(target/release/wfc --version)
+          cargo build --release --locked --target "$TRIPLE" --bin wfc 2>&1 | tee "$EVIDENCE/build.log"
+          bin="target/$TRIPLE/release/wfc"
+          sha256sum "$bin" | tee "$EVIDENCE/binaries.log"
+          version=$("$bin" --version)
           printf '%s\n' "$version" | tee -a "$EVIDENCE/binaries.log"
-          [[ "$version" == *"(Rust, x86_64-unknown-linux-gnu, release, build $WFC_BUILD_ID)" ]]
+          [[ "$version" == *"(Rust, $TRIPLE, release, build $WFC_BUILD_ID)" ]]
+          readelf -hW "$bin" | tee "$EVIDENCE/elf.log"
       - name: Run the focused dispatch question tests
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: product
-        run: cargo test --release --locked --test dispatch question 2>&1 | tee "$EVIDENCE/dispatch-question.log"
+        run: cargo test --release --locked --target "$TRIPLE" --test dispatch question 2>&1 | tee "$EVIDENCE/dispatch-question.log"
+      - name: Verify controller receipt recovery
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: |
+          cargo test --release --locked --target "$TRIPLE" --test dispatch \
+            controller_receipts_survive_restarts_and_concurrent_confirmation \
+            2>&1 | tee "$EVIDENCE/controller-receipts.log"
       - name: Ensure native tmux is available
         id: tmux
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
@@ -84,22 +112,50 @@ jobs:
             sudo apt-get install -y --no-install-recommends tmux 2>&1 | tee -a "$EVIDENCE/tmux-install.log"
           fi
           tmux -V | tee "$EVIDENCE/tmux-version.log"
-      - name: Run the Rust workspace tests
-        if: ${{ !cancelled() && steps.tmux.outcome == 'success' }}
-        working-directory: product
-        run: cargo test --workspace --release --locked 2>&1 | tee "$EVIDENCE/workspace-tests.log"
-      - name: Exercise public ask with a real tmux worker
+      - name: Exercise both public ask and close orders on real tmux
         if: ${{ !cancelled() && steps.tmux.outcome == 'success' }}
         working-directory: product
         run: |
-          python -Bu tools/check_tmux.py target/release/wfc -v Backend.test_public_question_reuses_terminal_evidence \
+          python -Bu tools/check_tmux.py "target/$TRIPLE/release/wfc" -v \
+            Backend.test_public_question_and_close_share_attempt_lock \
+            Backend.test_public_question_reuses_terminal_evidence \
+            Backend.test_revoke_and_close_a_retained_session_after_prestart_cancellation \
             2>&1 | tee "$EVIDENCE/tmux-ask.log"
       - name: Verify the relay question envelope
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: product
         run: |
-          python -Bu tests/relay.py target/release/wfc -v Relay.test_question_envelope_matches_python_json_separators \
+          python -Bu tests/relay.py "target/$TRIPLE/release/wfc" -v \
+            Relay.test_question_envelope_matches_python_json_separators \
             2>&1 | tee "$EVIDENCE/relay-question.log"
+      - name: Download and verify the Herdr 0.9.5 Linux release asset
+        id: herdr
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          asset=herdr-linux-x86_64
+          release="$GITHUB_SERVER_URL/herdrdev/herdr/releases/download/v0.9.5"
+          metadata="$GITHUB_API_URL/repos/herdrdev/herdr/releases/tags/v0.9.5"
+          cd "$RUNNER_TEMP"
+          curl --fail --silent --show-error --location --retry 3 "$metadata" \
+            | jq -e --arg asset "$asset" '.assets[] | select(.name == $asset) | {name,digest,browser_download_url}' \
+            | tee "$EVIDENCE/herdr-release.log"
+          jq -e --arg digest "sha256:$HERDR_SHA256" --arg url "$release/$asset" \
+            '.digest == $digest and .browser_download_url == $url' "$EVIDENCE/herdr-release.log"
+          curl --fail --silent --show-error --location --retry 3 "$release/$asset" -o "$asset"
+          printf '%s  %s\n' "$HERDR_SHA256" "$asset" | sha256sum -c | tee -a "$EVIDENCE/herdr-release.log"
+          chmod +x "$asset"
+          version=$("./$asset" --version)
+          printf '%s\n' "$version" | tee -a "$EVIDENCE/herdr-release.log"
+          test "$version" = 'herdr 0.9.5'
+      - name: Exercise public question replay and close on real Herdr
+        if: ${{ !cancelled() && steps.herdr.outcome == 'success' }}
+        working-directory: product
+        run: |
+          python -Bu tests/herdr_public.py "$RUNNER_TEMP/herdr-linux-x86_64" "target/$TRIPLE/release/wfc" -v \
+            PublicLifecycle.test_question_replays_after_herdr_close_intent \
+            PublicLifecycle.test_close_during_first_done_git_sample \
+            PublicLifecycle.test_opencode_prefill_only_sends_enter_for_this_attempt \
+            2>&1 | tee "$EVIDENCE/herdr-public.log"
       - name: Checksum the evidence logs
         if: ${{ always() }}
         run: |
@@ -109,7 +165,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ always() }}
         with:
-          name: linux-11-${{ env.WFC_BUILD_ID }}-attempt-${{ github.run_attempt }}
+          name: linux-11-r3-${{ env.WFC_BUILD_ID }}-attempt-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14
