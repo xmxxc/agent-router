@@ -201,7 +201,15 @@ impl<'a> Resume<'a> {
             "[router] Your session was interrupted and has been resumed. Check the worktree and what you already did, then continue"
         };
         let mut launch = options.prepare_worker(&state, &mut next, Some(opening))?;
-        if !row["codexHome"].is_null() && row["codexHome"] != next["codexHome"] {
+        if !row["codexHome"].is_null()
+            && row["codexHome"] != next["codexHome"]
+            && !row["codexHome"]
+                .as_str()
+                .zip(next["codexHome"].as_str())
+                .is_some_and(|(saved, current)| {
+                    host::matches_unresolved_codex_home(Path::new(saved), Path::new(current))
+                })
+        {
             return Ok(reconcile(
                 &row,
                 Value::Null,
@@ -364,6 +372,10 @@ fn conversation(old: &Value, next: &Value) -> Result<Uuid> {
         )?)
     };
     let home = Path::new(next["codexHome"].as_str().context("missing Codex home")?);
+    ensure!(
+        home.canonicalize()?.as_path() == home && home.is_dir(),
+        "configured Codex home is not a verified directory"
+    );
     let cwd = old["cwd"].as_str().context("missing original cwd")?;
     let root = home.join("sessions");
     let mut dirs = vec![root];

@@ -446,3 +446,30 @@ fn codex_home(cwd: &Path, settings: &Map<String, Value>) -> Result<PathBuf> {
     ensure!(path.to_str().is_some(), "Codex home must be UTF-8");
     Ok(path)
 }
+
+#[cfg(target_os = "linux")]
+pub(super) fn matches_unresolved_codex_home(saved: &Path, current: &Path) -> bool {
+    use std::path::Component;
+
+    // A canonical saved home must keep its identity even if the path becomes
+    // a symlink. Only the missing-directory fallback can contain "..".
+    if !saved.is_absolute() || !saved.components().any(|part| part == Component::ParentDir) {
+        return false;
+    }
+    let mut checked = PathBuf::new();
+    for part in saved.components() {
+        if part == Component::ParentDir {
+            checked.pop();
+            continue;
+        }
+        checked.push(part);
+        // Check before popping any component. A symlink followed by ".."
+        // resolves relative to the symlink's target, not its spelling.
+        if matches!(part, Component::Normal(_))
+            && !fs::symlink_metadata(&checked).is_ok_and(|metadata| metadata.is_dir())
+        {
+            return false;
+        }
+    }
+    checked.as_path() == current && saved.canonicalize().is_ok_and(|path| path == checked)
+}

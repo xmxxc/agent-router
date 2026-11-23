@@ -128,16 +128,24 @@ class Backend(unittest.TestCase):
             return result.stderr
         return json.loads(result.stdout)
 
-    def resume_fixture(self):
-        self.codex_home = self.root / "codex home"
-        self.codex_home.mkdir(exist_ok=True)
+    def resume_fixture(self, home_setting=None):
+        if home_setting is None:
+            self.codex_home = self.root / "codex home"
+            self.codex_home.mkdir(exist_ok=True)
+            home_setting = str(self.codex_home)
+        else:
+            self.codex_home = (self.work / home_setting).resolve()
         self.resume_config = self.work / "launch.json"
         worker = self.work / "resume-host.py"
         worker.write_text("""import json, os, sys, time
 from pathlib import Path
 attempt = os.environ['WFC_ATTEMPT']
 data = {k: os.environ.get(k) for k in ('WFC_ATTEMPT', 'WFC_ROUND', 'WFC_TASK', 'WFC_REPORT',
-                                      'WFC_DISPATCH', 'WFC_WORKER_CALLBACK', 'WFC_OWNER_TOKEN', 'VERSION')}
+                                      'WFC_DISPATCH', 'WFC_WORKER_CALLBACK', 'WFC_OWNER_TOKEN',
+                                      'CODEX_HOME', 'VERSION')}
+home = Path(os.environ['CODEX_HOME'])
+data['codexHomeExisted'] = home.is_dir()
+home.mkdir(parents=True, exist_ok=True)
 data['argv'] = sys.argv[1:]
 Path(attempt + '.tmp').write_text(json.dumps(data))
 Path(attempt + '.tmp').rename(attempt + '.json')
@@ -146,7 +154,7 @@ deadline = time.monotonic() + 30
 while time.monotonic() < deadline and not Path(attempt + '.quit').exists():
     time.sleep(.02)
 """)
-        self.resume_settings = {"env": {"CODEX_HOME": str(self.codex_home), "VERSION": "first"},
+        self.resume_settings = {"env": {"CODEX_HOME": home_setting, "VERSION": "first"},
                                 "hosts": {"codex": {"command": [sys.executable, str(worker)]}}}
         self.resume_config.write_text(json.dumps(self.resume_settings))
         (self.work / "task1").write_text("controlled task 1")
@@ -282,6 +290,53 @@ while time.monotonic() < deadline and not Path(attempt + '.quit').exists():
         self.assertEqual([m["messageId"] for m in row["messages"]], [question["messageId"], done["messageId"]])
         self.assertEqual([(a["fromAttempt"], a["toAttempt"], a["ownerGeneration"]) for a in row["audit"]],
                          [(attempt, resumed["attempt"], 2), (resumed["attempt"], later["attempt"], 2)])
+
+    def test_public_resume_relative_codex_home_created_after_dispatch(self):
+        hop = self.root / "home hop"
+        hop.mkdir()
+        relative = "../home hop/../codex home"
+        original, first = self.resume_fixture(relative)
+        dispatch, attempt = original["dispatch"], original["attempt"]
+        session = "11111111-2222-4333-8444-555555555555"
+        owner = {"WFC_OWNER_TOKEN": "owner-one"}
+        self.assertEqual(first["CODEX_HOME"], relative)
+        self.assertFalse(first["codexHomeExisted"])
+        self.assertEqual(original["codexHome"], str(self.work / relative))
+        self.end_resume_host(dispatch, attempt)
+
+        self.codex_home.rmdir()
+        missing = json.loads(self.resume_cli("resume", dispatch, code=1, **owner))
+        self.assertEqual(missing["error"], "lifecycle_reconcile_required")
+        self.rollout("21111111-2222-4333-8444-555555555555", "quoted: " + first["argv"][-1])
+        self.assertIn("cannot verify the original Codex conversation",
+                      self.resume_cli("resume", dispatch, code=1, **owner))
+        self.rollout(session, first["argv"][-1])
+
+        # A symlink in a component followed by ".." can change its meaning.
+        redirect = self.root / "redirect"
+        (redirect / hop.name).mkdir(parents=True)
+        redirected_home = redirect / self.codex_home.name
+        self.codex_home.rename(redirected_home)
+        hop.rmdir()
+        hop.symlink_to(redirect / hop.name, target_is_directory=True)
+        refused = json.loads(self.resume_cli("resume", dispatch, code=1, **owner))
+        self.assertIn("configured Codex home differs", refused["diagnostic"])
+        self.assertEqual(refused["error"], "lifecycle_reconcile_required")
+        row = self.resume_status(dispatch)
+        self.assertEqual(row["attempt"], attempt)
+        self.assertFalse(row.get("audit"))
+        hop.unlink()
+        hop.mkdir()
+        redirected_home.rename(self.codex_home)
+
+        resumed = self.resume_cli("resume", dispatch, **owner)
+        self.assertEqual((resumed["session"], resumed["round"]), (session, 1))
+        self.assertNotEqual(resumed["attempt"], attempt)
+        second = self.resumed_host(resumed["attempt"])
+        self.assertEqual(second["argv"][-2], session)
+        self.assertEqual(second["CODEX_HOME"], str(self.codex_home))
+        self.assertEqual(second["WFC_REPORT"], first["WFC_REPORT"])
+        self.end_resume_host(dispatch, resumed["attempt"])
 
     def test_public_resume_records_definite_spawn_failure(self):
         original, first = self.resume_fixture()
