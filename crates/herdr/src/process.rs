@@ -41,7 +41,13 @@ impl Process {
     }
 }
 
-pub(super) fn writers(info: &Value, pane: &str) -> Result<Vec<Process>> {
+pub(super) struct Writers {
+    // The first entry always has the observed identity of the PTY root.
+    pub known: Vec<Process>,
+    pub completeness: Result<()>,
+}
+
+pub(super) fn writers(info: &Value, pane: &str) -> Result<Writers> {
     let unknown = Failure::unknown("partial Herdr writer identity");
     if info["pane_id"] != pane {
         return Err(unknown);
@@ -52,25 +58,31 @@ pub(super) fn writers(info: &Value, pane: &str) -> Result<Vec<Process>> {
             .filter(|n| *n > 0)
             .ok_or(unknown)
     };
-    let mut pids = vec![pid(&info["shell_pid"])?];
+    let identity = |v: &Value| Process::observe(pid(v)?)?.ok_or(unknown);
+    let root = identity(&info["shell_pid"])?;
+    let mut known = vec![root];
+    let members = info
+        .get("foreground_processes")
+        .map(|v| v.as_array().ok_or(unknown))
+        .transpose()?;
+    let mut completeness = Ok(());
     if let Some(group) = info.get("foreground_process_group_id") {
-        pid(group)?;
-        if info["foreground_processes"]
-            .as_array()
-            .is_none_or(Vec::is_empty)
-        {
-            return Err(unknown);
+        if pid(group).is_err() || members.is_none_or(Vec::is_empty) {
+            completeness = Err(unknown);
         }
     }
-    if let Some(foreground) = info.get("foreground_processes") {
-        for entry in foreground.as_array().ok_or(unknown)? {
-            let id = pid(&entry["pid"])?;
-            if !pids.contains(&id) {
-                pids.push(id);
+    for member in members.into_iter().flatten() {
+        match identity(&member["pid"]) {
+            Ok(writer) => {
+                if !known.contains(&writer) {
+                    known.push(writer);
+                }
             }
+            Err(err) => completeness = Err(err),
         }
     }
-    pids.into_iter()
-        .map(|id| Process::observe(id)?.ok_or(unknown))
-        .collect()
+    Ok(Writers {
+        known,
+        completeness,
+    })
 }

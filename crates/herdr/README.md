@@ -5,9 +5,9 @@
 ## 调度器接入
 
 - 派发方在当前 owner 和 attempt 的锁内预留创建操作，选择显式 endpoint 或 `WFC_HERDR_ENDPOINT`。把私有启动器的 argv、cwd 和 label 交给 `Handle::create`。它在创建外部资源前，以及每次取得新身份后调用保存函数。保存函数应同步提交私有记录。创建未确认时用已落盘的记录观察或显式对账。
-- 后续调用直接反序列化原 handle。`inspect` 核查进程存活，`read` 返回画面、版本号和截断标记。`submit` 前持久认领输入，整个发送和 Codex 草稿观察期间持有该 dispatch 的输入锁。OpenCode 首派可在同一把锁内对已交给 argv 的 brief 调用一次 `activate_opencode_prompt`。
+- 后续调用直接反序列化本 crate 保存的原 handle。`inspect` 核查进程存活，`read` 返回画面、版本号和截断标记。`submit` 前持久认领输入，整个发送和 Codex 草稿观察期间持有该 dispatch 的输入锁。OpenCode 首派可在同一把锁内对已交给 argv 的 brief 调用一次 `activate_opencode_prompt`。这些可能检查写者的操作（inspect、submit、interrupt、补键和 close）使用同一 attempt 的同步保存回调。在锁内将新认出的写者身份并入原记录；即使另一个成员身份未知，已认出的写者也留供下次核验。
 - `submit` 和 `interrupt` 成功表示后端接受。`FailureKind::Uncertain` 表示结果未知，须保留认领。worker 的完成回执由调度器结算。`close` 在发送关闭前保存已观测的写者，核实原 pane 消失且写者均已停止之后返回成功。此处跟踪的是 Herdr 报告的根进程和前台进程。
-- `herdr-reconcile` 的调用方在当前 owner 授权下传入显式映射、actor 和 evidence。服务、映射或根进程改变时需要旧写者证据。对原映射，确认 pane 消失、已记录写者均退出且有显式停止证据，可以登记已停止状态。`Handle::reconcile` 核实 nonce、attempt、映射和可观测写者，返回候选 handle 和审计内容。提交事务时再次核对 owner、attempt 和读取的原记录，将新 handle 与审计原子保存，并保留原有输入认领和回执。
+- `herdr-reconcile` 的调用方在当前 owner 授权下传入显式映射、actor 和 evidence。服务、映射或根进程改变时需要旧写者证据。对原映射，确认 pane 消失、已记录写者均退出且有显式停止证据，可以登记已停止状态。此记录在服务下线后仍可查询，服务失联时活跃记录的存活状态为未知。`Handle::reconcile` 核实 nonce、attempt、映射和可观测写者，返回候选 handle 和审计内容。若对账在原服务、原映射和原根进程上只读到部分写者身份，保存回调仍会将已核实的写者追加到原记录，对账结果为未决。成功提交事务时再次核对 owner、attempt 和读取的原记录，将新 handle 与审计原子保存，并保留原有输入认领和回执。
 - Herdr 每条请求单独连接。适配器在每次连接上核对服务进程，操作前检查快照。协议 22 将快照与实际操作分成两个请求，同一账户的管理操作须与调度器协调。`WFC_HERDR_TIMEOUT` 指定每组 RPC 的秒数，默认 8，有效范围为大于 0 到 60。
 
 ## 独立复验

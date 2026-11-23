@@ -47,6 +47,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         result
     };
+    fn checkpoint<'a>(
+        state: &'a mut Value,
+        save: &'a impl Fn(&Value) -> io::Result<()>,
+    ) -> impl FnMut(&Handle) -> io::Result<()> + 'a {
+        |handle| {
+            state["handle"] = json!(handle);
+            save(state)
+        }
+    }
     let input: Value = serde_json::from_reader(io::stdin().take(2 * 1024 * 1024 + 1))?;
     let value = if operation == "create" {
         if state.get("handle").is_some() {
@@ -62,22 +71,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Path::new(&endpoint),
             input["attempt"].as_str().ok_or("missing attempt")?,
             &launch,
-            |h| {
-                state["handle"] = json!(h);
-                save(&state)
-            },
+            checkpoint(&mut state, &save),
         )
         .map(|_| json!({"result":"accepted"}))
     } else {
         let mut handle: Handle = serde_json::from_value(state["handle"].clone())?;
         match operation.as_str() {
             "inspect" => handle
-                .inspect()
+                .inspect(checkpoint(&mut state, &save))
                 .map(|alive| json!({"result":"accepted","alive":alive})),
             "read" => handle
                 .read()
                 .map(|screen| json!({"result":"accepted","screen":screen})),
-            "interrupt" => handle.interrupt().map(|_| json!({"result":"accepted"})),
+            "interrupt" => handle
+                .interrupt(checkpoint(&mut state, &save))
+                .map(|_| json!({"result":"accepted"})),
             "submit" => {
                 let text = input["text"].as_str().ok_or("missing text")?;
                 if state["pendingInput"] == true {
@@ -85,7 +93,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 state["pendingInput"] = json!(true);
                 save(&state)?;
-                let result = handle.submit(text, input["host"] == "codex");
+                let result = handle.submit(
+                    text,
+                    input["host"] == "codex",
+                    checkpoint(&mut state, &save),
+                );
                 if !matches!(result,Err(e) if e.kind == FailureKind::Uncertain) {
                     state["pendingInput"] = json!(false);
                     save(&state)?;
@@ -93,14 +105,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 result.map(|_| json!({"result":"accepted"}))
             }
             "close" => handle
-                .close(|h| {
-                    state["handle"] = json!(h);
-                    save(&state)
-                })
+                .close(checkpoint(&mut state, &save))
                 .map(|_| json!({"result":"completed"})),
             "herdr-reconcile" => {
                 let mapping: Mapping = serde_json::from_value(input)?;
-                match handle.reconcile(&mapping) {
+                match handle.reconcile(&mapping, checkpoint(&mut state, &save)) {
                     Ok(binding) => {
                         state["handle"] = json!(binding.handle);
                         state["audit"]

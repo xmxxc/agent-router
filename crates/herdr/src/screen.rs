@@ -37,52 +37,87 @@ fn compact(text: &str) -> String {
     text.split_whitespace().collect()
 }
 
-fn codex_box(screen: &Screen) -> Option<String> {
-    if screen.truncated {
-        return None;
-    }
+struct Composer<'a> {
+    draft: String,
+    footer: Vec<&'a str>,
+}
+
+fn codex_box<'a>(screen: &'a Screen, prior_footer: &[&str]) -> Result<Option<Composer<'a>>> {
+    // Herdr can truncate old scrollback even when the entire bottom composer is visible.
     let lines: Vec<_> = screen.text.trim_end().lines().map(str::trim_end).collect();
-    let start = lines
-        .iter()
-        .rposition(|s| *s == "›" || s.starts_with("› "))?;
+    let Some(start) = lines.iter().rposition(|s| *s == "›" || s.starts_with("› ")) else {
+        return Ok(None);
+    };
     let mut end = start + 1;
     while end < lines.len() && lines[end].starts_with("  ") {
         end += 1;
     }
     if end == lines.len() {
-        while end > start + 1 && lines[end - 1].contains(" · ") {
-            end -= 1;
-        }
+        let adjacent = lines[start + 1..]
+            .iter()
+            .rev()
+            .take(2)
+            .take_while(|s| s.contains(" · "))
+            .count();
+        // Wrapped draft lines can also contain the footer separator. If both
+        // footer lengths fit, use the footer seen independently before typing.
+        end -= match adjacent {
+            2 if !prior_footer.is_empty() && lines.ends_with(prior_footer) => prior_footer.len(),
+            2 => {
+                return Err(Failure::unknown(
+                    "Codex draft and footer boundary is ambiguous",
+                ))
+            }
+            count => count,
+        };
     }
-    let footer: Vec<_> = lines[end..].iter().filter(|s| !s.is_empty()).collect();
+    let footer: Vec<_> = lines[end..]
+        .iter()
+        .copied()
+        .filter(|s| !s.is_empty())
+        .collect();
     if !(1..=2).contains(&footer.len())
         || !footer
             .iter()
             .all(|s| s.starts_with("  ") && s.contains(" · "))
         || lines[start..end].iter().any(|s| s.ends_with(['↑', '↓']))
     {
-        return None;
+        return Ok(None);
     }
-    let text = lines[start..end].join(" ");
-    let draft = text.strip_prefix('›')?.trim();
-    if draft.is_empty() || compact(draft) == "AskCodextodoanything" {
-        return None;
-    }
-    Some(draft.into())
+    let body = lines[start..end].join(" ");
+    let draft = body.strip_prefix('›').unwrap().trim();
+    let draft = if compact(draft) == "AskCodextodoanything" {
+        String::new()
+    } else {
+        draft.to_owned()
+    };
+    Ok(Some(Composer { draft, footer }))
 }
 
-pub(super) fn confirm_codex(handle: &Handle, text: &str, before: &Screen) -> Result<()> {
-    let sample = || {
+pub(super) fn confirm_codex(
+    handle: &mut Handle,
+    text: &str,
+    before: &Screen,
+    save: &mut impl FnMut(&Handle) -> std::io::Result<()>,
+) -> Result<()> {
+    let footer = codex_box(before, &[])
+        .ok()
+        .flatten()
+        .map(|c| c.footer)
+        .unwrap_or_default();
+    let sample = |handle: &Handle| {
         sleep(Duration::from_millis(300));
         let screen = handle.read()?;
         if read_only(&screen.text) || refusals(&screen.text) > refusals(&before.text) {
             return Err(Failure::unknown("worker refused or paused input"));
         }
-        Ok(codex_box(&screen))
+        Ok(codex_box(&screen, &footer)?
+            .map(|c| c.draft)
+            .filter(|s| !s.is_empty()))
     };
     for retry in 0..=2 {
-        let first = sample()?;
-        let second = sample()?;
+        let first = sample(handle)?;
+        let second = sample(handle)?;
         if first != second
             || second
                 .as_deref()
@@ -97,6 +132,7 @@ pub(super) fn confirm_codex(handle: &Handle, text: &str, before: &Screen) -> Res
             "pane.send_keys",
             json!({"pane_id":handle.pane,"keys":["Enter"]}),
             true,
+            save,
         )?;
     }
     unreachable!()
@@ -126,7 +162,11 @@ fn opencode_box(text: &str) -> Option<String> {
 impl Handle {
     /// OpenCode's argv prompt may still be in the composer. Confirm this
     /// attempt's stable visible suffix before sending one Enter.
-    pub fn activate_opencode_prompt(&self, text: &str) -> Result<()> {
+    pub fn activate_opencode_prompt(
+        &mut self,
+        text: &str,
+        mut save: impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut previous = None;
         while Instant::now() < deadline {
@@ -143,6 +183,7 @@ impl Handle {
                             "pane.send_keys",
                             json!({"pane_id":self.pane,"keys":["Enter"]}),
                             true,
+                            &mut save,
                         )?;
                     }
                     return Ok(());
@@ -159,6 +200,20 @@ impl Handle {
 mod tests {
     use super::*;
     #[test]
+    fn adjacent_footer_with_no_matching_reference_stays_unknown() {
+        let screen = Screen {
+            text: "› draft\n  tail · value\n  model · dir".into(),
+            revision: 2,
+            truncated: true,
+        };
+        for footer in [&[][..], &["  previous · footer"][..]] {
+            assert!(
+                matches!(codex_box(&screen, footer), Err(e) if e.kind == crate::FailureKind::Uncertain)
+            );
+        }
+    }
+
+    #[test]
     fn only_a_complete_current_composer_matches() {
         let screen = |s: &str| Screen {
             text: s.into(),
@@ -166,7 +221,10 @@ mod tests {
             truncated: false,
         };
         assert_eq!(
-            codex_box(&screen("› hello\n  世界\n\n  model · dir")).as_deref(),
+            codex_box(&screen("› hello\n  世界\n\n  model · dir"), &[])
+                .unwrap()
+                .map(|c| c.draft)
+                .as_deref(),
             Some("hello   世界")
         );
         for s in [
@@ -175,7 +233,9 @@ mod tests {
             "› hello\ntranscript\n  model · dir",
             "› Ask Codex to do anything\n\n  model · dir",
         ] {
-            assert_eq!(codex_box(&screen(s)), None);
+            assert!(codex_box(&screen(s), &[])
+                .unwrap()
+                .is_none_or(|c| c.draft.is_empty()));
         }
         assert_eq!(
             opencode_box("┃ hello attempt-01\n┃ agent · model\n╹▀▀▀").as_deref(),

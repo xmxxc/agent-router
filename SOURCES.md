@@ -3,6 +3,7 @@
 | 组件 | 固定来源及保留范围 |
 | --- | --- |
 | WFC | xmxxc/workflow-core 提交 `3c06c0905faaf9e61de49404c33e70720409607f` 的 experiments/herdr-kernel-prototype。内核来自上游 src/main.rs，位于本仓 src/kernel.rs，入口改为由 wfc CLI 调用的 run。根 Cargo.toml 使用本仓的程序名和版本。tools/smoke.py 从 native_probe.py 增加协议、resize 和限时退出检查。tools/collect_notices.py 从同名脚本适配本仓目录和来源记录。原始 MIT 署名见 LICENSE-WFC。 |
+| WFC 外置 Herdr 适配器 | crates/herdr 是本仓维护的 Linux 客户端。运行单元身份、RPC、写者观察和输入框识别对照 xmxxc/workflow-core 提交 `60d7d76e4bb861ac9e0bbb043aa1a36946578397` 的 herdr_backend.py 和 router.py。适配器使用仓内 LICENSE-WFC 的 MIT 许可。 |
 | Herdr | herdrdev/herdr 0.9.5 提交 `ee5bfb5041bb3e4a49d591c72308aae3c81ecdde`。原始 Apache-2.0 文本在 licenses/LICENSE-Herdr。crates/ghostty-vt/build.rs 与 bindgen 0.72.1 生成的 src/bindings.rs 逐字保留。 |
 | Ghostty Rust 封装 | crates/ghostty-vt/src/lib.rs 是从 Herdr 同路径提取并在本仓维护的文件。保留初始化、禁用图像存储、字素模式、窗口大小与写回调、剪贴板协议回复、活动屏幕与视口格式化。内核没有消费的图像解码、绘制、鼠标、铃声计数和目录/剪贴板事件存储已裁去。crate 清单移除无调用者的依赖。Cargo.lock 从 WFC 锁文件裁去相应条目，保留条目的版本与 registry 校验和均来自原锁。 |
 | portable-pty | Wez Furlong 的 MIT crate 0.9.0。registry 原包 SHA-256 为 `b4a596a2b3d2752d94f51fac2d4a96737b8705dddd311a32b9af47211f08671e`。本仓保留 Herdr 已应用四项补丁后的完整 crate，Git tree 为 `2d925f8f0bcdbf1e74ff3be5ab59013a3649d7ed`。见 vendor/portable-pty/LICENSE.md、vendor/portable-pty.patches.md 和 vendor/patches/portable-pty。含 ConPTY 受控加载、Windows 命令尾、环境项和程序路径处理。 |

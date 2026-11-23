@@ -170,6 +170,8 @@ for line in sys.stdin:
         self.assertEqual(self.api('pane.process_info',pane_id=sibling['pane_id'])['process_info']['shell_pid'],sibling_pid)
         os.kill(sibling_pid,0)
         self.assertEqual(events.read_text().splitlines(), ['hello 世界'])
+        self.stop()
+        self.assertFalse(self.driver('inspect')['alive'])
 
     def test_restart_and_explicit_binding(self):
         h = self.create()
@@ -207,6 +209,7 @@ for line in sys.stdin:
     def test_restart_same_state_preserves_unknown(self):
         h = self.create()
         self.stop()
+        self.driver('inspect','uncertain')
         self.start('first')
         self.driver('inspect','uncertain')
         self.assertEqual(self.state()['handle'],h)
@@ -292,48 +295,121 @@ for line in sys.stdin:
             wait_for(lambda: events.exists() and events.read_text().splitlines() == ['one input'])
             self.driver('close','completed')
 
+    def test_long_history_with_two_footer_lines(self):
+        self.long_history_submit(lose_key=False, footer='two')
+
+    def test_long_history_with_one_footer_line(self):
+        self.long_history_submit(lose_key=False, footer='one')
+
     def test_followup_enter_lost_after_worker_submits(self):
-        # A controlled raw terminal drops the initial grouped Enter and shows
-        # the draft. Only the separate Enter commits one host event.
-        host = self.root / 'composer.py'
-        host.write_text(r'''import os, sys, tty
-from pathlib import Path
-tty.setraw(0)
-draft = b''
-def draw():
-    os.write(1,b'\x1b[2J\x1b[H'+'› '.encode()+draft+b'\r\n\r\n  fixture '+ '·'.encode()+b' model\r\n')
-draw()
-dropped = False
-while True:
-    key = os.read(0,1)
-    if key in (b'\r',b'\n'):
-        if not dropped:
-            dropped = True
-        else:
-            with Path('events').open('ab') as f:
-                f.write(draft+b'\n')
-            draft = b''
-        draw()
-    else:
-        draft += key
-        draw()
-''')
-        writes = []
-        def lose_key(req, reply):
-            if req['method'] in ('pane.send_input','pane.send_keys'):
-                writes.append(req['method'])
-                if req['method'] == 'pane.send_keys':
-                    return None
+        self.long_history_submit(lose_key=True, footer='two')
+
+    def long_history_submit(self, lose_key, footer):
+        # The raw terminal drops the first Enter. The second is a separate
+        # key, and only that key commits the draft as a worker event.
+        host = Path(__file__).with_name('composer.py').resolve()
+        calls = []
+        def trace(req, reply):
+            method = req['method']
+            if method in ('pane.read','pane.send_input','pane.send_keys'):
+                calls.append(method)
+            if lose_key and method == 'pane.send_keys':
+                return None
             return reply
-        with self.fault_proxy(lose_key) as endpoint:
-            self.create(endpoint, [sys.executable,'-u',str(host)])
-            wait_for(lambda: 'fixture' in self.driver('read')['screen']['text'])
-            self.driver('submit','uncertain',text='one draft',host='codex')
-            self.driver('submit','pending',text='one draft',host='codex')
-            self.assertEqual(writes,['pane.send_input','pane.send_keys'])
+        with self.fault_proxy(trace) as endpoint:
+            self.create(endpoint, [sys.executable,'-u',str(host),footer])
+            (self.root/'show-history').touch()
+            def complete():
+                screen = self.driver('read')['screen']
+                return screen['truncated'] and 'fixture · model' in screen['text']
+            wait_for(complete)
+            calls.clear()
+            text = 'one draft tail · value'
+            self.driver('submit','uncertain' if lose_key else 'accepted',text=text,host='codex')
+            expected = ['pane.read','pane.send_input','pane.read','pane.read','pane.send_keys']
+            if lose_key:
+                self.driver('submit','pending',text=text,host='codex')
+            else:
+                expected.extend(['pane.read','pane.read'])
+            self.assertEqual(calls,expected)
             events = self.root/'events'
-            wait_for(lambda: events.exists() and events.read_text().splitlines() == ['one draft'])
+            wait_for(lambda: events.exists() and events.read_text().splitlines() == [text])
             self.driver('close','completed')
+
+    def test_paired_samples_and_followup_limit(self):
+        # Script only the pane.read frames; count all writes to the real pane.
+        frames = []
+        calls = []
+        def render(req, reply):
+            if req['method'] in ('pane.read','pane.send_input','pane.send_keys'):
+                calls.append(req['method'])
+            if req['method'] == 'pane.read' and frames:
+                read = reply['result']['read']
+                read.update(text=frames.pop(0),truncated=True)
+            return reply
+        exact = '› draft\n  fixture · model'
+        with self.fault_proxy(render) as endpoint:
+            self.create(endpoint)
+            for pair in [(exact,'› changed\n  fixture · model'), (exact, '› draft ↓\n  fixture · model'),
+                         ('› draft ↑\n  fixture · model',exact),
+                         ('› draft\n  extra · text\n  model · dir\n  keys · info',)*2]:
+                calls.clear()
+                frames[:] = ['›\n\n  model · dir\n  keys · info',*pair]
+                self.driver('submit',text='draft',host='codex')
+                self.assertEqual(calls,['pane.read','pane.send_input','pane.read','pane.read'])
+            calls.clear()
+            frames[:] = ['›\n\n  fixture · model'] + ['› draft\n  tail · value\n  fixture · model']*2
+            self.driver('submit',text='draft',host='codex')
+            self.assertNotIn('pane.send_keys',calls)
+            calls.clear()
+            frames[:] = ['',*([exact]*6)]
+            self.driver('submit','uncertain',text='draft',host='codex')
+            self.assertEqual(calls,['pane.read','pane.send_input'] +
+                             ['pane.read','pane.read','pane.send_keys']*2 + ['pane.read','pane.read'])
+            self.driver('submit','pending',text='draft',host='codex')
+            self.driver('close','completed')
+
+    def test_close_tracks_writer_seen_by_inspect(self):
+        self.track_background_writer('inspect')
+
+    def test_close_tracks_writer_seen_by_submit(self):
+        self.track_background_writer('submit')
+
+    def track_background_writer(self, observe):
+        h = self.create(command=[sys.executable,str(Path(__file__).with_name('job_control.py').resolve())])
+        self.api('pane.split', target_pane_id=h['pane'], direction='right', focus=False)
+        siblings = [p for p in self.api('session.snapshot')['snapshot']['panes']
+                    if p['workspace_id'] == h['workspace'] and p['pane_id'] != h['pane']]
+        sibling, = siblings
+        sibling_pid = self.api('pane.process_info',pane_id=sibling['pane_id'])['process_info']['shell_pid']
+
+        (self.root/'start-job').touch()
+        job_file = self.root/'job-pid'
+        pid = int(wait_for(lambda: job_file.exists() and job_file.read_text()))
+        def foreground():
+            info = self.api('pane.process_info',pane_id=h['pane'])['process_info']
+            return {p['pid'] for p in info.get('foreground_processes', [])}
+        wait_for(lambda: pid in foreground())
+        self.assertNotIn(pid,[p['pid'] for p in h['writerProcesses']])
+        if observe == 'inspect':
+            self.assertTrue(self.driver('inspect')['alive'])
+        else:
+            self.driver('submit',text='fixture input')
+        self.assertIn(pid,[p['pid'] for p in self.state()['handle']['writerProcesses']])
+
+        (self.root/'background-job').touch()
+        wait_for(lambda: (self.root/'backgrounded').exists() and pid not in foreground())
+        if observe == 'submit':
+            self.driver('herdr-reconcile',**self.mapping(h))
+            self.assertIn(pid,[p['pid'] for p in self.state()['handle']['writerProcesses']])
+        self.driver('close','uncertain')
+        self.driver('inspect','uncertain')
+        os.kill(pid,0)
+        self.assertEqual(self.api('pane.process_info',pane_id=sibling['pane_id'])['process_info']['shell_pid'],sibling_pid)
+        (self.root/'stop-job').touch()
+        self.driver('close','completed')
+        self.assertFalse(self.driver('inspect')['alive'])
+        os.kill(sibling_pid,0)
 
     def test_close_requires_every_checkpointed_writer_to_exit(self):
         extra = subprocess.Popen(['/bin/sleep','60'])
@@ -354,6 +430,41 @@ while True:
         finally:
             extra.kill()
             extra.wait()
+
+    def test_partial_input_observation_retains_identified_writer(self):
+        self.partial_observation('submit')
+
+    def test_partial_reconcile_retains_identified_writer(self):
+        self.partial_observation('herdr-reconcile')
+
+    def partial_observation(self, operation):
+        mode = 'pass'
+        with subprocess.Popen(['/bin/sleep','30']) as writer:
+            def partial(req, reply):
+                if mode == 'partial' and req['method'] == 'pane.process_info':
+                    reply['result']['process_info']['foreground_processes'] = [
+                        {'pid':4294967295}, {'pid':writer.pid}]
+                return reply
+            try:
+                with self.fault_proxy(partial) as endpoint:
+                    h = self.create(endpoint)
+                    mode = 'partial'
+                    if operation == 'submit':
+                        self.driver('submit','uncertain',text='held')
+                        self.assertTrue(self.state()['pendingInput'])
+                    else:
+                        self.driver('herdr-reconcile','uncertain',**self.mapping(h))
+                        self.assertEqual(self.state()['audit'],[])
+                        self.assertEqual(self.state()['handle']['service'],h['service'])
+                    self.assertFalse((self.root/'events').exists())
+                    self.assertIn(writer.pid,[p['pid'] for p in self.state()['handle']['writerProcesses']])
+                    mode = 'pass'
+                    self.driver('close','uncertain')
+                    writer.terminate()
+                    writer.wait(timeout=3)
+                    self.driver('close','completed')
+            finally:
+                writer.kill()
 
     def test_wrong_protocol_and_partial_writer(self):
         mode = 'protocol'

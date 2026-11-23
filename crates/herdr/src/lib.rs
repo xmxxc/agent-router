@@ -170,13 +170,12 @@ impl Handle {
             let tab = field(&created["tab"], "tab_id")?;
             handle.workspace = Some(workspace.to_owned());
             checkpoint(&handle)?;
-            let snapshot = rpc.call("session.snapshot", json!({}))?;
-            let snapshot = &snapshot["snapshot"];
+            let snapshot = rpc.snapshot()?;
             let fresh =
-                record(snapshot, "workspaces", "workspace_id", workspace)?.ok_or(INVALID)?;
+                record(&snapshot, "workspaces", "workspace_id", workspace)?.ok_or(INVALID)?;
             let root = &created["root_pane"];
             let initial =
-                record(snapshot, "panes", "pane_id", field(root, "pane_id")?)?.ok_or(INVALID)?;
+                record(&snapshot, "panes", "pane_id", field(root, "pane_id")?)?.ok_or(INVALID)?;
             if fresh["tokens"].get("wfc_owner").is_some()
                 || fresh["tokens"].get("wfc_attempt").is_some()
                 || initial["workspace_id"] != workspace
@@ -190,10 +189,9 @@ impl Handle {
                 json!({"workspace_id":workspace,"source":"wfc",
                 "tokens":{"wfc_owner":handle.nonce,"wfc_attempt":attempt}}),
             )?;
-            let snapshot = rpc.call("session.snapshot", json!({}))?;
-            let snapshot = &snapshot["snapshot"];
-            handle.owned_workspace(snapshot)?.ok_or(INVALID)?;
-            let initial = record(snapshot, "tabs", "tab_id", tab)?.ok_or(INVALID)?;
+            let snapshot = rpc.snapshot()?;
+            handle.owned_workspace(&snapshot)?.ok_or(INVALID)?;
+            let initial = record(&snapshot, "tabs", "tab_id", tab)?.ok_or(INVALID)?;
             if initial["workspace_id"] != workspace || initial["pane_count"] != 1 {
                 return Err(INVALID);
             }
@@ -207,10 +205,9 @@ impl Handle {
             checkpoint(&handle)?;
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
-                let snapshot = rpc.call("session.snapshot", json!({}))?;
-                let snapshot = &snapshot["snapshot"];
-                handle.owned_workspace(snapshot)?.ok_or(INVALID)?;
-                if let Some(row) = record(snapshot, "panes", "pane_id", pane)? {
+                let snapshot = rpc.snapshot()?;
+                handle.owned_workspace(&snapshot)?.ok_or(INVALID)?;
+                if let Some(row) = record(&snapshot, "panes", "pane_id", pane)? {
                     if row["workspace_id"] != workspace {
                         return Err(INVALID);
                     }
@@ -223,14 +220,16 @@ impl Handle {
                 std::thread::sleep(Duration::from_millis(20));
             }
             checkpoint(&handle)?;
-            handle.writers = handle.observe_writers(&rpc)?;
-            checkpoint(&handle)
+            let writers = handle.observe_writers(&rpc)?;
+            handle.writers = writers.known;
+            checkpoint(&handle)?;
+            writers.completeness
         };
         finish().map_err(Failure::after_effect)?;
         Ok(handle)
     }
 
-    fn session(&self) -> Result<Session<'_>> {
+    fn session(&self) -> Result<Session> {
         let service = self.service.as_ref().ok_or(INVALID)?;
         Session::open(&self.endpoint, Some(service))
     }
@@ -278,9 +277,9 @@ impl Handle {
     }
 
     fn guarded(&self, rpc: &Session, input: bool) -> Result<()> {
-        let snapshot = rpc.call("session.snapshot", json!({}))?;
+        let snapshot = rpc.snapshot()?;
         let pane = self
-            .pane(&snapshot["snapshot"])?
+            .pane(&snapshot)?
             .ok_or(Failure::unsent("Herdr pane absent"))?;
         if input && field(pane, "agent_status")? == "blocked" {
             return Err(Failure::refused("Herdr reports a blocked worker"));
@@ -288,21 +287,43 @@ impl Handle {
         Ok(())
     }
 
-    fn observe_writers(&self, rpc: &Session) -> Result<Vec<Process>> {
+    fn observe_writers(&self, rpc: &Session) -> Result<process::Writers> {
         self.guarded(rpc, false)?;
         let pane = self.pane.as_deref().ok_or(INVALID)?;
         let data = rpc.call("pane.process_info", json!({"pane_id":pane}))?;
         process::writers(&data["process_info"], pane)
     }
 
-    fn bound_writers(&self, rpc: &Session) -> Result<Vec<Process>> {
+    fn checkpoint_writers(
+        &mut self,
+        rpc: &Session,
+        save: &mut impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<()> {
         let writers = self.observe_writers(rpc)?;
+        self.remember_writers(&writers.known, save)?;
+        writers.completeness
+    }
+
+    fn remember_writers(
+        &mut self,
+        known: &[Process],
+        save: &mut impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<()> {
         if self.stopped_evidence.is_some()
-            || self.writers.first().ok_or(INVALID)? != writers.first().ok_or(INVALID)?
+            || self.writers.first().ok_or(INVALID)? != known.first().ok_or(INVALID)?
         {
             return Err(Failure::unknown("Herdr pane writer identity changed"));
         }
-        Ok(writers)
+        if known.iter().any(|p| !self.writers.contains(p)) {
+            let mut updated = self.clone();
+            updated
+                .writers
+                .extend(known.iter().filter(|p| !self.writers.contains(p)).cloned());
+            save(&updated)
+                .map_err(|_| Failure::unknown("cannot checkpoint observed Herdr writers"))?;
+            *self = updated;
+        }
+        Ok(())
     }
 
     fn writers_alive(&self) -> Result<bool> {
@@ -317,18 +338,30 @@ impl Handle {
     }
 
     /// Returns false only when every recorded writer has positively stopped.
-    pub fn inspect(&self) -> Result<bool> {
-        let rpc = self.session()?;
-        let snap = rpc.call("session.snapshot", json!({}))?;
-        let present = self.pane(&snap["snapshot"])?.is_some();
-        if present {
-            self.bound_writers(&rpc)?;
+    pub fn inspect(&mut self, mut save: impl FnMut(&Self) -> std::io::Result<()>) -> Result<bool> {
+        if let Some(evidence) = &self.stopped_evidence {
+            // Reconcile commits this stopped binding and its audit together.
+            if evidence.trim().is_empty() || !self.writers.is_empty() {
+                return Err(INVALID);
+            }
+            return Ok(false);
         }
-        let live = self.writers_alive()?;
-        if live && !present {
-            return Err(Failure::unknown("writer survives missing Herdr pane"));
-        }
-        Ok(live)
+        let observation = (|| {
+            let rpc = self.session()?;
+            let present = self.pane(&rpc.snapshot()?)?.is_some();
+            if present {
+                self.checkpoint_writers(&rpc, &mut save)?;
+            }
+            let live = self.writers_alive()?;
+            if live && !present {
+                return Err(Failure::unknown("writer survives missing Herdr pane"));
+            }
+            Ok(live)
+        })();
+        observation.map_err(|err| match err.kind {
+            FailureKind::DefinitelyNotSent => Failure::unknown(err.diagnostic),
+            _ => err,
+        })
     }
 
     pub fn read(&self) -> Result<Screen> {
@@ -343,24 +376,36 @@ impl Handle {
         serde_json::from_value(data["read"].clone()).map_err(|_| INVALID)
     }
 
-    fn send(&self, method: &str, params: Value, input: bool) -> Result<()> {
+    fn send(
+        &mut self,
+        method: &str,
+        params: Value,
+        input: bool,
+        save: &mut impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<()> {
         let rpc = self.session()?;
-        self.bound_writers(&rpc)?;
+        self.checkpoint_writers(&rpc, save)?;
         self.guarded(&rpc, input)?;
         rpc.call(method, params)?;
         Ok(())
     }
 
-    pub fn interrupt(&self) -> Result<()> {
+    pub fn interrupt(&mut self, mut save: impl FnMut(&Self) -> std::io::Result<()>) -> Result<()> {
         self.send(
             "pane.send_keys",
             json!({"pane_id":self.pane,"keys":["C-c"]}),
             false,
+            &mut save,
         )
     }
 
     /// Caller holds the dispatch input claim. On uncertain, retain the claim.
-    pub fn submit(&self, text: &str, codex: bool) -> Result<()> {
+    pub fn submit(
+        &mut self,
+        text: &str,
+        codex: bool,
+        mut save: impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<()> {
         let before = self.read()?;
         if screen::read_only(&before.text) {
             return Err(Failure::refused("worker input is paused"));
@@ -369,9 +414,10 @@ impl Handle {
             "pane.send_input",
             json!({"pane_id":self.pane,"text":text,"keys":["Enter"]}),
             true,
+            &mut save,
         )?;
         if codex {
-            screen::confirm_codex(self, text, &before).map_err(Failure::after_effect)?;
+            screen::confirm_codex(self, text, &before, &mut save).map_err(Failure::after_effect)?;
         }
         Ok(())
     }
@@ -379,31 +425,17 @@ impl Handle {
     /// Close only the bound pane. Persist all observed writers before closing,
     /// so a lost response cannot erase the evidence needed by a later close.
     pub fn close(&mut self, mut save: impl FnMut(&Self) -> std::io::Result<()>) -> Result<()> {
-        let endpoint = self.endpoint.clone();
-        let rpc = Session::open(&endpoint, Some(self.service.as_ref().ok_or(INVALID)?))?;
-        let snap = rpc.call("session.snapshot", json!({}))?;
-        if self.pane(&snap["snapshot"])?.is_some() {
-            let current = self.bound_writers(&rpc)?;
-            for writer in current {
-                if !self.writers.contains(&writer) {
-                    self.writers.push(writer);
-                }
-            }
-            save(self).map_err(|_| Failure::unknown("cannot checkpoint writers before close"))?;
+        let rpc = self.session()?;
+        if self.pane(&rpc.snapshot()?)?.is_some() {
+            self.checkpoint_writers(&rpc, &mut save)?;
             self.guarded(&rpc, false)?;
             rpc.call("pane.close", json!({"pane_id":self.pane}))?;
         }
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             if !self.writers_alive()? {
-                let snap = rpc
-                    .call("session.snapshot", json!({}))
-                    .map_err(Failure::after_effect)?;
-                if self
-                    .pane(&snap["snapshot"])
-                    .map_err(Failure::after_effect)?
-                    .is_none()
-                {
+                let snap = rpc.snapshot().map_err(Failure::after_effect)?;
+                if self.pane(&snap).map_err(Failure::after_effect)?.is_none() {
                     return Ok(());
                 }
             }
@@ -416,7 +448,11 @@ impl Handle {
 
     /// Observe an explicit proposed mapping. Caller verifies current owner and
     /// attempt again when persisting the returned handle and audit together.
-    pub fn reconcile(&self, mapping: &Mapping) -> Result<Binding> {
+    pub fn reconcile(
+        &mut self,
+        mapping: &Mapping,
+        mut save: impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<Binding> {
         if [
             &mapping.actor,
             &mapping.evidence,
@@ -448,9 +484,21 @@ impl Handle {
                 "changed binding requires old writer evidence",
             ));
         }
-        let snapshot = rpc.call("session.snapshot", json!({}))?;
-        if next.pane(&snapshot["snapshot"])?.is_some() {
-            next.writers = next.observe_writers(&rpc)?;
+        let snapshot = rpc.snapshot()?;
+        if next.pane(&snapshot)?.is_some() {
+            let writers = next.observe_writers(&rpc)?;
+            if let Err(err) = writers.completeness {
+                // A failed proposal cannot change the binding. Evidence already
+                // belonging to the current unit still counts towards its close.
+                if same_mapping
+                    && self.service == next.service
+                    && self.writers.first() == writers.known.first()
+                {
+                    self.remember_writers(&writers.known, &mut save)?;
+                }
+                return Err(err);
+            }
+            next.writers = writers.known;
             if self.writers.first() != next.writers.first() && stop_proof.is_none() {
                 return Err(Failure::refused(
                     "changed writer requires old writer evidence",
@@ -469,11 +517,20 @@ impl Handle {
             next.writers.clear();
             next.stopped_evidence = Some(evidence.into());
         }
+        // On the same live binding a writer may have moved to the background.
+        // Keep its identity for close. A different binding requires evidence
+        // that each writer left outside the proposed binding has stopped.
+        let same_root = !next.writers.is_empty() && next.writers.first() == self.writers.first();
+        let same_unit = same_mapping && same_root && next.service == self.service;
         for old in &self.writers {
-            if !next.writers.contains(old) && old.alive()? {
-                return Err(Failure::unknown(
-                    "old writer still alive outside proposed binding",
-                ));
+            if !next.writers.contains(old) {
+                if same_unit {
+                    next.writers.push(old.clone());
+                } else if old.alive()? {
+                    return Err(Failure::unknown(
+                        "old writer still alive outside proposed binding",
+                    ));
+                }
             }
         }
         let audit = json!({

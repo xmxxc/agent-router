@@ -8,7 +8,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -89,14 +89,14 @@ fn connect(path: &Path) -> Result<(UnixStream, Process)> {
     Ok((stream, peer))
 }
 
-pub(super) struct Session<'a> {
-    endpoint: &'a Path,
+pub(super) struct Session {
+    endpoint: PathBuf,
     pub service: Process,
     deadline: Instant,
 }
 
-impl<'a> Session<'a> {
-    pub fn open(endpoint: &'a Path, expected: Option<&Process>) -> Result<Self> {
+impl Session {
+    pub fn open(endpoint: &Path, expected: Option<&Process>) -> Result<Self> {
         let seconds = match std::env::var("WFC_HERDR_TIMEOUT") {
             Ok(value) => value.parse::<f64>().ok(),
             Err(std::env::VarError::NotPresent) => Some(8.0),
@@ -110,7 +110,7 @@ impl<'a> Session<'a> {
             return Err(Failure::unknown("Herdr service identity changed"));
         }
         let rpc = Self {
-            endpoint,
+            endpoint: endpoint.into(),
             service,
             deadline,
         };
@@ -123,8 +123,16 @@ impl<'a> Session<'a> {
         Ok(rpc)
     }
 
+    pub fn snapshot(&self) -> Result<Value> {
+        let mut result = self.call("session.snapshot", json!({}))?;
+        if !result["snapshot"].is_object() {
+            return Err(super::INVALID);
+        }
+        Ok(result["snapshot"].take())
+    }
+
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
-        let (socket, peer) = connect(self.endpoint)?;
+        let (socket, peer) = connect(&self.endpoint)?;
         if peer != self.service {
             return Err(Failure::unknown("Herdr service identity changed"));
         }
