@@ -24,6 +24,8 @@ const RESERVED_COMMANDS: &[&str] = &[
     #[cfg(not(target_os = "linux"))]
     "resume",
     #[cfg(not(target_os = "linux"))]
+    "handoff",
+    #[cfg(not(target_os = "linux"))]
     "reclaim",
     #[cfg(not(target_os = "linux"))]
     "relay",
@@ -71,6 +73,8 @@ fn run() -> anyhow::Result<ExitCode> {
             println!("{}", workflow::herdr::USAGE);
             #[cfg(target_os = "linux")]
             println!("{}", workflow::resume::USAGE);
+            #[cfg(target_os = "linux")]
+            println!("{}", workflow::handoff::USAGE);
             println!("{DONE_USAGE}");
             println!("{ASK_USAGE}");
             #[cfg(target_os = "linux")]
@@ -237,6 +241,27 @@ fn run() -> anyhow::Result<ExitCode> {
                 };
                 let reply = request.run()?;
                 if reply["result"] != "accepted" {
+                    eprintln!("{reply}");
+                    return Ok(ExitCode::FAILURE);
+                }
+                println!("{reply}");
+            }
+        }
+        #[cfg(target_os = "linux")]
+        Some("handoff") => {
+            use workflow::handoff::{Handoff, USAGE};
+            if args == ["--help"] || args == ["-h"] {
+                println!("{USAGE}");
+            } else {
+                let request = match Handoff::parse(&args) {
+                    Ok(request) => request,
+                    Err(err) => {
+                        eprintln!("wfc: {err}. {USAGE}");
+                        return Ok(ExitCode::from(2));
+                    }
+                };
+                let reply = request.run()?;
+                if reply["result"] == "refused" {
                     eprintln!("{reply}");
                     return Ok(ExitCode::FAILURE);
                 }

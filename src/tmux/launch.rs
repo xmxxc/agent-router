@@ -529,6 +529,17 @@ impl Tmux<'_> {
                 .as_ref()
                 .map(|origin| self.pin_submission(origin))
                 .transpose()?;
+            if let Some(audit) = self.handoff_audit {
+                let execution = self.new_execution_id.ok_or_else(bad)?;
+                let previous = crate::workflow::handoff::require_launch(
+                    self.state,
+                    self.dispatch,
+                    execution,
+                    audit,
+                )
+                .map_err(|error| failure("definitely-not-sent", &format!("{error:#}")))?;
+                self.require_handoff_server(&previous, submission.origin.as_ref())?;
+            }
             submission.phase = SubmissionPhase::InFlight;
             super::binding::save(&path, &submission).map_err(|_| io_error())?;
             let out = if let Some(socket) = &pinned_socket {
@@ -680,10 +691,17 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
     fs::remove_file(spec_path)?;
     super::binding::record_server(&dir, id)?;
     let mut cmd = Command::new(spec.argv.first().context("empty launch argv")?);
+    // Track orphans before starting the worker. A direct child's exit alone
+    // cannot authorize a cross-host replacement.
+    ensure!(
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == 0
+            && unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) } != libc::SIG_ERR,
+        "cannot supervise the tmux worker process tree"
+    );
     cmd.args(&spec.argv[1..])
         .current_dir(spec.cwd)
         .env_clear()
-        .envs(spec.env);
+        .envs(&spec.env);
     for key in ["TMUX", "TMUX_PANE", "TERM"] {
         if let Some(value) = env::var_os(key) {
             cmd.env(key, value);
@@ -709,19 +727,44 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
     // and keep its receipt writer alive to record the actual exit.
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
+        // Keep observing descendants when tmux closes the old terminal.
+        // Set this after spawn so the worker retains its own HUP behavior.
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
     }
-    let started_receipt = json!({"category":"started","pid":child.id(),"launchId":id});
+    let started_receipt =
+        json!({"category":"started","pid":child.id(),"launchId":id,"treeTracked":true});
     let (status, _, started) = crate::workflow::startup::wait_host(&mut child, || {
         super::binding::save(&receipt, &started_receipt)
     })?;
     let code = status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
-    let mut terminal = json!({"category":"process_exited","exitCode":code,"launchId":id});
+    let mut terminal =
+        json!({"category":"process_exited","exitCode":code,"launchId":id,"treeTracked":true});
     if let Some(watching) = watching {
         terminal["startupExit"] = watching.tmux_exit_evidence(status);
     }
     super::binding::save(&receipt, &terminal)?;
     started?;
+    wait_for_worker_tree()?;
+    super::binding::save(
+        &dir.join(format!("{id}.stopped")),
+        &json!({"launchId":id,"dispatch":dispatch,"attempt":spec.env.get("WFC_ATTEMPT"),
+            "round":spec.env.get("WFC_ROUND"),"writerTreeStopped":true}),
+    )?;
     Ok(ExitCode::from(code as u8))
+}
+
+fn wait_for_worker_tree() -> Result<()> {
+    loop {
+        if unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::__WALL) } > 0 {
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ECHILD) => return Ok(()),
+            Some(libc::EINTR) => (),
+            _ => return Err(error).context("wait for tmux worker descendants"),
+        }
+    }
 }

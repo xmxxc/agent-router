@@ -233,6 +233,18 @@ pub(super) fn require_resolved_resume(record: &Value) -> Result<()> {
 
 // The caller holds the authorized scope lock for this assignment.
 pub(super) fn close_locked(state: &Path, selected: &Value) -> Result<Value> {
+    close_with_handoff(state, selected, None)
+}
+
+pub(super) fn close_for_handoff_locked(
+    state: &Path,
+    selected: &Value,
+    audit: usize,
+) -> Result<Value> {
+    close_with_handoff(state, selected, Some(audit))
+}
+
+fn close_with_handoff(state: &Path, selected: &Value, handoff: Option<usize>) -> Result<Value> {
     let id = selected["dispatch"].as_str().context("missing dispatch")?;
     let dir = state.join("dispatches");
     let current = super::assignment::public_record(&dir, id)?
@@ -241,11 +253,28 @@ pub(super) fn close_locked(state: &Path, selected: &Value) -> Result<Value> {
     ensure!(
         record_scope(record) == record_scope(selected)
             && record["round"] == selected["round"]
-            && record["attempt"] == selected["attempt"],
+            && record["attempt"] == selected["attempt"]
+            && record["executionId"] == selected["executionId"],
         "dispatch changed while preparing close; inspect status and retry"
     );
     validate_close(record)?;
     require_resolved_resume(record)?;
+    match (handoff, super::assignment::unresolved_handoff(record)) {
+        (None, None) => (),
+        (Some(id), Some(event))
+            if record == selected
+                && event["id"] == id
+                && event["phase"] == "closing"
+                && event["fromAttempt"] == record["attempt"]
+                && event["result"] == "pending" =>
+        {
+            ()
+        }
+        (_, event) => anyhow::bail!(
+            "handoff audit {} is unresolved; inspect status and reconcile before closing",
+            event.map_or(&Value::Null, |event| &event["id"])
+        ),
+    }
     if record["host"].is_string() {
         return super::backend::close(state, record);
     }

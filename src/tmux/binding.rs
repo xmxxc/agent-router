@@ -853,6 +853,22 @@ impl Tmux<'_> {
             })
     }
 
+    pub(super) fn require_handoff_server(
+        &self,
+        launch: &str,
+        live: Option<&ServerSession>,
+    ) -> Reply<()> {
+        let previous = self.binding(Claim::Launch(launch.to_owned()))?;
+        if live.is_some_and(|server| previous.same_server(server)) {
+            Ok(())
+        } else {
+            Err(failure(
+                "definitely-not-sent",
+                "handoff requires the same verified tmux server",
+            ))
+        }
+    }
+
     pub(super) fn launch_server(&self) -> Option<ServerSession> {
         let out = self
             .run(&["-N", "display-message", "-p", "#{pid}\n#{socket_path}"])

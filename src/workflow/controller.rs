@@ -319,6 +319,8 @@ impl<'a> Owner<'a> {
             } else {
                 1
             };
+            #[cfg(target_os = "linux")]
+            super::handoff::require_scope_settled(&state, &self.scope)?;
             owners.0.insert(
                 self.scope.clone(),
                 Lease {

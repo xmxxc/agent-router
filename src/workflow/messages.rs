@@ -1379,6 +1379,10 @@ impl<'a> Done<'a> {
                 .or_else(|| keyed_attempt.map(|id| format!("done:{dispatch}:{id}")));
             let receipt =
                 inbox.validate_done(&assignment, &row, &report, key.as_deref(), self.attempt)?;
+            ensure!(
+                receipt.is_some() || !super::assignment::handoff_blocks_old_writer(&row),
+                "attempt is no longer accepted for {dispatch}; handoff is closing the old execution"
+            );
             if receipt.is_none() && row["backend"] == "herdr" {
                 ensure!(
                     !super::backend::herdr_close_blocks_callback(&state, &row)?,
@@ -1502,6 +1506,10 @@ impl<'a> Ask<'a> {
                 inbox.sync_directory().context("sync question receipt")?;
                 Some(prior.receipt(true))
             } else {
+                ensure!(
+                    !super::assignment::handoff_blocks_old_writer(&row),
+                    "attempt is no longer accepted for {dispatch}; handoff is closing the old execution"
+                );
                 inbox.require_question_round(&assignment, &row, attempt)?;
                 // The Herdr close intent is saved under the inbox lock.
                 if row["backend"] == "herdr" {

@@ -19,6 +19,8 @@ pub mod worker_owner;
 mod assignment;
 mod backend;
 #[cfg(target_os = "linux")]
+pub mod handoff;
+#[cfg(target_os = "linux")]
 pub mod herdr;
 pub mod host;
 #[cfg(target_os = "linux")]
@@ -859,6 +861,11 @@ fn status_with_history(
             .as_object_mut()
             .unwrap()
             .remove(controller::CALLBACK_HASH);
+        #[cfg(target_os = "linux")]
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove(handoff::PENDING_CALLBACK_HASH);
         if let Some(scope) = record_scope(record) {
             if let Some(owner) = owners.public(scope)? {
                 record["controllerOwner"] = owner;
@@ -890,6 +897,7 @@ fn status_with_history(
                 || row["closePending"] == true
                 || row["resourceCleanup"] == "uncertain"
                 || assignment::unresolved_resume(row).is_some()
+                || assignment::unresolved_handoff(row).is_some()
             {
                 return true;
             }
