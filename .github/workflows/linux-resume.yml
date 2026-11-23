@@ -1,7 +1,7 @@
-name: Linux resume and reclaim combination
+name: Linux resume and reclaim callback fixture
 on:
   push:
-    branches: [rust-router/14-resume-reclaim-combination-ci]
+    branches: [rust-router/14-resume-reclaim-r9-callback-ci]
 
 permissions:
   contents: read
@@ -12,7 +12,7 @@ defaults:
 
 jobs:
   linux-resume:
-    name: '#15 resume with #36 reclaim'
+    name: '#15 resume callback and #36 history'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -25,7 +25,7 @@ jobs:
       TMUX_REFERENCE_TREE: dd18a02b2e9bbb78e1c8aa33a5e859d8a727a22b
       TARGET: x86_64-unknown-linux-gnu
       CARGO_BUILD_JOBS: '2'
-      EVIDENCE: ${{ github.workspace }}/linux-resume-reclaim-evidence
+      EVIDENCE: ${{ github.workspace }}/linux-resume-reclaim-callback-evidence
     steps:
       - name: Record workflow and run identity
         run: |
@@ -67,7 +67,7 @@ jobs:
         run: |
           {
             test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
-            test "$GITHUB_REF" = refs/heads/rust-router/14-resume-reclaim-combination-ci
+            test "$GITHUB_REF" = refs/heads/rust-router/14-resume-reclaim-r9-callback-ci
             test "$(git -C ../ci rev-parse HEAD)" = "$GITHUB_WORKFLOW_SHA"
             git -C ../ci show -s --format='ci=%H tree=%T parents=%P'
             test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
@@ -85,7 +85,7 @@ jobs:
               test -z "$(git -C "$checkout" status --porcelain)"
             done
             approved=../ci/tools/ci/resume/APPROVED.sha256
-            sha256sum "$approved" vendor/INPUTS.sha256 ../ci/tools/ci/resume/{verify.sh,run.py} \
+            sha256sum "$approved" vendor/INPUTS.sha256 ../ci/tools/ci/resume/{verify.sh,run.py,callback-fixture.patch} \
               ../ci/.github/workflows/linux-resume.yml
             sha256sum --check --strict "$approved"
             sha256sum --check --strict vendor/INPUTS.sha256
@@ -172,10 +172,10 @@ jobs:
             sha256sum "$binary" | tee "$EVIDENCE/elf.sha256"
             readelf -hW "$binary"
           } 2>&1 | tee "$EVIDENCE/build.log"
-      - name: Verify public resume and reclaim with the same ELF
+      - name: Verify the corrected callback case and adjacent resume regression
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: product
-        run: bash ../ci/tools/ci/resume/verify.sh resume-reclaim 2>&1 | tee "$EVIDENCE/resume-reclaim.log"
+        run: bash ../ci/tools/ci/resume/verify.sh resume-reclaim-callback 2>&1 | tee "$EVIDENCE/resume-reclaim-callback.log"
       - name: Checksum the available evidence
         if: ${{ always() }}
         run: |
@@ -188,7 +188,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: linux-resume-reclaim-${{ github.run_id }}-${{ github.run_attempt }}
+          name: linux-resume-reclaim-callback-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14

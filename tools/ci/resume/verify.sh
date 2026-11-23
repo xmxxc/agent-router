@@ -4,6 +4,13 @@ set -euo pipefail
 
 group=${1:?test group required}
 case "$group" in
+    resume-reclaim-callback)
+        fixture=tools/check_tmux.py
+        selectors=(
+            Backend.test_public_resume_after_reclaim_preserves_history
+            Backend.test_public_resume_preserves_conversation_rounds_and_callback_fences
+        )
+        ;;
     resume-reclaim)
         fixture=tools/check_tmux.py
         selectors=(
@@ -88,6 +95,17 @@ printf 'fixture=%s binary=%s\n%s\n' "$fixture" "$binary" "$version"
 [[ "$version" == *"(Rust, $TARGET, release, build $PRODUCT_SHA)" ]]
 sha256sum --check --strict "$EVIDENCE/elf.sha256"
 sha256sum "$binary"
+
+if [[ "$group" == resume-reclaim-callback ]]; then
+    overlay=$(realpath ../ci/tools/ci/resume/callback-fixture.patch)
+    mkdir -p "$scratch/fixture/tools"
+    cp -- "$fixture" "$scratch/fixture/$fixture"
+    git -C "$scratch/fixture" apply --no-index --unidiff-zero "$overlay"
+    fixture="$scratch/fixture/$fixture"
+    printf '%s  %s\n' 4c4e46cd7afdea99641454eb316400ba23bbddf464f7c3dcb57af7312a6f1116 "$fixture" |
+        sha256sum --check --strict
+    sha256sum "$overlay" "$fixture"
+fi
 
 mkdir -- "$scratch/home" "$scratch/codex" "$scratch/state" "$scratch/tmp"
 printf 'HOME=%s CODEX_HOME=%s WFC_STATE=%s TMPDIR=%s WFC_TMUX_SOCKET=%s\n' \
