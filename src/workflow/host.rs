@@ -4,6 +4,7 @@ use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Map, Value};
 use std::{
     env, fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -103,6 +104,50 @@ fn argv(object: &Value, key: &str) -> Result<Vec<String>> {
         .collect()
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ScriptUnavailable {
+    Missing,
+    PermissionDenied,
+}
+
+impl ScriptUnavailable {
+    pub(super) fn category(self) -> &'static str {
+        match self {
+            Self::Missing => "configured_script_missing",
+            Self::PermissionDenied => "configured_script_permission_denied",
+        }
+    }
+}
+
+impl std::fmt::Display for ScriptUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Missing => "invalid launch config or missing configured script",
+            Self::PermissionDenied => "permission denied while resolving configured script",
+        })
+    }
+}
+
+impl std::error::Error for ScriptUnavailable {}
+
+fn resolve_script(paths: impl IntoIterator<Item = PathBuf>) -> Result<PathBuf> {
+    let mut uncertain = false;
+    let mut denied = false;
+    for path in paths {
+        match path.metadata() {
+            Ok(meta) if meta.is_file() => return Ok(path),
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => (),
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => denied = true,
+            _ => uncertain = true,
+        }
+    }
+    if denied {
+        return Err(ScriptUnavailable::PermissionDenied.into());
+    }
+    ensure!(!uncertain, "configured script could not be resolved");
+    Err(ScriptUnavailable::Missing.into())
+}
+
 fn configured(path: &Path, name: &str, cwd: &Path) -> Result<Launch> {
     let data: Value = serde_json::from_reader(fs::File::open(path)?)?;
     ensure!(
@@ -139,7 +184,7 @@ fn configured(path: &Path, name: &str, cwd: &Path) -> Result<Launch> {
     if !prefix.is_empty() {
         let path = Path::new(&command[0]);
         let resolved = if path.components().count() > 1 || path.is_absolute() {
-            cwd.join(path)
+            resolve_script([cwd.join(path)])?
         } else {
             let search = env
                 .get("PATH")
@@ -147,12 +192,8 @@ fn configured(path: &Path, name: &str, cwd: &Path) -> Result<Launch> {
                 .map(Into::into)
                 .or_else(|| std::env::var_os("PATH"))
                 .unwrap_or_default();
-            std::env::split_paths(&search)
-                .map(|p| cwd.join(p).join(path))
-                .find(|p| p.is_file())
-                .context("configured script is missing")?
+            resolve_script(std::env::split_paths(&search).map(|p| cwd.join(p).join(path)))?
         };
-        ensure!(resolved.is_file(), "configured script is missing");
         command[0] = resolved
             .to_str()
             .context("script path must be UTF-8")?
@@ -256,8 +297,12 @@ impl Options<'_> {
                 };
                 let path = path.canonicalize().context("invalid launch config path")?;
                 selected_config = Some(path.clone());
-                configured(&path, self.name, cwd).map_err(|_| {
-                    anyhow::anyhow!("invalid launch config or missing configured script")
+                configured(&path, self.name, cwd).map_err(|err| {
+                    if err.is::<ScriptUnavailable>() {
+                        err
+                    } else {
+                        anyhow::anyhow!("invalid launch config or missing configured script")
+                    }
                 })?
             }
             None => Launch {
