@@ -426,14 +426,15 @@ impl ResumeProof {
         launch: &Launch,
     ) -> Result<()> {
         let identity = &self.adopted.identity;
+        let current_attempt = field(previous, "attempt")?;
         ensure!(
             ledger.dir() == self.state.as_path()
                 && previous["host"] == "claude"
                 && previous["dispatch"] == identity.dispatch
-                && previous["attempt"] == identity.attempt
                 && next["dispatch"] == previous["dispatch"]
                 && next["host"] == "claude"
                 && next["attempt"] == self.next_attempt
+                && self.next_attempt != current_attempt
                 && next["cwd"] == previous["cwd"]
                 && next["hostSession"] == previous["hostSession"]
                 && launch
@@ -456,7 +457,7 @@ impl ResumeProof {
                 && &workflow::decode_record(file, &path)? == previous,
             "Claude assignment changed while preparing resume"
         );
-        let (expected, adopted) = adoption(ledger, previous)?;
+        let (expected, adopted) = resume_source_adoption(ledger, previous)?;
         ensure!(
             expected == self.expected
                 && adopted == self.adopted
@@ -474,7 +475,7 @@ impl ResumeProof {
             event["operation"] == "resume"
                 && event["result"] == "pending"
                 && event["dispatch"] == identity.dispatch
-                && event["fromAttempt"] == identity.attempt
+                && event["fromAttempt"] == current_attempt
                 && event["toAttempt"] == self.next_attempt
                 && event["round"] == round
                 && event["session"] == identity.session
@@ -483,6 +484,7 @@ impl ResumeProof {
         );
         let receipt = serde_json::to_string(&adopted)?;
         event["claudeAdoption"] = json!({
+            "attempt": identity.attempt,
             "source": identity.source,
             "receiptHash": workflow::messages::body_hash(&receipt)
         });
@@ -519,7 +521,7 @@ pub(in crate::workflow) fn prepare_resume(
     );
     let (expected, saved) = {
         let ledger = workflow::messages::lock_for_publish(state)?;
-        adoption(&ledger, previous)?
+        resume_source_adoption(&ledger, previous)?
     };
     ensure!(
         expected.profile == effective_profile(cwd, launch)?,
@@ -575,11 +577,123 @@ fn persisted_transcript(saved: &Adoption) -> Result<()> {
     Ok(())
 }
 
+fn resume_source_adoption(ledger: &PublishLock, row: &Value) -> Result<(Expected, Adoption)> {
+    let Some(current) = workflow::assignment::resume_audit(row) else {
+        return adoption(ledger, row);
+    };
+    if current["launchResult"] != "definitely-not-sent" {
+        ensure!(
+            confirmed_resume_adoption(current),
+            "Claude resume adoption is unconfirmed"
+        );
+        return adoption(ledger, row);
+    }
+
+    // Only settled non-starts may borrow the source of an earlier attempt.
+    // The shared resume path separately confirms the current tmux slot is empty.
+    let error = "Claude non-start audit does not verify the resume source";
+    let mut create = &row["create"];
+    let dispatch = field(row, "dispatch")?;
+    let mut attempt = field(row, "attempt")?;
+    let mut round = row["round"].as_u64().context(error)?;
+    let mut skipped = Vec::new();
+    let mut source = Source::Startup;
+    for event in row["audit"].as_array().context(error)?.iter().rev() {
+        if event["operation"] != "resume"
+            || (event["attempt"] != attempt && event["toAttempt"] != attempt)
+        {
+            continue;
+        }
+        let event_round = event["round"].as_u64().context(error)?;
+        ensure!(
+            [
+                "dispatch",
+                "attempt",
+                "round",
+                "launchResult",
+                "result",
+                "category",
+                "adoptionResult",
+                "inputResult",
+                "receipt"
+            ]
+            .iter()
+            .all(|&key| create[key] == event[key])
+                && event["dispatch"] == dispatch
+                && event["attempt"] == attempt
+                && event["toAttempt"] == attempt
+                && event["fromHost"] == "claude"
+                && event["toHost"] == "claude"
+                && event["session"] == row["hostSession"]
+                && event["settledAt"].is_string()
+                && event_round > 0
+                && round
+                    .checked_sub(event_round)
+                    .is_some_and(|delta| delta <= 1),
+            "{error}"
+        );
+        if event["launchResult"] != "definitely-not-sent" {
+            ensure!(confirmed_resume_adoption(event), "{error}");
+            source = Source::Resume;
+            break;
+        }
+        ensure!(
+            matches!(
+                event["result"].as_str(),
+                Some("refused" | "definitely-not-sent")
+            ) && event["category"] != "process_exited"
+                && (event["inputResult"].is_null()
+                    || event["inputResult"] == "definitely-not-sent")
+                && event["adoptionResult"].is_null(),
+            "{error}"
+        );
+        let receipt = attempt_dir(ledger.dir(), dispatch, attempt)?.join("adopted.json");
+        ensure!(
+            matches!(receipt.symlink_metadata(), Err(e) if e.kind() == io::ErrorKind::NotFound),
+            "{error}"
+        );
+        skipped.push(event);
+        let previous = field(event, "fromAttempt")?;
+        ensure!(previous != attempt, "{error}");
+        attempt = previous;
+        round = event_round;
+        create = &event["priorCreate"];
+    }
+    ensure!(!skipped.is_empty(), "{error}");
+    let (expected, saved) = adoption_for(ledger, row, attempt)?;
+    let hash = workflow::messages::body_hash(&serde_json::to_string(&saved)?);
+    ensure!(
+        saved.identity.source == source
+            && skipped.into_iter().all(|event| {
+                let reference = &event["claudeAdoption"];
+                // Older audits recorded a hash of the immediately prior attempt.
+                reference
+                    .get("attempt")
+                    .unwrap_or(&event["fromAttempt"])
+                    .as_str()
+                    == Some(attempt)
+                    && reference["source"] == source.matcher()
+                    && reference["receiptHash"] == hash
+            }),
+        "{error}"
+    );
+    Ok((expected, saved))
+}
+
+fn confirmed_resume_adoption(event: &Value) -> bool {
+    event["result"] == "accepted"
+        && event["launchResult"] == "accepted"
+        && event["adoptionResult"] == "accepted"
+}
+
 // This can also be checked immediately after startup. The transcript can be
 // created later, so only resume preparation requires a regular file on disk.
 fn adoption(ledger: &PublishLock, row: &Value) -> Result<(Expected, Adoption)> {
+    adoption_for(ledger, row, field(row, "attempt")?)
+}
+
+fn adoption_for(ledger: &PublishLock, row: &Value, attempt: &str) -> Result<(Expected, Adoption)> {
     let dispatch = field(row, "dispatch")?;
-    let attempt = field(row, "attempt")?;
     let dir = attempt_dir(ledger.dir(), dispatch, attempt)?;
     let error = "Claude session adoption not verified";
     let binding = open_binding(&dir).context(error)?;

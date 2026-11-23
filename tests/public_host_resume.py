@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -23,6 +24,8 @@ def controlled_worker(host, argv):
         "callback": {key: os.environ[key] for key in CALLBACK_KEYS},
     }
     if host == "claude":
+        with (cwd / "claude-starts").open("a", encoding="utf-8") as starts:
+            starts.write(f"{attempt}\n")
         resumed = "--resume" in argv
         flag = "--resume" if resumed else "--session-id"
         session = argv[argv.index(flag) + 1]
@@ -133,20 +136,40 @@ class PublicHostResume(unittest.TestCase):
     def status(self, dispatch):
         return self.ok("status", "--dispatch", dispatch)["dispatches"][0]
 
-    def dispatch(self, host, *, skip=None):
+    def dispatch(self, host, *, skip=None, launcher=None):
         config = self.root / "launch.json"
         settings = {"CLAUDE_CONFIG_DIR": str(self.root / "profile")} if host == "claude" else {
             "WFC_OPENCODE_ISOLATED_STORE": "1",
         }
         if skip:
             settings["FIXTURE_SKIP_CLAUDE_HOOK"] = skip
+        command = [str(launcher)] if launcher else self.worker_command(host)
         config.write_text(json.dumps({"hosts": {host: {
-            "command": [sys.executable, str(Path(__file__).resolve()), "--worker", host],
+            "command": command,
             "env": settings,
         }}}), encoding="utf-8")
         return self.ok("dispatch", "--host", host, "--backend", "tmux", "--cwd", ".",
                        "--task", "original-task", "--report", self.report_dir / "original.md",
                        "--label", "fixture", "--launch-config", config)
+
+    def worker_command(self, host):
+        return [sys.executable, str(Path(__file__).resolve()), "--worker", host]
+
+    def claude_launcher(self):
+        launcher = self.root / "claude-fixture"
+        command = shlex.join(self.worker_command("claude"))
+        launcher.write_text(f'#!/bin/sh\nexec {command} "$@"\n', encoding="utf-8")
+        launcher.chmod(0o700)
+        return launcher
+
+    def denied_spawn(self, dispatch, *args):
+        failure = self.command("resume", dispatch, *args)
+        self.assertEqual(failure.returncode, 1, (failure.stdout, failure.stderr))
+        self.assertFalse(failure.stdout)
+        error = json.loads(failure.stderr)
+        self.assertEqual((error["result"], error["launchResult"], error["category"]),
+                         ("definitely-not-sent", "definitely-not-sent", "permission_denied"))
+        return error
 
     def trace(self, attempt):
         path = self.work / f"{attempt}.json"
@@ -226,6 +249,116 @@ class PublicHostResume(unittest.TestCase):
         self.assertFalse(self.status(dispatch).get("audit"))
         self.assertEqual(len(list(self.work.glob("a-*.json"))), 1)
 
+    def test_claude_retries_definite_spawn_failures_with_the_original_uuid(self):
+        launcher = self.claude_launcher()
+        original = self.dispatch("claude", launcher=launcher)
+        dispatch, attempt, uuid = original["dispatch"], original["attempt"], original["hostSession"]
+        first = self.trace(attempt)
+        self.terminate_worker(dispatch, attempt)
+
+        launcher.chmod(0o600)
+        attempts = [attempt]
+        for _ in range(2):
+            error = self.denied_spawn(dispatch)
+            self.assertEqual((error["session"], error["round"]), (uuid, 1))
+            self.assertNotIn(error["attempt"], attempts)
+            attempts.append(error["attempt"])
+            self.assertEqual(list(self.work.glob("a-*.json")), [self.work / f"{attempt}.json"])
+        self.assertEqual((self.work / "claude-starts").read_text().splitlines(), [attempt])
+
+        launcher.chmod(0o700)
+        assignment = self.state / "dispatches" / f"{dispatch}.json"
+        saved_assignment = assignment.read_bytes()
+        inconsistent = json.loads(saved_assignment)
+        inconsistent["audit"][0]["inputResult"] = "uncertain"
+        assignment.write_text(json.dumps(inconsistent), encoding="utf-8")
+        before = assignment.read_bytes()
+        denied = self.refused("resume", dispatch)
+        self.assertIn("non-start audit does not verify", denied["diagnostic"])
+        self.assertEqual(assignment.read_bytes(), before)
+        assignment.write_bytes(saved_assignment)
+
+        receipt = self.state / "claude-evidence" / f"{dispatch}.{attempt}" / "adopted.json"
+        saved = receipt.rename(receipt.with_suffix(".saved"))
+        denied = self.refused("resume", dispatch)
+        self.assertIn("Claude session adoption not verified", denied["diagnostic"])
+        unchanged = self.status(dispatch)
+        self.assertEqual(unchanged["attempt"], attempts[-1])
+        self.assertEqual(len(unchanged["audit"]), 2)
+        self.assertEqual(list(self.work.glob("a-*.json")), [self.work / f"{attempt}.json"])
+        saved.rename(receipt)
+
+        resumed = self.ok("resume", dispatch)
+        current_attempt = resumed["attempt"]
+        self.assertNotIn(current_attempt, attempts)
+        self.assertEqual((resumed["session"], resumed["round"], resumed["adoptionResult"]),
+                         (uuid, 1, "accepted"))
+        worker = self.trace(current_attempt)
+        argv = worker["argv"]
+        self.assertEqual(argv[argv.index("--resume") + 1], uuid)
+        self.assertEqual(argv.count("--resume"), 1)
+        self.assertNotIn("--session-id", argv)
+        self.assertEqual(sum("Read and do the task in " in arg for arg in argv), 1)
+        self.assertEqual(worker["task"], first["task"])
+        self.assertNotEqual(worker["callback"]["WFC_WORKER_CALLBACK"],
+                            first["callback"]["WFC_WORKER_CALLBACK"])
+        old = self.command("ask", "old attempt", "--attempt", attempt, callback=first["callback"])
+        self.assertEqual(old.returncode, 1)
+        self.assertIn("attempt is no longer accepted", old.stderr)
+        stale = {**worker["callback"], "WFC_WORKER_CALLBACK": first["callback"]["WFC_WORKER_CALLBACK"]}
+        refused = self.command("ask", "old callback", "--attempt", current_attempt, callback=stale)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("invalid_worker_callback", refused.stderr)
+        self.ok("ask", "current attempt", "--attempt", current_attempt, callback=worker["callback"])
+
+        audit = self.status(dispatch)["audit"]
+        self.assertEqual([(event["fromAttempt"], event["toAttempt"]) for event in audit],
+                         list(zip(attempts, [*attempts[1:], current_attempt])))
+        self.assertEqual([event["claudeAdoption"]["attempt"] for event in audit], [attempt] * 3)
+        self.assertEqual(len({event["claudeAdoption"]["receiptHash"] for event in audit}), 1)
+        self.terminate_worker(dispatch, current_attempt)
+        self.assertCountEqual(self.work.glob("a-*.json"),
+                              [self.work / f"{job}.json" for job in (attempt, current_attempt)])
+        self.assertEqual((self.work / "claude-starts").read_text().splitlines(), [attempt, current_attempt])
+        self.assertFalse((self.work / f"{current_attempt}.input").exists())
+
+    def test_claude_retries_unstarted_next_task_from_last_adopted_attempt(self):
+        launcher = self.claude_launcher()
+        original = self.dispatch("claude", launcher=launcher)
+        dispatch, first_attempt, uuid = original["dispatch"], original["attempt"], original["hostSession"]
+        self.trace(first_attempt)
+        self.terminate_worker(dispatch, first_attempt)
+        adopted = self.ok("resume", dispatch)
+        self.assertEqual((adopted["session"], adopted["adoptionResult"]), (uuid, "accepted"))
+        adopted_attempt = adopted["attempt"]
+        worker = self.trace(adopted_attempt)
+        report = self.report_dir / "original.md"
+        report.write_text("Completed before opening the next task.\n", encoding="utf-8")
+        self.ok("done", "--report", report, "--attempt", adopted_attempt, callback=worker["callback"])
+        self.terminate_worker(dispatch, adopted_attempt)
+
+        launcher.chmod(0o600)
+        next_report = self.report_dir / "next.md"
+        failure = self.denied_spawn(dispatch, "--task", "next-task", "--report", next_report)
+        self.assertEqual((failure["session"], failure["round"]), (uuid, 2))
+        launcher.chmod(0o700)
+        retried = self.ok("resume", dispatch)
+        self.assertEqual((retried["session"], retried["round"], retried["adoptionResult"]),
+                         (uuid, 2, "accepted"))
+        attempt = retried["attempt"]
+        self.assertNotIn(attempt, (first_attempt, adopted_attempt, failure["attempt"]))
+        self.assertEqual(Path(self.trace(attempt)["task"]), self.work / "next-task")
+        row = self.status(dispatch)
+        self.assertEqual(Path(row["report"]), next_report)
+        self.assertEqual(row["audit"][-1]["fromAttempt"], failure["attempt"])
+        self.assertEqual(row["audit"][-1]["claudeAdoption"]["attempt"], adopted_attempt)
+        self.assertEqual(row["audit"][-1]["claudeAdoption"]["source"], "resume")
+        self.assertCountEqual(self.work.glob("a-*.json"),
+                              [self.work / f"{job}.json" for job in (first_attempt, adopted_attempt, attempt)])
+        self.terminate_worker(dispatch, attempt)
+        self.assertEqual((self.work / "claude-starts").read_text().splitlines(),
+                         [first_attempt, adopted_attempt, attempt])
+
     def test_claude_missing_resume_hook_keeps_one_unresolved_attempt(self):
         original = self.dispatch("claude", skip="resume")
         dispatch, attempt = original["dispatch"], original["attempt"]
@@ -257,6 +390,7 @@ class PublicHostResume(unittest.TestCase):
         self.assertEqual((denial["category"], denial["launchResult"], denial["adoptionResult"]),
                          ("host_adoption_unconfirmed", "accepted", "uncertain"))
         self.trace(denial["attempt"])
+        self.terminate_worker(dispatch, denial["attempt"])
         again = self.refused("resume", dispatch)
         self.assertEqual(again["attempt"], denial["attempt"])
         row = self.status(dispatch)
