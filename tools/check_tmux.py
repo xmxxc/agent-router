@@ -32,28 +32,54 @@ def read_only_tree(root):
             path.chmod(mode)
 
 
-def composer(mode, logfile):
+def composer(mode, logfile, reply_worker=False):
     """Controlled terminal host: log actual input bytes and optionally drop Enter."""
     tty.setraw(0)
-    draft = b""
+    draft = "original draft ↑".encode() if mode == "existing-scroll" else b""
     enters = 0
     banner = "This chat uses A, but Codex now uses B, so this chat is read-only."
     refused = "This conversation is read-only or unavailable; no operation was sent."
     notice = banner if mode == "readonly" else refused if mode == "retry-refusal" else ""
+
     def draw():
         shown = draft.decode("utf-8", errors="replace") or "Ask Codex to do anything"
         print(f"\x1b[2J\x1b[H{notice}\r\n› {shown}\r\n\r\n  model · cwd", end="", flush=True)
+
+    wfc = os.getenv("WFC_BIN")
+    attempt = os.getenv("WFC_ATTEMPT")
+    accepted = False
+    if reply_worker:
+        receipt = subprocess.check_output([wfc, "ask", "One controlled question?",
+                                           "--attempt", attempt, "--message-id", "reply-question"])
+        Path("question.tmp").write_bytes(receipt)
+        Path("question.tmp").rename("question.json")
     with open(logfile, "a", buffering=1) as log:
         print(json.dumps({"cwd": os.getcwd(), "label_arg": sys.argv[-1],
                           "worker": [os.getenv(k) for k in ("WFC_WORKER_CALLBACK", "WFC_OWNER_TOKEN",
                                                             "WFC_STATE", "WFC_DISPATCH", "CHECK_ENV")]}), file=log)
         draw()
         while True:
+            if reply_worker:
+                if mode == "existing-scroll" and Path("clear-draft").exists():
+                    Path("clear-draft").unlink()
+                    draft = b""
+                    draw()
+                if notice == banner and Path("enable-input").exists():
+                    notice = ""
+                    draw()
+                if (accepted or mode == "finish-alone") and Path("finish").exists():
+                    report = Path(os.environ["WFC_REPORT"])
+                    Path("finish").unlink()
+                    report.write_text("original worker received the answer\n")
+                    subprocess.run([wfc, "done", "--report", report, "--attempt", attempt,
+                                    "--message-id", "reply-done"], check=True, stdout=subprocess.DEVNULL)
+                if not select.select([0], [], [], .025)[0]:
+                    continue
             b = os.read(0, 1)
             if not b:
                 return
             print(json.dumps([b.hex(), time.monotonic()]), file=log)
-            if b == b"\r":
+            if b == b"\r" or (reply_worker and b == b"\n"):
                 enters += 1
                 if mode == "refusal":
                     notice = refused
@@ -63,15 +89,23 @@ def composer(mode, logfile):
                         draft = b""
                 elif mode == "change":
                     draft = b"someone else's draft"
+                elif mode == "changed-reply":
+                    draft = draft.replace(b": a b", b": ab")
+                elif mode == "scroll":
+                    draft = "visible slice ↑".encode()
                 elif mode != "always-drop" and (mode != "drop" or enters > 1):
+                    if reply_worker:
+                        with Path("accepted").open("ab") as delivered:
+                            delivered.write(draft + b"\n")
+                        accepted = True
                     draft = b""
             elif b != b"\x03":
                 draft += b
             draw()
 
 
-if sys.argv[1:2] == ["--composer"]:
-    composer(sys.argv[2], sys.argv[3])
+if sys.argv[1:2] in (["--composer"], ["--reply-worker"]):
+    composer(sys.argv[2], sys.argv[3], reply_worker=sys.argv[1] == "--reply-worker")
     sys.exit(0)
 
 
@@ -717,6 +751,303 @@ os.execv({TMUX!r}, [{TMUX!r}, *a])
             self.assertEqual((reply["result"], reply.get("category")), (expected, category), (argv, reply))
             if category == "process_exited":
                 self.assertEqual(reply["exitCode"], 23)
+
+    def reply_cli(self, *args, expected=0, **overrides):
+        p = subprocess.run([WFC, *map(str, args)], cwd=self.work,
+                           env={**self.reply_env, **overrides},
+                           text=True, capture_output=True, timeout=35)
+        self.assertEqual(p.returncode, expected, (args, p.stdout, p.stderr))
+        if expected:
+            self.assertFalse(p.stdout)
+            return p.stderr
+        return json.loads(p.stdout)
+
+    def setup_reply(self, mode, scope=None):
+        self.reply_env = {**self.env, "WFC_STATE": str(self.state)}
+        for key in ("WFC_WORKER_CALLBACK", "WFC_OWNER_TOKEN"):
+            self.reply_env.pop(key, None)
+        self.reply_log = self.root / "reply.log"
+        config = self.work / "reply-config.json"
+        config.write_text(json.dumps({"hosts": {"codex": {"command": [
+            sys.executable, str(Path(__file__).resolve()), "--reply-worker", mode, str(self.reply_log),
+        ]}}}))
+        (self.work / "task").write_text("Ask one question, receive the answer, then report.")
+        scope_flags = []
+        if scope is not None:
+            owner = self.reply_cli("acquire", "--scope", scope, "--owner", "A")
+            self.reply_env["WFC_CONTROLLER_TOKEN"] = owner["token"]
+            scope_flags = ["--scope", scope]
+        self.reply_row = self.reply_cli("dispatch", "--host", "codex", "--backend", "tmux",
+                                        "--task", "task", "--cwd", ".", "--report", "report",
+                                        "--launch-config", config, *scope_flags)
+        self.reply_dispatch = self.reply_row["dispatch"]
+        question = self.work / "question.json"
+        deadline = time.monotonic() + 10
+        while not question.exists() or not self.reply_log.exists():
+            self.assertLess(time.monotonic(), deadline, "controlled worker did not publish its question")
+            time.sleep(.025)
+        ready = "read-only" if mode == "readonly" else "Ask Codex to do anything"
+        while ready not in self.reply_screen():
+            self.assertLess(time.monotonic(), deadline, "controlled composer did not draw")
+            time.sleep(.025)
+        self.question = json.loads(question.read_bytes())
+        self.number = str(self.question["message"])
+
+    def reply_status(self):
+        return self.reply_cli("status", "--dispatch", self.reply_dispatch)["dispatches"][0]
+
+    def reply_screen(self):
+        result = self.call("read", dispatch=self.reply_dispatch, executionId=self.reply_row["attempt"])
+        self.assertEqual(result["result"], "accepted", result)
+        return result["screen"]
+
+    def reply_attempts(self):
+        replies = [m for m in self.reply_status()["messages"] if m["type"] == "reply"]
+        for reply in replies:
+            self.assertEqual(reply["questionMessageId"], self.question["messageId"])
+            self.assertEqual(reply["to"], self.question["message"])
+            for key in ("dispatch", "round", "attempt"):
+                self.assertEqual(reply[key], self.reply_row[key])
+        return replies
+
+    def assert_reply_bytes(self, expected):
+        events = self.events(self.reply_log, len(expected))
+        self.assertEqual(b"".join(bytes.fromhex(byte) for byte, _ in events), expected)
+
+    def test_public_reply_once_and_original_done(self):
+        self.setup_reply("drop")
+        self.assertEqual(self.reply_status()["status"], "waiting-human")
+        waiting = self.reply_cli("wait", "--dispatch", self.reply_dispatch, "--timeout", "0")
+        question, = waiting["messages"]
+        self.assertEqual(question["messageId"], self.question["messageId"])
+        answer = "one '中文'\r\nsecond \\ $HOME #{pid}"
+        argv = [WFC, "reply", self.number, answer]
+        with subprocess.Popen(argv, env=self.reply_env, cwd=self.work, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as first, \
+             subprocess.Popen(argv, env=self.reply_env, cwd=self.work, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as second:
+            results = [(p, *p.communicate(timeout=35)) for p in (first, second)]
+        self.assertEqual(sorted(p.returncode for p, _, _ in results), [0, 1])
+        for proc, out, err in results:
+            if proc.returncode == 0:
+                self.assertEqual(json.loads(out),
+                                 {"replied": self.question["message"], "dispatch": self.reply_dispatch})
+            else:
+                self.assertFalse(out)
+                self.assertIn("already answered or has a reply pending", err)
+        self.assertIn("already answered", self.reply_cli("reply", self.number, "different", expected=1))
+        one_line = " ".join(answer.splitlines())
+        text = f"[router] Answer to question {self.number}: {one_line}".encode()
+        self.assert_reply_bytes(text + b"\r\r")
+        self.assertEqual((self.work / "accepted").read_bytes(), text + b"\n")
+        reply, = self.reply_attempts()
+        self.assertEqual(reply["inputResult"], "accepted")
+        self.assertEqual(self.reply_status()["status"], "online")
+        self.assertIn("no controller message", self.reply_cli("ack", reply["messageId"], expected=1))
+        (self.work / "finish").touch()
+        completed = self.reply_cli("wait", "--dispatch", self.reply_dispatch, "--timeout", "8")
+        done, = completed["messages"]
+        self.assertEqual((done["type"], done["round"], done["attempt"]),
+                         ("done", self.reply_row["round"], self.reply_row["attempt"]))
+        self.assertEqual(Path(done["report"]).read_text(), "original worker received the answer\n")
+        self.assertEqual(self.reply_cli("close", self.reply_dispatch)["result"], "completed")
+        self.assertEqual(self.reply_status()["state"], "done")
+
+    def test_public_reply_releases_known_unsent(self):
+        self.setup_reply("readonly")
+        self.assertIn("refused", self.reply_cli("reply", self.number, "blocked", expected=1))
+        attempt, = self.reply_attempts()
+        self.assertEqual(attempt["inputResult"], "refused")
+        self.assertIn("read-only", attempt["diagnostic"])
+        self.assert_reply_bytes(b"")
+        (self.work / "enable-input").touch()
+        deadline = time.monotonic() + 5
+        while "read-only" in self.reply_screen():
+            self.assertLess(time.monotonic(), deadline, "composer did not enable input")
+            time.sleep(.025)
+        self.assertIn("definitely-not-sent",
+                      self.reply_cli("reply", self.number, "missing tmux", expected=1, PATH=str(self.work)))
+        self.assert_reply_bytes(b"")
+        self.reply_cli("reply", self.number, "now active", "--owner-token", "unused-for-unowned")
+        self.assertEqual([m["inputResult"] for m in self.reply_attempts()],
+                         ["refused", "definitely-not-sent", "accepted"])
+        self.assert_reply_bytes(f"[router] Answer to question {self.number}: now active\r".encode())
+
+    def test_public_reply_and_reclaim_preserve_controller_receipts(self):
+        self.setup_reply("readonly")
+        dispatch = self.reply_dispatch
+        self.assertIn("read-only", self.reply_cli("reply", self.number, "blocked", expected=1))
+        self.assert_reply_bytes(b"")
+        (self.work / "enable-input").touch()
+        deadline = time.monotonic() + 5
+        while "read-only" in self.reply_screen():
+            self.assertLess(time.monotonic(), deadline, "composer did not enable input")
+            time.sleep(.025)
+        self.reply_cli("reply", self.number, "once")
+        answer = f"[router] Answer to question {self.number}: once".encode()
+        self.assert_reply_bytes(answer + b"\r")
+        self.assertEqual((self.work / "accepted").read_bytes(), answer + b"\n")
+        (self.work / "finish").touch()
+        deadline = time.monotonic() + 8
+        while self.reply_status()["state"] != "done":
+            self.assertLess(time.monotonic(), deadline, "worker did not publish done")
+            time.sleep(.025)
+
+        reclaim, = self.reply_cli("reclaim", "--yes", "--dispatch", dispatch)["sessions"]
+        self.assertEqual(reclaim["result"], "reclaimed")
+        status = self.reply_cli("status", "--dispatch", dispatch)
+        row, = status["dispatches"]
+        self.assertEqual((row["state"], row["status"], row["backendAlive"]), ("done", "reclaimed", False))
+        self.assertEqual([m["type"] for m in row["messages"]],
+                         ["question", "reply", "reply", "done", "reclaimed"])
+        question, refused, accepted, done, event = row["messages"]
+        self.assertEqual(question["messageId"], self.question["messageId"])
+        self.assertEqual([m["inputResult"] for m in self.reply_attempts()], ["refused", "accepted"])
+        self.assertEqual((event["id"], event["to"], event["delivered"]),
+                         (reclaim["message"], "worker", False))
+        self.assertEqual([(m["id"], m["messageId"]) for m in status["undelivered"]],
+                         [(m["id"], m["messageId"]) for m in (question, done)])
+        claimed = self.reply_cli("wait", "--dispatch", dispatch, "--timeout", "0")["messages"]
+        self.assertEqual([m["messageId"] for m in claimed], [question["messageId"], done["messageId"]])
+        for selector in (str(question["id"]), done["messageId"]):
+            self.assertEqual(self.reply_cli("ack", selector)["state"], "processed")
+        for entry in (refused, accepted, event):
+            for selector in (str(entry["id"]), entry["messageId"]):
+                self.assertIn("no controller message", self.reply_cli("ack", selector, expected=1))
+                self.assertIn("no controller message", self.reply_cli(
+                    "resolve", selector, "--actor", "fixture", "--reason", "mixed ledger",
+                    "--evidence", "test state", "--body-hash", "0" * 64, expected=1))
+        self.assertEqual(Path(done["report"]).read_text(), "original worker received the answer\n")
+        self.assertEqual(self.reply_cli("close", dispatch)["result"], "completed")
+        self.assertEqual(self.reply_status()["messages"][-1]["messageId"], event["messageId"])
+
+    def test_public_reply_retains_claim_on_lost_enter_confirmation(self):
+        self.setup_reply("empty")
+        shim = self.work / "tmux"
+        shim.write_text(f"""#!{sys.executable}
+import os, subprocess, sys
+argv = [{TMUX!r}, *sys.argv[1:]]
+if any("send-keys -t " in x and " Enter ; " in x for x in argv):
+    subprocess.run(argv, check=True, capture_output=True)
+    sys.exit(1)
+os.execv(argv[0], argv)
+""")
+        shim.chmod(0o700)
+        err = self.reply_cli("reply", self.number, "sent once", expected=1,
+                             PATH=f"{self.work}:{self.reply_env['PATH']}")
+        self.assertIn("Enter was not confirmed", err)
+        self.assertIn("already answered", self.reply_cli("reply", self.number, "again", expected=1))
+        reply, = self.reply_attempts()
+        self.assertEqual((reply["inputResult"], reply["category"]), ("uncertain", "input_uncertain"))
+        text = f"[router] Answer to question {self.number}: sent once".encode()
+        self.assert_reply_bytes(text + b"\r")
+        self.assertEqual((self.work / "accepted").read_bytes(), text + b"\n")
+        question, = self.reply_cli("wait", "--timeout", "0")["messages"]
+        self.assertEqual(question["type"], "question")
+        (self.work / "finish").touch()
+        done, = self.reply_cli("wait", "--timeout", "8")["messages"]
+        self.assertEqual((done["type"], done["attempt"]), ("done", self.reply_row["attempt"]))
+
+    def test_public_reply_keeps_ambiguous_draft(self):
+        self.setup_reply("scroll")
+        self.assertIn("composer did not confirm",
+                      self.reply_cli("reply", self.number, "visible slice of the draft", expected=1))
+        self.assertIn("already answered", self.reply_cli("reply", self.number, "again", expected=1))
+        reply, = self.reply_attempts()
+        self.assertEqual(reply["inputResult"], "uncertain")
+        self.assert_reply_bytes(f"[router] Answer to question {self.number}: visible slice of the draft\r".encode())
+        self.assertFalse((self.work / "accepted").exists())
+
+    def test_public_reply_preserves_tmux_draft_with_changed_whitespace(self):
+        self.setup_reply("changed-reply")
+        self.assertIn("composer did not confirm",
+                      self.reply_cli("reply", self.number, "a b", expected=1))
+        self.assertIn(": ab", self.reply_screen())
+        self.assertIn("already answered", self.reply_cli("reply", self.number, "again", expected=1))
+        reply, = self.reply_attempts()
+        self.assertEqual(reply["inputResult"], "uncertain")
+        self.assert_reply_bytes(f"[router] Answer to question {self.number}: a b\r".encode())
+        self.assertFalse((self.work / "accepted").exists())
+
+    def test_public_reply_rechecks_after_waiting_for_input_lock(self):
+        self.setup_reply("finish-alone")
+        path = self.state / "close-locks" / f"{self.reply_dispatch}.{self.reply_row['attempt']}"
+        with path.open("r+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with subprocess.Popen([WFC, "reply", self.number, "too late"], env=self.reply_env,
+                                  cwd=self.work, text=True, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE) as attempt:
+                try:
+                    deadline = time.monotonic() + 5
+                    while not self.reply_attempts():
+                        self.assertLess(time.monotonic(), deadline, "no durable reply reservation")
+                        time.sleep(.025)
+                    reply, = self.reply_attempts()
+                    self.assertEqual(reply["inputResult"], "pending")
+                    question, = self.reply_cli("wait", "--timeout", "0")["messages"]
+                    self.assertEqual(question["type"], "question")
+                    (self.work / "finish").touch()
+                    done, = self.reply_cli("wait", "--timeout", "8")["messages"]
+                    self.assertEqual(done["type"], "done")
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                out, err = attempt.communicate(timeout=10)
+        self.assertEqual(attempt.returncode, 1)
+        self.assertFalse(out)
+        self.assertIn("round is not running", err)
+        reply, = self.reply_attempts()
+        self.assertEqual(reply["inputResult"], "not-submitted")
+        self.assert_reply_bytes(b"")
+
+    def test_managed_tmux_reply_rechecks_owner_while_waiting(self):
+        scope = "managed-reply"
+        self.setup_reply("empty", scope)
+        error = self.reply_cli("reply", self.number, "callback cannot reply", expected=1,
+                               WFC_WORKER_CALLBACK="synthetic")
+        self.assertEqual(json.loads(error)["error"], "worker_callback_only")
+        error = self.reply_cli("reply", self.number, "missing owner", expected=1,
+                               WFC_CONTROLLER_TOKEN="")
+        self.assertEqual(json.loads(error)["error"], "stale_controller_owner")
+        self.assertEqual(self.reply_attempts(), [])
+        path = self.state / "close-locks" / f"{self.reply_dispatch}.{self.reply_row['attempt']}"
+        with path.open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with subprocess.Popen([WFC, "reply", self.number, "stale input"], env=self.reply_env,
+                                  cwd=self.work, text=True, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE) as old_reply:
+                try:
+                    deadline = time.monotonic() + 5
+                    while not self.reply_attempts():
+                        self.assertLess(time.monotonic(), deadline, "reply was not reserved")
+                        time.sleep(.025)
+                    attempt, = self.reply_attempts()
+                    self.assertEqual(attempt["inputResult"], "pending")
+                    current = self.reply_cli("takeover", "--scope", scope, "--owner", "B")
+                    out, err = old_reply.communicate(timeout=5)
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+        self.assertEqual((old_reply.returncode, out), (1, ""))
+        self.assertEqual((json.loads(err)["error"], json.loads(err)["generation"]),
+                         ("stale_controller_owner", current["generation"]))
+        attempt, = self.reply_attempts()
+        self.assertEqual(attempt["inputResult"], "not-submitted")
+        self.assertIn("stale_controller_owner", attempt["diagnostic"])
+        self.assert_reply_bytes(b"")
+        self.reply_cli("reply", self.number, "owner B", "--owner-token", current["token"])
+        self.reply_env["WFC_CONTROLLER_TOKEN"] = current["token"]
+        self.assertIn("already answered", self.reply_cli("reply", self.number, "again", expected=1))
+        text = f"[router] Answer to question {self.number}: owner B".encode()
+        self.assert_reply_bytes(text + b"\r")
+        self.assertEqual((self.work / "accepted").read_bytes(), text + b"\n")
+        self.assertEqual([m["inputResult"] for m in self.reply_attempts()], ["not-submitted", "accepted"])
+        question, = self.reply_cli("wait", "--scope", scope, "--timeout", 0)["messages"]
+        self.assertEqual(question["messageId"], self.question["messageId"])
+        (self.work / "finish").touch()
+        done, = self.reply_cli("wait", "--scope", scope, "--timeout", 8)["messages"]
+        self.assertEqual((done["type"], done["attempt"]), ("done", self.reply_row["attempt"]))
+        self.assertEqual(Path(done["report"]).read_text(), "original worker received the answer\n")
+        self.assertEqual(self.reply_cli("ack", done["messageId"])["state"], "processed")
+        self.assertEqual(self.reply_cli("close", self.reply_dispatch)["result"], "completed")
 
     def test_resume_host_inputs(self):
         log = self.launch_composer("resumed", op="resume", host="opencode", text="resume brief")
