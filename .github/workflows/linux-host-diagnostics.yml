@@ -15,9 +15,9 @@ jobs:
       run:
         shell: bash
     env:
-      PRODUCT_SHA: ac9e5b0167e13dc69c50cf83ed100fd6577d1163
-      PRODUCT_TREE: 38b1376542a55c12a414d9f9c9340ad6d739779b
-      PRODUCT_PARENTS: 'beacb150e76330413596c5acfaf385e6110ed12f de60d29ce0de5204f80625467049b127202eacb5'
+      PRODUCT_SHA: 5c0a0e6cdf68258333944312414548733d6427ad
+      PRODUCT_TREE: a7f2a5e43554c71b485323a99aab19193401b08d
+      PRODUCT_PARENTS: 'ac9e5b0167e13dc69c50cf83ed100fd6577d1163'
       REFERENCE_RUNS: '45246627284/2 45250815210/1'
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TARGET: x86_64-unknown-linux-gnu
@@ -70,7 +70,7 @@ jobs:
             git -C ../native-input show -s --format='native-input=%H tree=%T'
             printf '%s  %s\n' 17e88863f3600672ab49182f217281b6fc4d3c762bde361935e436a95214d05c \
               ../native-input/vendor/zlib-1.3.1.tar.gz | sha256sum --check --strict
-            printf '%s  %s\n' 64b6e564e08c16cf482693a9ff78a19c73847c4efd3d22a49174e2807ed7659a vendor/INPUTS.sha256 | sha256sum --check --strict
+            printf '%s  %s\n' 3881a6f60a0f43c19e91a16238978c743a7f807f1f87c138e51d3c61ea0b5b2b vendor/INPUTS.sha256 | sha256sum --check --strict
             sha256sum vendor/INPUTS.sha256
             sha256sum --check --strict vendor/INPUTS.sha256
           } 2>&1 | tee "$EVIDENCE/sources.log"
