@@ -824,6 +824,23 @@ pub(super) fn history(state: &Path, dispatch: &str) -> Result<Vec<Value>> {
         .collect())
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn reply_was_not_sent(state: &Path, row: &Value, message_id: &str) -> Result<bool> {
+    // Read a complete ledger generation while the Herdr assignment is
+    // locked. A pre-effect or uncertain snapshot only delays recovery.
+    let worker = Identity::deserialize(row).context("read Herdr reply assignment identity")?;
+    Ok(Inbox::snapshot(state)?.iter().any(|message| {
+        message.message_id == message_id
+            && message.worker == worker
+            && message.reply_payload.as_ref().is_some_and(|reply| {
+                matches!(
+                    reply.input_result,
+                    InputResult::DefinitelyNotSent | InputResult::Refused
+                )
+            })
+    }))
+}
+
 pub struct Done<'a> {
     report: &'a Path,
     attempt: Option<&'a str>,

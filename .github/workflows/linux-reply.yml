@@ -89,6 +89,13 @@ jobs:
             test "$version" = 'herdr 0.9.5'
           } 2>&1 | tee "$EVIDENCE/herdr-input.log"
           python -Bu tests/herdr_public.py "$herdr" target/release/wfc -v \
+            PublicLifecycle.test_public_reply_protects_herdr_placeholder_like_and_ambiguous_drafts \
+            PublicLifecycle.test_public_reply_retries_after_herdr_presend_checkpoint_failure \
+            PublicLifecycle.test_public_reply_on_bound_herdr_pane \
+            PublicLifecycle.test_public_reply_retains_claim_after_herdr_delivers_without_receipt \
+            PublicLifecycle.test_public_reply_releases_claim_after_herdr_preflight_read_fails \
+            PublicLifecycle.test_public_reply_preserves_existing_scrolled_herdr_draft \
+            PublicLifecycle.test_public_reply_keeps_claim_when_herdr_draft_reappears \
             PublicLifecycle.test_public_reply_preserves_herdr_draft_with_ambiguous_footer \
             PublicLifecycle.test_public_reply_distinguishes_zero_write_deadline_and_lost_receipt \
             PublicLifecycle.test_managed_herdr_reply_rechecks_owner_while_waiting \

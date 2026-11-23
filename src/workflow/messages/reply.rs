@@ -168,7 +168,15 @@ impl<'a> Reply<'a> {
             Ok(())
         };
 
-        let result = submit(&state, &row, worker.scope(), token.as_deref(), &text, begin);
+        let result = submit(
+            &state,
+            &row,
+            worker.scope(),
+            token.as_deref(),
+            &uid,
+            &text,
+            begin,
+        );
         let mut authorization_error = None;
         let (outcome, diagnostic, category) = match result {
             Ok(result) => {
@@ -255,6 +263,7 @@ fn submit(
     row: &Value,
     scope: &str,
     token: Option<&str>,
+    message_id: &str,
     text: &str,
     mut begin: impl FnMut() -> Result<()>,
 ) -> Result<Value> {
@@ -276,7 +285,9 @@ fn submit(
                     }
                 }
                 Some("herdr") => {
-                    if let Some(result) = herdr::try_submit_reply(state, row, text, &mut begin)? {
+                    if let Some(result) =
+                        herdr::try_submit_reply(state, row, message_id, text, &mut begin)?
+                    {
                         return Ok(result);
                     }
                 }
