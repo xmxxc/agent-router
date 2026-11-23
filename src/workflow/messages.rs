@@ -850,7 +850,21 @@ impl Inbox {
         else {
             return Ok(None);
         };
-        let worker = Identity::deserialize(row).context("read worker input identity")?;
+        let mut worker = Identity::deserialize(row).context("read worker input identity")?;
+        if event["round"] != worker.round || event["attempt"] != worker.attempt {
+            ensure!(
+                event["result"] == "accepted"
+                    && row["rounds"].as_array().into_iter().flatten().any(|round| {
+                        round["round"] == event["round"] && round["attempt"] == event["attempt"]
+                    }),
+                "worker input history conflict"
+            );
+            worker.round = event["round"].as_u64().context("invalid input round")?;
+            worker.attempt = event["attempt"]
+                .as_str()
+                .context("invalid input attempt")?
+                .to_owned();
+        }
         let input = WorkerInput::from_audit(event)?;
         ensure!(
             message.worker == worker

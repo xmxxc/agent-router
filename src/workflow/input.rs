@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 pub const CONTINUE_USAGE: &str =
     "wfc continue DISPATCH --task FILE --report FILE [--owner-token TOKEN]";
-pub const NUDGE_USAGE: &str = "wfc nudge DISPATCH --text TEXT [--owner-token TOKEN]";
+pub const NUDGE_USAGE: &str =
+    "wfc nudge DISPATCH --text TEXT [--message-id KEY] [--owner-token TOKEN]";
 
 pub fn usage(name: &str) -> &'static str {
     if name == "continue" {
@@ -41,13 +42,14 @@ impl Action<'_> {
 pub struct Request<'a> {
     dispatch: &'a str,
     token: Option<&'a str>,
+    key: Option<&'a str>,
     action: Action<'a>,
 }
 
 impl<'a> Request<'a> {
     pub fn parse(name: &str, args: &'a [OsString]) -> Result<Self> {
         let mut dispatch = None;
-        let (token, action) = if name == "continue" {
+        let (token, key, action) = if name == "continue" {
             let [token, task, report] = messages::options(
                 args,
                 ["--owner-token", "--task", "--report"],
@@ -55,18 +57,23 @@ impl<'a> Request<'a> {
             )?;
             (
                 token,
+                None,
                 Action::Continue {
                     task: Path::new(task.context("missing --task")?),
                     report: Path::new(report.context("missing --report")?),
                 },
             )
         } else {
-            let [token, text] = messages::options(
+            let [token, text, key] = messages::options(
                 args,
-                ["--owner-token", "--text"],
+                ["--owner-token", "--text", "--message-id"],
                 Some((&mut dispatch, "dispatch ID")),
             )?;
-            (token, Action::Nudge(text.context("missing --text")?))
+            ensure!(
+                key.is_none_or(|key| !key.trim().is_empty() && !key.chars().any(char::is_control)),
+                "invalid --message-id"
+            );
+            (token, key, Action::Nudge(text.context("missing --text")?))
         };
         let dispatch = dispatch
             .filter(|id| super::valid_id(id))
@@ -74,6 +81,7 @@ impl<'a> Request<'a> {
         Ok(Self {
             dispatch,
             token,
+            key,
             action,
         })
     }
@@ -97,9 +105,10 @@ impl<'a> Request<'a> {
             _ => None,
         };
         let original_unresolved = assignment::input_unresolved(&original);
+        let initial_replay = replay_index(&original, &self.action, nudge.as_deref(), self.key)?;
         ensure!(
             !original_unresolved
-                || replay_index(&original, &self.action, nudge.as_deref())
+                || initial_replay
                     .is_some_and(|index| original["audit"][index]["result"] == "pending"),
             "input is pending or uncertain; verify the prior input before retrying"
         );
@@ -119,13 +128,15 @@ impl<'a> Request<'a> {
         );
         let same_round =
             current["round"] == original["round"] && current["attempt"] == original["attempt"];
-        let replay = replay_index(&current, &self.action, nudge.as_deref()).filter(|index| {
-            let event = &current["audit"][*index];
-            same_round
-                || (operation == "continue"
-                    && event["fromRound"] == original["round"]
-                    && event["fromAttempt"] == original["attempt"])
-        });
+        let replay =
+            replay_index(&current, &self.action, nudge.as_deref(), self.key)?.filter(|index| {
+                let event = &current["audit"][*index];
+                same_round
+                    || (operation == "nudge" && event["result"] == "accepted")
+                    || (operation == "continue"
+                        && event["fromRound"] == original["round"]
+                        && event["fromAttempt"] == original["attempt"])
+            });
         if let Some(index) = replay {
             let mut event = current["audit"][index].clone();
             let inbox = messages::Inbox::open(&state)?;
@@ -257,6 +268,9 @@ impl<'a> Request<'a> {
                     );
                     let text = nudge.as_deref().context("missing nudge text")?;
                     event["text"] = json!(text);
+                    if let Some(key) = self.key {
+                        event["requestKey"] = json!(key);
+                    }
                     format!("[router] Message from the controller: {text}")
                 }
             };
@@ -402,10 +416,37 @@ fn input_response(dispatch: &str, event: &Value, duplicate: bool) -> Value {
     result
 }
 
-fn replay_index(row: &Value, action: &Action<'_>, nudge: Option<&str>) -> Option<usize> {
-    let audit = row["audit"].as_array()?;
+fn replay_index(
+    row: &Value,
+    action: &Action<'_>,
+    nudge: Option<&str>,
+    key: Option<&str>,
+) -> Result<Option<usize>> {
+    let Some(audit) = row["audit"].as_array() else {
+        return Ok(None);
+    };
     let unresolved = assignment::input_unresolved(row);
-    audit.iter().rposition(|event| {
+    if matches!(action, Action::Nudge(_)) {
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        let matches = |event: &Value| event["operation"] == "nudge" && event["requestKey"] == key;
+        ensure!(
+            audit
+                .iter()
+                .filter(|event| matches(event))
+                .all(|event| event["text"].as_str() == nudge),
+            "message request {key} conflicts with an existing reminder"
+        );
+        return Ok(audit.iter().rposition(|event| {
+            matches(event)
+                && ((!unresolved && event["result"] == "accepted")
+                    || (event["result"] == "pending"
+                        && event["round"] == row["round"]
+                        && event["attempt"] == row["attempt"]))
+        }));
+    }
+    Ok(audit.iter().rposition(|event| {
         event["operation"] == action.name()
             && matches!(event["result"].as_str(), Some("accepted" | "pending"))
             && (!unresolved || event["result"] == "pending")
@@ -429,9 +470,9 @@ fn replay_index(row: &Value, action: &Action<'_>, nudge: Option<&str>) -> Option
                             .and_then(|path| path_text(path).ok())
                             .is_some_and(|report| event["report"] == report)
                 }
-                Action::Nudge(_) => event["text"].as_str().map(str::trim_end) == nudge,
+                Action::Nudge(_) => false,
             }
-    })
+    }))
 }
 
 fn nudge_text(text: &str) -> Result<String> {
@@ -446,7 +487,12 @@ fn nudge_text(text: &str) -> Result<String> {
         !text.trim_end().is_empty() && !text.chars().any(char::is_control),
         "invalid nudge text"
     );
-    Ok(text.trim_end().to_owned())
+    let text = text.trim_end();
+    ensure!(
+        !text.ends_with(['↑', '↓']),
+        "a trailing scroll arrow cannot be verified before sending"
+    );
+    Ok(text.to_owned())
 }
 
 fn authorized_generation(

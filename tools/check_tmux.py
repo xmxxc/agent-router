@@ -1,5 +1,6 @@
 """Exercise the public CLI and private backend with a fresh tmux server and state roots."""
 from contextlib import contextmanager
+import errno
 import fcntl
 import hashlib
 import json
@@ -2315,6 +2316,11 @@ while time.monotonic() < deadline:
         print("\x1b[2J\x1b[H" + old + "".join(f"history {i}\r\n" for i in range(35)), end="", flush=True)
         draw()
         Path("history-ready").touch()
+    if Path("fill-transcript").exists():
+        Path("fill-transcript").unlink()
+        transcript += "".join(f"scroll anchor {i}\r\n" for i in range(10)) + "\r\n"
+        draw()
+        Path("filled-transcript").touch()
     if Path("finish-first-externally").exists():
         Path("finish-first-externally").unlink()
         Path(report).write_text("first report")
@@ -2390,6 +2396,9 @@ while time.monotonic() < deadline:
                 result = done(target, attempt, "--callback-ref", reference)
                 write_json("r2-done", json.loads(result.stdout))
     if draft:
+        if Path("refuse-draft").exists() and draft.endswith(b"and end your turn."):
+            draft = b""
+            transcript += old_refusal
         draw()
 """)
         config = self.work / "launch.json"
@@ -2436,15 +2445,12 @@ mode = os.environ["INPUT_TEST_GATE"]
 read = any("capture-pane -p -J -t " in arg for arg in args)
 enter = any("send-keys -t " in arg and " Enter" in arg for arg in args)
 if read and mode == "trace-redraw":
-    index = next(i for i, arg in enumerate(args) if "capture-pane -p -J -t " in arg)
-    action = args[index]
     result = subprocess.run([real, *args], close_fds=False, capture_output=True)
     trace = root / "redraw-frames"
     if result.returncode == 0:
         expected = "› [router] Message from the controller: finish first"
         def summarize(kind, out):
-            rows = [line.rstrip() for line in out.decode(errors="replace").splitlines()[1:-1]
-                    if line.strip()]
+            rows = [line.rstrip() for line in out if line.strip()]
             prompt = next((i for i in range(len(rows) - 1, -1, -1)
                            if rows[i] == "›" or rows[i].startswith("› ")), None)
             draft = "unrecognized" if prompt is None else "empty" if rows[prompt] == "›" else (
@@ -2452,20 +2458,15 @@ if read and mode == "trace-redraw":
             return {{"kind": kind, "draft": draft, "rows_before_prompt": prompt,
                     "exact_entries": rows[:prompt].count(expected) if prompt is not None else 0}}
 
-        kind = "history" if " -S - ;" in action else "viewport"
-        frame = summarize(kind, result.stdout)
+        rows = result.stdout.decode(errors="replace").splitlines()[1:-1]
+        cut = next(i for i, row in enumerate(rows) if row.startswith("wfc-input-viewport-"))
+        frame = summarize("viewport", rows[cut + 1:])
+        history = summarize("redraw-history" if frame["draft"] == "exact" else "history", rows[:cut])
         prior = trace.read_text().splitlines() if trace.exists() else []
         with trace.open("a") as log:
-            if len(prior) < 12:
+            if len(prior) < 11:
                 print(json.dumps(frame), file=log)
-                if len(prior) < 11 and kind == "viewport" and frame["draft"] == "exact" and not any(
-                        "redraw-history" in line for line in prior):
-                    probe_args = args.copy()
-                    probe_args[index] = action.replace(" ; display-message -p wfc-tmux-confirmed",
-                                                       " -S - ; display-message -p wfc-tmux-confirmed")
-                    probe = subprocess.run([real, *probe_args], close_fds=False, capture_output=True)
-                    if probe.returncode == 0:
-                        print(json.dumps(summarize("redraw-history", probe.stdout)), file=log)
+                print(json.dumps(history), file=log)
     sys.stdout.buffer.write(result.stdout)
     sys.stderr.buffer.write(result.stderr)
     sys.exit(result.returncode)
@@ -2476,7 +2477,8 @@ if mode == "lose-enter-response" and enter:
         (root / "enter-sent").touch()
     sys.exit(1)
 if read and mode in ("before-text", "before-enter") and not (root / "input-boundary").exists():
-    typed = (root / "input-bytes").exists()
+    byte_log = root / "input-bytes"
+    typed = byte_log.exists() and byte_log.stat().st_size > int(os.environ.get("INPUT_TEST_TYPED_BASELINE", "0"))
     if typed == (mode == "before-enter"):
         # Return the screen captured before the test acquires the Inbox lock.
         result = subprocess.run([real, *args], close_fds=False, capture_output=True)
@@ -2774,10 +2776,106 @@ os.execv(real, [real, *args])
         self.assertEqual(resumed["round"], 2)
         self.assertEqual(len(formal.read_text().splitlines()), 2)
 
-    def test_public_nudge_recovers_after_settlement_sync_failure(self):
+    def test_public_nudge_distinguishes_new_intent_and_keyed_replay(self):
         cli, first, token, _ = self.public_input_worker()
         dispatch = first["dispatch"]
-        source = self.work / "settlement-sync.c"
+        args = ("nudge", dispatch, "--text")
+        self.assertIn("trailing scroll arrow", cli(*args, "往上 ↑", token=token, expected=1))
+        self.assertFalse((self.work / "input-bytes").exists())
+        first_a = cli(*args, "甲 ↑ 中", token=token)
+        b = cli(*args, "乙", "--message-id", "intent-b", token=token)
+        second_a = cli(*args, "甲 ↑ 中", token=token)
+        self.assertEqual(len({r["message"] for r in (first_a, b, second_a)}), 3)
+        self.assertEqual(cli(*args, "乙 ", "--message-id", "intent-b", token=token),
+                         {**b, "duplicate": True})
+        self.assertIn("conflicts", cli(*args, "changed", "--message-id", "intent-b",
+                                       token=token, expected=1))
+        expected = ["[router] Message from the controller: " + body for body in ("甲 ↑ 中", "乙", "甲 ↑ 中")]
+        self.assertEqual([json.loads(line) for line in (self.work / "formal-input").read_text().splitlines()],
+                         expected)
+        self.assertEqual((self.work / "input-bytes").read_bytes(),
+                         b"".join(body.encode() + b"\r" for body in expected))
+        status = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual([m["id"] for m in status["messages"] if m["to"] == "worker"],
+                         [first_a["message"], b["message"], second_a["message"]])
+
+    def test_public_continue_confirms_soft_wrap_with_transcript_scroll(self):
+        cli, first, token, env = self.public_input_worker()
+        dispatch = first["dispatch"]
+        cli("nudge", dispatch, "--text", "finish first", token=token)
+        self.await_input_value(lambda: (self.work / "first-done").exists())
+        pane = self.active_pane(dispatch)
+        subprocess.run(self.tmux + ["resize-window", "-t", f"=wfc-{dispatch}:", "-x", "80", "-y", "16"],
+                       check=True)
+        (self.work / "fill-transcript").touch()
+        self.await_input_value(lambda: (self.work / "filled-transcript").exists())
+        capture = self.tmux + ["capture-pane", "-p", "-J", "-t", pane]
+        def anchors():
+            return [line.strip() for line in subprocess.check_output(capture, text=True).splitlines()
+                    if line.startswith("scroll anchor ")]
+        prior = anchors()
+        self.assertEqual(len(prior), 10)
+        gate = self.public_input_gate(env, "before-enter")
+        gate["INPUT_TEST_TYPED_BASELINE"] = str((self.work / "input-bytes").stat().st_size)
+        args = ["continue", dispatch, "--task", "next-task", "--report", "report2"]
+        with subprocess.Popen([WFC, *args, "--owner-token", token], cwd=self.work,
+                              env={**env, **gate}, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) as pending:
+            try:
+                self.await_input_value(lambda: (self.work / "input-boundary").exists())
+                during = anchors()
+                self.assertTrue(during and len(during) < len(prior), (prior, during))
+                self.assertEqual(during, prior[-len(during):])
+            finally:
+                (self.work / "release-input-boundary").touch()
+                out, error = pending.communicate(timeout=15)
+        self.assertEqual(pending.returncode, 0, (out, error))
+        result = json.loads(out)
+        after = anchors()
+        self.assertTrue(after and len(after) < len(during), (during, after))
+        self.assertEqual(after, prior[-len(after):])
+        self.assertEqual(len((self.work / "formal-input").read_text().splitlines()), 2)
+        self.assertEqual((self.work / "input-bytes").read_bytes().count(b"\r"), 2)
+        row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((result["round"], result["attempt"]), (2, row["attempt"]))
+        self.assertEqual(row["audit"][-1]["inputEvidence"], "appended-user-entry")
+        print("R19 scroll anchors " + json.dumps({"before": len(prior), "draft": len(during),
+                                                  "submitted": len(after), "enter_count": 2}), flush=True)
+
+    def test_public_continue_restores_round_on_unique_refusal_before_enter(self):
+        cli, first, token, _ = self.public_input_worker()
+        dispatch = first["dispatch"]
+        cli("nudge", dispatch, "--text", "finish first", token=token)
+        self.await_input_value(lambda: (self.work / "first-done").exists())
+        refusal = self.work / "refuse-draft"
+        refusal.touch()
+        args = ("continue", dispatch, "--task", "next-task", "--report", "report2")
+        for count in (1, 2):
+            self.assertIn("continue refused", cli(*args, token=token, expected=1))
+            row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+            self.assertEqual((row["round"], row["attempt"]), (1, first["attempt"]))
+            self.assertEqual(row["audit"][-1]["inputEvidence"], "new-host-refusal")
+            self.assertEqual([m["type"] for m in row["messages"] if m["to"] == "worker"], ["nudge"])
+            data = (self.work / "input-bytes").read_bytes()
+            self.assertEqual(data.count(b"\r"), 1)
+            self.assertEqual(data.count(b"[router] New task for you"), count)
+            self.assertEqual(len((self.work / "formal-input").read_text().splitlines()), 1)
+        refusal.unlink()
+        self.assertEqual(cli(*args, token=token)["round"], 2)
+        self.assertEqual(len((self.work / "formal-input").read_text().splitlines()), 2)
+
+    def test_public_nudge_recovers_after_settlement_sync_failure(self):
+        cli, first, token, env = self.public_input_worker()
+        dispatch = first["dispatch"]
+        self.assertIn(" ", str(self.work))
+        # glibc tokenizes LD_PRELOAD on spaces and colons, without an escape.
+        loader = tempfile.TemporaryDirectory(prefix="wfc-settlement-loader-", dir="/tmp")
+        self.addCleanup(loader.cleanup)
+        loader_dir = Path(loader.name)
+        shim = loader_dir / "settlement-sync.so"
+        self.assertFalse(any(char in str(shim) for char in " :\t\r\n"))
+        self.assertEqual(stat.S_IMODE(loader_dir.stat().st_mode), 0o700)
+        source = loader_dir / "settlement-sync.c"
         source.write_text(r"""
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -2787,9 +2885,26 @@ os.execv(real, [real, *args])
 #include <string.h>
 #include <unistd.h>
 
+static void record_event(const char *event, unsigned ordinal, int error) {
+    const char *log = getenv("WFC_TEST_SETTLEMENT_LOG");
+    if (!log) return;
+    FILE *file = fopen(log, "a");
+    if (!file) return;
+    fprintf(file, "%ld %s %u %d\n", (long)getpid(), event, ordinal, error);
+    fclose(file);
+}
+
+__attribute__((constructor)) static void loaded(void) {
+    record_event("loaded", 0, 0);
+}
+
 int fsync(int fd) {
     static unsigned dispatch_syncs;
     int (*real_fsync)(int) = dlsym(RTLD_NEXT, "fsync");
+    if (!real_fsync) {
+        errno = ENOSYS;
+        return -1;
+    }
     const char *directory = getenv("WFC_TEST_SETTLEMENT_DIR");
     char link[64];
     char path[4096];
@@ -2797,31 +2912,90 @@ int fsync(int fd) {
     ssize_t count = readlink(link, path, sizeof(path) - 1);
     if (directory && count >= 0) {
         path[count] = '\0';
-        if (strcmp(directory, path) == 0 && ++dispatch_syncs == 2) {
-            FILE *marker = fopen("injected-settlement-sync", "w");
-            if (marker) fclose(marker);
-            errno = EIO;
-            return -1;
+        if (strcmp(directory, path) == 0) {
+            unsigned ordinal = ++dispatch_syncs;
+            if (ordinal == 2) {
+                record_event("directory-sync", ordinal, EIO);
+                errno = EIO;
+                return -1;
+            }
+            int result = real_fsync(fd);
+            int saved_errno = errno;
+            record_event("directory-sync", ordinal, result == 0 ? 0 : saved_errno);
+            errno = saved_errno;
+            return result;
         }
     }
     return real_fsync(fd);
 }
 """)
-        shim = self.work / "settlement-sync.so"
         subprocess.run(["cc", "-shared", "-fPIC", "-o", shim, source, "-ldl"], check=True)
-        args = ("nudge", dispatch, "--text")
-        cli(*args, "safely repeat   ", token=token, expected=1, LD_PRELOAD=str(shim),
-            WFC_TEST_SETTLEMENT_DIR=str(self.state / "dispatches"))
-        self.assertTrue((self.work / "injected-settlement-sync").exists())
+
+        def run_with_loader(phase, args, **extra):
+            log = loader_dir / f"{phase}.log"
+            test_env = {**env, "LC_ALL": "C", "LD_PRELOAD": str(shim),
+                        "WFC_TEST_SETTLEMENT_LOG": str(log), **extra}
+            with subprocess.Popen([WFC, *args], cwd=self.work, env=test_env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child:
+                try:
+                    stdout, stderr = child.communicate(timeout=15)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.communicate()
+                    raise
+            events = []
+            if log.exists():
+                for line in log.read_text().splitlines():
+                    pid, event, ordinal, error = line.split()
+                    if int(pid) == child.pid:
+                        events.append([event, int(ordinal), int(error)])
+            print("R18 settlement loader " + json.dumps({
+                "phase": phase, "exit": child.returncode, "main_process_events": events,
+                "loader_warning": "ld.so" in stderr,
+            }), flush=True)
+            self.assertNotIn("ld.so", stderr)
+            return child.returncode, stdout, stderr, events
+
+        rc, version, error, events = run_with_loader("preflight", ("--version",))
+        self.assertEqual((rc, error, events), (0, "", [["loaded", 0, 0]]))
+        self.assertIn("(Rust,", version)
+        print("R18 settlement shim SHA-256 " + hashlib.sha256(shim.read_bytes()).hexdigest(), flush=True)
+        before = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertFalse(any(message["to"] == "worker" for message in before["messages"]))
+        byte_log = self.work / "input-bytes"
+        typed = self.work / "typed"
+        formal = self.work / "formal-input"
+        self.assertTrue(all(not path.exists() for path in (byte_log, typed, formal)))
+
+        args = ("nudge", dispatch, "--message-id", "settlement-receipt", "--text")
+        rc, output, error, events = run_with_loader(
+            "fault", (*args, "safely repeat   ", "--owner-token", token),
+            WFC_TEST_SETTLEMENT_DIR=str((self.state / "dispatches").resolve()))
+        self.assertEqual(events, [["loaded", 0, 0], ["directory-sync", 1, 0],
+                                  ["directory-sync", 2, errno.EIO]])
+        self.assertEqual((rc, output), (1, ""))
+        self.assertIn(f"os error {errno.EIO}", error)
+
         status = cli("status", "--dispatch", dispatch)["dispatches"][0]
         settled = status["audit"][-1]
-        self.assertEqual((settled["result"], settled["text"]), ("accepted", "safely repeat"))
-        formal = self.work / "formal-input"
-        self.assertEqual([json.loads(line) for line in formal.read_text().splitlines()],
-                         ["[router] Message from the controller: safely repeat"])
+        self.assertEqual((settled["result"], settled["text"], settled["inputEvidence"]),
+                         ("accepted", "safely repeat", "appended-user-entry"))
+        receipt = settled["message"]
+        self.assertIsInstance(receipt, int)
+        expected_entry = "[router] Message from the controller: safely repeat"
+        expected_bytes = expected_entry.encode() + b"\r"
+        self.assertEqual(byte_log.read_bytes(), expected_bytes)
+        self.assertEqual([json.loads(line) for line in typed.read_text().splitlines()], [expected_entry])
+        self.assertEqual([json.loads(line) for line in formal.read_text().splitlines()], [expected_entry])
+        self.assertEqual([m["id"] for m in status["messages"] if m["to"] == "worker"], [receipt])
+        ledger = self.state / "messages.json"
+        confirmed_ledger = ledger.read_bytes()
+
         visible = cli(*args, "safely repeat", token=token)
         self.assertEqual((visible["message"], visible["audit"], visible["duplicate"]),
-                         (settled["message"], settled["id"], True))
+                         (receipt, settled["id"], True))
+        self.assertEqual(byte_log.read_bytes(), expected_bytes)
+        self.assertEqual(ledger.read_bytes(), confirmed_ledger)
         # Reconstruct the pre-rename disk state while retaining the proven receipt.
         assignment = self.state / "dispatches" / f"{dispatch}.json"
         row = json.loads(assignment.read_text())
@@ -2833,12 +3007,18 @@ int fsync(int fd) {
         for text in ("safely repeat", "safely repeat  "):
             result = cli(*args, text, token=token)
             self.assertEqual((result["message"], result["audit"], result["duplicate"]),
-                             (settled["message"], settled["id"], True))
+                             (receipt, settled["id"], True))
+            self.assertEqual(byte_log.read_bytes(), expected_bytes)
+            self.assertEqual(ledger.read_bytes(), confirmed_ledger)
+        self.assertEqual(len(typed.read_text().splitlines()), 1)
         self.assertEqual(len(formal.read_text().splitlines()), 1)
         status = cli("status", "--dispatch", dispatch)["dispatches"][0]
         self.assertEqual(status["audit"][-1], settled)
-        self.assertEqual([m["id"] for m in status["messages"] if m["to"] == "worker"],
-                         [settled["message"]])
+        self.assertEqual([m["id"] for m in status["messages"] if m["to"] == "worker"], [receipt])
+        print("R18 settlement replay " + json.dumps({
+            "numeric_receipt_preserved": True, "ledger_bytes_preserved": True,
+            "literal_bytes": len(expected_bytes) - 1, "enter_count": 1, "formal_count": 1,
+        }), flush=True)
 
     def test_public_nudge_rechecks_draft_and_lease_after_inbox_wait(self):
         original = self.work
