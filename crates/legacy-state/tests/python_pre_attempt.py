@@ -14,12 +14,85 @@ from python_recovery import backup, digest, dump
 from python_history import check
 
 
+def repeated_legacy(fixture, early, later, binary):
+    """Exercise the two writers independently: schema upgrade selects first, modern done selects last."""
+    e = fixture()
+    try:
+        git = ["git", "-C", str(e.cwd), "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid"]
+        subprocess.run([*git, "init", "--quiet"], check=True)
+        subprocess.run([*git, "commit", "--allow-empty", "-qm", "initial"], check=True)
+        did = e.dispatch()
+        e.report.write_text("same report")
+        e.json("done", "--report", str(e.report), dispatch=did)
+        for phase in ("identical", "worktree-changed"):
+            if phase == "worktree-changed":
+                (e.cwd / "changed").write_text("changed")
+            e.json("done", "--report", str(e.report), dispatch=did)
+            src = e.state / "router.db"
+            source_sha = digest(src)
+            with closing(sqlite3.connect(src)) as db:
+                columns = ",".join(r[1] for r in db.execute("PRAGMA table_info(message)"))
+                message_sql = f"SELECT {columns} FROM message ORDER BY id"
+                original = db.execute(message_sql).fetchall()
+                receipts = db.execute("SELECT id,body,created FROM message ORDER BY id").fetchall()
+                assert receipts[0][1] == receipts[1][1] and receipts[0][2] < receipts[1][2]
+                if phase == "worktree-changed" and "dirty" in json.loads(receipts[0][1]):
+                    assert [json.loads(r[1])["dirty"] for r in receipts] == [False, False, True]
+            for py in (None, *later):
+                with tempfile.TemporaryDirectory() as tmp:
+                    work = Path(tmp)
+                    path = work / "router.db"
+                    backup(src, path)
+                    prior = dump(path)
+                    settings = {"HOME":tmp,"PATH":"/usr/bin:/bin","WFC_STATE":tmp,"WFC_DISPATCH":did}
+                    if py is None:
+                        saved = Path(json.loads(subprocess.check_output([binary, "migrate", "--offline-copy", work],
+                                                                       env=settings))["backup"])
+                        assert saved.stat().st_mode & 0o777 == 0o600 and dump(saved) == prior
+                    else:
+                        subprocess.run([sys.executable, "-B", "-c", "import router; router.connect().close()"],
+                                       cwd=py, env=settings, check=True)
+                    with closing(sqlite3.connect(path)) as db:
+                        assert db.execute(message_sql).fetchall() == original
+                        assert db.execute("SELECT result,completed FROM dispatch_round").fetchone() == receipts[0][1:]
+                    name = py.name if py else "direct"
+                    print("legacy selected", phase, name, did, "receipt", receipts[0], "remaining times", [r[2] for r in receipts[1:]])
+                    check(path, binary, did, phase + "-" + name, current_report=str(e.report))
+                    # A later legacy timestamp cannot prove Python's first-row backfill.
+                    check(path, binary, did, "wrong-first-clock", refuse=True, diagnostic="first legacy",
+                          damage="UPDATE dispatch_round SET completed=(SELECT max(created) FROM message);")
+                    if py:
+                        subprocess.run([sys.executable, "-B", py / "router.py", "done", "--report", str(e.report)],
+                                       env=settings, check=True, capture_output=True)
+                        with closing(sqlite3.connect(path)) as db:
+                            rows = db.execute("SELECT id,message_uid,status_version,body,created FROM message ORDER BY id").fetchall()
+                            assert len(rows) == len(receipts)+1 and json.loads(rows[-1][3])["attempt"]
+                            final, when = db.execute("SELECT result,completed FROM dispatch_round").fetchone()
+                            assert all(json.loads(rows[-1][3])[k] == v for k,v in json.loads(final).items())
+                            assert when >= rows[-1][4] and db.execute(message_sql).fetchall()[:-1] == original
+                            print("modern selected", phase, name, rows[-1], final, when)
+                        check(path, binary, did, phase + "-modern-" + name, current_report=str(e.report))
+                        # An old CLI can still append after a modern snapshot was written.
+                        subprocess.run([sys.executable, "-B", early / "router.py", "done", "--report", str(e.report)],
+                                       env=settings, check=True, capture_output=True)
+                        subprocess.run([sys.executable, "-B", "-c", "import router; router.connect().close()"],
+                                       cwd=py, env=settings, check=True)
+                        with closing(sqlite3.connect(path)) as db:
+                            assert db.execute("SELECT result,completed FROM dispatch_round").fetchone() == (final, when)
+                            assert db.execute("SELECT count(*) FROM message").fetchone() == (len(rows)+1,)
+                        check(path, binary, did, phase + "-old-after-modern-" + name, current_report=str(e.report))
+            assert digest(src) == source_sha
+    finally:
+        e.close()
+
+
 def run(early, later, binary):
     for key in list(os.environ):
         if key.startswith("WFC_"):
             del os.environ[key]
     sys.dont_write_bytecode = True
     fixture = runpy.run_path(str(early / "tests/test_router.py"))
+    repeated_legacy(fixture["Env"], early, later, binary)
     e = fixture["Env"]()
     try:
         did = e.dispatch()
@@ -106,6 +179,9 @@ def run(early, later, binary):
                                           "UPDATE message SET body_hash=body_sha(body) WHERE id=1;")
                                 check(db_path, binary, did, "old-conflicting-" + field, damage=change,
                                       refuse=True, diagnostic="conflicting done results")
+                            check(db_path, binary, did, "old-without-paths-or-final",
+                                  damage="UPDATE dispatch_round SET report=NULL,result=NULL; UPDATE dispatch SET report=NULL;",
+                                  refuse=True, diagnostic="without a final snapshot result")
                             check(db_path, binary, did, "old-without-final", damage="UPDATE dispatch_round SET result=NULL;",
                                   refuse=True, diagnostic="without a final snapshot result")
                         print(name, "pre-attempt -> modern repeated done", mid, "all rows and bytes unchanged", mixed_sha)

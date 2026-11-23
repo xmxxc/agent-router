@@ -316,11 +316,16 @@ fn recover(db: &Connection, id: &str) -> Result<()> {
         let mut by_report = BTreeMap::new();
         for f in facts {
             let report = f.report.context("legacy done has no report")?;
-            agree(
-                by_report.entry(report).or_default(),
-                f.done.map(|(raw, _)| raw),
-                "legacy done results",
-            )?;
+            if let Some((raw, _)) = f.done {
+                let first = by_report.entry(report).or_insert_with(|| raw.clone());
+                if first != &raw {
+                    ensure!(
+                        crate::completion::legacy_result(&serde_json::from_str(first)?)
+                            && crate::completion::legacy_result(&serde_json::from_str(&raw)?),
+                        "conflicting legacy done results"
+                    );
+                }
+            }
         }
         let report = match parent.report {
             Some(path) => Some(path),

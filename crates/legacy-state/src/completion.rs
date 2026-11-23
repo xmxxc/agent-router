@@ -21,6 +21,20 @@ fn has_git_result(body: &Value) -> bool {
         }
 }
 
+// Both pre-attempt Python formats have a report path, and the later one
+// also records a complete pair of Git fields. Neither names a writer.
+pub(super) fn legacy_result(body: &Value) -> bool {
+    body["report"].as_str().is_some_and(|s| !s.is_empty())
+        && body.as_object().is_some_and(|m| {
+            m.len() == 1
+                || (m.len() == 3
+                    && has_git_result(body)
+                    && body["head"].as_str().is_none_or(|s| {
+                        matches!(s.len(), 40 | 64) && s.bytes().all(|c| c.is_ascii_hexdigit())
+                    }))
+        })
+}
+
 struct Snapshot {
     rowid: i64,
     round: i64,
@@ -54,8 +68,14 @@ impl Completions {
             "UPDATE dispatch_round SET state='completed', report=coalesce(nullif(report,''),?1),
             result=coalesce(nullif(result,''),?2), completed=coalesce(completed,?3) WHERE rowid=?4",
         )?;
+        let mut fill_parent = db.prepare(
+            "UPDATE dispatch AS d SET report=r.report FROM dispatch_round AS r
+             WHERE r.rowid=? AND d.id=r.dispatch AND d.current_round=r.round
+               AND d.current_attempt=r.attempt AND nullif(d.report,'') IS NULL",
+        )?;
         for u in self.0 {
             write.execute(params![u.report, u.result, u.completed, u.rowid])?;
+            fill_parent.execute([u.rowid])?;
         }
         Ok(())
     }
@@ -99,7 +119,16 @@ impl Snapshot {
         }
         self.accept_result(&body)?;
         if let Some(previous) = &self.receipt {
-            // Python appends each fresh completion, then rewrites this one snapshot
+            // Python upgrades pre-attempt messages with ORDER BY id LIMIT 1.
+            // Later unqualified submissions never rewrote that snapshot.
+            if legacy_result(&body)
+                && (legacy_result(&previous.body)
+                    || (previous.body["round"].as_i64() == Some(self.round)
+                        && previous.body["attempt"].as_str() == Some(self.attempt.as_str())))
+            {
+                return Ok(());
+            }
+            // Modern Python appends each fresh completion, then rewrites this one snapshot
             // in the same transaction. Numeric message ID is the commit order.
             let modern = body["round"].as_i64() == Some(self.round)
                 && body["attempt"].as_str() == Some(self.attempt.as_str());
@@ -125,10 +154,7 @@ impl Snapshot {
                                 && matches!(k.as_str(), "round" | "attempt" | "scope" | "role")
                     });
                 ensure!(
-                    (modern
-                        || before_git
-                            && !new.contains_key("round")
-                            && !new.contains_key("attempt"))
+                    modern
                         && (before_git || has_git_result(&previous.body))
                         && has_git_result(&body)
                         && compatible,
@@ -208,6 +234,16 @@ impl Snapshot {
             .map(serde_json::from_str)
             .transpose()?;
         if let Some(receipt) = &self.receipt {
+            if legacy_result(&receipt.body) {
+                ensure!(
+                    stored.as_ref().is_none_or(|v| v == &receipt.body)
+                        && self
+                            .completed
+                            .zip(receipt.created)
+                            .is_none_or(|(saved, first)| saved == first),
+                    "stored snapshot conflicts with first legacy done receipt"
+                );
+            }
             if self.varying_results {
                 ensure!(
                     stored.as_ref().is_some_and(has_git_result),
@@ -311,10 +347,15 @@ fn attach_receipt(
 pub fn plan(db: &Connection) -> Result<Completions> {
     let mut groups: BTreeMap<String, Vec<Snapshot>> = BTreeMap::new();
     let mut q = db.prepare(
-        "SELECT r.dispatch,r.rowid,r.round,r.attempt,r.state,nullif(r.report,''),nullif(r.result,''),r.completed,
+        "WITH named_reports AS (
+            SELECT dispatch,body->>'$.round' n,body->>'$.attempt' a,min(body->>'$.report') path
+            FROM message WHERE type='done' AND json_valid(body) AND json_type(body,'$.report')='text'
+            GROUP BY dispatch,n,a HAVING count(DISTINCT body->>'$.report')=1)
+        SELECT r.dispatch,r.rowid,r.round,r.attempt,r.state,nullif(r.report,''),nullif(r.result,''),r.completed,
         CASE WHEN d.current_round=r.round AND d.current_attempt=r.attempt THEN nullif(d.report,'') END,
-        d.current_round IS r.round AND d.current_attempt IS r.attempt AND d.id IS NOT NULL
-        FROM dispatch_round r LEFT JOIN dispatch d ON d.id=r.dispatch ORDER BY r.dispatch,r.round,r.rowid",
+        d.current_round IS r.round AND d.current_attempt IS r.attempt AND d.id IS NOT NULL,nullif(m.path,'')
+        FROM dispatch_round r LEFT JOIN dispatch d ON d.id=r.dispatch
+        LEFT JOIN named_reports m ON m.dispatch=r.dispatch AND m.n=r.round AND m.a=r.attempt ORDER BY r.dispatch,r.round,r.rowid",
     )?;
     let mut rows = q.query([])?;
     while let Some(r) = rows.next()? {
@@ -341,6 +382,11 @@ pub fn plan(db: &Connection) -> Result<Completions> {
             current: r.get(9)?,
         };
         if snapshot.eligible() {
+            // Identify a missing path before replaying older path-only receipts.
+            // A later modern done may be the surviving witness to its identity.
+            if snapshot.report.is_none() {
+                snapshot.report = r.get(10)?;
+            }
             if let Some(raw) = &snapshot.result {
                 let result = serde_json::from_str(raw)
                     .with_context(|| format!("invalid recorded result for dispatch {id}"))?;

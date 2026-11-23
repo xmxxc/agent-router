@@ -14,7 +14,7 @@ from pathlib import Path
 from python_recovery import backup, digest, dump
 
 
-def check(source, binary, dispatch, label, *, damage="", repair="", refuse=False, diagnostic=""):
+def check(source, binary, dispatch, label, *, damage="", repair="", refuse=False, diagnostic="", current_report=None):
     original_sha = digest(source)
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -45,6 +45,12 @@ def check(source, binary, dispatch, label, *, damage="", repair="", refuse=False
                 saved = json.loads(result.stdout)["backup"]
                 assert bool(saved) == bool(repair and attempt == 0), (label, saved)
                 assert dump(work) == expected, label
+                if current_report is not None:
+                    view = subprocess.check_output([binary, "status", "--dispatch", dispatch],
+                                                   env={"HOME": tmp, "WFC_STATE": tmp})
+                    parent, = json.loads(view)["dispatches"]
+                    current, = (r for r in parent["rounds"] if r["attempt"] == parent["attempt"] and r["round"] == parent["round"])
+                    assert parent["report"] == current["report"] == current_report
                 if attempt or not repair:
                     assert digest(work) == after
                 after = digest(work)
@@ -64,6 +70,19 @@ def repeated(e, binary):
     e.report.write_text("completed")
     first = e.json("done", "--report", str(e.report), dispatch=did)
     source = e.state / "router.db"
+    clear_paths = "UPDATE dispatch SET report=NULL; UPDATE dispatch_round SET report=NULL;"
+    restore_paths = """UPDATE dispatch SET report=(SELECT body->>'$.report' FROM message WHERE type='done');
+        UPDATE dispatch_round SET report=(SELECT report FROM dispatch);"""
+    for label, damage, repair in [
+        ("both-paths", clear_paths, restore_paths),
+        ("both-columns", "ALTER TABLE dispatch DROP COLUMN report; ALTER TABLE dispatch_round DROP COLUMN report;",
+         "ALTER TABLE dispatch ADD COLUMN report TEXT; ALTER TABLE dispatch_round ADD COLUMN report TEXT;" + restore_paths),
+        ("paths-from-receipt", clear_paths + "UPDATE dispatch_round SET result=NULL;",
+         restore_paths + "UPDATE dispatch_round SET result=(SELECT body FROM message WHERE type='done');"),
+        ("paths-from-result", clear_paths + "DELETE FROM message;",
+         "UPDATE dispatch SET report=(SELECT result->>'$.report' FROM dispatch_round); UPDATE dispatch_round SET report=(SELECT report FROM dispatch);"),
+    ]:
+        check(source, binary, did, label, damage=damage, repair=repair, current_report=str(e.report))
     gaps = "UPDATE dispatch_round SET result=NULL, completed=NULL;"
     check(source, binary, did, "matching-body-hash", damage=gaps, repair="""
         UPDATE dispatch_round SET result=(SELECT body FROM message WHERE type='done'),

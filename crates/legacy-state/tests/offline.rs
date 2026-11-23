@@ -697,39 +697,59 @@ fn missing_transition_round_requires_one_consistent_target_round() {
 }
 
 #[test]
-fn invalid_utf8_body_with_existing_digest_keeps_a_restorable_backup() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("router.db");
-    let (db, _) = wfc_legacy_state::open_offline_copy(dir.path()).unwrap();
-    db.execute_batch(
-        "INSERT INTO message(dispatch,body,body_hash)
-        VALUES('damaged',CAST(X'FF' AS TEXT),'wrong')",
-    )
-    .unwrap();
-    drop(db);
-    let original = std::fs::read(&path).unwrap();
-    for count in 1..=2 {
-        let err = wfc_legacy_state::open_offline_copy(dir.path()).unwrap_err();
-        assert!(format!("{err:#}").contains("dispatch damaged, message 1: body hash mismatch"));
-        assert_eq!(std::fs::read(&path).unwrap(), original);
-        let backups: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .flatten()
-            .filter(|p| {
-                p.file_name()
-                    .to_string_lossy()
-                    .starts_with("router.before-")
-            })
-            .collect();
-        assert_eq!(backups.len(), count);
-        for file in backups {
-            let db = rusqlite::Connection::open(file.path()).unwrap();
-            let row: (String, String) = db
-                .query_row("SELECT hex(body),body_hash FROM message", [], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })
-                .unwrap();
-            assert_eq!(row, ("FF".into(), "wrong".into()));
+fn unreadable_bodies_refuse_before_hash_backfill_or_repair() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    let converted_hash = format!("{:x}", Sha256::digest("𐀀".as_bytes()));
+    for (encoding, expression, kind, hex) in [
+        ("UTF-8", "CAST(X'FF' AS TEXT)", "text", "FF"),
+        ("UTF-8", "X'7B7D'", "blob", "7B7D"),
+        ("UTF-16le", "CAST(X'00D800D8' AS TEXT)", "text", "00D800D8"),
+        ("UTF-16be", "CAST(X'D800D800' AS TEXT)", "text", "D800D800"),
+    ] {
+        for hash in [None, Some(""), Some(converted_hash.as_str())] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("router.db");
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.pragma_update(None, "encoding", encoding).unwrap();
+            db.execute_batch(include_str!("../src/schema.sql")).unwrap();
+            db.execute(
+                &format!(
+                    "INSERT INTO message(dispatch,body,body_hash) VALUES('damaged',{expression},?)"
+                ),
+                [hash],
+            )
+            .unwrap();
+            drop(db);
+            let original = std::fs::read(&path).unwrap();
+            for count in 1..=2 {
+                let err = wfc_legacy_state::open_offline_copy(dir.path()).unwrap_err();
+                assert!(format!("{err:#}")
+                    .contains("dispatch damaged, message 1: unreadable message body"));
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                let backups: Vec<_> = std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .flatten()
+                    .filter(|p| {
+                        p.file_name()
+                            .to_string_lossy()
+                            .starts_with("router.before-")
+                    })
+                    .collect();
+                assert_eq!(backups.len(), count);
+                for file in backups {
+                    assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+                    let db = rusqlite::Connection::open(file.path()).unwrap();
+                    let row: (String, String, Option<String>) = db
+                        .query_row(
+                            "SELECT typeof(body),hex(body),body_hash FROM message",
+                            [],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        )
+                        .unwrap();
+                    assert_eq!(row, (kind.into(), hex.into(), hash.map(String::from)));
+                }
+            }
         }
     }
 }

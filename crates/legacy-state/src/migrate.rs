@@ -10,6 +10,9 @@ use std::{
 };
 use uuid::Uuid;
 
+// CAST keeps SQLite's stored text encoding; asking SQLite for UTF-8 first
+// can silently replace a malformed UTF-16 surrogate pair with a valid character.
+const BODY_SHA: &str = "body_sha(typeof(body),CAST(body AS BLOB))";
 const INCOMPLETE_RECEIPT: &str = "coalesce(message_uid,'')='' OR coalesce(body_hash,'')='' OR
     coalesce(state,'')='' OR coalesce(status_version,0)=0";
 const DELIVERY_CONFLICT: &str =
@@ -49,9 +52,33 @@ fn register_functions(db: &Connection) -> Result<()> {
     db.create_scalar_function("new_uuid", 0, flags, |_| {
         Ok(Uuid::new_v4().simple().to_string())
     })?;
-    db.create_scalar_function("body_sha", 1, flags, |ctx| {
-        let body = ctx.get_raw(0).as_bytes()?;
-        Ok(format!("{:x}", Sha256::digest(body)))
+    let encoding: String = db.query_row("PRAGMA encoding", [], |r| r.get(0))?;
+    db.create_scalar_function("body_sha", 2, flags, move |ctx| {
+        if ctx.get_raw(0).as_str()? != "text" {
+            return Ok(None);
+        }
+        let bytes = ctx.get_raw(1).as_bytes()?;
+        let digest = match encoding.as_str() {
+            "UTF-8" => std::str::from_utf8(bytes)
+                .ok()
+                .map(|_| Sha256::digest(bytes)),
+            "UTF-16le" | "UTF-16be" if bytes.len().is_multiple_of(2) => {
+                let units = bytes.chunks_exact(2).map(|pair| {
+                    let unit = [pair[0], pair[1]];
+                    if encoding == "UTF-16le" {
+                        u16::from_le_bytes(unit)
+                    } else {
+                        u16::from_be_bytes(unit)
+                    }
+                });
+                char::decode_utf16(units)
+                    .collect::<std::result::Result<String, _>>()
+                    .ok()
+                    .map(|s| Sha256::digest(s.as_bytes()))
+            }
+            _ => None,
+        };
+        Ok(digest.map(|h| format!("{h:x}")))
     })?;
     db.create_scalar_function("legacy_role", 1, flags, |ctx| {
         let dir: Option<String> = ctx.get(0)?;
@@ -80,7 +107,7 @@ fn repair(db: &Connection, ids: Vec<String>) -> Result<()> {
         &format!(
             "UPDATE message SET
         message_uid=coalesce(nullif(message_uid,''),'m-'||new_uuid()),
-        body_hash=coalesce(nullif(body_hash,''),body_sha(body)),
+        body_hash=coalesce(nullif(body_hash,''),{BODY_SHA}),
         status_version=coalesce(nullif(status_version,0),1)+CASE WHEN {DELIVERY_CONFLICT}
             THEN 1 ELSE 0 END,
         state=CASE WHEN coalesce(state,'') IN ('','received','unsent') THEN
@@ -146,16 +173,30 @@ pub fn open_offline_copy(state: &Path) -> Result<(Connection, Option<PathBuf>)> 
     // surviving witness before any query uses a receipt to reconstruct state.
     let corrupt = tx
         .query_row(
-            "SELECT dispatch,id FROM message WHERE body_hash<>'' AND
-            CASE WHEN typeof(body)='text' THEN body_hash<>body_sha(body) ELSE 1 END LIMIT 1",
+            &format!(
+                "SELECT dispatch,id,{BODY_SHA} IS NULL FROM message WHERE CASE
+                WHEN nullif(body_hash,'') IS NULL THEN {BODY_SHA} IS NULL
+                ELSE {BODY_SHA} IS NOT body_hash END LIMIT 1"
+            ),
             [],
-            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, bool>(2)?,
+                ))
+            },
         )
         .optional()?;
-    if let Some((id, message)) = corrupt {
+    if let Some((id, message, unreadable)) = corrupt {
         preserve()?;
+        let reason = if unreadable {
+            "unreadable message body: expected UTF-8 text"
+        } else {
+            "body hash mismatch"
+        };
         bail!(
-            "dispatch {}, message {message}: body hash mismatch",
+            "dispatch {}, message {message}: {reason}",
             id.as_deref().unwrap_or("<missing>")
         );
     }
