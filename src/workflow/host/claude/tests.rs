@@ -30,7 +30,9 @@ impl Fixture {
     fn launch(&self) -> Launch {
         Launch {
             argv: vec!["controlled-claude".into()],
-            env: [("CLAUDE_CONFIG_DIR".into(), json!(self.0.join("profile")))].into(),
+            env: [("CLAUDE_CONFIG_DIR".into(), json!(self.0.join("profile")))]
+                .into_iter()
+                .collect(),
         }
     }
 }
