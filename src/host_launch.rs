@@ -118,6 +118,13 @@ pub(crate) fn spec_path(state: &Path, id: &Path) -> Result<PathBuf> {
 pub(crate) fn supervise(spec_path: &Path) -> Result<ExitCode> {
     let receipt = spec_path.with_extension("json");
     let spec: Spec = serde_json::from_reader(File::open(spec_path)?)?;
+    let startup = crate::workflow::startup::Startup::hosted(
+        &spec.env,
+        spec_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .context("invalid launch ID")?,
+    );
     fs::remove_file(spec_path)?;
     let mut cmd = Command::new(spec.argv.first().context("empty launch argv")?);
     cmd.args(&spec.argv[1..])
@@ -141,6 +148,9 @@ pub(crate) fn supervise(spec_path: &Path) -> Result<ExitCode> {
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
+            if let Some(startup) = &startup {
+                startup.spawn_failed(err.kind());
+            }
             let category = match err.kind() {
                 ErrorKind::NotFound => "executable_missing",
                 ErrorKind::PermissionDenied => "permission_denied",
@@ -150,6 +160,7 @@ pub(crate) fn supervise(spec_path: &Path) -> Result<ExitCode> {
             return Ok(ExitCode::FAILURE);
         }
     };
+    let watching = startup.as_ref().map(|startup| startup.watch(&child));
     // Ctrl-C addresses the terminal foreground group. Let the worker handle it
     // and keep its receipt writer alive to record the actual exit.
     unsafe {
@@ -161,16 +172,17 @@ pub(crate) fn supervise(spec_path: &Path) -> Result<ExitCode> {
     if let Ok(Some(writer)) = wfc_herdr::Process::observe(child.id()) {
         started_receipt["writerProcess"] = json!(writer);
     }
-    let started = crate::workflow::write_json(&receipt, &started_receipt, None);
-    let status = child.wait()?;
+    let (status, observed, started) = crate::workflow::startup::wait_host(&mut child, || {
+        crate::workflow::write_json(&receipt, &started_receipt, None)
+    })?;
     let code = status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
-    crate::workflow::write_json(
-        &receipt,
-        &json!({"category":"process_exited","exitCode":code}),
-        None,
-    )?;
+    let mut terminal = json!({"category":"process_exited","exitCode":code});
+    if let Some(zero) = watching.and_then(|watching| watching.host_exited(status, observed)) {
+        terminal["startupZero"] = zero;
+    }
+    crate::workflow::write_json(&receipt, &terminal, None)?;
     started?;
     Ok(ExitCode::from(code as u8))
 }

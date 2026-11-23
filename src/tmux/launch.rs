@@ -676,6 +676,7 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
             sleep(Duration::from_millis(10));
         }
     }
+    let startup = crate::workflow::startup::Startup::hosted(&spec.env, id);
     fs::remove_file(spec_path)?;
     super::binding::record_server(&dir, id)?;
     let mut cmd = Command::new(spec.argv.first().context("empty launch argv")?);
@@ -691,6 +692,9 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
+            if let Some(startup) = &startup {
+                startup.spawn_failed(err.kind());
+            }
             let category = match err.kind() {
                 ErrorKind::NotFound => "executable_missing",
                 ErrorKind::PermissionDenied => "permission_denied",
@@ -700,23 +704,24 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
             return Ok(ExitCode::FAILURE);
         }
     };
+    let watching = startup.as_ref().map(|startup| startup.watch(&child));
     // Ctrl-C addresses the terminal foreground group. Let the worker handle it
     // and keep its receipt writer alive to record the actual exit.
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
     }
-    let started = super::binding::save(
-        &receipt,
-        &json!({"category":"started","pid":child.id(),"launchId":id}),
-    );
-    let status = child.wait()?;
+    let started_receipt = json!({"category":"started","pid":child.id(),"launchId":id});
+    let (status, observed, started) = crate::workflow::startup::wait_host(&mut child, || {
+        super::binding::save(&receipt, &started_receipt)
+    })?;
     let code = status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
-    super::binding::save(
-        &receipt,
-        &json!({"category":"process_exited","exitCode":code,"launchId":id}),
-    )?;
+    let mut terminal = json!({"category":"process_exited","exitCode":code,"launchId":id});
+    if let Some(zero) = watching.and_then(|watching| watching.tmux_exited(status, observed)) {
+        terminal["startupZero"] = zero;
+    }
+    super::binding::save(&receipt, &terminal)?;
     started?;
     Ok(ExitCode::from(code as u8))
 }

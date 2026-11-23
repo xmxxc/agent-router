@@ -12,6 +12,21 @@ pub struct Process {
 impl Process {
     /// None is positive evidence of exit. Permission, parse and procfs errors stay unknown.
     pub fn observe(pid: u32) -> Result<Option<Self>> {
+        Self::read(pid, false)
+    }
+
+    /// Read creation identity before waiting on an owned child. An exited,
+    /// unreaped child still owns its PID and its procfs start time.
+    pub fn observe_unreaped_child(child: &std::process::Child) -> Result<Option<Self>> {
+        let unknown = Failure::unknown("cannot verify Linux child PID namespace");
+        let own_pid = fs::read_link("/proc/self").map_err(|_| unknown)?;
+        if own_pid.to_str().and_then(|pid| pid.parse::<u32>().ok()) != Some(std::process::id()) {
+            return Err(unknown);
+        }
+        Self::read(child.id(), true)
+    }
+
+    fn read(pid: u32, include_exited: bool) -> Result<Option<Self>> {
         let unknown = Failure::unknown("cannot observe Linux process creation identity");
         let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|_| unknown)?;
         if uuid::Uuid::parse_str(boot.trim()).is_err() || pid == 0 {
@@ -26,7 +41,8 @@ impl Process {
         let mut fields = std::str::from_utf8(&stat[end + 1..])
             .map_err(|_| unknown)?
             .split_whitespace();
-        if matches!(fields.next(), Some("Z" | "X" | "x")) {
+        let state = fields.next().ok_or(unknown)?;
+        if !include_exited && matches!(state, "Z" | "X" | "x") {
             return Ok(None);
         }
         let ticks: u64 = fields.nth(18).and_then(|s| s.parse().ok()).ok_or(unknown)?;

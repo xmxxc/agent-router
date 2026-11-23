@@ -366,11 +366,41 @@ impl Message {
         body
     }
 
+    fn is_startup_failure(&self) -> bool {
+        self.additional_fields.get("kind").and_then(Value::as_str) == Some("startup_failure")
+    }
+
+    fn is_done(&self) -> bool {
+        self.report.is_some() && !self.is_startup_failure()
+    }
+
+    fn message_type(&self) -> &str {
+        if self.is_startup_failure() {
+            self.additional_fields
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        } else if self.question_payload.is_some() {
+            "question"
+        } else {
+            "done"
+        }
+    }
+
     fn body(&self) -> Map<String, Value> {
         if let Some(question) = &self.question_payload {
             return question.body(&self.worker);
         }
         let mut body = self.original_body();
+        if self.is_startup_failure() {
+            body.insert("scope".into(), json!(self.worker.scope()));
+            for key in ["kind", "host", "message", "fault"] {
+                if let Some(value) = self.additional_fields.get(key) {
+                    body.insert(key.into(), value.clone());
+                }
+            }
+            return body;
+        }
         for key in ["head", "dirty"] {
             if let Some(value) = self.additional_fields.get(key) {
                 body.insert(key.into(), value.clone());
@@ -400,7 +430,7 @@ impl Message {
         // request key on every row. Its rewrite dropped newer fields. Only
         // publication-time values count: later claims can bind a digest or
         // add null Git fields even on a genuine legacy row.
-        self.report.is_some()
+        self.is_done()
             && self.request_key.is_some()
             && self.worker.scope.is_none()
             && self.created_at.is_none()
@@ -454,14 +484,7 @@ impl Message {
             ("id".into(), json!(self.id)),
             ("messageId".into(), json!(self.message_id)),
             ("dispatch".into(), json!(self.worker.dispatch)),
-            (
-                "type".into(),
-                json!(if self.question_payload.is_some() {
-                    "question"
-                } else {
-                    "done"
-                }),
-            ),
+            ("type".into(), json!(self.message_type())),
             ("state".into(), json!(state)),
             ("statusVersion".into(), json!(version)),
         ]);
@@ -524,10 +547,17 @@ impl Inbox {
                 // body (including the earlier four-field form) byte for byte.
                 for m in &mut messages {
                     ensure!(
-                        m.report.is_some() != m.question_payload.is_some(),
+                        if m.is_startup_failure() {
+                            m.question_payload.is_none()
+                                && m.additional_fields
+                                    .get("fault")
+                                    .is_some_and(Value::is_object)
+                        } else {
+                            m.report.is_some() != m.question_payload.is_some()
+                        },
                         "invalid controller message payload"
                     );
-                    if m.report.is_some()
+                    if m.is_done()
                         && m.delivery.legacy_unclaimed
                         && m.body_hash.is_none()
                         && m.worker.scope.is_none()
@@ -604,12 +634,13 @@ impl Inbox {
         let history = || {
             self.messages
                 .iter()
-                .filter(|m| m.worker.dispatch == worker.dispatch && m.report.is_some())
+                .filter(|m| m.worker.dispatch == worker.dispatch && m.is_done())
         };
         let prior = key.and_then(|key| self.prior(&worker.dispatch, key));
         if let (Some(key), Some(prior)) = (key, prior) {
             ensure!(
-                prior.worker.attempt == worker.attempt
+                prior.is_done()
+                    && prior.worker.attempt == worker.attempt
                     && prior.worker.round == worker.round
                     && prior.report.as_deref() == Some(report),
                 "message request {key} conflicts with an existing receipt"
@@ -695,9 +726,7 @@ impl Inbox {
             .filter(|r| r["round"] == worker.round && r["attempt"] == worker.attempt)
             .last();
         let confirmed_done = messages().any(|m| {
-            m.worker.round == worker.round
-                && m.worker.attempt == worker.attempt
-                && m.report.is_some()
+            m.worker.round == worker.round && m.worker.attempt == worker.attempt && m.is_done()
         }) || row["messages"].as_array().into_iter().flatten().any(|m| {
             m["type"] == "done"
                 && m["dispatch"] == dispatch
@@ -743,6 +772,60 @@ impl Inbox {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn publish_startup_failure(
+    state: &Path,
+    dispatch: &str,
+    attempt: &str,
+    failure: &super::startup::Failure<'_>,
+) -> Result<()> {
+    publish_startup_failure_locked(state, dispatch, attempt, failure, lock_for_publish(state)?)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn publish_startup_failure_locked(
+    state: &Path,
+    dispatch: &str,
+    attempt: &str,
+    failure: &super::startup::Failure<'_>,
+    ledger: File,
+) -> Result<()> {
+    ensure!(
+        valid_id(dispatch) && super::valid_identity(attempt, "a-"),
+        "invalid startup identity"
+    );
+    let mut inbox = Inbox::read_locked(state, ledger)?;
+    let dir = state.join("dispatches");
+    let (file, path) = super::assignment::open_assignment(&dir, dispatch)?;
+    let row = super::decode_record(file, &path)?;
+    let assignment = Assignment::deserialize(&row)?;
+    let worker = assignment.worker;
+    ensure!(
+        worker.attempt == attempt && worker.round > 0 && assignment.controller_owner.is_none(),
+        "startup failure does not match the current assignment"
+    );
+    // Any existing notice, completion, or question for this generation wins.
+    if inbox.messages.iter().any(|m| {
+        m.worker.dispatch == worker.dispatch
+            && m.worker.attempt == worker.attempt
+            && m.worker.round == worker.round
+    }) {
+        return Ok(());
+    }
+    let key = format!("startup:{dispatch}:{}:{attempt}", worker.round);
+    let mut message = Message::new(inbox.messages.len() as u64 + 1, worker, Some(key));
+    message.report = assignment.report;
+    message.additional_fields = Map::from_iter([
+        ("type".into(), json!(failure.message_type())),
+        ("kind".into(), json!("startup_failure")),
+        ("host".into(), row["host"].clone()),
+        ("message".into(), json!(failure.diagnostic())),
+        ("fault".into(), json!(failure)),
+    ]);
+    inbox.publish(message).context("publish startup failure")?;
+    Ok(())
+}
+
 // Writers publish complete snapshots by rename. A status reader can open
 // either generation without taking a lock or touching the state directory.
 pub(super) fn history(state: &Path, dispatch: &str) -> Result<Vec<Value>> {
@@ -760,6 +843,52 @@ pub(super) fn history(state: &Path, dispatch: &str) -> Result<Vec<Value>> {
             view
         })
         .collect())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_receipt_with_report_does_not_count_as_done() -> Result<()> {
+        let state = env::temp_dir().join(format!("wfc-startup-message-{}", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let dispatch = "d-aabbccdd";
+            let attempt = "a-123456789abc";
+            let report = state.join("report");
+            let row = json!({"dispatch":dispatch,"attempt":attempt,"round":1,
+                "scope":"notice-scope","role":"worker","cwd":state,"report":report});
+            let records = state.join("dispatches");
+            fs::create_dir_all(&records)?;
+            super::super::write_json(&records.join(format!("{dispatch}.json")), &row, None)?;
+            super::super::startup::Startup::new(&state, dispatch, attempt, None)
+                .spawn_failed(ErrorKind::NotFound);
+
+            let assignment = Assignment::deserialize(&row)?;
+            let inbox = Inbox::open(&state)?;
+            let [notice] = inbox.messages.as_slice() else {
+                anyhow::bail!("expected exactly one startup message");
+            };
+            assert_eq!(notice.view()["type"], "blocked");
+            assert_eq!(notice.view()["scope"], "notice-scope");
+            assert_eq!(notice.report.as_deref(), Some(report.as_path()));
+            assert!(inbox
+                .validate_done(
+                    &assignment,
+                    &report,
+                    notice.request_key.as_deref(),
+                    Some(attempt)
+                )
+                .is_err());
+            assert!(inbox
+                .validate_done(&assignment, &report, Some("fresh-done"), Some(attempt))?
+                .is_none());
+            inbox.require_question_round(&assignment, &row, Some(attempt))?;
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(state);
+        result
+    }
 }
 
 pub struct Done<'a> {
