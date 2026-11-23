@@ -14,7 +14,7 @@ pub(super) struct Registration {
 }
 
 impl Registration {
-    pub fn create(state: &Path, scope: Option<&str>, thread: &str) -> Result<Self> {
+    pub fn create(state: &Path, scope: Option<&str>, (field, id): (&str, &str)) -> Result<Self> {
         let dir = state.join("relays");
         fs::create_dir_all(&dir)?;
         let path = dir.join(Uuid::new_v4().to_string()).with_extension("json");
@@ -28,7 +28,7 @@ impl Registration {
         serde_json::to_writer(
             &entry._lock,
             &json!({"kind":"relay","pid":std::process::id(),
-            "since":receipt::timestamp(),"scope":scope,"thread":thread}),
+            "since":receipt::timestamp(),"scope":scope,(field):id}),
         )?;
         fs::rename(&entry.path, &path)?;
         entry.path = path;
