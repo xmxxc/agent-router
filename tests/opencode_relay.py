@@ -212,6 +212,29 @@ class OpenCodeRelay(unittest.TestCase):
         ack = self.data("ack", receipt["messageId"])
         self.assertEqual((ack["state"], ack["statusVersion"]), ("processed", 4))
 
+    def test_invalid_ports_are_rejected_before_claiming(self):
+        receipt = self.publish("ours")
+        for authority in ("127.0.0.1:65536", "127.0.0.1:xyz", "127.0.0.1:+80",
+                          "127.0.0.1:-1", "127.0.0.1:", "127.0.0.1:0", "[::1]:65536"):
+            with self.subTest(authority=authority):
+                self.cli("relay", *self.target(f"http://{authority}/api"), "--scope", "ours",
+                         "--for", ".2", code=2)
+                row = self.row(receipt)
+                self.assertEqual((row["messageId"], row["state"], row["statusVersion"]),
+                                 (receipt["messageId"], "unsent", 1))
+                self.assertEqual(self.posts, [])
+                self.assertEqual(self.data("status")["waiters"], [])
+        for url in ("http://127.0.0.1", "http://[::1]", "https://[::1]:65535"):
+            self.cli("relay", *self.target(url), "--scope", "empty", "--for", ".05")
+        self.assertEqual(self.posts, [])
+        self.send()
+        post, = self.posts
+        message, = self.batch(post)
+        self.assertEqual((message["id"], message["messageId"], message["statusVersion"]),
+                         (receipt["message"], receipt["messageId"], 2))
+        ack = self.data("ack", receipt["messageId"])
+        self.assertEqual((ack["state"], ack["statusVersion"]), ("processed", 4))
+
     def test_invalid_target_and_worker_callback_do_not_claim(self):
         receipt = self.publish("ours")
         for args in ((), ("--opencode-url", self.url), ("--opencode-session", self.session),

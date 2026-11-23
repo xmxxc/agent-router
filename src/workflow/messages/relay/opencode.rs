@@ -1,6 +1,6 @@
 //! Submit one batch to the explicitly selected OpenCode controller session.
 use super::Outcome;
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use curl::easy::{Easy2, Handler, HttpVersion, List, NetRc};
 use http::Uri;
 use serde_json::json;
@@ -39,12 +39,24 @@ impl<'a> Target<'a> {
         // and userinfo could change where the appended session path is sent.
         let invalid = "give an HTTP(S) --opencode-url without credentials, query or fragment";
         let uri: Uri = url.parse().map_err(|_| anyhow::anyhow!(invalid))?;
+        let authority = uri.authority().context(invalid)?;
         ensure!(
             matches!(uri.scheme_str(), Some("http" | "https"))
-                && uri.host().is_some_and(|host| !host.is_empty())
-                && uri.authority().is_some_and(|a| !a.as_str().contains('@'))
+                && !authority.as_str().contains('@')
+                && !authority.host().is_empty()
                 && !url.contains(['?', '#', '\\']),
             "{invalid}"
+        );
+        // Authority::port() returns None for both absent and malformed ports.
+        // The host includes brackets for IPv6, so only its suffix can be a port.
+        let suffix = &authority.as_str()[authority.host().len()..];
+        ensure!(
+            suffix.is_empty()
+                || suffix.strip_prefix(':').is_some_and(|port| {
+                    port.bytes().all(|b| b.is_ascii_digit())
+                        && port.parse::<u16>().is_ok_and(|number| number != 0)
+                }),
+            "--opencode-url must use a decimal port in 1..=65535"
         );
         ensure!(
             !matches!(session, "." | "..")
