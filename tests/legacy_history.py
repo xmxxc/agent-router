@@ -289,6 +289,42 @@ def verify_archive_direction(binary, root, target, archived, work):
                       "terminalFaultReadOnly": True}), flush=True)
 
 
+def claim_once(binary, root, target, row, receipt, kind, *, extra=None):
+    assert receipt["scope"] == row["scope"] == SCOPE
+    selection = ("--scope", SCOPE, "--dispatch", row["dispatch"])
+    result = run(binary, root, target, "wait", *selection, "--timeout", "4", token=NEW, extra=extra)
+    print(json.dumps({"scopedWait": kind, "exit": result.returncode, "stdout": result.stdout,
+                      "stderr": result.stderr}), flush=True)
+    messages = output(result)["messages"]
+    assert len(messages) == 1, messages
+    seen = messages[0]
+    assert (seen["id"], seen["messageId"], seen["type"], seen["state"], seen["statusVersion"]) == (
+        receipt["message"], receipt["messageId"], kind, "received", 2), seen
+    assert (seen["scope"], seen["dispatch"], seen["attempt"], seen["round"]) == (
+        SCOPE, row["dispatch"], row["attempt"], row["round"]), seen
+    empty = output(run(binary, root, target, "wait", *selection, "--timeout", "0", token=NEW, extra=extra), code=3)
+    assert empty == {"messages": [], "timedOut": True}, empty
+    return seen
+
+
+def verify_unclaimed_done(binary, root, target, row, receipt, report):
+    identity = (receipt["messageId"], SCOPE, row["dispatch"], row["attempt"], row["round"], str(report))
+    assert (receipt["state"], receipt["statusVersion"], receipt["duplicate"]) == ("unsent", 1, False), receipt
+    ledger = json.loads((target / "messages.json").read_text())
+    matching = [item for item in ledger if item["id"] == receipt["message"]]
+    print(json.dumps({"nativeDoneLedgerRows": matching}), flush=True)
+    stored, = matching
+    fields = ("messageId", "scope", "dispatch", "attempt", "round", "report")
+    assert tuple(stored[key] for key in fields) == identity, stored
+    assert (stored["state"], stored["statusVersion"], stored.get("legacy_body")) == ("unsent", 1, None), stored
+    view, undelivered = lookup(binary, root, target, row["dispatch"])
+    assert view["controllerOwner"]["generation"] == 9 and view["controllerOwner"]["active"] is True
+    public, = [item for item in view["messages"] if item["id"] == receipt["message"]]
+    assert tuple(public[key] for key in fields) == identity, public
+    assert (public["type"], public["to"], public["delivered"]) == ("done", "controller", False), public
+    assert public in undelivered, undelivered
+
+
 def verify_controller_ledger(binary, root, target, bodies, work):
     done, _ = lookup(binary, root, target, DISPATCH)
     by_id = {row["id"]: row for row in done["messages"]}
@@ -307,9 +343,14 @@ def verify_controller_ledger(binary, root, target, bodies, work):
     row = output(run(binary, root, target, "dispatch", "--scope", SCOPE, "--role", "worker", "--cwd", work,
                      "--task", task, "--report", report, "--", "/bin/true", token=NEW))
     try:
-        native = output(run(binary, root, target, "done", "--report", report, "--attempt", row["attempt"], token=NEW,
-                            extra={"WFC_DISPATCH": row["dispatch"], "WFC_ROUND": "1", "WFC_ATTEMPT": row["attempt"]}))
+        produced = run(binary, root, target, "done", "--report", report, "--attempt", row["attempt"], token=NEW,
+                       extra={"WFC_DISPATCH": row["dispatch"], "WFC_ROUND": "1", "WFC_ATTEMPT": row["attempt"]})
+        print(json.dumps({"unhostedDone": {"exit": produced.returncode, "stdout": produced.stdout,
+                                          "stderr": produced.stderr}}), flush=True)
+        native = output(produced)
         assert native["message"] == 126
+        verify_unclaimed_done(binary, root, target, row, native, report)
+        claim_once(binary, root, target, row, native, "done")
     finally:
         output(run(binary, root, target, "close", row["dispatch"], token=NEW))
     print(json.dumps({"ackedOriginal": one["messageId"], "statusVersion": one["statusVersion"],
@@ -369,7 +410,7 @@ def verify_combination(binary, root, target, source, work):
     log = fixture / "input.log"
     config = fixture / "launch.json"
     config.write_text(json.dumps({"hosts": {"codex": {"command": [
-        sys.executable, str(composer), "--reply-worker", "empty", str(log)]}}}))
+        sys.executable, str(composer), "--reply-worker", "empty-with-done-receipt", str(log)]}}}))
     task = work / "task.md"
     row = None
     try:
@@ -389,7 +430,7 @@ def verify_combination(binary, root, target, source, work):
         assert question["message"] == 127
         answer = output(run(binary, root, target, "reply", "127", "one native answer", token=NEW, extra=tmux_env))
         assert answer == {"replied": 127, "dispatch": row["dispatch"]}
-        detail, _ = lookup(binary, root, target, row["dispatch"])
+        detail, undelivered = lookup(binary, root, target, row["dispatch"])
         reply, = (item for item in detail["messages"] if item["type"] == "reply")
         assert (reply["id"], reply["to"], reply["questionMessageId"], reply["inputResult"]) == (
             128, 127, question["messageId"], "accepted")
@@ -397,11 +438,29 @@ def verify_combination(binary, root, target, source, work):
         assert (fixture / "accepted").read_bytes() == expected + b"\n"
         events = [json.loads(line) for line in log.read_text().splitlines()]
         assert b"".join(bytes.fromhex(event[0]) for event in events[1:]) == expected + b"\r"
+        print(json.dumps({"nativeQuestion": question["message"], "nativeReply": reply["id"],
+                          "confirmedInputCount": 1}), flush=True)
+        pending, = [item for item in detail["messages"] if item["id"] == 127]
+        assert (pending["type"], pending["messageId"], pending["state"], pending["statusVersion"],
+                pending["to"], pending["delivered"]) == (
+            "question", question["messageId"], "unsent", 1, "controller", False), pending
+        assert undelivered == [pending], undelivered
+        # Reply enters the worker's terminal. The controller receives the
+        # question in a separate step, before asking the worker to finish.
+        claim_once(binary, root, target, row, question, "question", extra=tmux_env)
         (fixture / "finish").touch()
-        received = output(run(binary, root, target, "wait", "--scope", SCOPE, "--dispatch", row["dispatch"], "--timeout", "8",
-                              token=NEW, extra=tmux_env))
-        completed, = (item for item in received["messages"] if item["type"] == "done")
-        assert completed["id"] == 129 and completed["attempt"] == row["attempt"]
+        done_result = fixture / "done-result.json"
+        deadline = time.monotonic() + 16
+        while not done_result.exists():
+            assert time.monotonic() < deadline, "the synthetic worker did not report its done exit and receipt"
+            time.sleep(.025)
+        produced = json.loads(done_result.read_text())
+        print(json.dumps({"hostedDone": produced}), flush=True)
+        assert produced["exit"] == 0 and produced["stderr"] == "", produced
+        native = json.loads(produced["stdout"])
+        assert native["message"] == 129, native
+        verify_unclaimed_done(binary, root, target, row, native, fixture / "report")
+        completed = claim_once(binary, root, target, row, native, "done", extra=tmux_env)
     finally:
         try:
             if row is not None:
@@ -411,6 +470,8 @@ def verify_combination(binary, root, target, source, work):
 
     failed = run(binary, root, target, "dispatch", "--scope", SCOPE, "--role", "worker", "--cwd", work,
                  "--task", task, "--report", work / "failed-start", "--", work / "absent-executable", token=NEW)
+    print(json.dumps({"startupDispatch": {"exit": failed.returncode, "stdout": failed.stdout,
+                                         "stderr": failed.stderr}}), flush=True)
     assert failed.returncode == 1, failed
     ledger = json.loads((target / "messages.json").read_text())
     startup, = (item for item in ledger if item.get("kind") == "startup_failure")
@@ -419,6 +480,11 @@ def verify_combination(binary, root, target, source, work):
     notice, = received["messages"]
     assert (notice["id"], notice["messageId"], notice["kind"], notice["fault"]["category"]) == (
         130, startup["messageId"], "startup_failure", "executable_missing")
+    assert (notice["scope"], notice["dispatch"], notice["state"], notice["statusVersion"]) == (
+        SCOPE, startup["dispatch"], "received", 2), notice
+    empty = output(run(binary, root, target, "wait", "--scope", SCOPE, "--dispatch", startup["dispatch"],
+                       "--timeout", "0", token=NEW), code=3)
+    assert empty == {"messages": [], "timedOut": True}, empty
     assert [item["id"] for item in ledger if item["id"] > 125] == [126, 127, 128, 129, 130]
     assert len({item["messageId"] for item in ledger}) == len(ledger)
     print(json.dumps({"nativeIds": [item["id"] for item in ledger if item["id"] > 125],
