@@ -5,9 +5,10 @@ use std::env;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::ExitCode;
+use workflow::messages::{Done, Wait, DONE_USAGE, WAIT_USAGE};
 
 const RESERVED_COMMANDS: &[&str] = &[
-    "done", "ask", "reply", "continue", "nudge", "resume", "reclaim", "wait", "relay", "ack",
+    "ask", "reply", "continue", "nudge", "resume", "reclaim", "relay", "ack",
 ];
 
 fn main() -> anyhow::Result<ExitCode> {
@@ -32,6 +33,8 @@ fn main() -> anyhow::Result<ExitCode> {
             println!("Usage: wfc [--help | --version]");
             println!("{}", workflow::DISPATCH_USAGE);
             println!("{}", workflow::STATUS_USAGE);
+            println!("{DONE_USAGE}");
+            println!("{WAIT_USAGE}");
             println!(
                 "Workflow commands reserved for later builds: {}",
                 RESERVED_COMMANDS.join(", ")
@@ -49,15 +52,16 @@ fn main() -> anyhow::Result<ExitCode> {
             );
         }
         Some("--kernel") if args.is_empty() => kernel::run()?,
-        Some("dispatch" | "status") if args == ["--help"] => {
-            println!(
-                "{}",
-                if command == "dispatch" {
-                    workflow::DISPATCH_USAGE
-                } else {
-                    workflow::STATUS_USAGE
-                }
-            );
+        Some(name @ ("dispatch" | "status" | "done" | "wait"))
+            if args == ["--help"] || (matches!(name, "done" | "wait") && args == ["-h"]) =>
+        {
+            let usage = match name {
+                "dispatch" => workflow::DISPATCH_USAGE,
+                "status" => workflow::STATUS_USAGE,
+                "done" => DONE_USAGE,
+                _ => WAIT_USAGE,
+            };
+            println!("{usage}");
         }
         Some("dispatch") => {
             let request = match workflow::Dispatch::parse(&args) {
@@ -79,6 +83,31 @@ fn main() -> anyhow::Result<ExitCode> {
                 }
             };
             println!("{}", workflow::status(id)?);
+        }
+        Some("done") => {
+            let request = match Done::parse(&args) {
+                Ok(request) => request,
+                Err(err) => {
+                    eprintln!("wfc: {err}. {DONE_USAGE}");
+                    return Ok(ExitCode::from(2));
+                }
+            };
+            println!("{}", request.run()?);
+        }
+        Some("wait") => {
+            let request = match Wait::parse(&args) {
+                Ok(request) => request,
+                Err(err) => {
+                    eprintln!("wfc: {err}. {WAIT_USAGE}");
+                    return Ok(ExitCode::from(2));
+                }
+            };
+            let messages = request.run()?;
+            if messages.is_empty() {
+                println!("{}", serde_json::json!({"messages": [], "timedOut": true}));
+                return Ok(ExitCode::from(3));
+            }
+            println!("{}", serde_json::json!({"messages": messages}));
         }
         Some(name) if RESERVED_COMMANDS.contains(&name) => {
             eprintln!("wfc: '{name}' is unavailable in this Rust build");

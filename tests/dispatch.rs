@@ -169,3 +169,120 @@ fn failed_handoffs_leave_only_the_successful_dispatch_queryable() {
     assert!(!unknown.status.success());
     assert!(unknown.stdout.is_empty());
 }
+
+#[test]
+fn live_worker_reports_once_and_wait_returns_the_same_receipt() {
+    let f = Fixture::new();
+    let worker = r#"
+import json, subprocess, sys
+from pathlib import Path
+Path("report.md").write_text("finished")
+args = [sys.argv[1], "done", "--report", "report.md"]
+first = json.loads(subprocess.check_output(args))
+assert first["state"] == "unsent" and not first["duplicate"]
+"#;
+    let record = run(f.dispatch("work", "reviewer", "task.md").args([
+        PYTHON,
+        "-c",
+        worker,
+        env!("CARGO_BIN_EXE_wfc"),
+    ]));
+    let batch = run(f.wfc().args(["wait", "--timeout", "5"]));
+    let receipt = run(f
+        .wfc()
+        .env("WFC_DISPATCH", record["dispatch"].as_str().unwrap())
+        .env("WFC_ROUND", "1")
+        .env("WFC_ATTEMPT", record["attempt"].as_str().unwrap())
+        .args(["done", "--report", "work/report.md"]));
+    assert_eq!(receipt["duplicate"], true);
+    let messages = batch["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    let message = &messages[0];
+    for field in ["dispatch", "round", "attempt", "role"] {
+        assert_eq!(message[field], record[field]);
+    }
+    assert_eq!(
+        message["report"],
+        f.0.join("work/report.md")
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+    assert_eq!(message["messageId"], receipt["messageId"]);
+    assert_eq!(message["id"], receipt["message"]);
+    assert_eq!(message["state"], "received");
+    assert_eq!(message["statusVersion"], 2);
+    let timeout = f.wfc().args(["wait", "--timeout", "0"]).output().unwrap();
+    assert_eq!(timeout.status.code(), Some(3));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&timeout.stdout).unwrap(),
+        json!({"messages": [], "timedOut": true})
+    );
+}
+
+#[test]
+fn invalid_callbacks_leave_the_queue_empty_and_parallel_retries_share_one_receipt() {
+    let f = Fixture::new();
+    let record = run(f
+        .dispatch("work", "reviewer", "task.md")
+        .args([PYTHON, "-c", "pass"]));
+    let id = record["dispatch"].as_str().unwrap();
+    let done = |report: &str| {
+        let mut cmd = f.wfc();
+        cmd.env("WFC_DISPATCH", id)
+            .env("WFC_ROUND", "1")
+            .env("WFC_ATTEMPT", record["attempt"].as_str().unwrap())
+            .args(["done", "--report", report, "--message-id", "review"]);
+        cmd
+    };
+    for mut cmd in [
+        done("absent.md"),
+        {
+            let mut c = done("task.md");
+            c.env("WFC_ROUND", "2");
+            c
+        },
+        {
+            let mut c = done("task.md");
+            c.env("WFC_ATTEMPT", "stale");
+            c
+        },
+        {
+            let mut c = done("task.md");
+            c.args(["--attempt", "stale"]);
+            c
+        },
+    ] {
+        let out = cmd.output().unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert!(out.stdout.is_empty());
+        assert!(!out.stderr.is_empty());
+    }
+    assert_eq!(
+        f.wfc()
+            .args(["wait", "--timeout", "0"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(3)
+    );
+    let (a, b) = std::thread::scope(|scope| {
+        let other = scope.spawn(|| run(&mut done("task.md")));
+        (run(&mut done("task.md")), other.join().unwrap())
+    });
+    assert_eq!(a["messageId"], b["messageId"]);
+    assert_ne!(a["duplicate"], b["duplicate"]);
+    fs::write(f.0.join("second.md"), "different report").unwrap();
+    let conflict = done("second.md").output().unwrap();
+    assert_eq!(conflict.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&conflict.stderr).contains("conflicts"));
+    let messages = run(f.wfc().args(["wait", "--timeout", "0"]));
+    assert_eq!(messages["messages"].as_array().unwrap().len(), 1);
+    let replay = run(&mut done("task.md"));
+    assert_eq!(replay["duplicate"], true);
+    assert_eq!(replay["state"], "received");
+    assert_eq!(replay["statusVersion"], 2);
+    assert_eq!(replay["messageId"], a["messageId"]);
+}

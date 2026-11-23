@@ -36,7 +36,7 @@ prepare 校验并解出仓内的 Ghostty 源码包，校验 zlib 下载字节和
 
 ## 运行和接入 WFC
 
-直接运行 `wfc` 或 `wfc --help` 会列出熟悉的工作流命令名。当前版本支持前台派发和状态查询，预留命令返回退出码 2。`wfc --version` 显示 Rust 标识、包版本、目标平台、构建类型和编译时的 `WFC_BUILD_ID`（未设置、为空或仅含空白时，使用本地构建时间的 Unix 纳秒数）。
+直接运行 `wfc` 或 `wfc --help` 会列出熟悉的工作流命令名。当前版本支持前台派发、状态查询、提交完成报告和等待消息，预留命令返回退出码 2。`wfc --version` 显示 Rust 标识、包版本、目标平台、构建类型和编译时的 `WFC_BUILD_ID`（未设置、为空或仅含空白时，使用本地构建时间的 Unix 纳秒数）。
 
 `dispatch` 接收调用方指定的角色、任务文件和工作目录。`--` 后依次放受控 worker 的程序和参数。下面的 Bash 示例让 worker 在工作目录中写出它实际读到的任务，再由另一个 CLI 查回编号。
 
@@ -52,6 +52,19 @@ wfc status --dispatch ID
 ```
 
 任务文件、工作目录和显式指定的程序路径都可以相对于调用方。程序也可使用 PATH 中的命令名。worker 以指定目录为当前目录，从 `WFC_TASK` 取得任务文件的绝对路径，并从 `WFC_ROLE`、`WFC_DISPATCH`、`WFC_ROUND`、`WFC_ATTEMPT` 和 `WFC_STATE` 取得本次派发上下文。派发在前台等待 worker 退出。worker 的标准输入和标准输出连接到空设备，诊断可写标准错误。worker 成功退出后，CLI 保存记录，标准输出返回一行 JSON，含 `dispatch`、`round`（首次为 1）、`attempt`、`role`、`task` 和 `cwd`。`status` 的 `dispatches` 数组列出已成功派发的记录，可用 `--dispatch` 按编号查询。启动失败、worker 返回非零或查询未知编号时，CLI 返回非零退出码并打印诊断。
+
+worker 写好报告后，在自己的启动环境中运行下面的命令。报告必须是现有文件，回执记录其绝对路径。总控在同一个 `WFC_STATE` 下运行 `wait`，可以先等待、再由 worker 报告。
+
+```sh
+# worker
+wfc done --report report.md
+# 总控
+wfc wait --timeout 30
+```
+
+`done` 用 `WFC_DISPATCH`、`WFC_ROUND` 和 `WFC_ATTEMPT` 校验本轮身份。可用 `--attempt ID` 再核对一次，用 `--message-id KEY` 自定重试键，默认键为 `done:<dispatch>:<attempt>`。每次尝试只能提交一份报告。以同一键和路径重试会返回原来的数字编号 `message` 和稳定编号 `messageId`，并标记 `duplicate: true`。错误身份或与已有回执冲突时退出 1。
+
+`wait` 默认等待 3600 秒，`--timeout` 接受小数秒，设为 0 可立即查询。它按提交顺序返回 `messages` 数组，每条完成消息含 `type`、`dispatch`、`round`、`attempt`、`role`、`report`、数字编号 `id` 和 `messageId`。若只想收一个任务的消息，可加 `--dispatch ID`。首次提交为 `unsent`（版本 1），收取后为 `received`（版本 2）。消息在输出前标记为已收取，其他等待者只会收到剩余消息。超时返回 `{"messages":[],"timedOut":true}`，退出码为 3。
 
 Rust 默认使用用户主目录下的 `.local/state/agent-router`，可用 `WFC_STATE` 指定独立状态目录。帮助、版本和内核入口都不会读写调度状态。与 Python 版并排使用时，把两份 `wfc` 放在不同目录，分别使用显式路径，并为每次调用指定各自的 `WFC_STATE`。
 
