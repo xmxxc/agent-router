@@ -114,7 +114,7 @@ impl Session {
             service,
             deadline,
         };
-        let pong = rpc.exchange(socket, "ping", json!({}))?;
+        let pong = rpc.exchange(socket, "ping", json!({}), None)?;
         if pong["version"] != "0.9.5" || pong["protocol"] != 22 {
             return Err(Failure::refused(
                 "Herdr requires version 0.9.5 / protocol 22",
@@ -132,8 +132,26 @@ impl Session {
     }
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
+        let unsent = (method == "pane.close").then_some("Herdr close was not sent");
+        self.call_with_write_boundary(method, params, unsent)
+    }
+
+    pub(super) fn send_reply(&self, params: Value) -> Result<Value> {
+        self.call_with_write_boundary(
+            "pane.send_input",
+            params,
+            Some("Herdr reply input was not sent"),
+        )
+    }
+
+    fn call_with_write_boundary(
+        &self,
+        method: &str,
+        params: Value,
+        unsent: Option<&'static str>,
+    ) -> Result<Value> {
         let before_send = |e: Failure| {
-            if method == "pane.close" {
+            if unsent.is_some() {
                 e.before_effect()
             } else {
                 e
@@ -145,10 +163,16 @@ impl Session {
                 "Herdr service identity changed",
             )));
         }
-        self.exchange(socket, method, params)
+        self.exchange(socket, method, params, unsent)
     }
 
-    fn exchange(&self, mut socket: UnixStream, method: &str, params: Value) -> Result<Value> {
+    fn exchange(
+        &self,
+        mut socket: UnixStream,
+        method: &str,
+        params: Value,
+        unsent: Option<&'static str>,
+    ) -> Result<Value> {
         let id = Uuid::new_v4().simple().to_string();
         let mut frame =
             serde_json::to_vec(&json!({"id":id, "method":method, "params":params})).unwrap();
@@ -165,8 +189,8 @@ impl Session {
         };
         let mut bytes = frame.as_slice();
         while !bytes.is_empty() {
-            let write_failure = if method == "pane.close" && bytes.len() == frame.len() {
-                Failure::unsent("Herdr close was not sent")
+            let write_failure = if bytes.len() == frame.len() {
+                unsent.map_or(unknown, Failure::unsent)
             } else {
                 unknown
             };

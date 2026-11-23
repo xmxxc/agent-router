@@ -51,6 +51,12 @@ struct Draft {
     scrolled: bool,
 }
 
+impl Draft {
+    fn empty(&self) -> bool {
+        !self.scrolled && (self.text.is_empty() || self.text == "Ask Codex to do anything")
+    }
+}
+
 fn codex_draft(screen: &str) -> Option<Draft> {
     let lines: Vec<_> = screen.trim_end().lines().map(str::trim_end).collect();
     let start = lines
@@ -85,7 +91,7 @@ fn codex_draft(screen: &str) -> Option<Draft> {
         } else {
             line
         };
-        scrolled |= line.ends_with('↑');
+        scrolled |= line.ends_with(['↑', '↓']);
         let line = line.strip_suffix(['↑', '↓']).unwrap_or(line);
         if n > 0 {
             text.push(' ');
@@ -170,11 +176,17 @@ impl Tmux<'_> {
         }
     }
 
-    pub(super) fn submit(&self, t: &Target, text: &str, host: Option<&str>) -> Reply<Value> {
+    pub(super) fn submit(
+        &self,
+        t: &Target,
+        text: &str,
+        host: Option<&str>,
+        confirm_reply: bool,
+    ) -> Reply<Value> {
         if text.contains('\0') {
             return Err(failure("definitely-not-sent", "tmux input contains NUL"));
         }
-        let before = notices(&self.worker_screen(t).map_err(|e| {
+        let screen = self.worker_screen(t).map_err(|e| {
             if e["result"] == "refused" {
                 e
             } else {
@@ -183,9 +195,17 @@ impl Tmux<'_> {
                     "could not observe the session before input",
                 )
             }
-        })?);
+        })?;
+        let before = notices(&screen);
         if let Some(message) = before.state {
             return Err(refused(&message));
+        }
+        let codex = host == Some("codex");
+        if confirm_reply && codex && codex_draft(&screen).is_some_and(|draft| !draft.empty()) {
+            return Err(failure(
+                "definitely-not-sent",
+                "Codex composer already contains a draft",
+            ));
         }
         // Single-quote for the tmux command parser inside if-shell. No shell is invoked.
         let literal = text.replace('\'', "'\\''");
@@ -202,30 +222,56 @@ impl Tmux<'_> {
         sleep(Duration::from_millis(500));
         let window = setting("WFC_TYPED_CHECK_SECONDS", 1.5);
         let mut earlier_refusals = before.refusals;
+        let after_text = |err: Value| {
+            if err["category"] == "permission_required" {
+                if confirm_reply {
+                    let mut err = err;
+                    err["result"] = json!("uncertain");
+                    err
+                } else {
+                    err
+                }
+            } else {
+                uncertain("could not observe the session after input")
+            }
+        };
         for retry in 0..=2 {
             self.worker_command(t, &format!("send-keys -t {} Enter", t.worker_pane()?))
                 .map_err(|_| uncertain("text was typed but Enter was not confirmed"))?;
-            let after_text = |err: Value| {
-                if err["category"] == "permission_required" {
-                    err
-                } else {
-                    uncertain("could not observe the session after input")
-                }
-            };
             self.observe(t, earlier_refusals, window)
                 .map_err(after_text)?;
-            if host != Some("codex") {
+            if !codex {
                 break;
             }
             let first = self.worker_screen(t).map_err(after_text)?;
-            check_notice(&first, earlier_refusals)?;
-            let Some(draft) = codex_draft(&first).filter(|d| matches_input(d, text)) else {
+            check_notice(&first, earlier_refusals).map_err(after_text)?;
+            let draft = codex_draft(&first);
+            if confirm_reply {
+                if draft.as_ref().is_some_and(Draft::empty) {
+                    break;
+                }
+                if !draft.as_ref().is_some_and(|d| {
+                    !d.scrolled
+                        && d.text
+                            .chars()
+                            .filter(|c| !c.is_whitespace())
+                            .eq(text.chars().filter(|c| !c.is_whitespace()))
+                }) {
+                    return Err(uncertain("Codex composer did not confirm the reply"));
+                }
+            } else if !draft.as_ref().is_some_and(|d| matches_input(d, text)) {
                 break;
-            };
+            }
             sleep(Duration::from_millis(300));
             let second = self.worker_screen(t).map_err(after_text)?;
-            check_notice(&second, earlier_refusals)?;
-            if Some(draft) != codex_draft(&second) {
+            check_notice(&second, earlier_refusals).map_err(after_text)?;
+            let next = codex_draft(&second);
+            if draft != next {
+                if confirm_reply && !next.as_ref().is_some_and(Draft::empty) {
+                    return Err(uncertain(
+                        "Codex composer changed before Enter could be retried",
+                    ));
+                }
                 break;
             }
             earlier_refusals = notices(&second).refusals;
@@ -253,7 +299,7 @@ impl Tmux<'_> {
                     )
                 })?;
                 if !screen.trim().is_empty() && screen == last {
-                    return self.submit(t, text.unwrap_or_default(), Some("opencode"));
+                    return self.submit(t, text.unwrap_or_default(), Some("opencode"), false);
                 }
                 last = screen;
                 sleep(Duration::from_secs(1));

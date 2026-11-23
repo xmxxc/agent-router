@@ -116,6 +116,7 @@ pub struct Binding {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Screen {
     pub text: String,
+    /// Herdr 0.9.5 reports zero for pane.read, independently of content changes.
     pub revision: u64,
     pub truncated: bool,
 }
@@ -387,15 +388,36 @@ impl Handle {
     }
 
     pub fn read(&self) -> Result<Screen> {
+        self.read_screen("text")
+    }
+
+    fn read_ansi(&self) -> Result<Screen> {
+        self.read_screen("ansi")
+    }
+
+    fn read_screen(&self, format: &str) -> Result<Screen> {
         let rpc = self.session()?;
         self.guarded(&rpc, false)?;
-        let data = rpc.call("pane.read",json!({"pane_id":self.pane,"source":"recent","format":"text","strip_ansi":true,"lines":200}))?;
+        let data = rpc.call("pane.read",json!({"pane_id":self.pane,"source":"recent","format":format,"strip_ansi":format != "ansi","lines":200}))?;
         if data["read"]["pane_id"].as_str() != self.pane.as_deref()
             || data["read"]["workspace_id"].as_str() != self.workspace.as_deref()
+            || (format == "ansi"
+                && (data["read"]["format"] != "ansi" || data["read"]["source"] != "recent"))
         {
             return Err(INVALID);
         }
         serde_json::from_value(data["read"].clone()).map_err(|_| INVALID)
+    }
+
+    fn prepare_send(
+        &mut self,
+        input: bool,
+        save: &mut impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<Session> {
+        let rpc = self.session()?;
+        self.checkpoint_writers(&rpc, save)?;
+        self.guarded(&rpc, input)?;
+        Ok(rpc)
     }
 
     fn send(
@@ -405,10 +427,7 @@ impl Handle {
         input: bool,
         save: &mut impl FnMut(&Self) -> std::io::Result<()>,
     ) -> Result<()> {
-        let rpc = self.session()?;
-        self.checkpoint_writers(&rpc, save)?;
-        self.guarded(&rpc, input)?;
-        rpc.call(method, params)?;
+        self.prepare_send(input, save)?.call(method, params)?;
         Ok(())
     }
 
@@ -426,20 +445,58 @@ impl Handle {
         &mut self,
         text: &str,
         codex: bool,
+        save: impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<()> {
+        self.submit_input(text, codex, false, save)
+    }
+
+    pub fn submit_reply(
+        &mut self,
+        text: &str,
+        codex: bool,
+        save: impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<()> {
+        if !codex {
+            return Err(Failure::unsent(
+                "a writable chat composer could not be verified for this Herdr host",
+            ));
+        }
+        self.submit_input(text, codex, true, save)
+    }
+
+    fn submit_input(
+        &mut self,
+        text: &str,
+        codex: bool,
+        confirm_reply: bool,
         mut save: impl FnMut(&Self) -> std::io::Result<()>,
     ) -> Result<()> {
-        let before = self.read()?;
+        let before_input = |error: Failure| {
+            if confirm_reply {
+                error.before_effect()
+            } else {
+                error
+            }
+        };
+        let before = self.read().map_err(before_input)?;
         if screen::read_only(&before.text) {
             return Err(Failure::refused("worker input is paused"));
         }
-        self.send(
-            "pane.send_input",
-            json!({"pane_id":self.pane,"text":text,"keys":["Enter"]}),
-            true,
-            &mut save,
-        )?;
+        if codex && confirm_reply {
+            screen::require_empty_reply_box(self, &before).map_err(before_input)?;
+        }
+        // Preparation performs only observation and local checkpoints. An
+        // incomplete response to the subsequent input call may be post-effect.
+        let rpc = self.prepare_send(true, &mut save).map_err(before_input)?;
+        let params = json!({"pane_id":self.pane,"text":text,"keys":["Enter"]});
+        if confirm_reply {
+            rpc.send_reply(params)?;
+        } else {
+            rpc.call("pane.send_input", params)?;
+        }
         if codex {
-            screen::confirm_codex(self, text, &before, &mut save).map_err(Failure::after_effect)?;
+            screen::confirm_codex(self, text, &before, confirm_reply, &mut save)
+                .map_err(Failure::after_effect)?;
         }
         Ok(())
     }

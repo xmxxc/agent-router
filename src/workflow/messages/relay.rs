@@ -328,7 +328,10 @@ fn claim_batch(
     let mut messages = Vec::new();
     let mut text = String::from(PREFIX);
     for m in &mut inbox.messages {
-        if m.delivery.state != State::Unsent || scope.is_some_and(|s| s != m.worker.scope()) {
+        if m.reply_payload.is_some()
+            || m.delivery.state != State::Unsent
+            || scope.is_some_and(|s| s != m.worker.scope())
+        {
             continue;
         }
         if verified.is_some_and(|assignments| {
