@@ -1012,3 +1012,15 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
     }
     Ok(result)
 }
+
+// An interrupted controller must leave its scope fenced until this backend
+// exits. Restoring CLOEXEC keeps the descriptor out of tmux and the worker.
+pub(crate) fn retain_scope_lock(fd: &std::ffi::OsStr) -> Result<()> {
+    let fd: std::os::fd::RawFd = fd.to_str().context("invalid scope lock descriptor")?.parse()?;
+    ensure!(fd > 2, "invalid scope lock descriptor");
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error()).context("retain inherited scope lock");
+    }
+    Ok(())
+}

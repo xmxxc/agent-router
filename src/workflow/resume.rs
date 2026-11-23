@@ -59,7 +59,7 @@ impl<'a> Resume<'a> {
             Ok(owners.public(scope)?.unwrap_or(Value::Null)["generation"].clone())
         };
         authorize()?;
-        let _scope = controller::lock_scope(&state, scope)?;
+        let scope_lock = controller::lock_scope(&state, scope)?;
         let generation = authorize()?;
         let row = read()?;
         ensure!(
@@ -91,7 +91,9 @@ impl<'a> Resume<'a> {
             ));
         }
         let _execution = assignment::close_lock(&state, &row)?;
-        let (worker, inspection) = match backend::observe_for_resume(&state, &row) {
+        let proof = super::reconcile::resume_absence_proof(&row, &generation);
+        let (worker, inspection) = match backend::observe_for_resume(&state, &row, proof.is_some())
+        {
             Ok(observation) => observation,
             Err(e) => {
                 return Ok(reconcile(
@@ -109,7 +111,8 @@ impl<'a> Resume<'a> {
                 inspection["result"].as_str(),
                 Some("accepted" | "completed")
             )
-            || !matches!(worker["state"].as_str(), Some("exited" | "not_started"))
+            || !(matches!(worker["state"].as_str(), Some("exited" | "not_started"))
+                || (proof.is_some() && worker["state"] != "running"))
         {
             return Ok(reconcile(
                 &row,
@@ -272,12 +275,15 @@ impl<'a> Resume<'a> {
             let audit = next["audit"]
                 .as_array_mut()
                 .context("invalid lifecycle audit")?;
+            if let Some(index) = proof {
+                audit[index]["resolution"]["consumedAt"] = json!(now.to_rfc3339());
+            }
             let event = audit.len() + 1;
             audit.push(
                 json!({"id":event,"operation":"resume","dispatch":self.dispatch,
                 "round":round,"attempt":attempt,"fromAttempt":row["attempt"],"toAttempt":attempt,
                 "fromHost":row["host"],"toHost":row["host"],"session":session.to_string(),
-                "at":now.to_rfc3339(),"ownerGeneration":generation,"result":"pending",
+                "at":now.to_rfc3339(),"ownerGeneration":generation,"result":"pending","scopeFence":true,
                 "priorInspection":inspection,"priorWorker":worker,"priorCreate":row["create"]}),
             );
             super::write_json(&path, &next, None)?;
@@ -287,7 +293,7 @@ impl<'a> Resume<'a> {
 
         // From here a lost response is indistinguishable from a running worker.
         // The scope lock still fences takeover, and callbacks can use the new assignment.
-        let mut answer = backend::resume(&state, &next, launch).unwrap_or_else(|e| {
+        let mut answer = backend::resume(&state, &next, launch, &scope_lock).unwrap_or_else(|e| {
             json!({"result":"definitely-not-sent","diagnostic":format!("could not call tmux backend: {e}")})
         });
         let launch_result = match answer["result"].as_str() {

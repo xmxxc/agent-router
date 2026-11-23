@@ -643,6 +643,7 @@ impl Inbox {
         if let Some(event) = resume {
             ensure!(
                 event["launchResult"] != "definitely-not-sent"
+                    && event["result"] != "definitely-not-sent"
                     && (event["result"] == "accepted"
                         || (attempt.is_some() && controller::worker_callback().is_some())),
                 "attempt is no longer accepted for {}; its launch is unconfirmed",

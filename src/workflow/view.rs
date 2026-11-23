@@ -140,7 +140,8 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
         {
             let unconfirmed_create =
                 row["backend"] == "herdr" && row["create"]["result"] != "accepted";
-            let unconfirmed_resume = super::assignment::resume_audit(row)
+            let resume = super::assignment::resume_audit(row);
+            let unconfirmed_resume = resume
                 .is_some_and(|event| event["result"] != "accepted");
             let state = match row["worker"]["state"].as_str() {
                 _ if unresolved_worker || unconfirmed_resume => "unknown",
@@ -149,6 +150,8 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
                     "unknown"
                 }
                 Some("running") => "running",
+                Some("unknown") if resume.is_some_and(|event| event["resolution"].is_object())
+                    && round["state"] == "running" => "running",
                 Some("cancelled" | "not_started") => "cancelled",
                 Some("exited") => "failed", // An exit without a done receipt is unfinished work.
                 None if row.get("worker").is_none() => "completed", // #4 foreground success

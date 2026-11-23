@@ -22,6 +22,8 @@ mod backend;
 pub mod herdr;
 pub mod host;
 #[cfg(target_os = "linux")]
+pub mod reconcile;
+#[cfg(target_os = "linux")]
 pub mod resume;
 mod view;
 
@@ -704,6 +706,16 @@ fn status_with_history(
                 .cloned(),
         );
         let alive = record["backendAlive"].as_bool();
+        let resolution_required = assignment::unresolved_lifecycle(record)
+            .filter(|event| record["backend"] == "tmux" && event["operation"] == "resume")
+            .map(|event| {
+                json!({"audit":event["id"],
+                    "operation":event["operation"],"result":event["result"],
+                    "round":event["round"],"attempt":event["attempt"]})
+            });
+        if let Some(required) = resolution_required {
+            record["reconcileRequired"] = required;
+        }
         if record["createPending"] == true && !assignment::identified(record) {
             for field in ["state", "status", "lifecycle"] {
                 record[field] = json!("unknown");
@@ -718,7 +730,10 @@ fn status_with_history(
     }
     if active {
         dispatches.retain(|row| {
-            if row["state"] != "done" || row["closePending"] == true {
+            if row["state"] != "done"
+                || row["closePending"] == true
+                || row["reconcileRequired"].is_object()
+            {
                 return true;
             }
             if row["backendAlive"] == true {

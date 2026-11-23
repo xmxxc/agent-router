@@ -70,6 +70,8 @@ fn run() -> anyhow::Result<ExitCode> {
             println!("{}", workflow::herdr::USAGE);
             #[cfg(target_os = "linux")]
             println!("{}", workflow::resume::USAGE);
+            #[cfg(target_os = "linux")]
+            println!("{}", workflow::reconcile::USAGE);
             println!("{DONE_USAGE}");
             println!("{ASK_USAGE}");
             println!("{WAIT_USAGE}");
@@ -125,7 +127,12 @@ fn run() -> anyhow::Result<ExitCode> {
             return host_launch::supervise(&spec);
         }
         #[cfg(target_os = "linux")]
-        Some("--tmux-backend") if args.is_empty() => {
+        Some("--tmux-backend") if args.is_empty()
+            || (args.len() == 2 && args[0] == "--scope-lock-fd") =>
+        {
+            if let Some(fd) = args.get(1) {
+                tmux::retain_scope_lock(fd)?;
+            }
             let request = serde_json::from_reader(std::io::stdin().lock())?;
             println!("{}", tmux::execute(&workflow::state_dir()?, request)?);
         }
@@ -238,6 +245,22 @@ fn run() -> anyhow::Result<ExitCode> {
                     return Ok(ExitCode::FAILURE);
                 }
                 println!("{reply}");
+            }
+        }
+        #[cfg(target_os = "linux")]
+        Some("reconcile") => {
+            use workflow::reconcile::{Reconcile, USAGE};
+            if args == ["--help"] || args == ["-h"] {
+                println!("{USAGE}");
+            } else {
+                let request = match Reconcile::parse(&args) {
+                    Ok(request) => request,
+                    Err(err) => {
+                        eprintln!("wfc: {err}. {USAGE}");
+                        return Ok(ExitCode::from(2));
+                    }
+                };
+                println!("{}", request.run()?);
             }
         }
         Some("dispatch") => {

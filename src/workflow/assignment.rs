@@ -65,7 +65,6 @@ pub(super) fn resume_audit(row: &Value) -> Option<&Value> {
     })
 }
 
-#[cfg(target_os = "linux")]
 pub(super) fn unresolved_lifecycle(row: &Value) -> Option<&Value> {
     row["audit"].as_array()?.iter().rev().find(|event| {
         matches!(event["result"].as_str(), Some("pending" | "uncertain"))

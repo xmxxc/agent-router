@@ -412,26 +412,8 @@ os.execv({TMUX!r}, [{TMUX!r}, *args])
         dispatch, attempt = original["dispatch"], original["attempt"]
         self.rollout("11111111-2222-4333-8444-555555555555", first["argv"][-1])
         self.end_resume_host(dispatch, attempt)
-        shim = self.work / "tmux"
-        shim.write_text(f"""#!{sys.executable}
-import os, signal, subprocess, sys
-from pathlib import Path
-args = sys.argv[1:]
-if "new-session" in args:
-    subprocess.run([{TMUX!r}, *args], check=True)
-    backend = os.getppid()
-    if {mode!r} == "pending":
-        status = Path(f"/proc/{{backend}}/status").read_text().splitlines()
-        router = int(next(line.split()[1] for line in status if line.startswith("PPid:")))
-        os.kill(router, signal.SIGKILL)
-    os.kill(backend, signal.SIGKILL)
-    sys.exit(0)
-os.execv({TMUX!r}, [{TMUX!r}, *args])
-""")
-        shim.chmod(0o700)
+        self.lose_resume_launch(dispatch, mode)
         owner = {"WFC_OWNER_TOKEN": "owner-one"}
-        failed = self.resume_cli("resume", dispatch, code=None, PATH=str(self.work), **owner)
-        self.assertEqual(failed.returncode, -signal.SIGKILL if mode == "pending" else 1, failed.stderr)
         row = self.resume_status(dispatch)
         self.assertEqual(row["audit"][0]["result"], mode)
         self.assertEqual(row["state"], "unknown")
@@ -446,7 +428,176 @@ os.execv({TMUX!r}, [{TMUX!r}, *args])
         self.assertEqual((again["error"], again["audit"], again["attempt"]),
                          ("lifecycle_reconcile_required", 1, row["attempt"]))
         self.assertEqual(len(self.resume_status(dispatch)["audit"]), 1)
+
+    def lose_resume_launch(self, dispatch, mode):
+        shim = self.work / "tmux"
+        release = self.work / "resume-backend-release"
+        if mode == "orphan":
+            self.addCleanup(release.touch, exist_ok=True)
+        shim.write_text(f"""#!{sys.executable}
+import os, signal, subprocess, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+if "new-session" in args:
+    subprocess.run([{TMUX!r}, *args], check=True)
+    backend = os.getppid()
+    if {mode!r} in ("pending", "orphan"):
+        status = Path(f"/proc/{{backend}}/status").read_text().splitlines()
+        router = int(next(line.split()[1] for line in status if line.startswith("PPid:")))
+        os.kill(router, signal.SIGKILL)
+    if {mode!r} == "orphan":
+        deadline = time.monotonic() + 12
+        while not Path({str(release)!r}).exists() and time.monotonic() < deadline:
+            time.sleep(.02)
+    else:
+        os.kill(backend, signal.SIGKILL)
+    sys.exit(0)
+os.execv({TMUX!r}, [{TMUX!r}, *args])
+""")
+        shim.chmod(0o700)
+        failed = self.resume_cli("resume", dispatch, code=None, PATH=str(self.work),
+                                 WFC_OWNER_TOKEN="owner-one")
+        self.assertEqual(failed.returncode, 1 if mode == "uncertain" else -signal.SIGKILL, failed.stderr)
+        if mode == "orphan":
+            # The live backend still needs its selected tmux binary for inspection.
+            return release
         shim.unlink()
+
+    @staticmethod
+    def reconcile_args(dispatch, result, evidence, audit=1):
+        return ("reconcile", dispatch, str(audit), "--result", result,
+                "--actor", "operator", "--evidence", evidence)
+
+    def test_public_reconcile_resume_after_orphaned_backend(self):
+        initial, first = self.resume_fixture()
+        dispatch, attempt = initial["dispatch"], initial["attempt"]
+        self.rollout("11111111-2222-4333-8444-555555555555", first["argv"][-1])
+        self.end_resume_host(dispatch, attempt)
+        release = self.lose_resume_launch(dispatch, "orphan")
+        args = self.reconcile_args(dispatch, "accepted", "same worker verified in tmux")
+        with self.subTest("live backend retains scope after controller exit"):
+            self.assertIn("operation still in progress",
+                          self.resume_cli(*args, code=1, WFC_OWNER_TOKEN="owner-one"))
+        release.touch()
+        row = self.resume_status(dispatch)
+        current = row["attempt"]
+        self.assertEqual(row["reconcileRequired"]["audit"], 1)
+        self.assertEqual(row["audit"][0]["result"], "pending")
+        new = self.resumed_host(current)
+        self.resume_cli("owner", "takeover", "--scope", "resume", "--owner", "two",
+                        "--token", "owner-two", "--lease", "180")
+        self.assertIn("stale_controller_owner",
+                      self.resume_cli(*args, code=1, WFC_OWNER_TOKEN="owner-one"))
+        bad = self.reconcile_args(dispatch, "definitely-not-sent", "contradicted by live writer")
+        self.assertIn("did not start", self.resume_cli(*bad, code=1, WFC_OWNER_TOKEN="owner-two"))
+        path = self.state / "dispatches" / f"{dispatch}.json"
+        good = path.read_bytes()
+        damaged = json.loads(good)
+        damaged["audit"][0]["toAttempt"] = attempt
+        path.write_text(json.dumps(damaged))
+        self.assertIn("invalid or foreign resume audit",
+                      self.resume_cli(*args, code=1, WFC_OWNER_TOKEN="owner-two"))
+        self.assertEqual(json.loads(path.read_bytes()), damaged)
+        path.write_bytes(good)
+        launch_receipt = Path(self.call("inspect", dispatch=dispatch, executionId=current)["receipt"])
+        original_launch = launch_receipt.read_bytes()
+        wrong_launch = json.loads(original_launch)
+        wrong_launch["dispatch"] = "d-deadbeef"
+        try:
+            launch_receipt.write_text(json.dumps(wrong_launch))
+            self.assertIn("belongs to another execution",
+                          self.resume_cli(*args, code=1, WFC_OWNER_TOKEN="owner-two"))
+            self.assertEqual(path.read_bytes(), good)
+        finally:
+            launch_receipt.write_bytes(original_launch)
+        self.assertIn("worker_callback_only", self.resume_cli(*args, code=1, WFC_OWNER_TOKEN="owner-two",
+                                                            WFC_WORKER_CALLBACK=new["WFC_WORKER_CALLBACK"]))
+        outcome = self.resume_cli(*args, WFC_OWNER_TOKEN="owner-two")
+        self.assertEqual((outcome["attempt"], outcome["duplicate"], outcome["inputReplayed"]),
+                         (current, False, False))
+        after = self.resume_status(dispatch)
+        self.assertNotIn("reconcileRequired", after)
+        self.assertEqual(after["rounds"][-1]["state"], "running")
+        event = after["audit"][0]
+        self.assertEqual((event["ownerGeneration"], event["resolution"]["ownerGeneration"]), (1, 2))
+        self.assertEqual(event["resolution"]["previousResult"], "pending")
+        self.assertTrue(self.resume_cli(*args, WFC_OWNER_TOKEN="owner-two")["duplicate"])
+        conflict = self.reconcile_args(dispatch, "accepted", "contradicting evidence")
+        self.assertIn("already settled", self.resume_cli(*conflict, code=1, WFC_OWNER_TOKEN="owner-two"))
+        self.assertEqual(self.resume_status(dispatch)["audit"][0], event)
+
+    def test_public_reconcile_lost_resume_reply_preserves_completion(self):
+        initial, first = self.resume_fixture()
+        dispatch, attempt = initial["dispatch"], initial["attempt"]
+        self.rollout("11111111-2222-4333-8444-555555555555", first["argv"][-1])
+        self.end_resume_host(dispatch, attempt)
+        self.lose_resume_launch(dispatch, "uncertain")
+        row = self.resume_status(dispatch)
+        current = row["attempt"]
+        new = self.resumed_host(current)
+        self.assertEqual(new["argv"][0], "resume")
+        self.assertIn("Your session was interrupted", new["argv"][-1])
+        report = Path(new["WFC_REPORT"])
+        report.write_text("completed after the external launch response was lost")
+        done = self.resume_callback(new, "done", "--report", str(report))
+        self.assertEqual(done["state"], "unsent")
+        self.end_resume_host(dispatch, current)
+        pending = self.resume_cli("status", "--active")["dispatches"]
+        self.assertTrue(any(r["dispatch"] == dispatch and r["reconcileRequired"]["result"] == "uncertain"
+                            for r in pending))
+        args = self.reconcile_args(dispatch, "unknown", "brief delivery could not be confirmed")
+        settled = self.resume_cli(*args, WFC_OWNER_TOKEN="owner-one")
+        self.assertEqual((settled["result"], settled["inputReplayed"]), ("unknown", False))
+        row = self.resume_status(dispatch)
+        self.assertEqual(row["state"], "done")
+        self.assertEqual(row["attempt"], current)
+        self.assertEqual(row["rounds"][-1]["result"]["messageId"], done["messageId"])
+        self.assertEqual(row["audit"][0]["resolution"]["previousResult"], "uncertain")
+        self.assertEqual(len(list(self.work.glob("a-*.json"))), 2)
+
+    def test_public_reconcile_resume_absence_proof_is_owner_bound_and_consumed(self):
+        for mode in ("consume", "takeover", "not-sent", "refused"):
+            with self.subTest(mode=mode):
+                self.state = self.root / mode
+                first, host = self.resume_fixture()
+                dispatch, original = first["dispatch"], first["attempt"]
+                session = "11111111-2222-4333-8444-555555555555"
+                self.rollout(session, host["argv"][-1])
+                self.end_resume_host(dispatch, original)
+                path = self.state / "dispatches" / f"{dispatch}.json"
+                row = json.loads(path.read_bytes())
+                # Model the persisted cut after the intent and before the backend runs.
+                pending = "a-" + "f1" * 16
+                row["rounds"] = [dict(round=1, attempt=a, task=row["task"], report=row["report"], state=s)
+                                 for a, s in [(original, "failed"), (pending, "unknown")]]
+                row["audit"] = [dict(id=1, dispatch=dispatch, operation="resume", round=1,
+                                     attempt=pending, toAttempt=pending, fromAttempt=original,
+                                     fromHost="codex", toHost="codex", session=session,
+                                     ownerGeneration=1, scopeFence=True, result="pending")]
+                row.update(attempt=pending, executionId=pending, hostSession=session)
+                row.pop("create")
+                path.write_text(json.dumps(row))
+                result = {"not-sent": "definitely-not-sent", "refused": "refused"}.get(mode, "accepted")
+                args = self.reconcile_args(dispatch, result, "operator verified the protected slot")
+                receipt = self.resume_cli(*args, WFC_OWNER_TOKEN="owner-one")
+                self.assertFalse(receipt["duplicate"])
+                if mode == "takeover":
+                    self.resume_cli("owner", "takeover", "--scope", "resume", "--owner", "two",
+                                    "--token", "owner-two", "--lease", "180")
+                    blocked = self.resume_cli("resume", dispatch, code=1, WFC_OWNER_TOKEN="owner-two")
+                    self.assertIn("lifecycle_reconcile_required", blocked)
+                    self.assertTrue(self.resume_cli(*args, WFC_OWNER_TOKEN="owner-two")["duplicate"])
+                elif mode == "refused":
+                    self.assertIn("lifecycle_reconcile_required",
+                                  self.resume_cli("resume", dispatch, code=1, WFC_OWNER_TOKEN="owner-one"))
+                else:
+                    launched = self.resume_cli("resume", dispatch, WFC_OWNER_TOKEN="owner-one")
+                    self.assertEqual((launched["session"], launched["round"]), (session, 1))
+                    self.assertNotEqual(launched["attempt"], pending)
+                    after = self.resume_status(dispatch)["audit"][0]
+                    self.assertEqual("consumedAt" in after["resolution"], mode == "consume")
+                    self.assertTrue(self.resume_cli(*args, WFC_OWNER_TOKEN="owner-one")["duplicate"])
+                    self.end_resume_host(dispatch, launched["attempt"])
 
     def test_read_only_unowned_close_replays_confirmed_archive(self):
         self.assertNotEqual(os.geteuid(), 0, "read-only fixture requires an ordinary user")
