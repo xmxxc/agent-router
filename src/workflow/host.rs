@@ -7,7 +7,10 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
-use uuid::Uuid;
+#[cfg(target_os = "linux")]
+pub(super) mod claude;
+#[cfg(target_os = "linux")]
+pub(crate) use claude::session_start as claude_session_start;
 
 #[derive(Default)]
 pub struct Options<'a> {
@@ -162,62 +165,6 @@ fn configured(path: &Path, name: &str, cwd: &Path) -> Result<Launch> {
     Ok(Launch { argv: prefix, env })
 }
 
-// Match the host's existing trust decision for this directory or a real
-// ancestor. Serialize router updates to the config, including symlinked files.
-#[cfg(unix)]
-fn claude_trust(cwd: &Path) -> Result<Option<PathBuf>> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let Some(config) = env::var_os("WFC_CLAUDE_CONFIG")
-        .map(PathBuf::from)
-        .or_else(|| env::home_dir().map(|p| p.join(".claude.json")))
-    else {
-        return Ok(None);
-    };
-    let path = match config.canonicalize() {
-        Ok(p) => p,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let name = path
-        .file_name()
-        .context("missing Claude config filename")?
-        .to_string_lossy();
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(path.with_file_name(format!(".{name}.wfc.lock")))?;
-    lock.lock()?;
-    let f = fs::File::open(&path)?;
-    let permissions = f.metadata()?.permissions();
-    let mut config: Value = serde_json::from_reader(f)?;
-    let Some(projects) = config.get_mut("projects").and_then(Value::as_object_mut) else {
-        return Ok(None);
-    };
-    let key = cwd.to_str().context("cwd must be UTF-8")?;
-    if projects
-        .get(key)
-        .is_some_and(|p| p["hasTrustDialogAccepted"] == true)
-    {
-        return Ok(Some(cwd.to_owned()));
-    }
-    let ancestor = projects
-        .iter()
-        .filter(|(_, v)| v["hasTrustDialogAccepted"] == true)
-        .filter_map(|(k, _)| Path::new(k).canonicalize().ok())
-        .filter(|p| p != cwd && cwd.starts_with(p))
-        .max_by_key(|p| p.components().count());
-    if ancestor.is_some() {
-        let project = projects.entry(key.to_owned()).or_insert_with(|| json!({}));
-        ensure!(project.is_object(), "invalid Claude project");
-        project["hasTrustDialogAccepted"] = json!(true);
-        super::write_json(&path, &config, Some(permissions))?;
-    }
-    Ok(ancestor)
-}
-
 impl Options<'_> {
     pub fn prepare(&self, state: &Path, record: &mut Value) -> Result<Launch> {
         let cwd = Path::new(record["cwd"].as_str().context("missing cwd")?);
@@ -310,32 +257,10 @@ impl Options<'_> {
                 a.extend(["--prompt".into(), brief]);
                 launch.env.insert("OPENCODE_CONFIG_CONTENT".into(),json!(json!({"permission":{"external_directory":{"*":"allow"},"read":{"*.env":"allow","*.env.*":"allow"}}}).to_string()));
             }
+            #[cfg(target_os = "linux")]
             "claude" => {
-                a.extend([brief, "--permission-mode".into(), "auto".into()]);
-                if let Some(m) = self.model {
-                    a.extend(["--model".into(), m.into()]);
-                }
-                if let Some(e) = self.effort {
-                    a.extend(["--effort".into(), e.into()]);
-                }
-                let session = Uuid::new_v4().to_string();
-                a.extend([
-                    "--name".into(),
-                    record["label"].as_str().context("missing label")?.into(),
-                    "--session-id".into(),
-                    session.clone(),
-                    "--add-dir".into(),
-                ]);
-                for p in writable {
-                    a.push(p.to_str().context("writable path must be UTF-8")?.into());
-                }
-                #[cfg(unix)]
-                match claude_trust(cwd) {
-                    Ok(Some(ancestor)) => record["trustedBy"] = json!(ancestor),
-                    Ok(None) => {}
-                    Err(_) => eprintln!("wfc: could not confirm Claude worktree trust"),
-                }
-                record["hostSession"] = json!(session);
+                claude::prepare_initial(state, self, record, &mut launch, brief, &writable)?;
+                claude::apply_existing_trust(record)?;
             }
             _ => bail!("unsupported host"),
         }
