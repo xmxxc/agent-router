@@ -98,13 +98,115 @@ fn audit(db: &Connection, id: &str) -> Result<Vec<Value>> {
     Ok(events)
 }
 
+/// Verify an existing legacy ledger through the same read-only path as preview.
+pub fn verify_router_db(state: &Path) -> Result<()> {
+    let path = state.join("router.db");
+    let (db, _) = reader(state)
+        .with_context(|| format!("verify {}", path.display()))?
+        .with_context(|| format!("{} disappeared during verification", path.display()))?;
+    let (dispatch, message) = original_ledger_identity(&db)?;
+    ensure!(
+        dispatch && message,
+        "unrecognized router.db schema in {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn original_ledger_identity(db: &Connection) -> Result<(bool, bool)> {
+    // Check the original tables. Preview projects missing columns in TEMP
+    // views, which are useful for history but cannot identify a live ledger.
+    Ok(db.query_row(
+        "SELECT EXISTS (
+            SELECT 1 FROM pragma_table_info('dispatch', 'main') WHERE name='id' AND pk > 0
+         ), (
+            SELECT count(*) FROM pragma_table_info('message', 'main')
+            WHERE name IN ('id', 'dispatch', 'recipient', 'type', 'body')
+              AND (name <> 'id' OR pk > 0)
+         ) = 5",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?)
+}
+
+/// Confirm that the offline preview can read a recognizable older schema.
+pub fn can_preview_router_db(state: &Path) -> bool {
+    reader(state).is_ok_and(|ledger| {
+        ledger.is_some_and(|(db, _)| {
+            original_ledger_identity(&db).is_ok_and(|(dispatch, message)| {
+                dispatch || message || original_history_identity(&db).unwrap_or(false)
+            })
+        })
+    })
+}
+
+fn original_history_identity(db: &Connection) -> Result<bool> {
+    // An old copy can contain only one of the evidence tables in offline_dispatch.
+    // Match both the real keys and characteristic columns before choosing it.
+    let shapes: &[(&str, &[&str], &[&str])] = &[
+        (
+            "dispatch_round",
+            &["dispatch", "round", "attempt"],
+            &["state"],
+        ),
+        ("message", &["id"], &["dispatch", "type", "body"]),
+        ("fault_event", &["dispatch"], &["operation", "outcome"]),
+        ("fault_event", &["dispatch"], &["operation", "diagnostic"]),
+        (
+            "lifecycle_event",
+            &["id"],
+            &["dispatch", "operation", "result"],
+        ),
+        (
+            "lifecycle_event",
+            &["id"],
+            &["dispatch", "operation", "attempt"],
+        ),
+        (
+            "lifecycle_event",
+            &["id"],
+            &["dispatch", "round", "attempt", "to_attempt"],
+        ),
+        (
+            "watchdog_fault",
+            &["dispatch", "round", "attempt", "kind", "fingerprint"],
+            &[],
+        ),
+        ("host_error", &["dispatch"], &["turn"]),
+        ("screen_watch", &["dispatch"], &["screen", "since"]),
+    ];
+    let mut columns = db.prepare("SELECT name, pk != 0 FROM pragma_table_info(?1, 'main')")?;
+    for &(table, keys, evidence) in shapes {
+        let actual = columns
+            .query_map([table], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })?
+            .collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()?;
+        if keys.iter().all(|key| actual.get(*key) == Some(&true))
+            && evidence.iter().all(|field| actual.contains_key(*field))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn reader(state: &Path) -> Result<Option<(Connection, bool)>> {
     let path = state.join("router.db");
-    let file = match File::open(&path) {
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, nix::libc::O_NONBLOCK);
+    let file = match options.open(&path) {
         Ok(file) => file,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
+    ensure!(
+        file.metadata()?.is_file(),
+        "{} is not a regular file",
+        path.display()
+    );
     // A read-only SQLite connection can still create WAL sidecars in a writable
     // directory. Python uses rollback journaling. Diagnose WAL before opening it.
     let mut header = Vec::new();

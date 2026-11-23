@@ -364,9 +364,22 @@ impl Handle {
     }
 
     /// Returns false only when every recorded writer has positively stopped.
-    pub fn inspect(&mut self, mut save: impl FnMut(&Self) -> std::io::Result<()>) -> Result<bool> {
+    pub fn inspect(&mut self, save: impl FnMut(&Self) -> std::io::Result<()>) -> Result<bool> {
+        self.observe(save).map(|(_, live)| live)
+    }
+
+    /// Checks the original pane or writers without changing the saved binding.
+    pub fn resource_present(&mut self) -> Result<bool> {
+        self.observe(|_| Ok(()))
+            .map(|(present, live)| present || live)
+    }
+
+    fn observe(
+        &mut self,
+        mut save: impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<(bool, bool)> {
         if self.verified_stopped()? {
-            return Ok(false);
+            return Ok((false, false));
         }
         let observation = (|| {
             let rpc = self.session()?;
@@ -378,7 +391,7 @@ impl Handle {
             if live && !present {
                 return Err(Failure::unknown("writer survives missing Herdr pane"));
             }
-            Ok(live)
+            Ok((present, live))
         })();
         observation.map_err(|err| match err.kind {
             FailureKind::DefinitelyNotSent => Failure::unknown(err.diagnostic),
@@ -610,6 +623,10 @@ pub struct PreparedClose<'a> {
 }
 
 impl PreparedClose<'_> {
+    pub fn has_pane(&self) -> bool {
+        self.present
+    }
+
     pub fn finish(self) -> Result<()> {
         if self.present {
             self.handle

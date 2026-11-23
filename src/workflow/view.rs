@@ -182,6 +182,17 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
     } else {
         status
     });
+    if let Some(event) = history.iter().rev().find(|m| {
+        m["type"] == "reclaimed"
+            && m["to"] == "worker"
+            && m["dispatch"] == row["dispatch"]
+            && m["round"] == row["round"]
+            && m["attempt"] == row["attempt"]
+    }) {
+        row["reclaimed"] = event["at"].clone();
+        row["status"] = json!("reclaimed");
+        row["lifecycle"] = json!("reclaimed");
+    }
     row["backendAlive"] = json!(alive);
     if row["backend"] == "tmux" {
         row["tmuxAlive"] = json!(alive);

@@ -32,6 +32,8 @@ pub struct Request {
     #[serde(default, rename = "freshDispatch")]
     fresh_dispatch: bool,
     backend: Option<String>,
+    #[serde(default, rename = "readOnly")]
+    read_only: bool,
     #[serde(flatten)]
     op: Operation,
 }
@@ -66,6 +68,7 @@ fn failure(result: &str, diagnostic: &str) -> Value {
 }
 
 struct Tmux<'a> {
+    read_only: bool,
     protect_offline: bool,
     legacy_execution_id: Option<&'a str>,
     legacy_worker_pane: Option<&'a str>,
@@ -132,6 +135,9 @@ fn tmux_arg(value: &str) -> String {
 impl Tmux<'_> {
     fn command(&self) -> Command {
         let mut command = Command::new("tmux");
+        if self.read_only {
+            command.arg("-N");
+        }
         if let Some(socket) = &self.socket {
             command.arg("-S").arg(socket);
         }
@@ -275,7 +281,7 @@ impl Tmux<'_> {
             owner: owner.to_owned(),
             owned,
         };
-        if claim.is_some() || owned {
+        if owned || (!self.read_only && claim.is_some()) {
             self.verify_claim(claim, &mut t)?;
         }
         Ok(Some(t))
@@ -515,7 +521,18 @@ impl Tmux<'_> {
                     _ => return Err(failure("refused", "execution has already closed")),
                 }
             }
-            self.remember_existing()?;
+            if self.read_only {
+                if self
+                    .claim()?
+                    .as_ref()
+                    .and_then(binding::Claim::execution_id)
+                    != Some(id)
+                {
+                    return Err(binding::unknown());
+                }
+            } else {
+                self.remember_existing()?;
+            }
         }
         match op {
             Operation::Inspect => self.inspect(),
@@ -809,6 +826,7 @@ pub(crate) fn attach(state: &Path, dispatch: &str, socket: &Path, token: &str) -
     let backend = Tmux {
         state: &state,
         dispatch,
+        read_only: false,
         protect_offline: true,
         legacy_execution_id: None,
         legacy_worker_pane: None,
@@ -924,10 +942,18 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
             || (matches!(request.op, Operation::Inspect) && !request.fresh_dispatch),
         "legacyRecovery requires ordinary inspect"
     );
+    ensure!(
+        !request.read_only
+            || (matches!(request.op, Operation::Inspect)
+                && !request.fresh_dispatch
+                && request.legacy_recovery.is_none()),
+        "readOnly requires ordinary inspect without legacy recovery"
+    );
     let native_id;
     let mut backend = Tmux {
         state: &state,
         dispatch: &request.dispatch,
+        read_only: request.read_only,
         protect_offline: !request.fresh_dispatch && !matches!(&request.op, Operation::Create(_)),
         legacy_execution_id: request.legacy_execution_id.as_deref(),
         legacy_worker_pane: request.legacy_worker_pane.as_deref(),
@@ -966,6 +992,9 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
             error
         });
     if inspect {
+        if request.read_only && result["alive"] == true && result["owned"] == false {
+            return Ok(result);
+        }
         let accepted = result["result"] == "accepted";
         let launch = if let Some(execution) = &request.execution_id {
             let id = backend

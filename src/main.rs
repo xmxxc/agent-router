@@ -26,8 +26,6 @@ const RESERVED_COMMANDS: &[&str] = &[
 ];
 
 const UNEXPECTED_ARGUMENTS: &str = "wfc: unexpected arguments. See wfc --help";
-#[cfg(target_os = "linux")]
-const RECLAIM_USAGE: &str = "wfc reclaim [--dispatch ID] (read-only preview of Python history)";
 
 fn main() -> anyhow::Result<ExitCode> {
     match run() {
@@ -62,7 +60,7 @@ fn run() -> anyhow::Result<ExitCode> {
             println!("{}", workflow::DISPATCH_USAGE);
             println!("{}", workflow::STATUS_USAGE);
             #[cfg(target_os = "linux")]
-            println!("{RECLAIM_USAGE}");
+            println!("{}", workflow::reclaim::USAGE);
             #[cfg(target_os = "linux")]
             println!("{}", workflow::worker_owner::CLOSE_USAGE);
             #[cfg(target_os = "linux")]
@@ -242,30 +240,20 @@ fn run() -> anyhow::Result<ExitCode> {
         }
         #[cfg(target_os = "linux")]
         Some("reclaim") => {
-            let dispatch = match args.as_slice() {
-                [] => None,
-                [flag] if flag == "--help" || flag == "-h" => {
-                    println!("{RECLAIM_USAGE}");
-                    return Ok(ExitCode::SUCCESS);
-                }
-                [flag, id]
-                    if flag == "--dispatch"
-                        && !id.is_empty()
-                        && !id.as_encoded_bytes().starts_with(b"-") =>
-                {
-                    Some(
-                        id.to_str()
-                            .ok_or_else(|| anyhow::anyhow!("invalid dispatch ID"))?,
-                    )
-                }
-                _ => {
-                    eprintln!("wfc: {RECLAIM_USAGE}");
+            use workflow::reclaim::{Reclaim, USAGE};
+            if args == ["--help"] || args == ["-h"] {
+                println!("{USAGE}");
+                return Ok(ExitCode::SUCCESS);
+            }
+            let request = match Reclaim::parse(&args) {
+                Ok(request) => request,
+                Err(error) => {
+                    eprintln!("wfc: {error}. {USAGE}");
                     return Ok(ExitCode::from(2));
                 }
             };
             controller::require_controller("reclaim")?;
-            let state = wfc_legacy_state::state_dir()?;
-            println!("{}", wfc_legacy_state::reclaim_preview(&state, dispatch)?);
+            return request.run();
         }
         Some("done") => {
             let request = match Done::parse(&args) {

@@ -116,6 +116,25 @@ for line in sys.stdin:
         os.kill(pid, 0)
         self.assertEqual((self.root/'events').read_text().splitlines(), ['finish'])
 
+    def test_reclaim_uses_verified_herdr_close_and_keeps_sibling(self):
+        self.dispatch()
+        sibling, pid = self.sibling()
+        self.submit('finish')
+        live.wait_for(lambda: self.status()['state'] == 'done')
+        assignment = self.root / 'router' / 'dispatches' / (self.dispatch_id + '.json')
+        before = assignment.read_bytes()
+        item, = self.cli('reclaim')['sessions']
+        self.assertEqual((item['dispatch'], item['result']), (self.dispatch_id, 'listed'))
+        self.assertEqual(assignment.read_bytes(), before)
+        item, = self.cli('reclaim', '--yes')['sessions']
+        self.assertEqual(item['result'], 'reclaimed')
+        view = self.status()
+        self.assertEqual((view['state'], view['status'], view['backendAlive']), ('done', 'reclaimed', False))
+        self.assertEqual(view['rounds'][0]['result']['attempt'], self.row['attempt'])
+        self.assertEqual(self.service.api('pane.process_info', pane_id=sibling)['process_info']['shell_pid'], pid)
+        self.assertEqual((self.root / 'report.md').read_text(), 'finished')
+        print(json.dumps(dict(herdrReclaim=item, siblingPid=pid)), flush=True)
+
     def test_close_after_scope_takeover_fences_stale_herdr_controls(self):
         self.dispatch()
         scope = self.row['scope']

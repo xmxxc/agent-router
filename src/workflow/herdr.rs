@@ -192,20 +192,27 @@ impl<'a> Assignment<'a> {
         }
     }
 
-    fn tracked_handle(&mut self) -> Result<Handle> {
+    fn tracked_handle(&mut self, read_only: bool) -> Result<Handle> {
         let mut h = self.handle()?;
         if let Some(writer) = self.launched_writer()? {
             if !h.writers.is_empty() && !h.writers.contains(&writer) {
                 h.writers.push(writer);
-                self.checkpoint(&h)?;
+                if !read_only {
+                    self.checkpoint(&h)?;
+                }
             }
         }
         Ok(h)
     }
 
-    fn inspect(&mut self) -> Result<Value> {
-        let mut h = self.tracked_handle()?;
-        Ok(match h.inspect(|h| self.checkpoint(h)) {
+    fn inspect(&mut self, read_only: bool) -> Result<Value> {
+        let mut h = self.tracked_handle(read_only)?;
+        let observed = if read_only {
+            h.resource_present()
+        } else {
+            h.inspect(|h| self.checkpoint(h))
+        };
+        Ok(match observed {
             Ok(alive) => json!({"result":"accepted","alive":alive,"owned":true}),
             Err(e) => json!(e),
         })
@@ -220,7 +227,7 @@ enum InputAction<'a> {
 impl Assignment<'_> {
     fn input(&mut self, action: InputAction<'_>) -> Result<Value> {
         ensure!(self.row["pendingInput"] == false, "input still pending");
-        let mut h = self.tracked_handle()?;
+        let mut h = self.tracked_handle(false)?;
         ensure!(h.stopped_evidence.is_none(), "Herdr writer stopped");
         let mut next = self.row.clone();
         next["pendingInput"] = json!(true);
@@ -289,7 +296,7 @@ pub(super) fn create(state: &Path, row: &Value, launch: host::Launch) -> Result<
             loop {
                 let evidence = host_launch::read_receipt(&files.receipt).unwrap_or(Value::Null);
                 if evidence["category"] == "started" {
-                    break match unit.tracked_handle() {
+                    break match unit.tracked_handle(false) {
                         Ok(_) => match &prefill {
                             Some(text) => unit.input(InputAction::ActivatePrefill(text))?,
                             None => json!({"result":"accepted"}),
@@ -324,7 +331,7 @@ pub(super) fn create(state: &Path, row: &Value, launch: host::Launch) -> Result<
     Ok(unit.row)
 }
 
-pub(super) fn observe(state: &Path, row: &mut Value) -> Result<(Value, Value)> {
+pub(super) fn observe(state: &Path, row: &mut Value, read_only: bool) -> Result<(Value, Value)> {
     let observed = (|| -> Result<_> {
         let id = row["dispatch"].as_str().context("missing dispatch")?;
         let mut unit = Assignment::lock(state, id, None)?;
@@ -350,7 +357,7 @@ pub(super) fn observe(state: &Path, row: &mut Value) -> Result<(Value, Value)> {
             } else if stopped {
                 json!({"result":"accepted","alive":false,"owned":true})
             } else {
-                unit.inspect()?
+                unit.inspect(read_only)?
             };
             Ok((archive, inspection))
         })();
@@ -504,7 +511,7 @@ pub(super) fn close(state: &Path, row: &Value) -> Result<Value> {
     let prepared = if stopped {
         None
     } else {
-        handle = match unit.tracked_handle() {
+        handle = match unit.tracked_handle(false) {
             Ok(handle) => handle,
             Err(error) => {
                 return Ok(unit
@@ -542,9 +549,15 @@ pub(super) fn close(state: &Path, row: &Value) -> Result<Value> {
     }
     let Some(close) = prepared else {
         // Explicit stopped evidence already confirms this unit, even offline.
+        let mut receipt = receipt;
+        receipt["diagnostic"] = json!("session was already gone");
         return Ok(receipt);
     };
+    let has_pane = close.has_pane();
     let outcome = match close.finish() {
+        Ok(()) if !has_pane => {
+            json!({"result":"completed","diagnostic":"session was already gone"})
+        }
         Ok(()) => json!({"result":"completed"}),
         Err(e) => json!(e),
     };
@@ -675,7 +688,7 @@ impl Reconcile {
             );
             unit.handle()?
         } else {
-            unit.tracked_handle()?
+            unit.tracked_handle(false)?
         };
         let binding = h.reconcile(&self.mapping, |h| unit.checkpoint(h))?;
         let mut next = unit.row.clone();

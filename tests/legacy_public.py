@@ -178,7 +178,9 @@ def native_dispatch_traverse_only(binary):
             assert entry["label"] == "native" and entry["attempt"] == native["attempt"], view
             assert "schema" not in view, view
             preview = run(binary, root, root, str(root), ("reclaim", "--dispatch", dispatch))
-            assert preview["sessions"][0]["dispatch"] == dispatch and "schema" in preview, preview
+            entry, = preview["sessions"]
+            assert entry["dispatch"] == dispatch and entry["result"] == "gone", preview
+            assert "schema" not in preview, preview
             for flags in ((), ("--active",)):
                 error = run(binary, root, root, str(root), ("status", *flags), code=1)
                 assert "list dispatch records" in error and f"os error {errno.EACCES}" in error, error
@@ -255,8 +257,171 @@ def native_ledger_directory(binary):
             assert "messages.json" in error and "not a regular file" in error, error
         preview = run(binary, root, root, str(root), ("reclaim", "--dispatch", DISPATCH))
         assert preview["sessions"][0]["dispatch"] == DISPATCH and "schema" in preview, preview
+        assert preview["yes"] is False
+        assert preview["sessions"][0]["result"] == "unknown"
+        assert preview["sessions"][0]["reclaimable"] is False
+        assert run(binary, root, root, str(root), ("reclaim",)) == preview
+        unknown = run(binary, root, root, str(root), ("reclaim", "--dispatch", "d-000000ff"), code=1)
+        assert "unknown dispatch d-000000ff" in unknown, unknown
         assert snapshot(root) == before
+
+        task = root / "private-task.md"
+        task.write_text("controlled worker for the reclaim refusal fixture")
+        worker = run(binary, root, root, str(root), (
+            "dispatch", "--role", "fixture", "--task", str(task), "--cwd", str(root),
+            "--", "/bin/sleep", "90",
+        ))
+        target = worker["dispatch"]
+        database = root / "router.db"
+        parked = root / "router.fixture"
+
+        def reject_reclaim(path_fragment, diagnostic):
+            before = snapshot(root)
+            for flags in ((), ("--dispatch", DISPATCH), ("--dispatch", target)):
+                error = run(binary, root, root, str(root), ("reclaim", "--yes", *flags), code=1)
+                assert path_fragment in error and diagnostic in error, error
+                assert snapshot(root) == before
+
+        try:
+            for legacy_present in (True, False):
+                if not legacy_present:
+                    database.rename(parked)
+                    before = snapshot(root)
+                    missing = run(binary, root, root, str(root),
+                                  ("reclaim", "--dispatch", DISPATCH), code=1)
+                    assert f"unknown dispatch {DISPATCH}" in missing, missing
+                    assert snapshot(root) == before
+                reject_reclaim("messages.json", "not a regular file")
+            native.rmdir()
+            native.symlink_to("missing-messages-target")
+            try:
+                reject_reclaim("messages.json", f"os error {errno.ENOENT}")
+            finally:
+                native.unlink()
+
+            # A valid native ledger and live worker do not make an ambiguous
+            # old path safe to ignore for confirmation.
+            native.write_text("[]")
+            database.symlink_to(database.name)
+            try:
+                reject_reclaim("router.db", f"os error {errno.ELOOP}")
+            finally:
+                database.unlink()
+            database.mkdir()
+            try:
+                reject_reclaim("router.db", "not a regular file")
+            finally:
+                database.rmdir()
+            database.write_bytes(b"SQLite format 3\0")
+            try:
+                reject_reclaim("router.db", "verify")
+            finally:
+                database.unlink()
+            for statement in ("CREATE TABLE unrelated(id INTEGER PRIMARY KEY)",
+                              "CREATE TABLE message(body TEXT)"):
+                with closing(sqlite3.connect(database)) as db:
+                    db.execute(statement)
+                    db.commit()
+                try:
+                    reject_reclaim("router.db", "unrecognized router.db schema")
+                finally:
+                    database.unlink()
+            status = run(binary, root, root, str(root), ("status", "--dispatch", target))
+            assert status["dispatches"][0]["backendAlive"] is True, status
+        finally:
+            if parked.exists():
+                parked.rename(database)
+            run(binary, root, root, str(root), ("close", target))
         print("a messages.json directory reports the path type error; the legacy ledger is unchanged")
+
+
+def native_ledger_lookup_failure(binary):
+    assert os.geteuid() != 0, "run the path permissions fixture as an ordinary user"
+    with tempfile.TemporaryDirectory(prefix="wfc-public-broken-native-") as tmp:
+        root = Path(tmp).resolve()
+        setting = str(root)
+        seed_legacy(root)
+        native = root / "messages.json"
+        database = root / "router.db"
+        saved_database = root / "router.fixture"
+        previews = (("reclaim",), ("reclaim", "--dispatch", DISPATCH))
+
+        def existing_preview():
+            for args in previews:
+                preview = run(binary, root, root, setting, args)
+                item, = preview["sessions"]
+                assert preview["yes"] is False and "Older router.db schema" in preview["schema"]
+                assert (item["dispatch"], item["result"], item["reclaimable"]) == (
+                    DISPATCH, "unknown", False), preview
+
+        def refuses(commands, expected):
+            for args in commands:
+                error = run(binary, root, root, setting, args, code=1)
+                assert "messages.json" in error and f"os error {expected}" in error, error
+
+        confirms = tuple((*args, "--yes") for args in previews)
+        native.symlink_to(native.name)
+        before = snapshot(root)
+        existing_preview()
+        refuses(COMMANDS[:3] + confirms, errno.ELOOP)
+        assert snapshot(root) == before
+
+        database.rename(saved_database)
+        try:
+            before = snapshot(root)
+            refuses(previews + confirms, errno.ELOOP)
+            assert snapshot(root) == before
+            database.write_bytes(b"not SQLite")
+            before = snapshot(root)
+            refuses(previews, errno.ELOOP)
+            assert snapshot(root) == before
+            database.unlink()
+            with closing(sqlite3.connect(database)) as db:
+                db.execute("CREATE TABLE message(body TEXT)")
+                db.commit()
+            before = snapshot(root)
+            refuses(previews, errno.ELOOP)
+            assert snapshot(root) == before
+            database.unlink()
+            histories = (
+                ("CREATE TABLE dispatch_round(dispatch TEXT, round INTEGER, attempt TEXT,"
+                 "state TEXT, PRIMARY KEY(dispatch,round,attempt))",
+                 "INSERT INTO dispatch_round VALUES(?,1,'a-000000000030','completed')"),
+                ("CREATE TABLE fault_event(dispatch TEXT PRIMARY KEY, operation TEXT, diagnostic TEXT)",
+                 "INSERT INTO fault_event VALUES(?,'create','worker confirmation missing')"),
+                ("CREATE TABLE lifecycle_event(id INTEGER PRIMARY KEY, dispatch TEXT, operation TEXT, attempt TEXT)",
+                 "INSERT INTO lifecycle_event VALUES(19,?,'create','a-000000000030')"),
+            )
+            for ddl, insert in histories:
+                with closing(sqlite3.connect(database)) as db:
+                    db.execute(ddl)
+                    db.execute(insert, (DISPATCH,))
+                    db.commit()
+                before = snapshot(root)
+                archive = run(binary, root, root, setting, previews[0])
+                assert archive["sessions"] == [] and "schema" in archive, archive
+                archive = run(binary, root, root, setting, previews[1])
+                item, = archive["sessions"]
+                assert (item["dispatch"], item["result"], item["reclaimable"]) == (
+                    DISPATCH, "unknown", False), archive
+                assert snapshot(root) == before
+                database.unlink()
+        finally:
+            saved_database.rename(database)
+
+        native.unlink()
+        native.write_text("[]")
+        before = snapshot(root)
+        mode = stat.S_IMODE(native.stat().st_mode)
+        native.chmod(0)
+        try:
+            existing_preview()
+            refuses(confirms, errno.EACCES)
+            assert stat.S_IMODE(native.stat().st_mode) == 0
+        finally:
+            native.chmod(mode)
+        assert snapshot(root) == before
+        print("native ledger lookup: cycle and unreadable file preserve safe legacy preview; no writes")
 
 
 def wal_refusal(binary):
@@ -283,4 +448,5 @@ if __name__ == "__main__":
     broken_legacy_path(wfc)
     native_ledger_and_relay(wfc)
     native_ledger_directory(wfc)
+    native_ledger_lookup_failure(wfc)
     wal_refusal(wfc)
