@@ -848,3 +848,14 @@ fn r1_bare_retry_preserves_receipt_across_upgrade() {
         }
     }
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn codex_relay_contracts() {
+    let status = Command::new("python3")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/relay.py"))
+        .arg(env!("CARGO_BIN_EXE_wfc"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+}

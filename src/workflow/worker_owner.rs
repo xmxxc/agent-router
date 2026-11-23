@@ -19,16 +19,20 @@ const POLL: Duration = Duration::from_millis(50);
 pub fn command(program: &Path) -> Result<Command> {
     let mut owner = Command::new(std::env::current_exe()?);
     owner.arg("--worker-owner").arg(program);
+    new_session(&mut owner);
+    Ok(owner)
+}
+
+pub(super) fn new_session(command: &mut Command) {
     // SAFETY: setsid is async-signal-safe and touches only the child.
     unsafe {
-        owner.pre_exec(|| {
+        command.pre_exec(|| {
             if libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
         });
     }
-    Ok(owner)
 }
 
 pub fn launch(mut command: Command) -> Result<()> {
