@@ -1,4 +1,6 @@
 mod kernel;
+#[cfg(target_os = "linux")]
+mod tmux;
 mod workflow;
 
 use std::env;
@@ -47,6 +49,15 @@ fn main() -> anyhow::Result<ExitCode> {
                     .filter(|id| !id.trim().is_empty())
                     .unwrap_or(env!("WFC_BUILT_AT"))
             );
+        }
+        #[cfg(target_os = "linux")]
+        Some("--tmux-backend") if args.is_empty() => {
+            let request = serde_json::from_reader(std::io::stdin().lock())?;
+            println!("{}", tmux::execute(&workflow::state_dir()?, request)?);
+        }
+        #[cfg(target_os = "linux")]
+        Some("--tmux-host") if args.len() == 1 => {
+            return tmux::launch::run_host(Path::new(&args[0]));
         }
         Some("--kernel") if args.is_empty() => kernel::run()?,
         Some("dispatch" | "status") if args == ["--help"] => {
