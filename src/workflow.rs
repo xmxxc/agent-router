@@ -257,7 +257,7 @@ impl<'a> Dispatch<'a> {
                     #[cfg(target_os = "linux")]
                     if let Some(failure) = err.downcast_ref::<host::ScriptUnavailable>() {
                         record["create"] = json!({"result":"definitely-not-sent","category":failure.category(),
-                            "dispatch":dispatch,"attempt":attempt,"round":round});
+                            "dispatch":dispatch,"attempt":attempt,"round":round,"scope":scope});
                         record["worker"] =
                             json!({"state":"not_started","exit_code":null,"signal":null});
                         write_json(&records.join(format!("{dispatch}.json")), &record, None)?;
@@ -305,7 +305,7 @@ impl<'a> Dispatch<'a> {
                         format!("could not publish launch evidence for {dispatch}; retaining its pending assignment")
                     })?;
                     #[cfg(target_os = "linux")]
-                    if backend::publish_unconfirmed_zero(&state, &record).is_err() {
+                    if backend::publish_unconfirmed_tmux_exit(&state, &record).is_err() {
                         eprintln!("wfc: could not verify early host exit");
                     }
                     fs::remove_file(&pending)?;
