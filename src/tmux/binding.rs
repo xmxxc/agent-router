@@ -90,6 +90,27 @@ fn process_start(pid: u32) -> Result<Option<u64>> {
     ))
 }
 
+#[derive(PartialEq)]
+pub(super) enum Worker {
+    LegacyPane,
+    Started(u32),
+    Exited,
+}
+
+impl Worker {
+    pub(super) fn check_before_kill(&self) -> Reply<()> {
+        if let Self::Started(pid) = self {
+            if process_start(*pid).map_err(|_| unknown())?.is_none() {
+                return Err(failure(
+                    "uncertain",
+                    "worker is gone but its exit receipt is pending",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl ServerSession {
     fn capture(pid: u32, session: String, pane: String, socket: PathBuf) -> Result<Self> {
         Ok(Self {
@@ -283,19 +304,35 @@ impl Tmux<'_> {
         .map_err(|_| unknown())
     }
 
-    pub(super) fn exited_pane_absent(&self, t: &Target) -> Reply<bool> {
-        if !matches!(self.claim()?, Some(Claim::Launch(id)) if id == t.token) {
-            return Ok(false);
+    pub(super) fn close_worker(&self, t: &Target) -> Reply<Worker> {
+        match self.claim()? {
+            Some(Claim::Observed { token, .. }) if token == t.token => {
+                return Ok(Worker::LegacyPane)
+            }
+            Some(Claim::Launch(id)) if id == t.token => (),
+            _ => return Err(unknown()),
         }
-        let receipt = self
+        let path = self
             .state
             .join("launches")
             .join(format!("{}.json", t.token));
-        if !super::launch::read_receipt(&receipt)
-            .is_some_and(|r| r["category"] == "process_exited" && r["exitCode"].is_i64())
-        {
-            return Ok(false);
+        let receipt = super::launch::read_receipt(&path).unwrap_or_default();
+        match (receipt["category"].as_str(), receipt["exitCode"].as_u64()) {
+            (Some("started"), _) => receipt["pid"]
+                .as_u64()
+                .and_then(|pid| u32::try_from(pid).ok())
+                .filter(|pid| *pid > 0)
+                .map(Worker::Started)
+                .ok_or_else(unknown),
+            (Some("process_exited"), Some(0..=255)) => Ok(Worker::Exited),
+            _ => Err(failure(
+                "uncertain",
+                "could not confirm the original worker's launch receipt",
+            )),
         }
+    }
+
+    pub(super) fn worker_pane_absent(&self, t: &Target) -> Reply<bool> {
         let list = self.run(&[
             "-S",
             &fd_path(&t.socket_fd),

@@ -630,12 +630,121 @@ os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
         self.assertEqual(len(log.read_text().splitlines()), 1)
         self.assertEqual(self.call("close", environ=endpoint)["result"], "completed")
 
-    def test_close_after_normal_exit_with_remaining_window(self):
+    def gated_exit(self, environ=None):
         trigger = self.root / "exit"
-        argv = [sys.executable, "-c", "import sys,time,pathlib\np=pathlib.Path(sys.argv[1])\nwhile not p.exists(): time.sleep(.02)", str(trigger)]
-        reply = self.call("create", **{**self.launch, "argv": argv})
+        argv = [sys.executable, "-c",
+                "import sys,time,pathlib\np=pathlib.Path(sys.argv[1])\nwhile not p.exists(): time.sleep(.01)\nsys.exit(37)",
+                str(trigger)]
+        reply = self.call("create", **{**self.launch, "argv": argv}, environ=environ)
         self.assertEqual(reply["result"], "accepted", reply)
-        receipt = Path(reply["receipt"])
+        return trigger, Path(reply["receipt"])
+
+    def test_close_observes_exit_in_the_inspection_gap(self):
+        trigger, receipt = self.gated_exit()
+        self.assertTrue(self.call("inspect")["alive"])
+        shim = self.work / "tmux"
+        shim.write_text(f"""#!{sys.executable}
+import os, subprocess, sys, time
+from pathlib import Path
+if "#{{pane_active}}" in sys.argv:
+    Path({str(trigger)!r}).touch()
+    deadline = time.monotonic() + 5
+    while subprocess.run({self.tmux!r} + ["has-session", "-t", "=wfc-d-abc12345"], capture_output=True).returncode == 0:
+        assert time.monotonic() < deadline
+        time.sleep(.01)
+os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
+""")
+        shim.chmod(0o700)
+        closed = self.call("close", environ={"PATH": str(self.work)})
+        self.assertEqual((closed["result"], closed.get("closeEffect")), ("completed", "already_absent"))
+        self.assertEqual(json.loads(receipt.read_bytes()), {"category": "process_exited", "exitCode": 37})
+        # Same dispatch, new live worker; its previous receipt still exists.
+        self.assertEqual(self.call("resume", **self.launch)["result"], "accepted")
+        closed = self.call("close")
+        self.assertEqual((closed["result"], closed.get("closeEffect")), ("completed", "session_closed"))
+        self.assertEqual(self.call("close").get("closeEffect"), "already_absent")
+
+    def test_close_does_not_guess_exit_order_at_kill(self):
+        trigger, receipt = self.gated_exit()
+        subprocess.run(self.tmux + ["set-option", "-w", "-t", "=wfc-d-abc12345:", "remain-on-exit", "on"],
+                       env=self.env, check=True)
+        shim = self.work / "tmux"
+        shim.write_text(f"""#!{sys.executable}
+import os, subprocess, sys, time
+from pathlib import Path
+if any("kill-session -t " in arg for arg in sys.argv):
+    Path({str(trigger)!r}).touch()
+    deadline = time.monotonic() + 5
+    while subprocess.check_output({self.tmux!r} + ["display-message", "-pt", "=wfc-d-abc12345:", "#{{pane_dead}}"]).strip() != b"1":
+        assert time.monotonic() < deadline
+        time.sleep(.01)
+os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
+""")
+        shim.chmod(0o700)
+        closed = self.call("close", environ={"PATH": str(self.work)})
+        self.assertEqual(closed["result"], "uncertain", closed)
+        self.assertNotIn("closeEffect", closed)
+        self.assertEqual(json.loads(receipt.read_bytes())["exitCode"], 37)
+        self.assertEqual(self.call("close").get("closeEffect"), "worker_exited")
+
+    def test_close_waits_for_an_unpublished_exit(self):
+        # tmux continues a stopped direct child. Put a waiting parent between
+        # tmux and the real receipt writer so only the latter can be paused.
+        shim = self.work / "tmux"
+        shim.write_text(f"""#!{sys.executable}
+import os, sys
+args = sys.argv[1:]
+if "new-session" in args:
+    i = args.index("--") + 1
+    args[i:i] = [{sys.executable!r}, "-c", "import subprocess,sys; sys.exit(subprocess.call(sys.argv[1:]))"]
+os.execv({TMUX!r}, [{TMUX!r}, *args])
+""")
+        shim.chmod(0o700)
+        trigger, receipt = self.gated_exit(environ={"PATH": str(self.work)})
+        pid = json.loads(receipt.read_bytes())["pid"]
+        host = int(Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[1])
+        self.assertIn(b"--tmux-host", Path(f"/proc/{host}/cmdline").read_bytes().split(b"\0"))
+        subprocess.run(self.tmux + ["new-window", "-t", "=wfc-d-abc12345:", "/bin/cat"], env=self.env, check=True)
+        try:
+            os.kill(host, signal.SIGSTOP)
+            deadline = time.monotonic() + 4
+            while Path(f"/proc/{host}/stat").read_text().rsplit(") ", 1)[1][0] != "T":
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.01)
+            trigger.touch()
+            while Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1][0] != "Z":
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.01)
+            self.assertEqual(json.loads(receipt.read_bytes())["category"], "started")
+            closed = self.call("close")
+            self.assertEqual(closed["result"], "uncertain", closed)
+            self.assertNotIn("closeEffect", closed)
+        finally:
+            os.kill(host, signal.SIGCONT)
+        deadline = time.monotonic() + 4
+        while json.loads(receipt.read_bytes()).get("exitCode") != 37:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        self.assertEqual(self.call("close").get("closeEffect"), "worker_exited")
+
+    def test_lost_close_confirmation(self):
+        self.assertEqual(self.call("create", **self.launch)["result"], "accepted")
+        shim = self.work / "tmux"
+        shim.write_text(f"""#!{sys.executable}
+import os, subprocess, sys
+if any("kill-session -t " in arg for arg in sys.argv):
+    subprocess.run([{TMUX!r}, *sys.argv[1:]], stdout=subprocess.DEVNULL, check=True)
+    sys.exit(1)
+os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
+""")
+        shim.chmod(0o700)
+        closed = self.call("close", environ={"PATH": str(self.work)})
+        self.assertEqual(closed["result"], "uncertain", closed)
+        self.assertNotIn("closeEffect", closed)
+        self.assertEqual(self.call("close").get("closeEffect"), "already_absent")
+
+    def test_close_after_normal_exit_with_remaining_window(self):
+        trigger, receipt = self.gated_exit()
         worker = subprocess.check_output(self.tmux + ["display-message", "-p", "-t", "=wfc-d-abc12345:",
                                                      "#{pane_id}"], env=self.env, text=True).strip()
         subprocess.run(self.tmux + ["new-window", "-t", "=wfc-d-abc12345:", "/bin/cat"], env=self.env, check=True)
@@ -649,7 +758,9 @@ os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
         receipt.unlink()
         self.assertIn(self.call("close")["result"], {"refused", "uncertain"})
         receipt.write_bytes(evidence)
-        self.assertEqual(self.call("close")["result"], "completed")
+        closed = self.call("close")
+        self.assertEqual((closed["result"], closed.get("closeEffect")), ("completed", "worker_exited"))
+        self.assertEqual(json.loads(receipt.read_bytes())["exitCode"], 37)
         self.assertEqual(self.call("resume", **self.launch)["result"], "accepted")
         subprocess.run(self.tmux + ["has-session", "-t", "=sibling"], env=self.env, check=True)
 
