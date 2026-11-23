@@ -154,12 +154,14 @@ impl<'a> Confirm<'a> {
         let state = state_dir()?;
         let mut inbox = Inbox::open(&state)?;
         let numeric = self.id.parse::<u64>().ok();
-        let message = inbox
+        let index = inbox
             .messages
-            .iter_mut()
-            .find(|m| Some(m.id) == numeric || m.message_id == self.id)
+            .iter()
+            .position(|m| Some(m.id) == numeric || m.message_id == self.id)
             .with_context(|| format!("no controller message with id {}", self.id))?;
-        let duplicate = self.action.apply(message)?;
+        let (earlier, tail) = inbox.messages.split_at_mut(index);
+        let message = &mut tail[0];
+        let duplicate = self.action.apply(message, earlier)?;
         let receipt = message.receipt(duplicate);
         if duplicate {
             // The previous rename can be visible even if syncing its directory
@@ -175,13 +177,13 @@ impl<'a> Confirm<'a> {
 }
 
 impl Confirmation<'_> {
-    fn apply(self, message: &mut Completion) -> Result<bool> {
+    fn apply(self, message: &mut Completion, earlier: &[Completion]) -> Result<bool> {
         match self {
             Self::Ack { body } => {
                 ensure!(message.delivery.delivered(), "ACK requires received");
                 if let Some(body) = body {
                     ensure!(
-                        message.matches_ack_body(body),
+                        message.matches_ack_body(body, earlier),
                         "ACK conflicts with its body"
                     );
                 }
