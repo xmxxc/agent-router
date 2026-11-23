@@ -1,7 +1,7 @@
-name: Linux resume receipt compatibility
+name: Linux resume Codex home
 on:
   push:
-    branches: [rust-router/14-resume-r4-receipts-ci]
+    branches: [rust-router/14-resume-r6-codex-home-ci]
 
 permissions:
   contents: read
@@ -12,20 +12,20 @@ defaults:
 
 jobs:
   linux-resume:
-    name: '#15 receipt compatibility follow-up'
+    name: '#15 same-session resume with Codex home proof'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      PRODUCT_SHA: 74cbb19132b948bff0b69113c6cd811b327ca2f8
-      PRODUCT_TREE: 60e6bb6c5a9e14db867cc4d7412b59f384ad5b11
-      PRODUCT_PARENT: 3cb02aefd325ce310b9f38fa7fc6df447c43b35e
+      PRODUCT_SHA: 1d45ee0c6239320d49acb4a11169d5e030f1e3d0
+      PRODUCT_TREE: c110474cab01d224fe36b9c88069b2fecd6c7663
+      PRODUCT_PARENT: 74cbb19132b948bff0b69113c6cd811b327ca2f8
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       NATIVE_INPUT_TREE: 7480986f4468ffafc76b95012562945ee586b52a
       TMUX_REFERENCE_SHA: fe7af38cb24796c82e52108adbc6b5ade2c1d18c
       TMUX_REFERENCE_TREE: dd18a02b2e9bbb78e1c8aa33a5e859d8a727a22b
       TARGET: x86_64-unknown-linux-gnu
       CARGO_BUILD_JOBS: '2'
-      EVIDENCE: ${{ github.workspace }}/linux-resume-receipts-evidence
+      EVIDENCE: ${{ github.workspace }}/linux-resume-codex-home-evidence
     steps:
       - name: Record workflow and run identity
         run: |
@@ -67,7 +67,7 @@ jobs:
         run: |
           {
             test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
-            test "$GITHUB_REF" = refs/heads/rust-router/14-resume-r4-receipts-ci
+            test "$GITHUB_REF" = refs/heads/rust-router/14-resume-r6-codex-home-ci
             test "$(git -C ../ci rev-parse HEAD)" = "$GITHUB_WORKFLOW_SHA"
             git -C ../ci show -s --format='ci=%H tree=%T parents=%P'
             test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
@@ -172,6 +172,22 @@ jobs:
             sha256sum "$binary" | tee "$EVIDENCE/elf.sha256"
             readelf -hW "$binary"
           } 2>&1 | tee "$EVIDENCE/build.log"
+      - name: Verify five public resume cases
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: bash ../ci/tools/ci/resume/verify.sh public-resume 2>&1 | tee "$EVIDENCE/public-resume.log"
+      - name: Verify the two tmux backend resume cases
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: bash ../ci/tools/ci/resume/verify.sh tmux-resume 2>&1 | tee "$EVIDENCE/tmux-resume.log"
+      - name: Verify the managed tmux worker callback
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: bash ../ci/tools/ci/resume/verify.sh tmux-owner 2>&1 | tee "$EVIDENCE/tmux-owner.log"
+      - name: Verify scope and callback compatibility
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: bash ../ci/tools/ci/resume/verify.sh scope 2>&1 | tee "$EVIDENCE/scope.log"
       - name: Verify receipt and acknowledgement compatibility
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: product
@@ -188,7 +204,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: linux-resume-receipts-${{ github.run_id }}-${{ github.run_attempt }}
+          name: linux-resume-codex-home-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14

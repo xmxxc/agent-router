@@ -8,6 +8,7 @@ case "$group" in
         fixture=tools/check_tmux.py
         selectors=(
             Backend.test_public_resume_preserves_conversation_rounds_and_callback_fences
+            Backend.test_public_resume_relative_codex_home_created_after_dispatch
             Backend.test_public_resume_records_definite_spawn_failure
             Backend.test_public_resume_rechecks_completion_before_reserving
             Backend.test_public_resume_fences_pending_and_lost_launch_responses

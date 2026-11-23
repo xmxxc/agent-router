@@ -122,6 +122,7 @@ def run(group_root, fixture, binary, evidence, selectors):
                     "host-argv", case, dispatch=host["WFC_DISPATCH"], attempt=attempt,
                     round=int(host["WFC_ROUND"]), session=session, state=str(case.state),
                     codexHome=str(case.codex_home), socket=case.socket,
+                    codexHomeEnv=host.get("CODEX_HOME"), codexHomeExisted=host.get("codexHomeExisted"),
                 )
                 return host
 
