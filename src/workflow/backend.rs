@@ -1,6 +1,8 @@
 //! Public lifecycle clients for tmux and Herdr.
 use super::{host::Launch, valid_identity, write_json};
 use anyhow::{bail, ensure, Context, Result};
+#[cfg(target_os = "linux")]
+use serde_json::Map;
 use serde_json::{json, Value};
 use std::{
     env,
@@ -168,6 +170,96 @@ fn existing(state: &Path, row: &Value, op: &str, read_only: bool) -> Result<Valu
         request["closeOperationId"] = json!(close_operation(row)?);
     }
     call(state, row, request)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) enum RuntimeScreen {
+    Screen(String),
+    Unavailable,
+    Unobserved,
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn runtime_screen(
+    state: &Path,
+    row: &mut Value,
+    progress: &mut dyn FnMut(bool),
+) -> Result<RuntimeScreen> {
+    if row["backend"] == "herdr" {
+        return Ok(super::herdr::runtime_screen(state, row, progress)?
+            .map_or(RuntimeScreen::Unobserved, RuntimeScreen::Screen));
+    }
+    if runtime_closing(state, row)? {
+        return Ok(RuntimeScreen::Unobserved);
+    }
+    let mut reply = existing(state, row, "observe-screen", true)?;
+    if reply["result"] != "accepted" {
+        return Ok(RuntimeScreen::Unobserved);
+    }
+    let Some(registered) = receipt_id(row)? else {
+        return Ok(RuntimeScreen::Unobserved);
+    };
+    if inspect_launch(state, row, &reply).ok().flatten() != Some(registered) {
+        return Ok(RuntimeScreen::Unobserved);
+    }
+    if let Value::String(screen) = reply["screen"].take() {
+        Ok(RuntimeScreen::Screen(screen))
+    } else if reply["observation"] == "target_absent" {
+        Ok(RuntimeScreen::Unavailable)
+    } else {
+        Ok(RuntimeScreen::Unobserved)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn runtime_closing(state: &Path, row: &Value) -> Result<bool> {
+    if row["backend"] == "herdr" {
+        return super::herdr::runtime_closing(state, row);
+    }
+    Ok(archive(state, row)?.is_some_and(|saved| confirmed(row, &saved)))
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn runtime_exit(state: &Path, row: &Value) -> Result<Option<Map<String, Value>>> {
+    let receipt = if row["backend"] == "herdr" {
+        super::herdr::runtime_receipt(state, row)?
+    } else {
+        let Some(id) = receipt_id(row)?.filter(|id| valid_launch(id)) else {
+            return Ok(None);
+        };
+        let receipt = private_receipt(state, Some(id))?;
+        if receipt["launchId"] != id {
+            return Ok(None);
+        }
+        receipt
+    };
+    let Some(code) = receipt["exitCode"].as_u64().filter(|code| *code <= 255) else {
+        return Ok(None);
+    };
+    if receipt["category"] != "process_exited" {
+        return Ok(None);
+    }
+    let process = &receipt["exitProcess"];
+    let creation = process["processStart"].as_str().filter(|value| {
+        value.len() <= 64
+            && value.strip_prefix("linux:").is_some_and(|suffix| {
+                suffix.split_once(':').is_some_and(|(boot, ticks)| {
+                    uuid::Uuid::parse_str(boot).is_ok() && ticks.parse::<u64>().is_ok()
+                })
+            })
+    });
+    let signal = receipt["signal"]
+        .as_u64()
+        .filter(|signal| (1..=64).contains(signal));
+    let pid = process["pid"]
+        .as_u64()
+        .filter(|pid| (1..=u32::MAX as u64).contains(pid));
+    Ok(Some(Map::from_iter([
+        ("exitCode".into(), json!(code)),
+        ("signal".into(), json!(signal)),
+        ("processStart".into(), json!(creation)),
+        ("pid".into(), json!(pid)),
+    ])))
 }
 
 fn receipt_id(row: &Value) -> Result<Option<&str>> {
