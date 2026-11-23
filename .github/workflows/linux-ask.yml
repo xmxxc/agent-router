@@ -12,12 +12,12 @@ defaults:
 
 jobs:
   ask:
-    name: '#11 R4 tmux and Herdr question/close'
+    name: '#11 R5 worker, tmux and Herdr question/close'
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     env:
-      WFC_BUILD_ID: d017b54e236281d83672ddedd07a0f5884e25f73
-      PRODUCT_TREE: e1c6957170494371b7f89e5a75df9366a340851b
+      WFC_BUILD_ID: aa0a73443cfc2312fcccceba6e14257d22928768
+      PRODUCT_TREE: 5427a23559e1e6872e1ba55493f60e8075c706d6
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       HERDR_SHA256: 14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d
       TRIPLE: x86_64-unknown-linux-gnu
@@ -92,6 +92,33 @@ jobs:
           printf '%s\n' "$version" | tee -a "$EVIDENCE/binaries.log"
           [[ "$version" == *"(Rust, $TRIPLE, release, build $WFC_BUILD_ID)" ]]
           readelf -hW "$bin" | tee "$EVIDENCE/elf.log"
+      - name: Run the exact R5 dispatch tests as a non-root user
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: |
+          runner_uid=$(id -u)
+          printf 'Effective UID %s\n' "$runner_uid" | tee "$EVIDENCE/r5-runner-user.log"
+          if [[ "$runner_uid" == 0 ]]; then
+            printf 'R5 permission checks require a non-root runner\n' | tee -a "$EVIDENCE/r5-runner-user.log"
+            exit 1
+          fi
+          failed=0
+          for selector in \
+            controlled_close_replays_from_a_read_only_archive \
+            controlled_pending_close_rejects_new_question_and_replays_original \
+            question_shorthand_accepts_frozen_unowned_argument_shapes; do
+            log="$EVIDENCE/$selector.log"
+            if ! cargo test --release --locked --target "$TRIPLE" --test dispatch "$selector" \
+              -- --exact --color never 2>&1 | tee "$log"; then
+              failed=1
+              continue
+            fi
+            if ! grep -Fxq 'running 1 test' "$log" || ! grep -Fxq "test $selector ... ok" "$log"; then
+              printf 'Expected one passing test for %s\n' "$selector" | tee -a "$log"
+              failed=1
+            fi
+          done
+          exit "$failed"
       - name: Run the focused dispatch question tests
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: product
@@ -165,7 +192,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ always() }}
         with:
-          name: linux-11-r4-${{ env.WFC_BUILD_ID }}-attempt-${{ github.run_attempt }}
+          name: linux-11-r5-${{ env.WFC_BUILD_ID }}-attempt-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14
