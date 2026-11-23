@@ -35,15 +35,28 @@ def read_only_tree(root):
 def composer(mode, logfile, reply_worker=False):
     """Controlled terminal host: log actual input bytes and optionally drop Enter."""
     tty.setraw(0)
-    draft = "original draft ↑".encode() if mode == "existing-scroll" else b""
+    draft = {"existing-scroll": "original draft ↑".encode(),
+             "upstream-reply": b"original draft"}.get(mode, b"")
+    unknown_footer = False
     enters = 0
     banner = "This chat uses A, but Codex now uses B, so this chat is read-only."
     refused = "This conversation is read-only or unavailable; no operation was sent."
     notice = banner if mode == "readonly" else refused if mode == "retry-refusal" else ""
 
     def draw():
-        shown = draft.decode("utf-8", errors="replace") or "Ask Codex to do anything"
-        print(f"\x1b[2J\x1b[H{notice}\r\n› {shown}\r\n\r\n  model · cwd", end="", flush=True)
+        placeholder = "Ask Codex to do anything"
+        shown = draft.decode("utf-8", errors="replace")
+        prompt = "\x1b[1m›\x1b[0m" if reply_worker else "›"
+        if not shown:
+            shown = f"\x1b[2m{placeholder}\x1b[0m" if reply_worker else placeholder
+        if unknown_footer:
+            footer = "  unknown editor mode"
+        elif mode == "upstream-reply":
+            hint = "? for shortcuts" if not draft or draft == placeholder.encode() else ""
+            footer = f"  {hint:<46}100% context left"
+        else:
+            footer = "  model · cwd"
+        print(f"\x1b[2J\x1b[H{notice}\r\n{prompt} {shown}\r\n\r\n{footer}", end="", flush=True)
 
     wfc = os.getenv("WFC_BIN")
     attempt = os.getenv("WFC_ATTEMPT")
@@ -60,9 +73,18 @@ def composer(mode, logfile, reply_worker=False):
         draw()
         while True:
             if reply_worker:
-                if mode == "existing-scroll" and Path("clear-draft").exists():
+                if Path("clear-draft").exists():
                     Path("clear-draft").unlink()
                     draft = b""
+                    unknown_footer = False
+                    draw()
+                if mode == "upstream-reply" and Path("show-placeholder-draft").exists():
+                    Path("show-placeholder-draft").unlink()
+                    draft = b"Ask Codex to do anything"
+                    draw()
+                if mode == "upstream-reply" and Path("show-unknown-footer").exists():
+                    Path("show-unknown-footer").unlink()
+                    unknown_footer = True
                     draw()
                 if notice == banner and Path("enable-input").exists():
                     notice = ""
@@ -786,7 +808,8 @@ os.execv({TMUX!r}, [{TMUX!r}, *a])
         while not question.exists() or not self.reply_log.exists():
             self.assertLess(time.monotonic(), deadline, "controlled worker did not publish its question")
             time.sleep(.025)
-        ready = "read-only" if mode == "readonly" else "Ask Codex to do anything"
+        ready = {"readonly": "read-only", "upstream-reply": "original draft"}.get(
+            mode, "Ask Codex to do anything")
         while ready not in self.reply_screen():
             self.assertLess(time.monotonic(), deadline, "controlled composer did not draw")
             time.sleep(.025)
@@ -968,6 +991,68 @@ os.execv(argv[0], argv)
         self.assertEqual(reply["inputResult"], "uncertain")
         self.assert_reply_bytes(f"[router] Answer to question {self.number}: a b\r".encode())
         self.assertFalse((self.work / "accepted").exists())
+
+    def test_public_reply_requires_confirmed_tmux_chat_composer(self):
+        self.setup_reply("upstream-reply")
+        pane = f"={self.reply_row['tmux']}:"
+
+        def styled():
+            return subprocess.check_output(
+                self.tmux + ["capture-pane", "-p", "-e", "-t", pane], env=self.env, text=True)
+
+        def wait_for_screen(text):
+            deadline = time.monotonic() + 5
+            while text not in self.reply_screen():
+                self.assertLess(time.monotonic(), deadline, f"composer did not draw {text}")
+                time.sleep(.025)
+
+        def refuse(reason):
+            before = self.reply_screen(), styled()
+            diagnostic = self.reply_cli("reply", self.number, "blocked", expected=1)
+            self.assertIn(reason, diagnostic)
+            self.assertEqual((self.reply_screen(), styled()), before)
+            self.assert_reply_bytes(b"")
+            self.assertFalse((self.work / "accepted").exists())
+            self.assertEqual(self.reply_attempts()[-1]["inputResult"], "definitely-not-sent")
+
+        self.assertIn("100% context left", self.reply_screen())
+        refuse("composer already contains a draft")
+        (self.work / "show-placeholder-draft").touch()
+        wait_for_screen("› Ask Codex to do anything")
+        placeholder_draft = self.reply_screen(), styled()
+        refuse("composer already contains a draft")
+        (self.work / "show-unknown-footer").touch()
+        wait_for_screen("unknown editor mode")
+        refuse("writable chat composer could not be verified")
+        (self.work / "clear-draft").touch()
+        wait_for_screen("100% context left")
+        self.assertEqual(self.reply_screen(), placeholder_draft[0])
+        self.assertNotEqual(styled(), placeholder_draft[1])
+
+        subprocess.run(self.tmux + ["copy-mode", "-t", pane], env=self.env, check=True)
+        try:
+            self.assertIn("refused", self.reply_cli("reply", self.number, "copy mode", expected=1))
+            self.assert_reply_bytes(b"")
+            self.assertEqual(self.reply_screen(), placeholder_draft[0])
+            self.assertEqual(self.reply_attempts()[-1]["inputResult"], "refused")
+        finally:
+            subprocess.run(self.tmux + ["send-keys", "-t", pane, "-X", "cancel"], env=self.env, check=True)
+
+        question, = self.reply_cli("wait", "--dispatch", self.reply_dispatch, "--timeout", "0")["messages"]
+        self.assertEqual(question["messageId"], self.question["messageId"])
+        self.reply_cli("reply", self.number, "once")
+        self.assertEqual([m["inputResult"] for m in self.reply_attempts()],
+                         ["definitely-not-sent"] * 3 + ["refused", "accepted"])
+        answer = f"[router] Answer to question {self.number}: once".encode()
+        self.assert_reply_bytes(answer + b"\r")
+        self.assertEqual((self.work / "accepted").read_bytes(), answer + b"\n")
+        self.assertIn("already answered", self.reply_cli("reply", self.number, "again", expected=1))
+        (self.work / "finish").touch()
+        done, = self.reply_cli("wait", "--dispatch", self.reply_dispatch, "--timeout", "8")["messages"]
+        self.assertEqual((done["type"], done["dispatch"], done["round"], done["attempt"]),
+                         ("done", self.reply_dispatch, self.reply_row["round"], self.reply_row["attempt"]))
+        self.assertEqual(Path(done["report"]).read_text(), "original worker received the answer\n")
+        self.assertEqual(self.reply_cli("close", self.reply_dispatch)["result"], "completed")
 
     def test_public_reply_rechecks_after_waiting_for_input_lock(self):
         self.setup_reply("finish-alone")

@@ -382,12 +382,17 @@ impl Tmux<'_> {
     }
 
     fn worker_command(&self, t: &Target, action: &str) -> Reply<String> {
+        self.worker_command_if(t, action, "1")
+    }
+
+    fn worker_command_if(&self, t: &Target, action: &str, condition: &str) -> Reply<String> {
         if let Some((id, pid)) = &t.supervisor {
             if binding::host_launch_id(*pid, self.state, self.dispatch, t).as_ref() != Some(id) {
                 return Err(failure("refused", "original worker is no longer running"));
             }
         }
-        let live = format!("#{{&&:{EXCLUSIVE_WINDOW},#{{==:#{{pane_dead}},0}}}}");
+        let live =
+            format!("#{{&&:{EXCLUSIVE_WINDOW},#{{&&:#{{==:#{{pane_dead}},0}},{condition}}}}}");
         self.guarded(t, t.worker_pane()?, action, &t.guard_worker_process(&live))
     }
 

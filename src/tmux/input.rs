@@ -3,9 +3,11 @@ use serde_json::{json, Value};
 use std::env;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+use wfc_herdr::{classify_reply_capture, matches_single_line_draft, ReplyBox};
 
 const UNAVAILABLE: &str = "This conversation is unavailable. Its cached transcript and draft remain here; input is paused.";
 const REFUSAL: &str = "This conversation is read-only or unavailable; no operation was sent.";
+const NO_TMUX_MODE: &str = "#{==:#{pane_in_mode},0}";
 
 #[derive(Default)]
 struct Notices {
@@ -50,12 +52,6 @@ struct Draft {
     text: String,
     scrolled: bool,
     single_line: Option<String>,
-}
-
-impl Draft {
-    fn empty(&self) -> bool {
-        !self.scrolled && (self.text.is_empty() || self.text == "Ask Codex to do anything")
-    }
 }
 
 fn codex_draft(screen: &str) -> Option<Draft> {
@@ -174,6 +170,45 @@ impl ResumeInput {
 }
 
 impl Tmux<'_> {
+    fn reply_snapshot(&self, t: &Target, host: &str) -> Reply<(String, ReplyBox)> {
+        let capture = self.worker_command_if(
+            t,
+            &format!("capture-pane -p -e -t {}", t.worker_pane()?),
+            NO_TMUX_MODE,
+        )?;
+        classify_reply_capture(host, &capture)
+            .ok_or_else(|| failure("definitely-not-sent", "could not read tmux composer styles"))
+    }
+
+    fn reply_needs_enter(
+        &self,
+        t: &Target,
+        host: &str,
+        text: &str,
+        earlier_refusals: &mut usize,
+    ) -> Reply<bool> {
+        let (screen, first) = self.reply_snapshot(t, host)?;
+        check_notice(&screen, *earlier_refusals)?;
+        match first {
+            ReplyBox::Empty => return Ok(false),
+            ReplyBox::Draft(Some(shown)) if matches_single_line_draft(&shown, text) => {}
+            _ => return Err(uncertain("chat composer did not confirm the reply")),
+        }
+        sleep(Duration::from_millis(300));
+        let (screen, second) = self.reply_snapshot(t, host)?;
+        check_notice(&screen, *earlier_refusals)?;
+        match second {
+            ReplyBox::Empty => Ok(false),
+            ReplyBox::Draft(Some(shown)) if matches_single_line_draft(&shown, text) => {
+                *earlier_refusals = notices(&screen).refusals;
+                Ok(true)
+            }
+            _ => Err(uncertain(
+                "chat composer changed before Enter could be retried",
+            )),
+        }
+    }
+
     fn observe(&self, t: &Target, before: usize, window: Duration) -> Reply<()> {
         let start = Instant::now();
         loop {
@@ -199,8 +234,15 @@ impl Tmux<'_> {
         if text.contains('\0') {
             return Err(failure("definitely-not-sent", "tmux input contains NUL"));
         }
-        let screen = self.worker_screen(t).map_err(|e| {
-            if e["result"] == "refused" {
+        let host_for_reply = host.unwrap_or_default();
+        let before = if confirm_reply {
+            self.reply_snapshot(t, host_for_reply)
+                .map(|(screen, composer)| (screen, Some(composer)))
+        } else {
+            self.worker_screen(t).map(|screen| (screen, None))
+        };
+        let (screen, composer) = before.map_err(|e| {
+            if e["result"] == "refused" || e["result"] == "definitely-not-sent" {
                 e
             } else {
                 failure(
@@ -214,18 +256,29 @@ impl Tmux<'_> {
             return Err(refused(&message));
         }
         let codex = host == Some("codex");
-        if confirm_reply && codex && codex_draft(&screen).is_some_and(|draft| !draft.empty()) {
-            return Err(failure(
-                "definitely-not-sent",
-                "Codex composer already contains a draft",
-            ));
+        match composer {
+            Some(ReplyBox::Draft(_)) => {
+                return Err(failure(
+                    "definitely-not-sent",
+                    "chat composer already contains a draft",
+                ));
+            }
+            Some(ReplyBox::Unproven(reason)) => return Err(failure("definitely-not-sent", reason)),
+            _ => {}
         }
+        let send = |action: &str| {
+            if confirm_reply {
+                self.worker_command_if(t, action, NO_TMUX_MODE)
+            } else {
+                self.worker_command(t, action)
+            }
+        };
         // Single-quote for the tmux command parser inside if-shell. No shell is invoked.
         let literal = text.replace('\'', "'\\''");
-        self.worker_command(
-            t,
-            &format!("send-keys -t {} -l -- '{literal}'", t.worker_pane()?),
-        )
+        send(&format!(
+            "send-keys -t {} -l -- '{literal}'",
+            t.worker_pane()?
+        ))
         .map_err(|mut err| {
             if err["result"] == "uncertain" {
                 err["category"] = json!("input_uncertain");
@@ -244,33 +297,36 @@ impl Tmux<'_> {
                 } else {
                     err
                 }
+            } else if err["category"] == "input_uncertain" {
+                err
             } else {
                 uncertain("could not observe the session after input")
             }
         };
         for retry in 0..=2 {
-            self.worker_command(t, &format!("send-keys -t {} Enter", t.worker_pane()?))
+            send(&format!("send-keys -t {} Enter", t.worker_pane()?))
                 .map_err(|_| uncertain("text was typed but Enter was not confirmed"))?;
             self.observe(t, earlier_refusals, window)
                 .map_err(after_text)?;
+            if confirm_reply {
+                if !self
+                    .reply_needs_enter(t, host_for_reply, text, &mut earlier_refusals)
+                    .map_err(after_text)?
+                {
+                    break;
+                }
+                if retry == 2 {
+                    return Err(uncertain("typed text remained in the host input box"));
+                }
+                continue;
+            }
             if !codex {
                 break;
             }
             let first = self.worker_screen(t).map_err(after_text)?;
             check_notice(&first, earlier_refusals).map_err(after_text)?;
             let draft = codex_draft(&first);
-            if confirm_reply {
-                if draft.as_ref().is_some_and(Draft::empty) {
-                    break;
-                }
-                if !draft
-                    .as_ref()
-                    .and_then(|d| d.single_line.as_deref())
-                    .is_some_and(|shown| wfc_herdr::matches_single_line_draft(shown, text))
-                {
-                    return Err(uncertain("Codex composer did not confirm the reply"));
-                }
-            } else if !draft.as_ref().is_some_and(|d| matches_input(d, text)) {
+            if !draft.as_ref().is_some_and(|d| matches_input(d, text)) {
                 break;
             }
             sleep(Duration::from_millis(300));
@@ -278,11 +334,6 @@ impl Tmux<'_> {
             check_notice(&second, earlier_refusals).map_err(after_text)?;
             let next = codex_draft(&second);
             if draft != next {
-                if confirm_reply && !next.as_ref().is_some_and(Draft::empty) {
-                    return Err(uncertain(
-                        "Codex composer changed before Enter could be retried",
-                    ));
-                }
                 break;
             }
             earlier_refusals = notices(&second).refusals;

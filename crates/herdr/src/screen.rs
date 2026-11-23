@@ -181,23 +181,24 @@ fn codex_box<'a>(
     })
 }
 
+fn visible_text(rows: &[ansi::Row]) -> String {
+    rows.iter()
+        .map(|row| row.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn matching_styles(
-    plain: &Screen,
+    plain: &str,
     tail: &[&str],
-    styled: &Screen,
+    rows: Option<Vec<ansi::Row>>,
 ) -> Option<(Vec<ansi::Row>, usize)> {
-    // Herdr 0.9.5 always returns revision 0 for pane.read. The later read
-    // supplies styles for a matching suffix on the bound pane, not a frame ID.
-    let mut rows = ansi::rows(&styled.text)?;
+    let mut rows = rows?;
     while rows.last().is_some_and(|row| row.text.trim().is_empty()) {
         rows.pop();
     }
-    let visible = rows
-        .iter()
-        .map(|row| row.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if read_only(&visible) || refusals(&visible) > refusals(&plain.text) {
+    let visible = visible_text(&rows);
+    if read_only(&visible) || refusals(&visible) > refusals(plain) {
         return None;
     }
     let first = rows.len().checked_sub(tail.len())?;
@@ -208,7 +209,7 @@ fn matching_styles(
         .then_some((rows, first))
 }
 
-enum ReplyBox {
+pub enum ReplyBox {
     Empty,
     Draft(Option<String>),
     Unproven(&'static str),
@@ -224,8 +225,11 @@ fn attached_image(line: &str) -> bool {
     !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
 }
 
-fn observe_codex(plain: &Screen, read_ansi: impl FnOnce() -> Result<Screen>) -> Result<ReplyBox> {
-    let lines = screen_lines(&plain.text);
+fn observe_codex(
+    plain: &str,
+    read_styles: impl FnOnce() -> Result<Option<Vec<ansi::Row>>>,
+) -> Result<ReplyBox> {
+    let lines = screen_lines(plain);
     let unknown = ReplyBox::Unproven("Codex writable chat composer could not be verified");
     let Some(start) = prompt_row(&lines) else {
         return Ok(unknown);
@@ -239,7 +243,7 @@ fn observe_codex(plain: &Screen, read_ansi: impl FnOnce() -> Result<Screen>) -> 
     // Associate the preceding rows as well as the prompt. Codex puts remote
     // image labels above the textarea, separated by an optional blank row.
     let offset = start.saturating_sub(2);
-    let Some((styled, first)) = matching_styles(plain, &lines[offset..], &read_ansi()?) else {
+    let Some((styled, first)) = matching_styles(plain, &lines[offset..], read_styles()?) else {
         return Ok(unknown);
     };
     let prompt = first + start - offset;
@@ -295,11 +299,11 @@ fn opencode_row<'a>(line: &'a str, indent: &str) -> Option<&'a str> {
 }
 
 fn observe_opencode(
-    plain: &Screen,
-    read_ansi: impl FnOnce() -> Result<Screen>,
+    plain: &str,
+    read_styles: impl FnOnce() -> Result<Option<Vec<ansi::Row>>>,
 ) -> Result<ReplyBox> {
     let unknown = ReplyBox::Unproven("OpenCode writable chat composer could not be verified");
-    let lines = screen_lines(&plain.text);
+    let lines = screen_lines(plain);
     let [above @ .., bar, footer] = lines.as_slice() else {
         return Ok(unknown);
     };
@@ -325,7 +329,7 @@ fn observe_opencode(
         .rposition(|line| opencode_row(line, indent).is_none())
         .map_or(0, |index| index + 1);
     let body = &body[start..];
-    let Some((styles, first)) = matching_styles(plain, &lines[start..], &read_ansi()?) else {
+    let Some((styles, first)) = matching_styles(plain, &lines[start..], read_styles()?) else {
         return Ok(unknown);
     };
     if !styles[first + body.len() + 1].visible_foreground {
@@ -345,9 +349,12 @@ fn observe_opencode(
     }
 }
 
-fn observe_claude(plain: &Screen, read_ansi: impl FnOnce() -> Result<Screen>) -> Result<ReplyBox> {
+fn observe_claude(
+    plain: &str,
+    read_styles: impl FnOnce() -> Result<Option<Vec<ansi::Row>>>,
+) -> Result<ReplyBox> {
     let unknown = ReplyBox::Unproven("Claude writable chat composer could not be verified");
-    let lines = screen_lines(&plain.text);
+    let lines = screen_lines(plain);
     let [.., top, prompt, bottom, footer] = lines.as_slice() else {
         return Ok(unknown);
     };
@@ -366,7 +373,7 @@ fn observe_claude(plain: &Screen, read_ansi: impl FnOnce() -> Result<Screen>) ->
     {
         return Ok(unknown);
     }
-    let Some((styles, first)) = matching_styles(plain, &lines[lines.len() - 4..], &read_ansi()?)
+    let Some((styles, first)) = matching_styles(plain, &lines[lines.len() - 4..], read_styles()?)
     else {
         return Ok(unknown);
     };
@@ -382,21 +389,37 @@ fn observe_claude(plain: &Screen, read_ansi: impl FnOnce() -> Result<Screen>) ->
 
 fn observe_reply_box(
     host: &str,
-    plain: &Screen,
-    read_ansi: impl FnOnce() -> Result<Screen>,
+    plain: &str,
+    read_styles: impl FnOnce() -> Result<Option<Vec<ansi::Row>>>,
 ) -> Result<ReplyBox> {
     match host {
-        "codex" => observe_codex(plain, read_ansi),
-        "opencode" => observe_opencode(plain, read_ansi),
-        "claude" => observe_claude(plain, read_ansi),
+        "codex" => observe_codex(plain, read_styles),
+        "opencode" => observe_opencode(plain, read_styles),
+        "claude" => observe_claude(plain, read_styles),
         _ => Ok(ReplyBox::Unproven(
-            "Herdr writable chat composer could not be verified",
+            "writable chat composer could not be verified for this host",
         )),
     }
 }
 
+/// Classify a single styled terminal capture and return its visible text.
+pub fn classify_reply_capture(host: &str, capture: &str) -> Option<(String, ReplyBox)> {
+    let rows = ansi::rows(capture)?;
+    let plain = visible_text(&rows);
+    let observation = observe_reply_box(host, &plain, || Ok(Some(rows))).ok()?;
+    Some((plain, observation))
+}
+
+fn observe_herdr_reply_box(handle: &Handle, screen: &Screen, host: &str) -> Result<ReplyBox> {
+    // Herdr 0.9.5 always returns revision 0. The later read supplies styles
+    // for a matching suffix on the bound pane, not a frame ID.
+    observe_reply_box(host, &screen.text, || {
+        Ok(ansi::rows(&handle.read_ansi()?.text))
+    })
+}
+
 pub(super) fn require_empty_reply_box(handle: &Handle, screen: &Screen, host: &str) -> Result<()> {
-    match observe_reply_box(host, screen, || handle.read_ansi())? {
+    match observe_herdr_reply_box(handle, screen, host)? {
         ReplyBox::Empty => Ok(()),
         ReplyBox::Draft(_) => Err(Failure::unsent("chat composer already contains a draft")),
         ReplyBox::Unproven(diagnostic) => Err(Failure::unsent(diagnostic)),
@@ -416,7 +439,7 @@ pub(super) fn confirm_reply(
         if read_only(&screen.text) || refusals(&screen.text) > refusals(&before.text) {
             return Err(Failure::unknown("worker refused or paused input"));
         }
-        match observe_reply_box(host, &screen, || handle.read_ansi())? {
+        match observe_herdr_reply_box(handle, &screen, host)? {
             ReplyBox::Empty => Ok(false),
             ReplyBox::Draft(Some(draft)) if super::matches_single_line_draft(&draft, text) => {
                 Ok(true)
@@ -564,6 +587,14 @@ impl Handle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn observe_codex(
+        plain: &Screen,
+        read_ansi: impl FnOnce() -> Result<Screen>,
+    ) -> Result<ReplyBox> {
+        super::observe_codex(&plain.text, || Ok(ansi::rows(&read_ansi()?.text)))
+    }
+
     fn view(text: &str) -> Screen {
         Screen {
             text: text.into(),

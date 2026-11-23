@@ -1,5 +1,5 @@
-//! Cell styles in Herdr 0.9.5's ANSI pane snapshot. Ghostty emits standalone
-//! SGR sequences for a styled selection, without screen or cursor extras.
+//! Cell styles in Herdr 0.9.5 and tmux 3.4 pane captures. Ghostty emits
+//! standalone SGR sequences, while tmux can group attributes in one SGR.
 
 #[derive(Default)]
 struct Style {
@@ -14,35 +14,34 @@ struct Style {
 impl Style {
     fn sgr(&mut self, params: &str) -> Option<()> {
         let mut fields = params.split(';');
-        let code = fields.next()?;
-        if let Some(mode) = fields.next() {
-            if !matches!(code, "38" | "48" | "58") {
-                return None;
+        while let Some(code) = fields.next() {
+            match code {
+                "0" => *self = Self::default(),
+                "1" => self.bold = true,
+                "2" => self.dim = true,
+                "7" => self.reverse = true,
+                "8" => self.hidden = true,
+                "39" => self.foreground = false,
+                "49" => self.background = false,
+                "38" | "48" | "58" => {
+                    let components = match fields.next()? {
+                        "2" => 3,
+                        "5" => 1,
+                        _ => return None,
+                    };
+                    for _ in 0..components {
+                        fields.next()?.parse::<u8>().ok()?;
+                    }
+                    self.background |= code == "48";
+                    self.foreground |= code == "38";
+                }
+                "3" | "4" | "4:2" | "4:3" | "4:4" | "4:5" | "5" | "9" | "53" => {}
+                _ => match code.parse::<u8>().ok()? {
+                    30..=37 | 90..=97 => self.foreground = true,
+                    40..=47 | 100..=107 => self.background = true,
+                    _ => return None,
+                },
             }
-            let components = match mode {
-                "2" => 3,
-                "5" => 1,
-                _ => return None,
-            };
-            for _ in 0..components {
-                fields.next()?.parse::<u8>().ok()?;
-            }
-            if fields.next().is_some() {
-                return None;
-            }
-            self.background |= code == "48";
-            self.foreground |= code == "38";
-            return Some(());
-        }
-
-        match code {
-            "0" => *self = Self::default(),
-            "1" => self.bold = true,
-            "2" => self.dim = true,
-            "7" => self.reverse = true,
-            "8" => self.hidden = true,
-            "3" | "4" | "4:2" | "4:3" | "4:4" | "4:5" | "5" | "9" | "53" => {}
-            _ => return None,
         }
         Some(())
     }

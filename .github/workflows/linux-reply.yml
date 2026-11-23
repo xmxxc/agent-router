@@ -1,7 +1,7 @@
 name: Linux reply, reclaim and controller receipts
 on:
   push:
-    branches: [rust-router/11-reply-r10-combination-compile]
+    branches: [rust-router/11-reply-r11-tmux-composer]
   workflow_dispatch:
 
 permissions:
@@ -125,6 +125,7 @@ jobs:
           python -Bu tools/check_tmux.py target/release/wfc -v \
             Backend.test_public_reply_once_and_original_done \
             Backend.test_public_reply_preserves_tmux_draft_with_changed_whitespace \
+            Backend.test_public_reply_requires_confirmed_tmux_chat_composer \
             Backend.test_managed_tmux_reply_rechecks_owner_while_waiting \
             Backend.test_public_reply_and_reclaim_preserve_controller_receipts \
             Backend.test_public_reclaim_preview_mixed_results_and_history \
