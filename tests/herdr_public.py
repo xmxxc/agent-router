@@ -142,26 +142,28 @@ for line in sys.stdin:
             self.assertEqual((self.root/'events').read_text().splitlines(), ['unique'])
             self.cli('close', self.dispatch_id)
 
-    def setup_reply_worker(self, endpoint=None, mode='empty'):
+    def setup_reply_worker(self, endpoint=None, mode='empty', host='codex'):
         repo = Path(__file__).resolve().parents[1]
         draft_screens = {
             'ambiguous-footer': '› original draft\n  tail · value\n  model · dir',
             'ambiguous-continuation': '›\n  tail · value\n  model · dir',
             'compact-placeholder': '› AskCodextodoanything\n  model · dir',
+            'existing-scroll': '› original draft ↑',
+            'folded-placeholder-draft': '› Ask Codex to do\n  anything',
+            'shell': '! echo untouched',
+            'unknown': '❯ Ask Codex to do anything',
+            'ultra-empty': '» Ask Codex to do anything',
+            'ultra-draft': '» original Ultra draft',
         }
         compact = '›\n  model · dir\n  keys · help'
         draft_screens.update({mode: compact for mode in (
             'styled-compact-empty', 'styled-compact-draft', 'unstyled-compact-empty', 'unstyled-compact-draft',
         )})
-        if mode in draft_screens:
-            args = [repo/'crates/herdr/tests/composer.py', 'one', '--submit-first', '--reply-worker', mode]
-        else:
-            args = [repo/'tools/check_tmux.py', '--reply-worker', mode, self.root/'reply.log']
-        self.dispatch(endpoint=endpoint, command=[sys.executable, *map(str, args)])
+        args = [repo/'crates/herdr/tests/composer.py', 'one', '--submit-first', '--reply-worker', mode]
+        self.dispatch(endpoint=endpoint, host=host, command=[sys.executable, *map(str, args)])
         question = self.root/'question.json'
         receipt = json.loads(live.wait_for(lambda: question.exists() and question.read_bytes()))
-        prompt = draft_screens.get(mode, 'original draft ↑' if mode == 'existing-scroll'
-                                   else 'Ask Codex to do anything')
+        prompt = draft_screens.get(mode, '› Ask Codex to do anything')
         live.wait_for(lambda: prompt in '\n'.join(line.rstrip() for line in self.reply_screen().splitlines()))
         return receipt
 
@@ -217,36 +219,39 @@ for line in sys.stdin:
 
     def test_public_reply_releases_claim_after_herdr_preflight_read_fails(self):
         sends = []
-        captures = []
         dropped = []
-        armed = False
+        fail_at = None
+        saw_ansi = False
 
         def lose(req, reply):
+            nonlocal fail_at, saw_ansi
             method = req['method']
             if method in ('pane.send_input', 'pane.send_keys'):
                 sends.append(method)
-            if armed and not dropped:
-                if method == 'pane.read':
-                    captures.append(method)
-                elif captures and method == 'session.snapshot':
-                    dropped.append(method)
-                    return None
+            at_ansi = method == 'pane.read' and req['params']['format'] == 'ansi'
+            if (fail_at == 'ansi' and at_ansi
+                    or fail_at == 'prepare' and saw_ansi and method == 'session.snapshot'):
+                dropped.append(fail_at)
+                fail_at = None
+                return None
+            saw_ansi |= at_ansi
             return reply
 
         with self.service.fault_proxy(lose) as proxy:
             question = self.setup_reply_worker(proxy)
-            armed = True
-            self.cli('reply', question['message'], 'unsent', error='definitely-not-sent')
-            self.assertEqual(captures, ['pane.read'])
-            self.assertEqual(dropped, ['session.snapshot'])
-            self.assertEqual(sends, [])
-            self.assertFalse((self.root/'accepted').exists())
-            self.assertFalse(self.status()['pendingInput'])
-            attempt, = self.reply_attempts()
-            self.assertEqual(attempt['inputResult'], 'definitely-not-sent')
-            self.assertIn('Herdr exchange incomplete or invalid', attempt['diagnostic'])
+            for phase in ('ansi', 'prepare'):
+                fail_at = phase
+                saw_ansi = False
+                self.cli('reply', question['message'], 'unsent', error='definitely-not-sent')
+                self.assertEqual(dropped[-1], phase)
+                self.assertEqual(sends, [])
+                self.assertFalse((self.root/'accepted').exists())
+                self.assertFalse(self.status()['pendingInput'])
+                attempt = self.reply_attempts()[-1]
+                self.assertEqual(attempt['inputResult'], 'definitely-not-sent')
+                self.assertIn('Herdr exchange incomplete or invalid', attempt['diagnostic'])
             self.cli('reply', question['message'], 'once')
-            self.assert_reply_worker_finished(question, 'accepted', earlier=('definitely-not-sent',))
+            self.assert_reply_worker_finished(question, 'accepted', earlier=('definitely-not-sent',) * 2)
             self.assertEqual(sends, ['pane.send_input'])
 
     def test_public_reply_preserves_existing_scrolled_herdr_draft(self):
@@ -283,8 +288,9 @@ for line in sys.stdin:
                 sends.append(method)
             elif method == 'pane.read' and sends:
                 read = reply['result']['read']
-                if not samples:
-                    read['text'] = '› Ask Codex to do anything\n\n  model · cwd'
+                if len(samples) < 2:
+                    read['text'] = ('\x1b[1m›\x1b[0m' if req['params']['format'] == 'ansi' else '›')
+                    read['text'] += '\n\n  model · dir'
                 samples.append(read['text'])
             return reply
 
@@ -292,9 +298,9 @@ for line in sys.stdin:
             question = self.setup_reply_worker(proxy, mode='always-drop')
             expected = f"[router] Answer to question {question['message']}: once"
             self.cli('reply', question['message'], 'once', error='draft after an empty composer')
-            self.assertEqual(len(samples), 2)
-            self.assertIn('Ask Codex to do anything', samples[0])
-            self.assertIn(expected, samples[1])
+            self.assertEqual(len(samples), 4)
+            self.assertEqual(samples[0], '›\n\n  model · dir')
+            self.assertIn(expected, samples[2])
             self.assertEqual(sends, ['pane.send_input'])
             self.assertFalse((self.root/'accepted').exists())
             self.assertTrue(self.status()['pendingInput'])
@@ -356,12 +362,12 @@ for line in sys.stdin:
             question = self.setup_reply_worker(proxy)
             number = str(question['message'])
             expiring = True
-            # Connections 1–3 read the composer and 4–7 prepare the send.
+            # Connections 1–6 read text and ANSI, then 7–10 prepare the send.
             # Delay the exit of the input connection syscall past its session
             # deadline, so the real proxy sees that connection but no bytes.
             trace = self.root/'reply-connect.log'
             result = subprocess.run([
-                'strace', '-e', 'trace=connect', '-e', 'inject=connect:delay_exit=3s:when=8',
+                'strace', '-e', 'trace=connect', '-e', 'inject=connect:delay_exit=3s:when=11',
                 '-o', trace, '--', live.DRIVER, 'reply', number, 'expired',
             ], env={**self.env, 'WFC_HERDR_TIMEOUT': '2'}, text=True,
                capture_output=True, timeout=12)
@@ -371,6 +377,7 @@ for line in sys.stdin:
             live.wait_for(lambda: empty_requests)
             expiring = False
             self.assertEqual(preparation, ['ping', 'session.snapshot', 'pane.read',
+                                           'ping', 'session.snapshot', 'pane.read',
                                            'ping', 'session.snapshot', 'pane.process_info',
                                            'session.snapshot'])
             self.assertEqual(empty_requests, [b''])
@@ -534,6 +541,109 @@ for line in sys.stdin:
                 self.cli('reply', question['message'], 'once')
                 self.assert_reply_worker_finished(question, 'accepted', earlier=('definitely-not-sent',))
                 self.assertEqual(sends, ['pane.send_input'], mode)
+
+    def test_public_reply_distinguishes_authored_herdr_text_from_dim_placeholder(self):
+        writes = []
+
+        def observe(req, reply):
+            if req['method'] in ('pane.send_input', 'pane.send_keys'):
+                writes.append(req['method'])
+            return reply
+
+        with self.service.fault_proxy(observe) as proxy:
+            for mode in ('plain-placeholder-draft', 'folded-placeholder-draft'):
+                with self.subTest(mode=mode):
+                    writes.clear()
+                    for name in ('accepted', 'question.json'):
+                        (self.root/name).unlink(missing_ok=True)
+                    question = self.setup_reply_worker(proxy, mode=mode)
+                    plain, styled = self.reply_screen(), self.reply_screen('ansi')
+                    self.assertNotIn('\x1b[2m', styled)
+                    self.cli('reply', question['message'], 'unsent', error='composer already contains a draft')
+                    self.assertEqual(writes, [])
+                    self.assertEqual((self.reply_screen(), self.reply_screen('ansi')), (plain, styled))
+                    self.assertFalse((self.root/'accepted').exists())
+                    self.assertFalse(self.status()['pendingInput'])
+                    self.assertEqual(self.reply_attempts()[-1]['inputResult'], 'definitely-not-sent')
+
+                    (self.root/'clear-draft').touch()
+                    live.wait_for(lambda: '\x1b[2m' in self.reply_screen('ansi'))
+                    self.assertEqual(self.reply_screen(), plain)
+                    self.cli('reply', question['message'], 'once')
+                    self.assertFalse(self.status()['pendingInput'])
+                    self.assert_reply_worker_finished(question, 'accepted', earlier=('definitely-not-sent',))
+                    self.assertEqual(writes, ['pane.send_input'])
+
+    def test_public_reply_requires_a_writable_herdr_chat_prompt(self):
+        writes = []
+
+        def observe(req, reply):
+            if req['method'] in ('pane.send_input', 'pane.send_keys'):
+                writes.append(req['method'])
+            return reply
+
+        with self.service.fault_proxy(observe) as proxy:
+            for mode, host, complaint in (
+                ('ultra-draft', 'codex', 'composer already contains a draft'),
+                ('shell', 'codex', 'writable chat composer could not be verified'),
+                ('unknown', 'codex', 'writable chat composer could not be verified'),
+                ('disabled', 'codex', 'writable chat composer could not be verified'),
+                ('empty', 'claude', 'writable chat composer could not be verified'),
+                ('ultra-empty', 'codex', None),
+            ):
+                with self.subTest(mode=mode, host=host):
+                    writes.clear()
+                    for name in ('accepted', 'question.json'):
+                        (self.root/name).unlink(missing_ok=True)
+                    question = self.setup_reply_worker(proxy, mode=mode, host=host)
+                    if complaint is not None:
+                        plain, styled = self.reply_screen(), self.reply_screen('ansi')
+                        self.cli('reply', question['message'], 'unsent', error=complaint)
+                        self.assertEqual(writes, [])
+                        self.assertEqual((self.reply_screen(), self.reply_screen('ansi')), (plain, styled))
+                        self.assertFalse((self.root/'accepted').exists())
+                        self.assertFalse(self.status()['pendingInput'])
+                        self.assertEqual(self.reply_attempts()[-1]['inputResult'], 'definitely-not-sent')
+                        first, = self.cli('wait', '--scope', self.row['scope'], '--timeout', 0)['messages']
+                        self.assertEqual((first['type'], first['messageId']), ('question', question['messageId']))
+                        self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+                        continue
+                    self.cli('reply', question['message'], 'once')
+                    self.assertFalse(self.status()['pendingInput'])
+                    self.assert_reply_worker_finished(question, 'accepted')
+                    self.assertEqual(writes, ['pane.send_input'])
+
+    def test_public_reply_retains_claim_when_herdr_empty_composer_cannot_be_confirmed(self):
+        writes, dropped = [], []
+        drop_ansi = False
+
+        def observe(req, reply):
+            if req['method'] in ('pane.send_input', 'pane.send_keys'):
+                writes.append(req['method'])
+            if drop_ansi and writes and req['method'] == 'pane.read' and req['params']['format'] == 'ansi':
+                dropped.append(req['params']['format'])
+                return None
+            return reply
+
+        with self.service.fault_proxy(observe) as proxy:
+            for mode in ('plain-after-send', 'empty'):
+                with self.subTest(mode=mode):
+                    writes.clear()
+                    dropped.clear()
+                    for name in ('accepted', 'question.json'):
+                        (self.root/name).unlink(missing_ok=True)
+                    question = self.setup_reply_worker(proxy, mode=mode)
+                    drop_ansi = mode == 'empty'
+                    diagnostic = self.cli('reply', question['message'], 'once', error='uncertain')
+                    drop_ansi = False
+                    self.assertEqual(dropped, ['ansi'] if mode == 'empty' else [])
+                    if mode == 'plain-after-send':
+                        self.assertIn('Codex composer did not confirm the reply', diagnostic)
+                        self.assertIn('› Ask Codex to do anything', self.reply_screen())
+                        self.assertNotIn('\x1b[2m', self.reply_screen('ansi'))
+                    self.assertTrue(self.status()['pendingInput'])
+                    self.assert_reply_worker_finished(question, 'uncertain')
+                    self.assertEqual(writes, ['pane.send_input'])
 
     def drop_close(self, calls):
         def read(stream):

@@ -48,7 +48,10 @@ fn shows_placeholder(lines: &[&str]) -> bool {
     let Some((prompt, continuation)) = lines.split_first() else {
         return false;
     };
-    let Some(first) = prompt.strip_prefix("› ") else {
+    let Some(first) = prompt
+        .strip_prefix(['›', '»'])
+        .and_then(|body| body.strip_prefix(' '))
+    else {
         return false;
     };
     // Remove only the composer prefix and the indentation of displayed
@@ -64,16 +67,20 @@ fn shows_placeholder(lines: &[&str]) -> bool {
     text == "Ask Codex to do anything"
 }
 
-fn complete_draft(lines: &[&str]) -> Option<String> {
+fn visible_draft(lines: &[&str]) -> Option<String> {
     if lines.iter().any(|s| s.ends_with(['↑', '↓'])) {
         return None;
     }
     let body = lines.join(" ");
-    let draft = body.strip_prefix('›')?.trim();
+    Some(body.strip_prefix(['›', '»'])?.trim().to_owned())
+}
+
+fn complete_draft(lines: &[&str]) -> Option<String> {
+    let draft = visible_draft(lines)?;
     Some(if shows_placeholder(lines) {
         String::new()
     } else {
-        draft.to_owned()
+        draft
     })
 }
 
@@ -86,7 +93,34 @@ fn screen_lines(text: &str) -> Vec<&str> {
 }
 
 fn prompt_row(lines: &[&str]) -> Option<usize> {
-    lines.iter().rposition(|s| *s == "›" || s.starts_with("› "))
+    lines.iter().rposition(|s| {
+        s.strip_prefix(['›', '»'])
+            .is_some_and(|body| body.is_empty() || body.starts_with(' '))
+    })
+}
+
+fn composer_end(tail: &[&str]) -> (usize, usize) {
+    let end = 1 + tail[1..].iter().take_while(|s| s.starts_with("  ")).count();
+    let adjacent = if end == tail.len() {
+        tail[1..]
+            .iter()
+            .rev()
+            .take(2)
+            .take_while(|s| s.contains(" · "))
+            .count()
+    } else {
+        0
+    };
+    (end, adjacent)
+}
+
+fn footer_lines<'a>(lines: &[&'a str]) -> Option<Vec<&'a str>> {
+    let footer: Vec<_> = lines.iter().copied().filter(|s| !s.is_empty()).collect();
+    ((1..=2).contains(&footer.len())
+        && footer
+            .iter()
+            .all(|s| s.starts_with("  ") && s.contains(" · ")))
+    .then_some(footer)
 }
 
 fn codex_box<'a>(
@@ -96,17 +130,9 @@ fn codex_box<'a>(
 ) -> Option<Composer<'a>> {
     let lines = screen_lines(&screen.text);
     let start = prompt_row(&lines)?;
-    let mut end = start + 1;
-    while end < lines.len() && lines[end].starts_with("  ") {
-        end += 1;
-    }
-    if end == lines.len() {
-        let adjacent = lines[start + 1..]
-            .iter()
-            .rev()
-            .take(2)
-            .take_while(|s| s.contains(" · "))
-            .count();
+    let (end, adjacent) = composer_end(&lines[start..]);
+    let mut end = start + end;
+    if adjacent > 0 {
         // Wrapped draft lines can also contain the footer separator. If both
         // footer lengths fit, use the footer seen independently before typing.
         end -= match adjacent {
@@ -133,30 +159,15 @@ fn codex_box<'a>(
             count => count,
         };
     }
-    let footer: Vec<_> = lines[end..]
-        .iter()
-        .copied()
-        .filter(|s| !s.is_empty())
-        .collect();
-    if !(1..=2).contains(&footer.len())
-        || !footer
-            .iter()
-            .all(|s| s.starts_with("  ") && s.contains(" · "))
-    {
-        return None;
-    }
     Some(Composer {
         draft: complete_draft(&lines[start..end]),
-        footer: Some(footer),
+        footer: Some(footer_lines(&lines[end..])?),
     })
 }
 
-fn styled_footer<'a>(plain: &'a Screen, styled: &Screen) -> Option<Vec<&'a str>> {
-    if plain.revision != styled.revision {
-        return None;
-    }
-    let lines = screen_lines(&plain.text);
-    let tail = lines.get(prompt_row(&lines)?..)?;
+fn matching_styles(plain: &Screen, tail: &[&str], styled: &Screen) -> Option<Vec<ansi::Row>> {
+    // Herdr 0.9.5 always returns revision 0 for pane.read. The later read
+    // supplies styles for a matching suffix on the bound pane, not a frame ID.
     let mut rows = ansi::rows(&styled.text)?;
     while rows.last().is_some_and(|row| row.text.trim().is_empty()) {
         rows.pop();
@@ -169,62 +180,69 @@ fn styled_footer<'a>(plain: &'a Screen, styled: &Screen) -> Option<Vec<&'a str>>
     if read_only(&visible) || refusals(&visible) > refusals(&plain.text) {
         return None;
     }
-    let rows = &rows[rows.len().checked_sub(tail.len())?..];
-    if !rows
-        .iter()
+    let rows = rows.split_off(rows.len().checked_sub(tail.len())?);
+    rows.iter()
         .zip(tail)
         .all(|(row, &line)| row.text.trim_end_matches(' ') == line)
-        || !rows.first()?.prompt_background
-    {
-        return None;
-    }
-    let footer = tail.len().checked_sub(2)?;
-    if footer == 0
-        || rows[footer..]
-            .iter()
-            .any(|row| row.has_nondefault_background)
-    {
-        return None;
-    }
-    if shows_placeholder(&tail[..footer]) && rows[..footer].iter().any(|row| row.has_undimmed_body)
-    {
-        return None;
-    }
-    Some(tail[footer..].to_vec())
+        .then_some(rows)
 }
 
-fn reply_box<'a>(handle: &Handle, plain: &'a Screen) -> Result<Option<Composer<'a>>> {
-    let observed = codex_box(plain, &[], None);
-    if observed
-        .as_ref()
-        .is_some_and(|composer| composer.footer.is_none())
+enum ReplyBox {
+    Empty,
+    Draft(Option<String>),
+    Unproven(&'static str),
+}
+
+fn observe_reply_box(
+    plain: &Screen,
+    read_ansi: impl FnOnce() -> Result<Screen>,
+) -> Result<ReplyBox> {
+    let lines = screen_lines(&plain.text);
+    let unknown = ReplyBox::Unproven("Codex writable chat composer could not be verified");
+    let Some(start) = prompt_row(&lines) else {
+        return Ok(unknown);
+    };
+    let tail = &lines[start..];
+    let (end, adjacent) = composer_end(tail);
+    let end = end - adjacent;
+    let Some(footer) = footer_lines(&tail[end..]) else {
+        return Ok(unknown);
+    };
+    let Some(rows) = matching_styles(plain, tail, &read_ansi()?) else {
+        return Ok(unknown);
+    };
+    let body = &tail[..end];
+    let draft = visible_draft(body);
+    let bare = matches!(body, ["›"] | ["»"]);
+    // Codex paints its editable rectangle separately from the footer. If
+    // a footer-shaped row could be the draft, require that distinction.
+    if ((adjacent == 2 || bare && (adjacent == 1 || footer.len() == 2))
+        && !rows[0].prompt_background)
+        || rows[end..].iter().any(|row| row.has_nondefault_background)
     {
-        // Codex paints editable rows with the composer background. The
-        // footer is drawn outside that rectangle. Flat text loses this
-        // distinction when a draft line looks like a footer.
-        let styled = handle.read_ansi()?;
-        if let Some(footer) = styled_footer(plain, &styled) {
-            return Ok(codex_box(plain, &footer, None));
-        }
-    }
-    Ok(observed)
-}
-
-fn has_draft(composer: Option<Composer<'_>>) -> bool {
-    composer.is_some_and(|c| c.draft.is_none_or(|draft| !draft.is_empty()))
-}
-
-pub(super) fn require_empty_reply_box(handle: &Handle, screen: &Screen) -> Result<()> {
-    let composer = reply_box(handle, screen)?;
-    if composer.as_ref().is_some_and(|c| c.footer.is_none()) {
-        return Err(Failure::unsent(
+        return Ok(ReplyBox::Unproven(
             "Codex composer already contains a draft or has an unverified footer boundary",
         ));
     }
-    if has_draft(composer) {
-        return Err(Failure::unsent("Codex composer already contains a draft"));
+    // Both enabled chat glyphs are bold. The disabled composer uses a dim ›.
+    if !rows[0].active_prompt {
+        return Ok(unknown);
     }
-    Ok(())
+    if bare
+        || (shows_placeholder(body) && rows[..end].iter().all(|row| !row.has_nonplaceholder_body))
+    {
+        Ok(ReplyBox::Empty)
+    } else {
+        Ok(ReplyBox::Draft(draft))
+    }
+}
+
+pub(super) fn require_empty_reply_box(handle: &Handle, screen: &Screen) -> Result<()> {
+    match observe_reply_box(screen, || handle.read_ansi())? {
+        ReplyBox::Empty => Ok(()),
+        ReplyBox::Draft(_) => Err(Failure::unsent("Codex composer already contains a draft")),
+        ReplyBox::Unproven(diagnostic) => Err(Failure::unsent(diagnostic)),
+    }
 }
 
 pub(super) fn confirm_codex(
@@ -245,19 +263,22 @@ pub(super) fn confirm_codex(
         if read_only(&screen.text) || refusals(&screen.text) > refusals(&before.text) {
             return Err(Failure::unknown("worker refused or paused input"));
         }
-        let composer = if confirm_reply {
-            reply_box(handle, &screen)?
-        } else {
-            codex_box(&screen, &footer, Some(&expected))
-        };
+        if confirm_reply {
+            return match observe_reply_box(&screen, || handle.read_ansi())? {
+                ReplyBox::Empty => Ok(None),
+                ReplyBox::Draft(Some(draft)) if compact(&draft) == expected => {
+                    Ok(Some((draft, true)))
+                }
+                _ => Err(Failure::unknown("Codex composer did not confirm the reply")),
+            };
+        }
+        let composer = codex_box(&screen, &footer, Some(&expected));
         let composer = composer.and_then(|c| Some((c.draft?, c.footer.is_some())));
         match composer {
             Some((draft, certain)) if !draft.is_empty() && compact(&draft) == expected => {
                 Ok(Some((draft, certain)))
             }
-            Some((draft, true)) if draft.is_empty() => Ok(None),
-            _ if !confirm_reply => Ok(None),
-            _ => Err(Failure::unknown("Codex composer did not confirm the reply")),
+            _ => Ok(None),
         }
     };
     for retry in 0..=2 {
@@ -360,6 +381,14 @@ impl Handle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn view(text: &str) -> Screen {
+        Screen {
+            text: text.into(),
+            revision: 0,
+            truncated: false,
+        }
+    }
+
     #[test]
     fn footer_ambiguity_depends_on_whether_the_draft_matches() {
         let screen = Screen {
@@ -375,66 +404,83 @@ mod tests {
             }
             assert!(codex_box(&screen, footer, Some("unrelated")).is_none());
         }
-        assert!(has_draft(codex_box(&screen, &[], None)));
-        let view = |text: &str| Screen {
-            text: text.into(),
-            ..screen
-        };
-        for text in [
-            "›\n\n  model · dir",
-            "› Ask Codex to do anything\n\n  model · dir\n  keys · help",
-            "› Ask Codex to do\n  anything\n\n  model · dir",
-        ] {
-            assert!(!has_draft(codex_box(&view(text), &[], None)), "{text}");
-        }
-        for text in [
-            "› AskCodextodoanything\n\n  model · dir",
-            "› Ask  Codex to do anything\n\n  model · dir",
-            "› Ask Codex to do anything\t\n\n  model · dir",
-            "›\n  tail · value\n  model · dir",
-            "› Ask Codex to do anything\n  note · value\n  model · dir",
-        ] {
-            assert!(has_draft(codex_box(&view(text), &[], None)), "{text}");
-        }
     }
 
     #[test]
     fn only_matching_styled_cells_prove_a_compact_footer() {
-        let view = |text: &str| Screen {
-            text: text.into(),
-            revision: 5,
-            truncated: false,
-        };
         let flat = view("›\n  model · dir\n  keys · help");
-        let empty = view(
-            "\x1b[48;2;0;12;32m›\x1b[0m\r\n  \x1b[38;2;0;0;18mmodel · dir\x1b[0m\r\n  keys · help",
-        );
-        let draft = view("\x1b[48;2;0;12;32m›\r\n  model · dir\x1b[0m\r\n  keys · help");
-        let footer = styled_footer(&flat, &empty).unwrap();
-        assert_eq!(footer, ["  model · dir", "  keys · help"]);
-        assert!(!has_draft(codex_box(&flat, &footer, None)));
-        assert!(styled_footer(&flat, &draft).is_none());
-        assert!(styled_footer(&flat, &flat).is_none());
-        assert!(
-            styled_footer(&view("› different\n  model · dir\n  keys · help"), &empty).is_none()
-        );
-        assert!(styled_footer(
-            &flat,
-            &Screen {
-                revision: 6,
-                ..empty
-            }
-        )
-        .is_none());
+        let empty =
+            "\x1b[48;2;0;12;32m\x1b[1m›\x1b[0m\r\n  \x1b[38;2;0;0;18mmodel · dir\x1b[0m\r\n  keys · help";
+        assert!(matches!(
+            observe_reply_box(&flat, || Ok(view(empty))).unwrap(),
+            ReplyBox::Empty
+        ));
+        let draft = "\x1b[48;2;0;12;32m\x1b[1m›\r\n  model · dir\x1b[0m\r\n  keys · help";
+        for ansi in [
+            draft,
+            flat.text.as_str(),
+            "› different\n  model · dir\n  keys · help",
+        ] {
+            assert!(matches!(
+                observe_reply_box(&flat, || Ok(view(ansi))).unwrap(),
+                ReplyBox::Unproven(_)
+            ));
+        }
 
         let placeholder = view("› Ask Codex to do anything\n  model · dir\n  keys · help");
         let ordinary =
-            view("\x1b[48;5;24m› Ask Codex to do anything\x1b[0m\n  model · dir\n  keys · help");
-        assert!(styled_footer(&placeholder, &ordinary).is_none());
-        let dimmed = view(
-            "\x1b[48;5;24m› \x1b[2mAsk Codex to do anything\x1b[0m\n  model · dir\n  keys · help",
-        );
-        assert!(styled_footer(&placeholder, &dimmed).is_some());
+            "\x1b[48;5;24m\x1b[1m› Ask Codex to do anything\x1b[0m\n  model · dir\n  keys · help";
+        assert!(matches!(
+            observe_reply_box(&placeholder, || Ok(view(ordinary))).unwrap(),
+            ReplyBox::Draft(Some(draft)) if draft == "Ask Codex to do anything"
+        ));
+        let dimmed =
+            "\x1b[48;5;24m\x1b[1m› \x1b[2mAsk Codex to do anything\x1b[0m\n  model · dir\n  keys · help";
+        assert!(matches!(
+            observe_reply_box(&placeholder, || Ok(view(dimmed))).unwrap(),
+            ReplyBox::Empty
+        ));
+    }
+
+    #[test]
+    fn matching_placeholder_needs_dim_text_and_an_enabled_chat_prompt() {
+        let flat = view("» Ask Codex to do\n  anything\n\n  model · dir");
+        for (styled, empty) in [
+            (
+                "\x1b[1m»\x1b[0m \x1b[2mAsk Codex to do\n  anything\x1b[0m",
+                true,
+            ),
+            ("\x1b[1m»\x1b[0m Ask Codex to do\n  anything", false),
+            (
+                "\x1b[1m»\x1b[0m \x1b[2mAsk Codex to do\x1b[0m\n  anything",
+                false,
+            ),
+            ("\x1b[2m» Ask Codex to do\n  anything\x1b[0m", false),
+        ] {
+            let ansi = view(&format!("{styled}\n\n  model · dir"));
+            assert_eq!(
+                matches!(
+                    observe_reply_box(&flat, || Ok(ansi)).unwrap(),
+                    ReplyBox::Empty
+                ),
+                empty
+            );
+        }
+        assert!(matches!(
+            observe_reply_box(
+                &view("›\n\n  model · dir\n! echo x\n\n  model · dir"),
+                || { panic!("a non-chat frame cannot supply a reply box") }
+            )
+            .unwrap(),
+            ReplyBox::Unproven(_)
+        ));
+        assert!(matches!(
+            observe_reply_box(&view("› \u{a0}\n\n  model · dir"), || {
+                Ok(view("\x1b[1m›\x1b[0m \u{a0}\n\n  model · dir"))
+            })
+            .unwrap(),
+            ReplyBox::Draft(_)
+        ));
     }
 
     #[test]

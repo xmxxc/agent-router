@@ -4,6 +4,7 @@
 #[derive(Default)]
 struct Style {
     background: bool,
+    bold: bool,
     dim: bool,
     reverse: bool,
     hidden: bool,
@@ -34,10 +35,11 @@ impl Style {
 
         match code {
             "0" => *self = Self::default(),
+            "1" => self.bold = true,
             "2" => self.dim = true,
             "7" => self.reverse = true,
             "8" => self.hidden = true,
-            "1" | "3" | "4" | "4:2" | "4:3" | "4:4" | "4:5" | "5" | "9" | "53" => {}
+            "3" | "4" | "4:2" | "4:3" | "4:4" | "4:5" | "5" | "9" | "53" => {}
             _ => return None,
         }
         Some(())
@@ -47,9 +49,10 @@ impl Style {
 #[derive(Default)]
 pub(super) struct Row {
     pub text: String,
+    pub active_prompt: bool,
     pub prompt_background: bool,
     pub has_nondefault_background: bool,
-    pub has_undimmed_body: bool,
+    pub has_nonplaceholder_body: bool,
 }
 
 pub(super) fn rows(input: &str) -> Option<Vec<Row>> {
@@ -69,8 +72,9 @@ pub(super) fn rows(input: &str) -> Option<Vec<Row>> {
                 if text.chars().any(char::is_control) {
                     return None;
                 }
-                let prompt = row.text.is_empty() && text.starts_with('›');
+                let prompt = row.text.is_empty() && text.starts_with(['›', '»']);
                 if prompt {
+                    row.active_prompt = style.bold && !style.dim && !style.reverse && !style.hidden;
                     row.prompt_background = style.background && !style.reverse && !style.hidden;
                 }
                 if text.chars().any(|c| c != ' ') {
@@ -78,12 +82,12 @@ pub(super) fn rows(input: &str) -> Option<Vec<Row>> {
                         style.background || style.reverse || style.hidden;
                 }
                 let body = if prompt {
-                    text.strip_prefix('›')?
+                    text.strip_prefix(['›', '»'])?
                 } else {
                     text
                 };
-                if !style.dim && body.chars().any(|c| c != ' ') {
-                    row.has_undimmed_body = true;
+                if (!style.dim || style.reverse || style.hidden) && body.chars().any(|c| c != ' ') {
+                    row.has_nonplaceholder_body = true;
                 }
                 row.text.push_str(text);
             }
