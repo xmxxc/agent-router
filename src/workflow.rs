@@ -254,14 +254,9 @@ impl<'a> Dispatch<'a> {
                     answer["round"] = record["round"].clone();
                     record["create"] = answer.clone();
                     let published = records.join(format!("{dispatch}.json"));
-                    if let Err(e) = write_json(&published, &record, None) {
-                        // A live host may already be using this identity. Keep its
-                        // original assignment reachable for inspection and close.
-                        fs::rename(&pending, &published).with_context(|| format!("publishing {dispatch} failed: {e}; retaining its pending assignment"))?;
-                        return Err(e).with_context(|| {
-                            format!("could not publish launch evidence for {dispatch}")
-                        });
-                    }
+                    write_json(&published, &record, None).with_context(|| {
+                        format!("could not publish launch evidence for {dispatch}; retaining its pending assignment")
+                    })?;
                     fs::remove_file(&pending)?;
                 }
                 ensure!(
