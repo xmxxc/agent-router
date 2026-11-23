@@ -4,6 +4,13 @@ set -euo pipefail
 
 group=${1:?test group required}
 case "$group" in
+    codex-home-paths)
+        fixture=tools/check_tmux.py
+        selectors=(
+            Backend.test_public_resume_dot_codex_home_created_after_dispatch
+            Backend.test_public_resume_relative_codex_home_created_after_dispatch
+        )
+        ;;
     public-resume)
         fixture=tools/check_tmux.py
         selectors=(
