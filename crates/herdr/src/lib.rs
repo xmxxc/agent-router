@@ -472,10 +472,12 @@ impl Handle {
         // Preparation performs only observation and local checkpoints. An
         // incomplete response to the subsequent input call may be post-effect.
         let rpc = self.prepare_send(true, &mut save).map_err(before_input)?;
-        rpc.call(
-            "pane.send_input",
-            json!({"pane_id":self.pane,"text":text,"keys":["Enter"]}),
-        )?;
+        let params = json!({"pane_id":self.pane,"text":text,"keys":["Enter"]});
+        if confirm_reply {
+            rpc.send_reply(params)?;
+        } else {
+            rpc.call("pane.send_input", params)?;
+        }
         if codex {
             screen::confirm_codex(self, text, &before, confirm_reply, &mut save)
                 .map_err(Failure::after_effect)?;

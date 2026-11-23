@@ -165,13 +165,18 @@ for line in sys.stdin:
             self.cli('close', self.dispatch_id)
 
     def setup_reply_worker(self, endpoint=None, mode='empty'):
-        fixture = Path(__file__).resolve().parents[1] / 'tools/check_tmux.py'
-        self.dispatch(endpoint=endpoint, command=[
-            sys.executable, str(fixture), '--reply-worker', mode, str(self.root/'reply.log'),
-        ])
+        repo = Path(__file__).resolve().parents[1]
+        if mode == 'ambiguous-footer':
+            args = [repo/'crates/herdr/tests/composer.py', 'one', '--submit-first', '--reply-worker']
+        else:
+            args = [repo/'tools/check_tmux.py', '--reply-worker', mode, self.root/'reply.log']
+        self.dispatch(endpoint=endpoint, command=[sys.executable, *map(str, args)])
         question = self.root/'question.json'
         receipt = json.loads(live.wait_for(lambda: question.exists() and question.read_bytes()))
-        prompt = 'original draft ↑' if mode == 'existing-scroll' else 'Ask Codex to do anything'
+        prompt = {
+            'existing-scroll': 'original draft ↑',
+            'ambiguous-footer': '› original draft\n  tail · value\n  model · dir',
+        }.get(mode, 'Ask Codex to do anything')
         live.wait_for(lambda: prompt in self.reply_screen())
         return receipt
 
@@ -313,6 +318,88 @@ for line in sys.stdin:
             self.cli('reply', question['message'], 'again', error='already answered')
             self.assertEqual(sends, ['pane.send_input'])
             self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+
+    def test_public_reply_preserves_herdr_draft_with_ambiguous_footer(self):
+        sends = []
+
+        def count(req, reply):
+            if req['method'] in ('pane.send_input', 'pane.send_keys'):
+                sends.append(req['method'])
+            return reply
+
+        with self.service.fault_proxy(count) as proxy:
+            question = self.setup_reply_worker(proxy, mode='ambiguous-footer')
+            screen = self.reply_screen()
+            self.cli('reply', question['message'], 'unsent', error='definitely-not-sent')
+            self.assertEqual(sends, [])
+            self.assertEqual(self.reply_screen(), screen)
+            self.assertFalse((self.root/'accepted').exists())
+            self.assertFalse(self.status()['pendingInput'])
+            attempt, = self.reply_attempts()
+            self.assertEqual(attempt['inputResult'], 'definitely-not-sent')
+            self.assertIn('composer already contains a draft', attempt['diagnostic'])
+            (self.root/'clear-draft').touch()
+            live.wait_for(lambda: 'Ask Codex to do anything' in self.reply_screen())
+            self.cli('reply', question['message'], 'once')
+            self.assert_reply_worker_finished(question, 'accepted', earlier=('definitely-not-sent',))
+            self.assertEqual(sends, ['pane.send_input'])
+
+    def test_public_reply_distinguishes_zero_write_deadline_and_lost_receipt(self):
+        preparation = []
+        empty_requests = []
+        sends = []
+        expiring = False
+        lose_receipt = False
+
+        def read_frame(stream):
+            frame = stream.readline()
+            if expiring and not frame:
+                empty_requests.append(frame)
+            return frame or None
+
+        def observe(req, reply):
+            method = req['method']
+            if expiring:
+                preparation.append(method)
+            if method in ('pane.send_input', 'pane.send_keys'):
+                sends.append(method)
+                if lose_receipt:
+                    return None
+            return reply
+
+        with self.service.fault_proxy(observe, read_frame=read_frame) as proxy:
+            question = self.setup_reply_worker(proxy)
+            number = str(question['message'])
+            expiring = True
+            # Connections 1–3 read the composer and 4–7 prepare the send.
+            # Delay the exit of the input connection syscall past its session
+            # deadline, so the real proxy sees that connection but no bytes.
+            trace = self.root/'reply-connect.log'
+            result = subprocess.run([
+                'strace', '-e', 'trace=connect', '-e', 'inject=connect:delay_exit=3s:when=8',
+                '-o', trace, '--', live.DRIVER, 'reply', number, 'expired',
+            ], env={**self.env, 'WFC_HERDR_TIMEOUT': '2'}, text=True,
+               capture_output=True, timeout=12)
+            self.assertEqual((result.returncode, result.stdout), (1, ''), result.stderr)
+            self.assertIn('definitely-not-sent: Herdr reply input was not sent', result.stderr,
+                          trace.read_text())
+            live.wait_for(lambda: empty_requests)
+            expiring = False
+            self.assertEqual(preparation, ['ping', 'session.snapshot', 'pane.read',
+                                           'ping', 'session.snapshot', 'pane.process_info',
+                                           'session.snapshot'])
+            self.assertEqual(empty_requests, [b''])
+            self.assertEqual(sends, [])
+            self.assertFalse((self.root/'accepted').exists())
+            self.assertFalse(self.status()['pendingInput'])
+            attempt, = self.reply_attempts()
+            self.assertEqual(attempt['inputResult'], 'definitely-not-sent')
+            self.assertEqual(attempt['diagnostic'], 'Herdr reply input was not sent')
+            lose_receipt = True
+            self.cli('reply', number, 'once', error='uncertain')
+            self.assertTrue(self.status()['pendingInput'])
+            self.assert_reply_worker_finished(question, 'uncertain', earlier=('definitely-not-sent',))
+            self.assertEqual(sends, ['pane.send_input'])
 
     def test_managed_herdr_reply_rechecks_owner_while_waiting(self):
         sends = []
