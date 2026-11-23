@@ -116,6 +116,283 @@ class Backend(unittest.TestCase):
         return subprocess.check_output(self.tmux + ["display-message", "-pt", f"=wfc-{dispatch}:", "#{pane_id}"],
                                        env=self.env, text=True).strip()
 
+    def resume_cli(self, *args, code=0, **env):
+        result = subprocess.run([WFC, *args], cwd=self.work, text=True, capture_output=True,
+                                env={**self.env, "WFC_STATE": str(self.state),
+                                     "WFC_RESUME_CHECK_SECONDS": "0.25", **env}, timeout=20)
+        if code is None:
+            return result
+        self.assertEqual(result.returncode, code, (args, result.stdout, result.stderr))
+        if code:
+            self.assertFalse(result.stdout)
+            return result.stderr
+        return json.loads(result.stdout)
+
+    def resume_fixture(self):
+        self.codex_home = self.root / "codex home"
+        self.codex_home.mkdir(exist_ok=True)
+        self.resume_config = self.work / "launch.json"
+        worker = self.work / "resume-host.py"
+        worker.write_text("""import json, os, sys, time
+from pathlib import Path
+attempt = os.environ['WFC_ATTEMPT']
+data = {k: os.environ.get(k) for k in ('WFC_ATTEMPT', 'WFC_ROUND', 'WFC_TASK', 'WFC_REPORT',
+                                      'WFC_DISPATCH', 'WFC_WORKER_CALLBACK', 'WFC_OWNER_TOKEN', 'VERSION')}
+data['argv'] = sys.argv[1:]
+Path(attempt + '.tmp').write_text(json.dumps(data))
+Path(attempt + '.tmp').rename(attempt + '.json')
+print('› ready', flush=True)
+deadline = time.monotonic() + 30
+while time.monotonic() < deadline and not Path(attempt + '.quit').exists():
+    time.sleep(.02)
+""")
+        self.resume_settings = {"env": {"CODEX_HOME": str(self.codex_home), "VERSION": "first"},
+                                "hosts": {"codex": {"command": [sys.executable, str(worker)]}}}
+        self.resume_config.write_text(json.dumps(self.resume_settings))
+        (self.work / "task1").write_text("controlled task 1")
+        (self.work / "task2").write_text("controlled task 2")
+        owner = self.resume_cli("owner", "acquire", "--scope", "resume", "--owner", "one",
+                                "--token", "owner-one", "--lease", "180")
+        self.assertEqual(owner["generation"], 1)
+        row = self.resume_cli("dispatch", "--host", "codex", "--scope", "resume", "--role", "worker",
+                              "--cwd", ".", "--task", "task1", "--report", "reports/r1.md", "--model",
+                              "test-model", "--effort", "high", "--network", "--launch-config",
+                              str(self.resume_config), WFC_OWNER_TOKEN="owner-one")
+        return row, self.resumed_host(row["attempt"])
+
+    def resumed_host(self, attempt):
+        path = self.work / f"{attempt}.json"
+        deadline = time.monotonic() + 5
+        while not path.is_file():
+            self.assertLess(time.monotonic(), deadline, "worker launch was not observed")
+            time.sleep(.025)
+        return json.loads(path.read_text())
+
+    def resume_status(self, dispatch):
+        return self.resume_cli("status", "--dispatch", dispatch)["dispatches"][0]
+
+    def end_resume_host(self, dispatch, attempt):
+        (self.work / f"{attempt}.quit").touch()
+        deadline = time.monotonic() + 5
+        while True:
+            row = self.resume_status(dispatch)
+            if row["backendAlive"] is False and row["worker"]["state"] == "exited":
+                return
+            self.assertLess(time.monotonic(), deadline, "original worker exit was not verified")
+            time.sleep(.025)
+
+    def rollout(self, session, text, source="cli", *, folder="2026/11/23"):
+        directory = self.codex_home / "sessions" / folder
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"rollout-2026-11-23T10-00-01-{session}.jsonl"
+        events = [
+            {"type": "session_meta", "payload": {"id": session, "cwd": str(self.work.resolve()), "source": source}},
+            {"type": "response_item", "payload": {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "<environment_context>fixture</environment_context>"}]}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": text}},
+        ]
+        path.write_text("".join(json.dumps(event) + "\n" for event in events))
+        return path
+
+    def resume_callback(self, worker, command, *args, code=0, exact=True):
+        env = {key: worker[key] for key in ("WFC_DISPATCH", "WFC_ROUND", "WFC_ATTEMPT", "WFC_WORKER_CALLBACK")}
+        if exact:
+            args += ("--attempt", env["WFC_ATTEMPT"])
+        return self.resume_cli(command, *args, code=code, **env)
+
+    def test_public_resume_preserves_conversation_rounds_and_callback_fences(self):
+        original, first = self.resume_fixture()
+        dispatch, attempt = original["dispatch"], original["attempt"]
+        request = ("resume", dispatch)
+        session = "11111111-2222-4333-8444-555555555555"
+        brief = first["argv"][-1]
+        self.rollout("21111111-2222-4333-8444-555555555555", brief, {"subagent": {"thread_spawn": {}}})
+        self.rollout("31111111-2222-4333-8444-555555555555", "quoted: " + brief)
+        self.assertIn("still running", self.resume_cli(*request, code=1, WFC_OWNER_TOKEN="owner-one"))
+        self.end_resume_host(dispatch, attempt)
+        self.assertIn("cannot verify the original Codex conversation",
+                      self.resume_cli(*request, code=1, WFC_OWNER_TOKEN="owner-one"))
+        self.rollout(session, brief)
+        duplicate = self.rollout(session, "unrelated input", folder="2026/11/22")
+        self.assertIn("more than one rollout uses the original session ID",
+                      self.resume_cli(*request, code=1, WFC_OWNER_TOKEN="owner-one"))
+        duplicate.unlink()
+        unchanged = self.resume_status(dispatch)
+        self.assertEqual(unchanged["attempt"], attempt)
+        self.assertFalse(unchanged.get("audit"))
+        wrong_home = self.resume_settings["env"].copy()
+        wrong_home["CODEX_HOME"] = str(self.root / "elsewhere")
+        self.resume_config.write_text(json.dumps({**self.resume_settings, "env": wrong_home}))
+        self.assertIn("differs from the original dispatch",
+                      self.resume_cli(*request, code=1, WFC_OWNER_TOKEN="owner-one"))
+        self.resume_settings["env"]["VERSION"] = "reloaded"
+        self.resume_config.write_text(json.dumps(self.resume_settings))
+        self.resume_cli("owner", "takeover", "--scope", "resume", "--owner", "two",
+                        "--token", "owner-two", "--lease", "180")
+        self.assertIn("stale_controller_owner",
+                      self.resume_cli(*request, code=1, WFC_OWNER_TOKEN="owner-one"))
+        self.assertIn("unfinished", self.resume_cli(*request, "--task", "task2", "--report",
+                                                     "reports/r2.md", code=1, WFC_OWNER_TOKEN="owner-two"))
+        commands = [WFC, *request]
+        env = {**self.env, "WFC_STATE": str(self.state), "WFC_OWNER_TOKEN": "owner-two",
+               "WFC_RESUME_CHECK_SECONDS": "0.25"}
+        with subprocess.Popen(commands, cwd=self.work, env=env, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as one:
+            two = subprocess.run(commands, cwd=self.work, env=env, text=True, capture_output=True, timeout=20)
+            out, err = one.communicate(timeout=20)
+        self.assertEqual(sorted((one.returncode, two.returncode)), [0, 1], (err, two.stderr))
+        resumed = json.loads(out if one.returncode == 0 else two.stdout)
+        self.assertEqual((resumed["session"], resumed["round"], resumed["launchResult"]),
+                         (session, 1, "accepted"))
+        self.assertNotEqual(resumed["attempt"], attempt)
+        second = self.resumed_host(resumed["attempt"])
+        self.assertEqual(second["argv"][0], "resume")
+        self.assertEqual(second["argv"][-2], session)
+        self.assertIn("test-model", second["argv"])
+        self.assertIn("model_reasoning_effort=high", second["argv"])
+        self.assertIn("sandbox_workspace_write.network_access=true", second["argv"])
+        self.assertEqual(second["VERSION"], "reloaded")
+        self.assertIsNone(second["WFC_OWNER_TOKEN"])
+        self.assertTrue(second["WFC_WORKER_CALLBACK"] and first["WFC_WORKER_CALLBACK"] != second["WFC_WORKER_CALLBACK"])
+        for key in ("WFC_TASK", "WFC_REPORT", "WFC_ROUND", "WFC_DISPATCH"):
+            self.assertEqual(second[key], first[key])
+        report = Path(second["WFC_REPORT"])
+        report.write_text("round 1")
+        self.assertIn("attempt is no longer accepted",
+                      self.resume_callback(first, "done", "--report", str(report), code=1))
+        self.assertIn("attempt is no longer accepted", self.resume_callback(first, "ask", "old", code=1))
+        self.assertIn("ambiguous report", self.resume_callback(second, "done", "--report", str(report), code=1, exact=False))
+        question = self.resume_callback(second, "ask", "current question")
+        done = self.resume_callback(second, "done", "--report", str(report))
+        self.end_resume_host(dispatch, resumed["attempt"])
+        self.assertIn("current task is complete", self.resume_cli(*request, code=1, WFC_OWNER_TOKEN="owner-two"))
+        self.assertIn("already used", self.resume_cli(*request, "--task", "task2", "--report", str(report),
+                                                        code=1, WFC_OWNER_TOKEN="owner-two"))
+        self.assertIn("original report directory", self.resume_cli(*request, "--task", "task2", "--report",
+                                                                     "r2.md", code=1, WFC_OWNER_TOKEN="owner-two"))
+        later = self.resume_cli(*request, "--task", "task2", "--report", "reports/r2.md", WFC_OWNER_TOKEN="owner-two")
+        third = self.resumed_host(later["attempt"])
+        self.assertEqual((later["session"], later["round"], third["WFC_ROUND"]), (session, 2, "2"))
+        self.assertEqual(Path(third["WFC_TASK"]).name, "task2")
+        self.assertEqual(Path(third["WFC_REPORT"]).name, "r2.md")
+        row = self.resume_status(dispatch)
+        self.assertNotIn("workerCallbackHash", row)
+        self.assertEqual([(r["round"], r["state"]) for r in row["rounds"]],
+                         [(1, "failed"), (1, "completed"), (2, "running")])
+        self.assertEqual([m["messageId"] for m in row["messages"]], [question["messageId"], done["messageId"]])
+        self.assertEqual([(a["fromAttempt"], a["toAttempt"], a["ownerGeneration"]) for a in row["audit"]],
+                         [(attempt, resumed["attempt"], 2), (resumed["attempt"], later["attempt"], 2)])
+
+    def test_public_resume_records_definite_spawn_failure(self):
+        original, first = self.resume_fixture()
+        dispatch, attempt = original["dispatch"], original["attempt"]
+        session = "11111111-2222-4333-8444-555555555555"
+        self.rollout(session, first["argv"][-1])
+        self.end_resume_host(dispatch, attempt)
+        command = self.resume_settings["hosts"]["codex"]["command"]
+        self.resume_settings["hosts"]["codex"]["command"] = [str(self.work / "missing-executable")]
+        self.resume_config.write_text(json.dumps(self.resume_settings))
+        error = json.loads(self.resume_cli("resume", dispatch, code=1, WFC_OWNER_TOKEN="owner-one"))
+        self.assertEqual((error["result"], error["launchResult"], error["category"]),
+                         ("definitely-not-sent", "definitely-not-sent", "executable_missing"))
+        row = self.resume_status(dispatch)
+        self.assertNotEqual(row["attempt"], attempt)
+        self.assertEqual(row["state"], "unknown")
+        self.assertEqual(row["audit"][0]["launchResult"], "definitely-not-sent")
+        self.resume_settings["hosts"]["codex"]["command"] = command
+        self.resume_config.write_text(json.dumps(self.resume_settings))
+        resumed = self.resume_cli("resume", dispatch, WFC_OWNER_TOKEN="owner-one")
+        self.assertEqual((resumed["round"], resumed["session"]), (1, session))
+        self.assertNotIn(resumed["attempt"], (attempt, row["attempt"]))
+        self.assertEqual(self.resume_status(dispatch)["audit"][1]["fromAttempt"], row["attempt"])
+
+    def test_public_resume_rechecks_completion_before_reserving(self):
+        original, first = self.resume_fixture()
+        dispatch, attempt = original["dispatch"], original["attempt"]
+        self.rollout("11111111-2222-4333-8444-555555555555", first["argv"][-1])
+        self.end_resume_host(dispatch, attempt)
+        shim = self.work / "tmux"
+        shim.write_text(f"""#!{sys.executable}
+import os, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+if "list-panes" in args and {f'=wfc-{dispatch}:'!r} in args:
+    Path("inspecting").touch()
+    deadline = time.monotonic() + 8
+    while not Path("checked").exists() and time.monotonic() < deadline:
+        time.sleep(.025)
+os.execv({TMUX!r}, [{TMUX!r}, *args])
+""")
+        shim.chmod(0o700)
+        env = {**self.env, "PATH": str(self.work), "WFC_OWNER_TOKEN": "owner-one",
+               "WFC_STATE": str(self.state)}
+        with subprocess.Popen([WFC, "resume", dispatch], cwd=self.work, env=env,
+                              text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as resume:
+            try:
+                deadline = time.monotonic() + 5
+                while not (self.work / "inspecting").exists():
+                    self.assertLess(time.monotonic(), deadline, "resume did not reach inspection")
+                    time.sleep(.025)
+                report = Path(first["WFC_REPORT"])
+                report.write_text("done during resume")
+                done = self.resume_callback(first, "done", "--report", str(report))
+            finally:
+                (self.work / "checked").touch()
+            out, err = resume.communicate(timeout=15)
+        self.assertEqual((resume.returncode, out), (1, ""), err)
+        self.assertIn("current task is complete", err)
+        row = self.resume_status(dispatch)
+        self.assertEqual(row["attempt"], attempt)
+        self.assertFalse(row.get("audit"))
+        self.assertEqual(row["rounds"][0]["result"]["messageId"], done["messageId"])
+
+    def test_public_resume_fences_pending_and_lost_launch_responses(self):
+        for mode in ("pending", "uncertain"):
+            with self.subTest(mode=mode):
+                self.verify_resume_lost_launch(mode)
+
+    def verify_resume_lost_launch(self, mode):
+        self.state = self.root / mode
+        original, first = self.resume_fixture()
+        dispatch, attempt = original["dispatch"], original["attempt"]
+        self.rollout("11111111-2222-4333-8444-555555555555", first["argv"][-1])
+        self.end_resume_host(dispatch, attempt)
+        shim = self.work / "tmux"
+        shim.write_text(f"""#!{sys.executable}
+import os, signal, subprocess, sys
+from pathlib import Path
+args = sys.argv[1:]
+if "new-session" in args:
+    subprocess.run([{TMUX!r}, *args], check=True)
+    backend = os.getppid()
+    if {mode!r} == "pending":
+        status = Path(f"/proc/{{backend}}/status").read_text().splitlines()
+        router = int(next(line.split()[1] for line in status if line.startswith("PPid:")))
+        os.kill(router, signal.SIGKILL)
+    os.kill(backend, signal.SIGKILL)
+    sys.exit(0)
+os.execv({TMUX!r}, [{TMUX!r}, *args])
+""")
+        shim.chmod(0o700)
+        owner = {"WFC_OWNER_TOKEN": "owner-one"}
+        failed = self.resume_cli("resume", dispatch, code=None, PATH=str(self.work), **owner)
+        self.assertEqual(failed.returncode, -signal.SIGKILL if mode == "pending" else 1, failed.stderr)
+        row = self.resume_status(dispatch)
+        self.assertEqual(row["audit"][0]["result"], mode)
+        self.assertEqual(row["state"], "unknown")
+        self.assertNotEqual(row["attempt"], attempt)
+        new = self.resumed_host(row["attempt"])
+        self.assertIn("attempt is no longer accepted", self.resume_callback(first, "ask", "old", code=1))
+        if mode == "pending":
+            question = self.resume_callback(new, "ask", "new pending attempt")
+            self.assertEqual(question["state"], "unsent")
+        self.end_resume_host(dispatch, row["attempt"])
+        again = json.loads(self.resume_cli("resume", dispatch, code=1, **owner))
+        self.assertEqual((again["error"], again["audit"], again["attempt"]),
+                         ("lifecycle_reconcile_required", 1, row["attempt"]))
+        self.assertEqual(len(self.resume_status(dispatch)["audit"]), 1)
+        shim.unlink()
+
     def test_read_only_unowned_close_replays_confirmed_archive(self):
         self.assertNotEqual(os.geteuid(), 0, "read-only fixture requires an ordinary user")
         scope = "archive"

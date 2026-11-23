@@ -596,6 +596,7 @@ impl Inbox {
     fn validate_done(
         &self,
         assignment: &Assignment,
+        row: &Value,
         report: &Path,
         key: Option<&str>,
         attempt: Option<&str>,
@@ -638,9 +639,24 @@ impl Inbox {
         if let Some(prior) = prior {
             return Ok(Some(prior.receipt(true)));
         }
-        if attempt.is_none() {
+        let resume = super::assignment::resume_audit(row);
+        if let Some(event) = resume {
             ensure!(
-                !history().any(|m| (m.worker.round != worker.round
+                event["launchResult"] != "definitely-not-sent"
+                    && (event["result"] == "accepted"
+                        || (attempt.is_some() && controller::worker_callback().is_some())),
+                "attempt is no longer accepted for {}; its launch is unconfirmed",
+                worker.dispatch
+            );
+        }
+        if attempt.is_none() {
+            let reused_report = resume.is_some()
+                && row["rounds"].as_array().into_iter().flatten().any(|r| {
+                    r["attempt"] != worker.attempt
+                        && r["report"].as_str().map(Path::new) == Some(report)
+                });
+            ensure!(
+                !reused_report && !history().any(|m| (m.worker.round != worker.round
                     || m.worker.attempt != worker.attempt)
                     && m.report.as_deref() == Some(report)),
                 "ambiguous report for {}; supply --attempt",
@@ -704,8 +720,13 @@ impl Inbox {
                 && m["round"] == worker.round
                 && m["attempt"] == worker.attempt
         });
+        let pending_resume = attempt.is_some()
+            && controller::worker_callback().is_some()
+            && super::assignment::resume_audit(row).is_some_and(|event| event["result"] == "pending");
         ensure!(
-            !confirmed_done && current_round.map_or(worker.round == 1, |r| r["state"] == "running"),
+            !confirmed_done
+                && (pending_resume
+                    || current_round.map_or(worker.round == 1, |r| r["state"] == "running")),
             "attempt is no longer accepted for {dispatch}; its round is not running"
         );
         Ok(())
@@ -813,7 +834,7 @@ impl<'a> Done<'a> {
                 .map(str::to_owned)
                 .or_else(|| keyed_attempt.map(|id| format!("done:{dispatch}:{id}")));
             let receipt =
-                inbox.validate_done(&assignment, &report, key.as_deref(), self.attempt)?;
+                inbox.validate_done(&assignment, &row, &report, key.as_deref(), self.attempt)?;
             if receipt.is_none() && row["backend"] == "herdr" {
                 ensure!(
                     !super::backend::herdr_close_blocks_callback(&state, &row)?,

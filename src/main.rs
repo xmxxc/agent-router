@@ -18,6 +18,7 @@ const RESERVED_COMMANDS: &[&str] = &[
     "reply",
     "continue",
     "nudge",
+    #[cfg(not(target_os = "linux"))]
     "resume",
     #[cfg(not(target_os = "linux"))]
     "reclaim",
@@ -67,6 +68,8 @@ fn run() -> anyhow::Result<ExitCode> {
             println!("{}", workflow::worker_owner::CLOSE_USAGE);
             #[cfg(target_os = "linux")]
             println!("{}", workflow::herdr::USAGE);
+            #[cfg(target_os = "linux")]
+            println!("{}", workflow::resume::USAGE);
             println!("{DONE_USAGE}");
             println!("{ASK_USAGE}");
             println!("{WAIT_USAGE}");
@@ -214,6 +217,27 @@ fn run() -> anyhow::Result<ExitCode> {
                 };
                 controller::require_controller(name)?;
                 println!("{}", request.run()?);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        Some("resume") => {
+            use workflow::resume::{Resume, USAGE};
+            if args == ["--help"] || args == ["-h"] {
+                println!("{USAGE}");
+            } else {
+                let request = match Resume::parse(&args) {
+                    Ok(request) => request,
+                    Err(err) => {
+                        eprintln!("wfc: {err}. {USAGE}");
+                        return Ok(ExitCode::from(2));
+                    }
+                };
+                let reply = request.run()?;
+                if reply["result"] != "accepted" {
+                    eprintln!("{reply}");
+                    return Ok(ExitCode::FAILURE);
+                }
+                println!("{reply}");
             }
         }
         Some("dispatch") => {

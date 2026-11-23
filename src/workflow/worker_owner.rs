@@ -211,7 +211,22 @@ pub fn close(id: &str, explicit_token: Option<&str>) -> Result<Value> {
     let _scope_lock = controller::lock_scope(&state, scope)?;
     authorize()?;
     if hosted {
-        return super::backend::close(&state, &record);
+        let current = super::assignment::public_record(&dir, id)?
+            .context("dispatch disappeared while preparing close")?;
+        ensure!(
+            super::record_scope(&current) == Some(scope)
+                && current["round"] == record["round"]
+                && current["attempt"] == record["attempt"],
+            "dispatch changed while preparing close; inspect status and retry"
+        );
+        if let Some(event) = super::assignment::resume_audit(&current) {
+            ensure!(
+                !matches!(event["result"].as_str(), Some("pending" | "uncertain")),
+                "resume audit {} is unresolved; inspect status and reconcile before closing",
+                event["id"]
+            );
+        }
+        return super::backend::close(&state, &current);
     }
     // Older foreground records were only published after successful exit.
     let mut already_gone = true;

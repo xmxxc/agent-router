@@ -97,6 +97,44 @@ pub fn create(state: &Path, row: &Value, launch: Launch) -> Result<Value> {
     )
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn resume(state: &Path, row: &Value, launch: Launch) -> Result<Value> {
+    call(
+        state,
+        row,
+        json!({"op":"resume","executionId":row["executionId"],"cwd":row["cwd"],
+            "label":row["label"],"argv":launch.argv,"env":launch.env,"host":row["host"],
+            "probe_read_only":true}),
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn observe_for_resume(state: &Path, row: &Value) -> Result<(Value, Value)> {
+    if super::assignment::resume_audit(row)
+        .is_some_and(|event| event["launchResult"] == "definitely-not-sent")
+    {
+        // A proven spawn refusal may have no keyed worker receipt. Still
+        // require the backend to confirm the protected session slot is absent.
+        let inspection = call(state, row, json!({"op":"inspect"}))?;
+        let worker_state = if inspection["result"] == "accepted" && inspection["alive"] == false {
+            "not_started"
+        } else {
+            "unknown"
+        };
+        return Ok((json!({"state":worker_state}), inspection));
+    }
+    let (worker, inspection) = observe(state, &mut row.clone())?;
+    if inspection["alive"] == false {
+        // An archived execution can be absent while its original name is
+        // occupied. Check the slot before recording a new attempt.
+        let slot = call(state, row, json!({"op":"inspect"}))?;
+        if slot["result"] != "accepted" || slot["alive"] != false {
+            return Ok((worker, slot));
+        }
+    }
+    Ok((worker, inspection))
+}
+
 fn close_operation(row: &Value) -> Result<String> {
     let attempt = row["attempt"]
         .as_str()

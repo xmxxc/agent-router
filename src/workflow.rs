@@ -21,6 +21,8 @@ mod backend;
 #[cfg(target_os = "linux")]
 pub mod herdr;
 pub mod host;
+#[cfg(target_os = "linux")]
+pub mod resume;
 mod view;
 
 pub const DISPATCH_USAGE: &str =
@@ -230,7 +232,9 @@ impl<'a> Dispatch<'a> {
             record["host"] = json!(host.name);
             record["backend"] = json!(host.backend);
             record["model"] = json!(host.model);
+            record["effort"] = json!(host.effort);
             record["git"] = json!(host.git);
+            record["network"] = json!(host.network);
             record["tmux"] = json!(format!("wfc-{dispatch}"));
             ensure!(
                 cfg!(target_os = "linux"),
