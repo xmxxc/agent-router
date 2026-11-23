@@ -1048,7 +1048,7 @@ pub(super) fn history(state: &Path, dispatch: &str) -> Result<Vec<Value>> {
         .map(|m| {
             let mut view = m.view();
             match m.kind() {
-                MessageKind::Done | MessageKind::Question => {
+                MessageKind::Done | MessageKind::Question | MessageKind::HostRuntime => {
                     view["to"] = json!("controller");
                     view["delivered"] = json!(m.delivery.delivered());
                 }

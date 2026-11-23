@@ -734,6 +734,11 @@ while True:
             self.assertTrue(self.status()['pendingInput'])
             replies = self.reply_attempts()
             self.assertEqual([item["inputResult"] for item in replies], ["definitely-not-sent", "uncertain"])
+            for reply in replies:
+                self.assertEqual((reply["to"], reply["questionMessageId"]),
+                                 (question["message"], question["messageId"]))
+                self.assertNotIn("delivered", reply)
+                self.cli("ack", reply["messageId"], error="no controller message")
             for missing, evidence, read_state in (
                     (True, "backend_unavailable", "unavailable"),
                     (False, "read_restored", "readable")):

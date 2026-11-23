@@ -150,7 +150,14 @@ subprocess.run([sys.argv[1], 'ask', '选甲,乙？', '--options', '甲,乙',
                          ("host_runtime", "blocked", "quota"))
         for key in ("dispatch", "round", "attempt", "scope"):
             self.assertEqual(notice[key], job[key])
+        row, = self.data("status", "--dispatch", job["dispatch"])["dispatches"]
+        saved, = row["messages"]
+        for key in ("id", "messageId", "kind", "type", "dispatch", "round", "attempt", "scope", "fault"):
+            self.assertEqual(saved[key], notice[key])
+        self.assertEqual((saved["to"], saved["delivered"], saved["state"], saved["statusVersion"]),
+                         ("controller", True, "received", 3))
         ack = self.data("ack", notice["messageId"])
+        self.assertEqual((ack["message"], ack["messageId"]), (notice["id"], notice["messageId"]))
         self.assertEqual((ack["state"], ack["statusVersion"]), ("processed", 4))
         self.cli("relay", "--codex", "--scope", "failure", "--for", "1.25")
         self.assertEqual(self.calls(), [call])
