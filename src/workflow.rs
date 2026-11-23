@@ -497,8 +497,10 @@ fn status_with_history(
             record["backendAlive"] = Value::Null;
         } else if record["host"].is_string() {
             let (worker, inspection) = backend::observe(&state, record)?;
-            if let Some(effect) = inspection.get("closeEffect") {
-                record["closeEffect"] = effect.clone();
+            for field in ["closeEffect", "revocation"] {
+                if let Some(value) = inspection.get(field) {
+                    record[field] = value.clone();
+                }
             }
             record["worker"] = worker;
             record["backendResult"] = inspection["result"].clone();

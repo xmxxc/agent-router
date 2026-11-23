@@ -76,7 +76,8 @@ fn call(state: &Path, row: &Value, mut request: Value) -> Result<Value> {
             if matches!(
                 reply["result"].as_str(),
                 Some("accepted" | "refused" | "definitely-not-sent" | "uncertain")
-            ) || (request["op"] == "close" && reply["result"] == "completed") =>
+            ) || (matches!(request["op"].as_str(), Some("close" | "revoke"))
+                && reply["result"] == "completed") =>
         {
             Ok(reply)
         }
@@ -156,7 +157,7 @@ fn existing(state: &Path, row: &Value, op: &str) -> Result<Value> {
             request["legacyLaunchId"] = json!(hint);
         }
     }
-    if op == "close" {
+    if matches!(op, "close" | "revoke") {
         request["closeOperationId"] = json!(close_operation(row)?);
     }
     call(state, row, request)
@@ -304,7 +305,51 @@ fn archived_exit(saved: &Value) -> bool {
     worker["state"] == "exited" && worker["exit_code"].as_u64().is_some_and(|code| code <= 255)
 }
 
-fn confirmed(saved: &Value) -> bool {
+// A missing session does not establish whether a worker ever ran. The
+// backend supplies the fact only after winning the one-shot launch reservation.
+fn matches_revocation(row: &Value, fact: &Value) -> bool {
+    row["executionId"].is_string()
+        && row["executionId"] == row["attempt"]
+        && fact["dispatch"] == row["dispatch"]
+        && fact["executionId"] == row["executionId"]
+        && close_operation(row).is_ok_and(|op| fact["closeOperationId"] == op)
+        && fact["launchId"].as_str().is_some_and(valid_launch)
+        && fact["category"] == "not_started"
+}
+
+fn revocation(state: &Path, row: &Value, answer: &Value) -> Result<Value> {
+    ensure!(
+        matches_revocation(row, answer) && answer["closeEffect"] == "already_absent",
+        "close uncertain: cancellation does not identify this reservation"
+    );
+    let stem = answer["launchId"].as_str().context("missing launchId")?;
+    let prefix = state.canonicalize()?.join("launches").join(stem);
+    let path = Path::new(
+        answer["cancellationEvidence"]
+            .as_str()
+            .context("missing cancellation evidence")?,
+    );
+    ensure!(
+        path == prefix.with_extension("json") || path == prefix.with_extension("revoked"),
+        "unexpected cancellation evidence path"
+    );
+    let fact: Value = serde_json::from_reader(File::open(path)?)?;
+    ensure!(
+        matches_revocation(row, &fact) && fact["launchId"] == stem,
+        "close uncertain: cancellation receipt mismatch"
+    );
+    Ok(fact)
+}
+
+fn confirmed(row: &Value, saved: &Value) -> bool {
+    if saved["worker"]["state"] == "not_started" {
+        return saved["worker"] == json!({"state":"not_started"})
+            && saved["closeEffect"] == "already_absent"
+            && matches_revocation(row, &saved["revocation"])
+            && saved["closeOperationId"] == saved["revocation"]["closeOperationId"]
+            && saved["launchId"] == saved["revocation"]["launchId"]
+            && saved["executionId"] == row["attempt"];
+    }
     // R2 could archive cancellation while a server was lost. An old process
     // exit code is still evidence about the worker, not proof of session cleanup.
     match saved["closeEffect"].as_str() {
@@ -370,11 +415,13 @@ fn closed_worker(state: &Path, row: &Value, saved: &Value) -> Result<Value> {
 
 pub fn observe(state: &Path, row: &Value) -> Result<(Value, Value)> {
     let saved = archive(state, row)?.unwrap_or(Value::Null);
-    if confirmed(&saved) {
-        return Ok((
-            closed_worker(state, row, &saved)?,
-            json!({"result":"completed","alive":false,"closeEffect":saved["closeEffect"]}),
-        ));
+    if confirmed(row, &saved) {
+        let mut observation =
+            json!({"result":"completed","alive":false,"closeEffect":saved["closeEffect"]});
+        if let Some(revocation) = saved.get("revocation") {
+            observation["revocation"] = revocation.clone();
+        }
+        return Ok((closed_worker(state, row, &saved)?, observation));
     }
     let mut inspection = existing(state, row, "inspect")
         .unwrap_or_else(|e| json!({"result":"uncertain","diagnostic":e.to_string()}));
@@ -406,18 +453,18 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
     let id = row["dispatch"].as_str().context("missing dispatch")?;
     // Archived replay works on read-only state. A first close serializes on a
     // stable per-attempt file regardless of which publication the reader saw.
-    let saved = archive(state, row)?.filter(confirmed);
+    let saved = archive(state, row)?.filter(|saved| confirmed(row, saved));
     let _lock;
     let saved = if saved.is_some() {
         saved
     } else {
         _lock = super::assignment::close_lock(state, row)?;
-        archive(state, row)?.filter(confirmed)
+        archive(state, row)?.filter(|saved| confirmed(row, saved))
     };
     let mut receipt = json!({"dispatch":id,"operation":"close","result":"completed","round":row["round"],"attempt":row["attempt"]});
     if let Some(saved) = saved {
         receipt["worker"] = closed_worker(state, row, &saved)?;
-        for field in ["closeOperationId", "closeEffect"] {
+        for field in ["closeOperationId", "closeEffect", "revocation"] {
             if let Some(value) = saved.get(field) {
                 receipt[field] = value.clone();
             }
@@ -426,8 +473,15 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
         return Ok(receipt);
     }
     let (before, observed) = observe(state, row)?;
+    // After a publisher dies before startup, inspect may have no process
+    // to identify. The keyed backend close can still revoke that reservation.
+    let pending_native = (row["createPending"] == true || row["create"]["result"] == "uncertain")
+        && row["executionId"].is_string()
+        && row["executionId"] == row["attempt"]
+        && receipt_id(row)?.is_none();
+    let recovery = pending_native && observed["result"] == "uncertain";
     ensure!(
-        observed["result"] == "accepted",
+        observed["result"] == "accepted" || recovery,
         "backend inspection {}: {}",
         observed["result"],
         observed["diagnostic"]
@@ -439,7 +493,9 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
         );
     }
     let launch = inspect_launch(state, row, &observed)?;
-    let answer = existing(state, row, "close")?;
+    // An older backend must reject this verb instead of falling through to
+    // a normal close if the worker starts or the original socket returns.
+    let answer = existing(state, row, if recovery { "revoke" } else { "close" })?;
     ensure!(
         answer["result"] == "completed",
         "close {}: {}",
@@ -448,7 +504,22 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
     );
     // Only the service performing the guarded close knows whether it killed
     // a live session. Its observation can be later than our last inspection.
+    let cancellation = if answer["category"] == "not_started" {
+        let fact = revocation(state, row, &answer)?;
+        ensure!(
+            before["state"] == "unknown" && launch.is_none_or(|id| fact["launchId"] == id),
+            "close uncertain: conflicting worker evidence"
+        );
+        Some(fact)
+    } else {
+        ensure!(
+            !recovery,
+            "close uncertain: missing verified reservation cancellation"
+        );
+        None
+    };
     let worker = match answer["closeEffect"].as_str() {
+        Some("already_absent") if cancellation.is_some() => json!({"state":"not_started"}),
         Some("already_absent" | "worker_exited") => {
             if before["state"] == "exited" {
                 before
@@ -471,8 +542,13 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
     }
     receipt["closeEffect"] = answer["closeEffect"].clone();
     receipt["worker"] = worker.clone();
-    let snapshot = json!({"launchId":launch, "executionId":row["executionId"], "legacyExecutionId":observed["legacyExecutionId"], "closeOperationId":answer["closeOperationId"], "dispatch":id,"round":row["round"],"attempt":row["attempt"],
+    let mut snapshot = json!({"launchId":launch, "executionId":row["executionId"], "legacyExecutionId":observed["legacyExecutionId"], "closeOperationId":answer["closeOperationId"], "dispatch":id,"round":row["round"],"attempt":row["attempt"],
         "worker":worker,"closeEffect":answer["closeEffect"]});
+    if let Some(fact) = cancellation {
+        snapshot["launchId"] = fact["launchId"].clone();
+        snapshot["revocation"] = fact.clone();
+        receipt["revocation"] = fact;
+    }
     let path = closed_path(state, row)?;
     write_json(&path, &snapshot, None)?;
     Ok(receipt)
@@ -481,6 +557,35 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_requires_the_original_keyed_receipt() -> Result<()> {
+        let attempt = "a-123456789abc";
+        let launch = "0123456789abcdef0123456789abcdef";
+        let row =
+            json!({"dispatch":"d-12345678","attempt":attempt,"executionId":attempt,"round":1});
+        let fact = json!({"category":"not_started","dispatch":row["dispatch"],"executionId":attempt,
+            "closeOperationId":close_operation(&row)?,"launchId":launch});
+        let mut saved = json!({"closeEffect":"already_absent","executionId":attempt,
+            "closeOperationId":fact["closeOperationId"],"launchId":launch,"worker":{"state":"not_started"}});
+        assert!(!confirmed(&row, &saved));
+        saved["revocation"] = fact;
+        assert!(confirmed(&row, &saved));
+        for name in [
+            "executionId",
+            "dispatch",
+            "launchId",
+            "category",
+            "closeOperationId",
+        ] {
+            let mut other = saved.clone();
+            other["revocation"][name] = json!("mismatch");
+            assert!(!confirmed(&row, &other));
+        }
+        saved["worker"]["exit_code"] = json!(0);
+        assert!(!confirmed(&row, &saved));
+        Ok(())
+    }
 
     #[test]
     fn recovered_launch_requires_the_registered_attempt_and_receipt_path() -> Result<()> {
