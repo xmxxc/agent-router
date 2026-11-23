@@ -80,7 +80,9 @@ fn worker_receives_context_and_a_fresh_cli_finds_the_same_dispatch() {
     let status = run(f
         .wfc()
         .args(["status", "--dispatch", record["dispatch"].as_str().unwrap()]));
-    assert_eq!(status["dispatches"], json!([record]));
+    let mut expected = record.clone();
+    expected["messages"] = json!([]);
+    assert_eq!(status["dispatches"], json!([expected]));
 }
 
 #[test]
@@ -119,7 +121,9 @@ while not (Path('..') / sys.argv[1] / 'ready').exists():
         assert!(rows.contains(&record));
         let id = record["dispatch"].as_str().unwrap();
         let one = run(f.wfc().args(["status", "--dispatch", id]));
-        assert_eq!(one["dispatches"], json!([record]));
+        let mut expected = record.clone();
+        expected["messages"] = json!([]);
+        assert_eq!(one["dispatches"], json!([expected]));
         let receipt: Value =
             serde_json::from_slice(&fs::read(f.0.join(dir).join("receipt.json")).unwrap()).unwrap();
         assert_eq!(receipt["dispatch"], id);
@@ -212,6 +216,14 @@ assert first["state"] == "unsent" and not first["duplicate"]
     assert_eq!(message["id"], receipt["message"]);
     assert_eq!(message["state"], "received");
     assert_eq!(message["statusVersion"], 2);
+    let history = run(f
+        .wfc()
+        .args(["status", "--dispatch", record["dispatch"].as_str().unwrap()]));
+    let stored = &history["dispatches"][0]["messages"][0];
+    for (key, value) in message.as_object().unwrap() {
+        assert_eq!(stored[key], *value);
+    }
+    assert_eq!(stored["delivered"], true);
     let timeout = f.wfc().args(["wait", "--timeout", "0"]).output().unwrap();
     assert_eq!(timeout.status.code(), Some(3));
     assert_eq!(
@@ -286,6 +298,16 @@ fn invalid_callbacks_leave_the_queue_empty_and_parallel_retries_share_one_receip
     assert_eq!(replay["state"], "received");
     assert_eq!(replay["statusVersion"], 2);
     assert_eq!(replay["messageId"], a["messageId"]);
+}
+
+#[test]
+fn controller_receipts_survive_restarts_and_concurrent_confirmation() {
+    let status = Command::new(PYTHON)
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/receipts.py"))
+        .arg(env!("CARGO_BIN_EXE_wfc"))
+        .status()
+        .unwrap();
+    assert!(status.success());
 }
 
 #[test]

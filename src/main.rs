@@ -5,10 +5,10 @@ use std::env;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::ExitCode;
-use workflow::messages::{Done, Wait, DONE_USAGE, WAIT_USAGE};
+use workflow::messages::{Confirm, Done, Wait, ACK_USAGE, DONE_USAGE, RESOLVE_USAGE, WAIT_USAGE};
 
 const RESERVED_COMMANDS: &[&str] = &[
-    "ask", "reply", "continue", "nudge", "resume", "reclaim", "relay", "ack",
+    "ask", "reply", "continue", "nudge", "resume", "reclaim", "relay",
 ];
 
 fn main() -> anyhow::Result<ExitCode> {
@@ -35,6 +35,8 @@ fn main() -> anyhow::Result<ExitCode> {
             println!("{}", workflow::STATUS_USAGE);
             println!("{DONE_USAGE}");
             println!("{WAIT_USAGE}");
+            println!("{ACK_USAGE}");
+            println!("{RESOLVE_USAGE}");
             println!(
                 "Workflow commands reserved for later builds: {}",
                 RESERVED_COMMANDS.join(", ")
@@ -52,14 +54,17 @@ fn main() -> anyhow::Result<ExitCode> {
             );
         }
         Some("--kernel") if args.is_empty() => kernel::run()?,
-        Some(name @ ("dispatch" | "status" | "done" | "wait"))
-            if args == ["--help"] || (matches!(name, "done" | "wait") && args == ["-h"]) =>
+        Some(name @ ("dispatch" | "status" | "done" | "wait" | "ack" | "resolve"))
+            if args == ["--help"]
+                || (matches!(name, "done" | "wait" | "ack" | "resolve") && args == ["-h"]) =>
         {
             let usage = match name {
                 "dispatch" => workflow::DISPATCH_USAGE,
                 "status" => workflow::STATUS_USAGE,
                 "done" => DONE_USAGE,
-                _ => WAIT_USAGE,
+                "wait" => WAIT_USAGE,
+                "ack" => ACK_USAGE,
+                _ => RESOLVE_USAGE,
             };
             println!("{usage}");
         }
@@ -89,6 +94,21 @@ fn main() -> anyhow::Result<ExitCode> {
                 Ok(request) => request,
                 Err(err) => {
                     eprintln!("wfc: {err}. {DONE_USAGE}");
+                    return Ok(ExitCode::from(2));
+                }
+            };
+            println!("{}", request.run()?);
+        }
+        Some(name @ ("ack" | "resolve")) => {
+            let request = match Confirm::parse(name, &args) {
+                Ok(request) => request,
+                Err(err) => {
+                    let usage = if name == "ack" {
+                        ACK_USAGE
+                    } else {
+                        RESOLVE_USAGE
+                    };
+                    eprintln!("wfc: {err}. {usage}");
                     return Ok(ExitCode::from(2));
                 }
             };

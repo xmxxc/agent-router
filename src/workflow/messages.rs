@@ -1,9 +1,14 @@
 //! A worker can retry a keyed completion. A controller claims a batch
 //! before printing it, so another waiter cannot deliver the same messages.
+mod receipt;
+pub use receipt::{Confirm, ACK_USAGE, RESOLVE_USAGE};
+use receipt::{Delivery, Resolution, State};
+
 use super::{git_snapshot::Snapshot, resolve_report_path, state_dir, valid_id};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -18,20 +23,35 @@ pub const WAIT_USAGE: &str = "wfc wait [--timeout SECONDS] [--scope NAME] [--dis
 fn options<'a, const N: usize>(
     args: &'a [OsString],
     names: [&str; N],
+    mut positional: Option<&mut Option<&'a str>>,
 ) -> Result<[Option<&'a str>; N]> {
     let mut values = [None; N];
-    for pair in args.chunks(2) {
-        let [flag, value] = pair else {
-            anyhow::bail!("option requires a value");
-        };
+    let mut tokens = args.iter();
+    while let Some(token) = tokens.next() {
+        let flag = token.to_str().context("expected UTF-8 argument")?;
+        if let Some(slot) = positional.as_deref_mut() {
+            if !flag.starts_with('-') {
+                ensure!(
+                    !flag.is_empty() && slot.replace(flag).is_none(),
+                    "expected one message id"
+                );
+                continue;
+            }
+        }
         let index = names
             .iter()
-            .position(|name| flag == name)
+            .position(|name| flag == *name)
             .with_context(|| format!("unknown option {flag:?}"))?;
-        let value = value
+        let value = tokens
+            .next()
+            .context("option requires a value")?
             .to_str()
-            .filter(|v| !v.is_empty())
-            .context("expected a nonempty UTF-8 value")?;
+            .context("expected UTF-8 option value")?;
+        ensure!(!value.is_empty() || flag == "--body", "empty option value");
+        ensure!(
+            positional.is_none() || !value.starts_with("--"),
+            "option requires a value"
+        );
         ensure!(
             values[index].replace(value).is_none(),
             "duplicate option {flag:?}"
@@ -113,34 +133,136 @@ struct Completion {
     worker: Identity,
     report: PathBuf,
     request_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body_hash: Option<String>,
     #[serde(flatten)]
-    snapshot: Snapshot,
-    received: bool,
+    delivery: Delivery,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolution: Option<Resolution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<String>,
+    // Keep additive fields when rewriting a receipt from a newer publisher.
+    #[serde(flatten)]
+    additional_fields: Map<String, Value>,
+}
+
+fn body_hash(body: &str) -> String {
+    format!("{:x}", Sha256::digest(body.as_bytes()))
+}
+
+fn canonical_body(body: Map<String, Value>) -> String {
+    // Python #40 uses sorted keys, UTF-8, and a space after each separator.
+    // All done payload fields are scalar. Map iterates in sorted key order.
+    let fields: Vec<_> = body
+        .into_iter()
+        .map(|(key, value)| format!("{}: {value}", json!(key)))
+        .collect();
+    format!("{{{}}}", fields.join(", "))
 }
 
 impl Completion {
-    fn delivery(&self) -> (&'static str, u8) {
-        if self.received {
-            ("received", 2)
-        } else {
-            ("unsent", 1)
+    fn original_body(&self) -> Map<String, Value> {
+        Map::from_iter([
+            ("attempt".into(), json!(self.worker.attempt)),
+            ("report".into(), json!(self.report)),
+            ("role".into(), json!(self.worker.role)),
+            ("round".into(), json!(self.worker.round)),
+        ])
+    }
+
+    fn body(&self) -> Map<String, Value> {
+        let mut body = self.original_body();
+        for key in ["head", "dirty"] {
+            if let Some(value) = self.additional_fields.get(key) {
+                body.insert(key.into(), value.clone());
+            }
         }
+        // The scope-aware publisher uses the dispatch ID for older rows
+        // without a scope when it writes their (possibly null) Git snapshot.
+        if self.worker.scope.is_some() || body.contains_key("head") {
+            body.insert("scope".into(), json!(self.worker.scope()));
+        }
+        body
+    }
+
+    fn computed_hash(&self) -> String {
+        body_hash(&canonical_body(self.body()))
+    }
+
+    fn matches_hash(&self, hash: &str) -> bool {
+        self.body_hash
+            .as_deref()
+            .is_none_or(|stored| stored == hash)
+            && self.computed_hash() == hash
+    }
+
+    fn could_survive_legacy_write(&self) -> bool {
+        // The four-field publisher read the whole inbox, requiring a string
+        // request key on every row. Its rewrite dropped newer fields. Only
+        // publication-time values count: later claims can bind a digest or
+        // add null Git fields even on a genuine legacy row.
+        self.request_key.is_some()
+            && self.worker.scope.is_none()
+            && self.created_at.is_none()
+            && self
+                .additional_fields
+                .get("head")
+                .is_none_or(Value::is_null)
+            && self
+                .additional_fields
+                .get("dirty")
+                .is_none_or(Value::is_null)
+    }
+
+    fn matches_ack_body(&self, body: &str, earlier: &[Self]) -> bool {
+        if self.matches_hash(&body_hash(body)) {
+            return true;
+        }
+        // A pre-scope message could already have been received when a later
+        // publisher rewrote the inbox, adding the two null Git fields. That
+        // row is indistinguishable from one claimed after the rewrite. The
+        // original publisher accepted only one completion per dispatch and
+        // attempt, and its write had to preserve the preceding publications.
+        self.body_hash.is_none()
+            && self.could_survive_legacy_write()
+            && self.additional_fields.contains_key("head")
+            && self.additional_fields.contains_key("dirty")
+            && body == canonical_body(self.original_body())
+            && earlier.iter().all(|m| {
+                m.could_survive_legacy_write()
+                    && (m.worker.dispatch != self.worker.dispatch
+                        || m.worker.attempt != self.worker.attempt)
+            })
     }
 
     fn receipt(&self, duplicate: bool) -> Value {
-        let (state, version) = self.delivery();
-        json!({"message": self.id, "messageId": self.message_id, "state": state,
-            "statusVersion": version, "duplicate": duplicate, "scope": self.worker.scope()})
+        let mut receipt = json!({"message": self.id, "messageId": self.message_id, "state": self.delivery.state,
+            "statusVersion": self.delivery.status_version, "duplicate": duplicate, "scope": self.worker.scope()});
+        if let Some(resolution) = &self.resolution {
+            receipt["resolution"] = json!(resolution);
+        }
+        receipt
     }
 
-    fn receive(&mut self) -> Value {
-        self.received = true;
-        let (state, version) = self.delivery();
-        json!({"id": self.id, "messageId": self.message_id, "dispatch": self.worker.dispatch,
-            "type": "done", "state": state, "statusVersion": version,
-            "scope": self.worker.scope(), "head": self.snapshot.head, "dirty": self.snapshot.dirty,
-            "report": self.report, "role": self.worker.role, "round": self.worker.round,
-            "attempt": self.worker.attempt})
+    fn view(&self) -> Value {
+        let mut view = self.body();
+        view.extend([
+            ("id".into(), json!(self.id)),
+            ("messageId".into(), json!(self.message_id)),
+            ("dispatch".into(), json!(self.worker.dispatch)),
+            ("type".into(), json!("done")),
+            ("state".into(), json!(self.delivery.state)),
+            ("statusVersion".into(), json!(self.delivery.status_version)),
+        ]);
+        Value::Object(view)
+    }
+
+    fn receive(&mut self) -> Result<Value> {
+        self.delivery.advance(State::Received)?;
+        if self.body_hash.is_none() {
+            self.body_hash = Some(self.computed_hash());
+        }
+        Ok(self.view())
     }
 }
 
@@ -168,15 +290,41 @@ fn lock_file(dir: &Path) -> Result<File> {
 }
 
 impl Inbox {
-    fn read_locked(dir: &Path, lock: File) -> Result<Self> {
+    fn snapshot(dir: &Path) -> Result<Vec<Completion>> {
         let path = dir.join("messages.json");
-        let messages = match File::open(&path) {
+        match File::open(&path) {
             Ok(file) => {
-                serde_json::from_reader(BufReader::new(file)).context("read controller messages")?
+                let mut messages: Vec<Completion> = serde_json::from_reader(BufReader::new(file))
+                    .context("read controller messages")?;
+                // The first scoped wait on an unclaimed pre-snapshot completion
+                // supplies an unknown Git snapshot. Preserve an already bound
+                // body (including the earlier four-field form) byte for byte.
+                for m in &mut messages {
+                    if m.delivery.legacy_unclaimed
+                        && m.body_hash.is_none()
+                        && m.worker.scope.is_none()
+                        && !m.additional_fields.contains_key("head")
+                        && !m.additional_fields.contains_key("dirty")
+                    {
+                        m.additional_fields.insert("head".into(), Value::Null);
+                        m.additional_fields.insert("dirty".into(), Value::Null);
+                    }
+                }
+                Ok(messages)
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e.into()),
-        };
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn open(dir: &Path) -> Result<Self> {
+        let lock = lock_file(dir)?;
+        lock.lock().context("lock controller messages")?;
+        Self::read_locked(dir, lock)
+    }
+
+    fn read_locked(dir: &Path, lock: File) -> Result<Self> {
+        let messages = Self::snapshot(dir)?;
         Ok(Self {
             dir: dir.to_owned(),
             messages,
@@ -266,10 +414,33 @@ impl Inbox {
         writer.get_ref().sync_all()?;
         drop(writer);
         fs::rename(tmp, self.dir.join("messages.json"))?;
+        self.sync_directory()
+    }
+
+    fn sync_directory(&self) -> Result<()> {
         #[cfg(unix)]
         File::open(&self.dir)?.sync_all()?;
         Ok(())
     }
+}
+
+// Writers publish complete snapshots by rename. A status reader can open
+// either generation without taking a lock or touching the state directory.
+pub(super) fn history(state: &Path, dispatch: &str) -> Result<Vec<Value>> {
+    Ok(Inbox::snapshot(state)?
+        .into_iter()
+        .filter(|m| m.worker.dispatch == dispatch)
+        .map(|m| {
+            let mut view = m.view();
+            view["to"] = json!("controller");
+            view["delivered"] = json!(m.delivery.delivered());
+            view["at"] = json!(m.created_at);
+            if let Some(resolution) = &m.resolution {
+                view["resolution"] = json!(resolution);
+            }
+            view
+        })
+        .collect())
 }
 
 pub struct Done<'a> {
@@ -280,7 +451,8 @@ pub struct Done<'a> {
 
 impl<'a> Done<'a> {
     pub fn parse(args: &'a [OsString]) -> Result<Self> {
-        let [report, attempt, key] = options(args, ["--report", "--attempt", "--message-id"])?;
+        let [report, attempt, key] =
+            options(args, ["--report", "--attempt", "--message-id"], None)?;
         Ok(Self {
             report: Path::new(report.context("missing --report")?),
             attempt,
@@ -299,8 +471,7 @@ impl<'a> Done<'a> {
             .context("run done inside a dispatched worker (WFC_DISPATCH)")?;
         ensure!(valid_id(&dispatch), "invalid dispatch ID");
         let check = || {
-            let lock = lock_file(&state)?;
-            lock.lock().context("lock controller messages")?;
+            let inbox = Inbox::open(&state)?;
             let assignment = Assignment::current(&state, &dispatch, self.attempt)?;
             // R1 dispatches had neither field and derived the default key from
             // the worker's launch environment. Assignment::current checked it.
@@ -315,7 +486,6 @@ impl<'a> Done<'a> {
                 .key
                 .map(str::to_owned)
                 .or_else(|| keyed_attempt.map(|id| format!("done:{dispatch}:{id}")));
-            let inbox = Inbox::read_locked(&state, lock)?;
             let receipt =
                 inbox.validate_done(&assignment, &report, key.as_deref(), self.attempt)?;
             Ok::<_, anyhow::Error>((assignment, inbox, receipt, key))
@@ -338,15 +508,22 @@ impl<'a> Done<'a> {
         if let Some(receipt) = duplicate {
             return Ok(receipt);
         }
-        let message = Completion {
+        let mut message = Completion {
             id: inbox.messages.len() as u64 + 1,
             message_id: format!("m-{}", Uuid::new_v4().simple()),
             worker: current.worker,
-            snapshot,
             report,
             request_key: key,
-            received: false,
+            body_hash: None,
+            delivery: Delivery::unsent(),
+            resolution: None,
+            created_at: Some(receipt::timestamp()),
+            additional_fields: Map::from_iter([
+                ("head".into(), json!(snapshot.head)),
+                ("dirty".into(), json!(snapshot.dirty)),
+            ]),
         };
+        message.body_hash = Some(message.computed_hash());
         let receipt = message.receipt(false);
         inbox.messages.push(message);
         inbox.save().context("publish completion")?;
@@ -362,7 +539,8 @@ pub struct Wait<'a> {
 
 impl<'a> Wait<'a> {
     pub fn parse(args: &'a [OsString]) -> Result<Self> {
-        let [timeout, dispatch, scope] = options(args, ["--timeout", "--dispatch", "--scope"])?;
+        let [timeout, dispatch, scope] =
+            options(args, ["--timeout", "--dispatch", "--scope"], None)?;
         let seconds: f64 = timeout
             .unwrap_or("3600")
             .parse()
@@ -389,12 +567,12 @@ impl<'a> Wait<'a> {
             .messages
             .iter_mut()
             .filter(|m| {
-                !m.received
+                m.delivery.state == State::Unsent
                     && self.dispatch.is_none_or(|id| id == m.worker.dispatch)
                     && self.scope.is_none_or(|scope| scope == m.worker.scope())
             })
             .map(Completion::receive)
-            .collect();
+            .collect::<Result<_>>()?;
         if !batch.is_empty() {
             inbox.save().context("claim controller messages")?;
         }

@@ -68,6 +68,21 @@ wfc wait --scope team-a --timeout 30
 
 `wait` 默认等待 3600 秒，`--timeout` 接受小数秒，设为 0 可立即查询。它按提交顺序返回 `messages`，包含派发、轮次、attempt、角色、scope、报告路径、Git 快照、数字编号 `id` 和 `messageId`。可按 `--scope NAME`、`--dispatch ID` 或两者共同筛选。首次提交为 `unsent`（版本 1），领取为 `received`（版本 2）。消息在输出前标记为已收取，其他等待者可领取剩余消息。超时返回 `{"messages":[],"timedOut":true}`，退出码为 3。
 
+总控重启后，运行 `wfc status --dispatch ID`，从 `dispatches[0].messages` 找回原消息。历史按提交顺序排列，查询不会改变回执。处理完报告后，用消息的数字编号或稳定编号运行 `wfc ack MESSAGE`。回执变为 `processed`，版本增加一次。并发确认时只有一个调用实际推进状态，其余调用和稍后的重试返回同一版本，并标记 `duplicate: true`。
+
+外部投递结果为 `unknown` 时，先核实对方确已收到，再用下面的命令记录证据。
+
+```sh
+wfc resolve MESSAGE --actor reviewer --reason "核对外部送达记录" \
+  --evidence "外部回执编号" --body-hash SHA256
+```
+
+`--source` 默认为 `operator`。成功裁决后状态为 `received`，之后仍可单独 `ack`。同一声明可重试，改动证据或哈希会报冲突。`--body-hash` 是消息正文的 SHA-256。当前完成消息的正文字段为 `attempt`、`report`、`role`、`round`，带 `scope`、`head`、`dirty` 的快照还要保留这些字段及其原值。按键排序，以 UTF-8 编码 JSON，在冒号和逗号后各留一个空格，相当于 Python 的 `json.dumps(body, ensure_ascii=False, sort_keys=True).encode("utf-8")`。如需确认处理的是同一份正文，`ack --body BODY` 接受这段 JSON 原文。
+
+本版首次领取缺少正文哈希的旧消息时，会将实际交付正文的 SHA-256 和 `received` 状态一起保存。升级前已领取的旧消息可能在后来写入收件箱时被补上两个值为 null 的 Git 字段。同一派发、同一 attempt 的第一条记录若带有请求键，缺少创建时间、显式 scope 和正文哈希，且两个 Git 字段均为 null，`ack --body` 也接受旧版领取时的四字段原文。判断时还会查看整份收件箱中排在它之前的记录。旧程序追加回报时需要读写整个收件箱；较早记录中的空请求键会使它读取失败，而保留至今的显式 scope、非空 Git 快照或创建时间也能排除旧程序曾在其后写入。其他派发的普通旧记录可以排在它前面。
+
+提供正文的 `ack --body` 和提供摘要的 `resolve --body-hash` 都核对当前记录的正文；若记录已有正文哈希，还会核对已存哈希。省略正文的 `ack MESSAGE` 按消息编号和交付状态确认。在 Unix 上，确认或裁决因目录同步失败而报错时，可重试同一命令。重试会补做同步，并保留已有版本与裁决证据。
+
 Rust 默认使用用户主目录下的 `.local/state/agent-router`，可用 `WFC_STATE` 指定独立状态目录。帮助、版本和内核入口都不会读写调度状态。与 Python 版并排使用时，把两份 `wfc` 放在不同目录，分别使用显式路径，并为每次调用指定各自的 `WFC_STATE`。
 
 启动 `wfc --kernel` 会收到一行 JSON 握手，其中含协议版本 1 和本次启动的 generation。保持标准输入打开，每行发送一个 JSON 请求。spawn 返回 nonce，后续 read、input、resize 和 close 使用同一个 unit、generation 和 nonce。关闭标准输入会结束内核。smoke 启动真实子进程，等待它就绪，调整窗口，输入随机文本并核对它回写的反转文本。
