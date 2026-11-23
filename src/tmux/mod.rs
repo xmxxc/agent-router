@@ -704,7 +704,7 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
             error
         });
     if inspect && result["result"] == "accepted" {
-        if let Some(execution) = &request.execution_id {
+        let launch = if let Some(execution) = &request.execution_id {
             let id = backend
                 .legacy_execution_id
                 .expect("resolved execution selector");
@@ -712,6 +712,20 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
                 return Ok(e);
             }
             result["executionId"] = json!(execution);
+            Some(id.to_owned())
+        } else if let Some(execution) = &request.legacy_execution_id {
+            match backend.observed_launch(execution) {
+                Ok(Some(id)) => {
+                    result["legacyExecutionId"] = json!(execution);
+                    Some(id)
+                }
+                Ok(None) => None,
+                Err(e) => return Ok(e),
+            }
+        } else {
+            None
+        };
+        if let Some(id) = launch {
             result["launchId"] = json!(id);
             result["receipt"] = json!(state.join("launches").join(format!("{id}.json")));
         }

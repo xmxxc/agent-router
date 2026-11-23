@@ -458,7 +458,7 @@ impl Tmux<'_> {
         self.receipt_worker(&id)
     }
 
-    fn receipt_worker(&self, id: &str) -> Reply<Worker> {
+    pub(super) fn receipt_worker(&self, id: &str) -> Reply<Worker> {
         let path = self.state.join("launches").join(format!("{id}.json"));
         let receipt = super::launch::read_receipt(&path).unwrap_or_default();
         match (receipt["category"].as_str(), receipt["exitCode"].as_u64()) {

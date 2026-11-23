@@ -27,6 +27,8 @@ pub(super) enum CloseOperation {
 #[derive(Default, Deserialize, Serialize)]
 struct Registry {
     launches: BTreeMap<String, String>,
+    #[serde(default)]
+    legacy_launches: BTreeMap<String, String>,
     closed: BTreeSet<String>,
     close_operations: BTreeMap<String, BTreeMap<String, CloseOperation>>,
 }
@@ -72,6 +74,22 @@ impl Tmux<'_> {
             .filter(|id| valid_launch_id(id) && registry.closed.contains(*id))
             .cloned()
             .ok_or_else(unknown)
+    }
+
+    pub(super) fn observed_launch(&self, execution: &str) -> Reply<Option<String>> {
+        let launch = match self.claim()? {
+            Some(Claim::Observed {
+                execution: Some(active),
+                receipt,
+                ..
+            }) if active == execution => receipt,
+            _ => self.registry()?.legacy_launches.get(execution).cloned(),
+        };
+        Ok(launch.filter(|id| {
+            valid_launch_id(id)
+                && self.legacy_launch_id.is_none_or(|hint| hint == id)
+                && self.receipt_worker(id).is_ok()
+        }))
     }
 
     pub(super) fn previous_close(
@@ -122,9 +140,22 @@ impl Tmux<'_> {
         let mut registry = self.registry()?;
         let before = registry.closed.len();
         registry.closed.insert(id.to_owned());
-        if let Claim::Observed { token, receipt, .. } = claim {
+        if let Claim::Observed {
+            token,
+            receipt,
+            execution,
+            ..
+        } = claim
+        {
             registry.closed.insert(token.clone());
             registry.closed.extend(receipt.iter().cloned());
+            if let (Some(execution), Some(launch)) = (execution, receipt) {
+                registry
+                    .legacy_launches
+                    .insert(execution.clone(), launch.clone());
+                // Persist the association even when a prior release already archived the IDs.
+                return self.save_registry(&registry);
+            }
         }
         let archived_assignment = if let Claim::Registered { id, execution } = claim {
             registry

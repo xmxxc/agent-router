@@ -901,6 +901,52 @@ os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
         self.assertEqual(self.call("close", legacyExecutionId=receipt.stem)["closeEffect"], "already_absent")
         self.assertTrue(self.call("inspect")["owned"])
 
+    @unittest.skipUnless(LEGACY_WFC, "set WFC_TEST_R1_BINARY to the R1 executable for the upgrade test")
+    def test_legacy_inspect_replays_verified_receipt(self):
+        trigger, receipt = self.gated_exit(binary=LEGACY_WFC)
+        sibling = self.call("create", binary=LEGACY_WFC, dispatch="d-sibling", **self.launch)
+        self.assertEqual(sibling["result"], "accepted")
+        other_receipt = Path(sibling["receipt"])
+        # A real receipt from the same state cannot identify a different worker.
+        wrong = self.call("inspect", dispatch="d-sibling", legacyExecutionId="old-B",
+                          legacyLaunchId=receipt.stem, receipt=str(receipt))
+        self.assertNotIn("launchId", wrong)
+        self.assertNotIn("receipt", wrong)
+        args = dict(legacyExecutionId="old-A")
+        original = self.active_pane()
+
+        def check_association(reply):
+            self.assertEqual(reply["result"], "accepted", reply)
+            self.assertEqual((reply.get("legacyExecutionId"), reply.get("launchId"), reply.get("receipt")),
+                             ("old-A", receipt.stem, str(receipt)))
+
+        check_association(self.call("inspect", **args, legacyWorkerPane=original))
+        check_association(self.call("inspect", **args))
+        subprocess.run(self.tmux + ["new-window", "-t", "=wfc-d-abc12345:", "/bin/cat"], check=True, env=self.env)
+        trigger.touch()
+        deadline = time.monotonic() + 5
+        while json.loads(receipt.read_bytes()).get("exitCode") != 37 or original in subprocess.check_output(
+                self.tmux + ["list-panes", "-a", "-F", "#{pane_id}"], env=self.env, text=True).splitlines():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.02)
+        check_association(self.call("inspect", **args))
+        self.assertEqual(self.call("close", **args)["closeEffect"], "worker_exited")
+        self.assertEqual(self.call("create", executionId="new-A", **self.launch)["result"], "accepted")
+        replay = self.call("inspect", **args)
+        self.assertFalse(replay["alive"])
+        check_association(replay)
+        self.assertEqual(json.loads(Path(replay["receipt"]).read_bytes())["exitCode"], 37)
+        spoof = self.call("inspect", **args, legacyLaunchId=other_receipt.stem, receipt=str(other_receipt))
+        self.assertNotEqual(spoof.get("receipt"), str(other_receipt))
+        saved = receipt.read_bytes()
+        receipt.unlink()
+        missing = self.call("inspect", **args, receipt=str(other_receipt))
+        self.assertNotIn("receipt", missing)
+        self.assertNotIn("launchId", missing)
+        receipt.write_bytes(saved)
+        check_association(self.call("inspect", **args))
+        self.assertTrue(self.call("inspect", executionId="new-A")["owned"])
+
     def test_lost_create_recovers_only_the_registered_execution(self):
         trigger = self.root / "exit-41"
         launch = {**self.launch, "argv": [sys.executable, "-c",
@@ -969,7 +1015,9 @@ os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
         self.assertTrue(self.call("inspect", executionId="attempt-B")["owned"])
 
     def test_lifecycle(self):
-        launched = self.call("create", **self.launch)
+        # Keep the worker alive across Ctrl-C so close tests the active-session path.
+        argv = ["/bin/sh", "-c", "trap '' INT; exec /bin/cat"]
+        launched = self.call("create", **{**self.launch, "argv": argv})
         self.assertEqual(launched["result"], "accepted", launched)
         seen = self.call("inspect", backend="tmux")
         self.assertTrue(seen["owned"] and seen["alive"])
