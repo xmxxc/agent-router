@@ -35,12 +35,13 @@ run_group() {
 
 case "${1:-}" in
     combination)
-        run_group runtime-tmux 5 python3 -Bu tests/relay.py "$binary" -v \
+        run_group runtime-tmux 6 python3 -Bu tests/relay.py "$binary" -v \
             Relay.test_tmux_bound_absence_is_reported_and_recovers \
             Relay.test_unverified_tmux_timeout_and_abandoned_relay \
             Relay.test_codex_unicode_appended_activity \
             Relay.test_runtime_scope_takeover_fences_the_inflight_read \
-            Relay.test_runtime_notice_through_the_private_queue
+            Relay.test_runtime_notice_through_the_private_queue \
+            Relay.test_timer_redraw_does_not_delay_stall
         # Import the fixture so unittest receives the method selectors.
         run_group owner 2 env PYTHONPATH=tests python3 -Bu -c '
 import unittest
@@ -54,18 +55,23 @@ unittest.main(module=owner)
             Backend.test_public_reclaim_requires_sticky_ownership \
             Backend.test_public_reclaim_stops_on_scope_authority_loss \
             Backend.test_public_reclaim_rechecks_selected_execution_under_scope_lock
-        run_group resume 2 bash "$fixtures/verify-resume.sh" "$binary" -v \
+        run_group resume 3 bash "$fixtures/verify-resume.sh" "$binary" -v \
             Backend.test_public_resume_preserves_conversation_rounds_and_callback_fences \
-            Backend.test_public_resume_after_reclaim_preserves_history
+            Backend.test_public_resume_after_reclaim_preserves_history \
+            Backend.test_runtime_deadline_restarts_for_each_resumed_attempt
+        run_group reply-tmux 2 python3 -Bu tools/check_tmux.py "$binary" -v \
+            Backend.test_public_reply_requires_confirmed_tmux_chat_composer \
+            Backend.test_public_reply_keeps_claim_when_tmux_draft_reappears
         run_group relay-opencode 2 python3 -Bu tests/opencode_relay.py "$binary" -v \
             OpenCodeRelay.test_runtime_notice_preserves_the_explicit_opencode_target \
             OpenCodeRelay.test_204_detached_preserves_batch_order_scope_and_session
         ;;
     herdr)
         test -x "${HERDR_BIN:?verified Herdr binary required}"
-        run_group runtime-herdr 2 python3 -Bu tests/herdr_public.py "$HERDR_BIN" "$binary" -v \
+        run_group runtime-herdr 3 python3 -Bu tests/herdr_public.py "$HERDR_BIN" "$binary" -v \
             PublicLifecycle.test_runtime_read_evidence_and_independent_recovery \
-            PublicLifecycle.test_close_after_scope_takeover_fences_stale_herdr_controls
+            PublicLifecycle.test_close_after_scope_takeover_fences_stale_herdr_controls \
+            PublicLifecycle.test_public_reply_distinguishes_zero_write_deadline_and_lost_receipt
         ;;
     *) printf 'Unsupported host diagnostics group: %s\n' "${1:-}" >&2; exit 2 ;;
 esac

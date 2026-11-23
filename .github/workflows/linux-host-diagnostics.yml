@@ -1,7 +1,7 @@
 name: Linux host diagnostics
 on:
   push:
-    branches: [rust-router/13-host-diagnostics-r9-callback-ci]
+    branches: [rust-router/13-host-diagnostics-r11-reply-ci]
 
 permissions:
   contents: read
@@ -15,9 +15,9 @@ jobs:
       run:
         shell: bash
     env:
-      PRODUCT_SHA: 357f022fbef686f9716605c76114930df397b6f0
-      PRODUCT_TREE: e16e9a323c451e55299194517812f01c4c3145f4
-      PRODUCT_PARENTS: 'cc98f8a65b438a8eab65b7eefd5f1ecad6b9758e 3bbb7d209bf4e1c0775d5f9b18e611b4f8dc3d4a'
+      PRODUCT_SHA: ac9e5b0167e13dc69c50cf83ed100fd6577d1163
+      PRODUCT_TREE: 38b1376542a55c12a414d9f9c9340ad6d739779b
+      PRODUCT_PARENTS: 'beacb150e76330413596c5acfaf385e6110ed12f de60d29ce0de5204f80625467049b127202eacb5'
       REFERENCE_RUNS: '45246627284/2 45250815210/1'
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TARGET: x86_64-unknown-linux-gnu
@@ -70,7 +70,7 @@ jobs:
             git -C ../native-input show -s --format='native-input=%H tree=%T'
             printf '%s  %s\n' 17e88863f3600672ab49182f217281b6fc4d3c762bde361935e436a95214d05c \
               ../native-input/vendor/zlib-1.3.1.tar.gz | sha256sum --check --strict
-            printf '%s  %s\n' 13ba59dd77daa7479cc7ea84def477acbfa06c2ca2f65160d42c9b7ad6a3e75a vendor/INPUTS.sha256 | sha256sum --check --strict
+            printf '%s  %s\n' 64b6e564e08c16cf482693a9ff78a19c73847c4efd3d22a49174e2807ed7659a vendor/INPUTS.sha256 | sha256sum --check --strict
             sha256sum vendor/INPUTS.sha256
             sha256sum --check --strict vendor/INPUTS.sha256
           } 2>&1 | tee "$EVIDENCE/sources.log"
@@ -106,9 +106,9 @@ jobs:
         run: |
           {
             rustup toolchain install 1.96.1 --profile minimal --component rustfmt
-            if ! command -v tmux >/dev/null; then
+            if ! command -v tmux >/dev/null || ! command -v strace >/dev/null; then
               sudo apt-get update
-              sudo apt-get install -y --no-install-recommends tmux
+              sudo apt-get install -y --no-install-recommends tmux strace
             fi
             uname -srm
             rustc +1.96.1 -vV
@@ -116,6 +116,7 @@ jobs:
             zig version
             python3 --version
             tmux -V
+            strace --version
             cc --version
           } 2>&1 | tee "$EVIDENCE/toolchain.log"
       - name: Build the frozen release
