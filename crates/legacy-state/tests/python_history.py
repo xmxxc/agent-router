@@ -30,6 +30,10 @@ def check(source, binary, dispatch, label, *, damage="", repair="", refuse=False
                 src.backup(wanted)
             wanted.executescript(repair)
             expected = list(wanted.iterdump())
+            if current_report is not None and not refuse:
+                expected_rounds = dict(((n, a), (state, path, result, at))
+                                       for n, a, state, path, result, at in wanted.execute(
+                                           "SELECT round,attempt,state,report,result,completed FROM dispatch_round WHERE dispatch=?", (dispatch,)))
 
         after = before
         for attempt in range(2):
@@ -51,6 +55,8 @@ def check(source, binary, dispatch, label, *, damage="", repair="", refuse=False
                     parent, = json.loads(view)["dispatches"]
                     current, = (r for r in parent["rounds"] if r["attempt"] == parent["attempt"] and r["round"] == parent["round"])
                     assert parent["report"] == current["report"] == current_report
+                    assert {(r["round"], r["attempt"]): (r["state"], r["report"], r["result"], r["completed"])
+                            for r in parent["rounds"]} == expected_rounds
                 if attempt or not repair:
                     assert digest(work) == after
                 after = digest(work)

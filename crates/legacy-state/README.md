@@ -55,7 +55,8 @@
 逐轮核对会保留已有结果原文和快照完成时间。Python 写入快照与 done 收件时分别读取时钟；
 快照时间丢失时，仅能以唯一匹配的 done 收件时间作为完成的观察时间。两处时间都缺失时会拒写。
 现代账本可包含同一报告多次完成的回执。按消息编号核对提交顺序，最终快照须能印证同一 attempt 的最后一次 Git 结果。
-早期 Python 升级器按数字编号选取当前报告的第一条旧 done，直接复制其正文与时间。重复提交的旧回执保留各自的创建时间。现代 worker 随后提交时则由末次带 attempt 的回执核验更新后的快照。父行和当前快照同时缺少报告路径时，在同一事务内补回两处。
+早期 Python 升级器按数字编号选取当前报告的第一条旧 done，直接复制其正文与时间。重复提交的旧回执保留各自的创建时间。现代 worker 随后提交时则由末次带 attempt 的回执核验更新后的快照。按任务、当前轮次和 attempt 核对父行与快照的报告路径，运行中快照也可从派工记录补回路径。两处都缺失时，从能确认归属的记录在同一事务内恢复。
+现代完成结果中的 report、head、dirty 分别核验。缺键时仅补有证据的值，保留已有字段及完成时间；非 Git 工作区写入的 JSON null 是有效值。早期仅含报告路径的回执按其原格式恢复。
 早期 done 曾只记录报告路径。升级后再次提交时，按旧回执当时已有的字段核对归属，由末次回执核验最终的 Git 结果和完成时间。
 后端观测失败也可能写入完成时间列。running 快照没有 done 时，若只留有后端诊断或没有结果，且同一尝试有随后接受的启动裁决，就保留其运行状态、原时间和裁决记录。
 resume 或 handoff 的前后 attempt 在启动前已提交，离线核验沿审计链确定当前身份，并保留每次启动的原始结果。
@@ -69,6 +70,7 @@ resume 或 handoff 的前后 attempt 在启动前已提交，离线核验沿审�
 cargo test --locked -p wfc-legacy-state
 python3 crates/legacy-state/tests/python_ledger.py /path/to/workflow-core-checkout target/debug/wfc-legacy-state
 python3 crates/legacy-state/tests/python_recovery.py /path/to/workflow-core-checkout target/debug/wfc-legacy-state
+python3 -B crates/legacy-state/tests/python_fields.py /path/to/workflow-core-checkout target/debug/wfc-legacy-state
 python3 -B crates/legacy-state/tests/python_history.py /path/to/workflow-core-checkout target/debug/wfc-legacy-state
 python3 -B crates/legacy-state/tests/python_pre_attempt.py /path/to/pr39 /path/to/pr40 target/debug/wfc-legacy-state
 ```

@@ -6,19 +6,25 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::recovery::{agree, text};
 
+const GIT_FIELDS: [&str; 2] = ["head", "dirty"];
+
 struct Done {
     raw: String,
     body: Value,
     created: Option<f64>,
 }
 
+fn valid_git_pair(head: Option<&Value>, dirty: Option<&Value>) -> bool {
+    match (head, dirty) {
+        (Some(Value::Null), Some(Value::Null)) => true,
+        (Some(Value::String(head)), Some(Value::Bool(_))) => !head.is_empty(),
+        _ => false,
+    }
+}
+
 fn has_git_result(body: &Value) -> bool {
     body["report"].as_str().is_some_and(|p| !p.is_empty())
-        && match (body.get("head"), body.get("dirty")) {
-            (Some(Value::Null), Some(Value::Null)) => true,
-            (Some(Value::String(head)), Some(Value::Bool(_))) => !head.is_empty(),
-            _ => false,
-        }
+        && valid_git_pair(body.get("head"), body.get("dirty"))
 }
 
 // Both pre-attempt Python formats have a report path, and the later one
@@ -44,7 +50,8 @@ struct Snapshot {
     result: Option<String>,
     completed: Option<f64>,
     receipt: Option<Done>,
-    varying_results: bool,
+    previous_git: Vec<[Option<Value>; 2]>,
+    modern_writer: bool,
     missing_report: bool,
     current: bool,
 }
@@ -66,7 +73,7 @@ impl Completions {
     pub fn apply(self, db: &Connection) -> Result<()> {
         let mut write = db.prepare(
             "UPDATE dispatch_round SET state='completed', report=coalesce(nullif(report,''),?1),
-            result=coalesce(nullif(result,''),?2), completed=coalesce(completed,?3) WHERE rowid=?4",
+            result=?2, completed=coalesce(completed,?3) WHERE rowid=?4",
         )?;
         let mut fill_parent = db.prepare(
             "UPDATE dispatch AS d SET report=r.report FROM dispatch_round AS r
@@ -144,23 +151,22 @@ impl Snapshot {
                     && previous.body["report"]
                         .as_str()
                         .is_some_and(|p| !p.is_empty());
-                let compatible = old
-                    .iter()
-                    .all(|(k, v)| matches!(k.as_str(), "head" | "dirty") || new.get(k) == Some(v))
-                    && new.keys().all(|k| {
-                        old.contains_key(k)
-                            || before_git && matches!(k.as_str(), "head" | "dirty")
-                            || pre_attempt
-                                && matches!(k.as_str(), "round" | "attempt" | "scope" | "role")
-                    });
+                let compatible = old.iter().all(|(k, v)| {
+                    matches!(k.as_str(), "report" | "head" | "dirty") || new.get(k) == Some(v)
+                }) && new.keys().all(|k| {
+                    old.contains_key(k)
+                        || before_git && matches!(k.as_str(), "head" | "dirty")
+                        || pre_attempt
+                            && matches!(k.as_str(), "round" | "attempt" | "scope" | "role")
+                });
                 ensure!(
-                    modern
-                        && (before_git || has_git_result(&previous.body))
-                        && has_git_result(&body)
-                        && compatible,
+                    modern && (before_git || has_git_result(&previous.body)) && compatible,
                     "conflicting done results"
                 );
-                self.varying_results = true;
+                // Keep only the earlier Git fields, so a surviving part of the
+                // snapshot can distinguish the final submission if its clock is lost.
+                self.previous_git
+                    .push(GIT_FIELDS.map(|k| previous.body.get(k).cloned()));
             } else if !modern && self.completed.is_none() {
                 agree(&mut time, previous.created, "legacy done receipt times")?;
             }
@@ -223,6 +229,101 @@ impl Snapshot {
         Ok(false)
     }
 
+    fn corroborates_last_done(&self, stored: Option<&Value>, receipt: &Done) -> bool {
+        let Some(stored) = stored else { return false };
+        if !["report", "head", "dirty"]
+            .iter()
+            .any(|k| stored.get(k).is_some())
+        {
+            return false;
+        }
+        if self
+            .completed
+            .zip(receipt.created)
+            .is_some_and(|(saved, observed)| saved >= observed)
+        {
+            return true;
+        }
+        // Every earlier result consistent with the retained fields must imply
+        // the same Git outcome. Never fill a missing key from an earlier done.
+        let retained = GIT_FIELDS.map(|k| stored.get(k));
+        let final_git = GIT_FIELDS.map(|k| receipt.body.get(k).or_else(|| stored.get(k)));
+        self.previous_git.iter().all(|old| {
+            let prior = old.each_ref().map(Option::as_ref);
+            prior == final_git
+                || retained
+                    .iter()
+                    .zip(prior)
+                    .any(|(v, p)| v.is_some() && *v != p)
+        })
+    }
+
+    // A Python task result projects report/head/dirty out of the larger done
+    // body. Keep the stored JSON when complete, including independent metadata.
+    fn patch_result(&self, db: &Connection, stored: Option<&Value>) -> Result<Option<String>> {
+        let receipt = self.receipt.as_ref();
+        let evidence = receipt.map(|r| &r.body);
+        let Some(base) = stored.or(evidence) else {
+            return Ok(None);
+        };
+
+        if let Some(early) = receipt.filter(|r| legacy_result(&r.body)) {
+            // Python copied the first matching legacy body verbatim.
+            return Ok((base != &early.body).then(|| early.raw.clone()));
+        }
+
+        // attach_receipt already resolved any partial identity to this unique snapshot.
+        let qualified = evidence.filter(|v| {
+            v["round"].as_i64() == Some(self.round)
+                || v["attempt"].as_str() == Some(self.attempt.as_str())
+        });
+        let has_git_field = |v: &Value| GIT_FIELDS.iter().any(|k| v.get(k).is_some());
+        // Some receipt writers recorded round and attempt before adding Git data.
+        // When a receipt survives, its own format is stronger evidence than the callback.
+        let expects_git = (self.modern_writer && receipt.is_none())
+            || has_git_field(base)
+            || qualified.is_some_and(|v| {
+                has_git_field(v) || (v.get("scope").is_some() && v.get("role").is_some())
+            });
+        if !expects_git {
+            return Ok(None);
+        }
+
+        // SQL NULL (an absent result), a missing JSON key and a recorded JSON
+        // null (a non-Git worktree) are three different observations.
+        let field = |k: &str| base.get(k).or_else(|| qualified.and_then(|v| v.get(k)));
+        let report = self.report.as_deref().context("missing completed report")?;
+        ensure!(
+            base.get("report")
+                .is_none_or(|v| v.as_str() == Some(report)),
+            "invalid recorded report"
+        );
+        let head = field("head").context("missing Git head evidence")?;
+        let dirty = field("dirty").context("missing Git dirty evidence")?;
+        ensure!(
+            valid_git_pair(Some(head), Some(dirty)),
+            "invalid recorded Git result"
+        );
+
+        if ["report", "head", "dirty"]
+            .iter()
+            .all(|key| base.get(key).is_some())
+        {
+            return Ok(None);
+        }
+        let raw = self
+            .result
+            .as_deref()
+            .or_else(|| receipt.map(|r| r.raw.as_str()))
+            .unwrap();
+        let patched = db.query_row(
+            "SELECT json_insert(?1,'$.report',?2,'$.head',json(?3),'$.dirty',json(?4))",
+            params![raw, report, head.to_string(), dirty.to_string()],
+            |r| r.get(0),
+        )?;
+        Ok(Some(patched))
+    }
+
     fn update(self, db: &Connection, dispatch: &str) -> Result<Option<Update>> {
         if !self.eligible() {
             return Ok(None);
@@ -236,7 +337,11 @@ impl Snapshot {
         if let Some(receipt) = &self.receipt {
             if legacy_result(&receipt.body) {
                 ensure!(
-                    stored.as_ref().is_none_or(|v| v == &receipt.body)
+                    stored
+                        .as_ref()
+                        .is_none_or(|v| v.as_object().is_some_and(|m| m
+                            .iter()
+                            .all(|(k, value)| receipt.body.get(k) == Some(value))))
                         && self
                             .completed
                             .zip(receipt.created)
@@ -244,9 +349,9 @@ impl Snapshot {
                     "stored snapshot conflicts with first legacy done receipt"
                 );
             }
-            if self.varying_results {
+            if !self.previous_git.is_empty() {
                 ensure!(
-                    stored.as_ref().is_some_and(has_git_result),
+                    self.corroborates_last_done(stored.as_ref(), receipt),
                     "conflicting done results without a final snapshot result"
                 );
             }
@@ -276,12 +381,16 @@ impl Snapshot {
         } else if !completed && !self.running_completion(db, dispatch, stored.as_ref())? {
             return Ok(None);
         }
-        let needs_update =
-            !completed || self.missing_report || self.result.is_none() || self.completed.is_none();
+        let patched = self.patch_result(db, stored.as_ref())?;
+        let needs_update = patched.is_some()
+            || !completed
+            || self.missing_report
+            || self.result.is_none()
+            || self.completed.is_none();
         let report = self.report.context("missing completed report")?;
         let receipt_time = self.receipt.as_ref().and_then(|r| r.created);
-        let result = self
-            .result
+        let result = patched
+            .or(self.result)
             .or_else(|| self.receipt.map(|r| r.raw))
             .context("missing completed result")?;
         // Python samples the snapshot clock separately. If that value is lost,
@@ -350,11 +459,18 @@ pub fn plan(db: &Connection) -> Result<Completions> {
         "WITH named_reports AS (
             SELECT dispatch,body->>'$.round' n,body->>'$.attempt' a,min(body->>'$.report') path
             FROM message WHERE type='done' AND json_valid(body) AND json_type(body,'$.report')='text'
-            GROUP BY dispatch,n,a HAVING count(DISTINCT body->>'$.report')=1)
+            GROUP BY dispatch,n,a HAVING count(DISTINCT body->>'$.report')=1),
+        writers(dispatch,n,a) AS (
+            SELECT dispatch,body->>'$.round',body->>'$.attempt' FROM message
+                WHERE type='continue' AND json_valid(body)
+            UNION SELECT dispatch,round,coalesce(to_attempt,attempt) FROM lifecycle_event
+                WHERE operation IN ('create','resume','handoff'))
         SELECT r.dispatch,r.rowid,r.round,r.attempt,r.state,nullif(r.report,''),nullif(r.result,''),r.completed,
         CASE WHEN d.current_round=r.round AND d.current_attempt=r.attempt THEN nullif(d.report,'') END,
-        d.current_round IS r.round AND d.current_attempt IS r.attempt AND d.id IS NOT NULL,nullif(m.path,'')
+        d.current_round IS r.round AND d.current_attempt IS r.attempt AND d.id IS NOT NULL,nullif(m.path,''),
+        (coalesce(r.callback_channel,'')<>'' AND coalesce(r.callback_hash,'')<>'') OR w.a IS NOT NULL
         FROM dispatch_round r LEFT JOIN dispatch d ON d.id=r.dispatch
+        LEFT JOIN writers w ON w.dispatch=r.dispatch AND w.n=r.round AND w.a=r.attempt
         LEFT JOIN named_reports m ON m.dispatch=r.dispatch AND m.n=r.round AND m.a=r.attempt ORDER BY r.dispatch,r.round,r.rowid",
     )?;
     let mut rows = q.query([])?;
@@ -377,7 +493,8 @@ pub fn plan(db: &Connection) -> Result<Completions> {
             result: r.get(6)?,
             completed: r.get(7)?,
             receipt: None,
-            varying_results: false,
+            previous_git: Vec::new(),
+            modern_writer: r.get(11)?,
             missing_report,
             current: r.get(9)?,
         };

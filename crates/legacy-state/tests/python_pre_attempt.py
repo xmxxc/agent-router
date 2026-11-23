@@ -140,6 +140,10 @@ def run(early, later, binary):
                         assert db.execute("SELECT current_round,current_attempt FROM dispatch").fetchone() == snap[:2]
                     print(name, "pre-attempt reports", n, "selected done", mid, "clock", when, "messages", len(messages))
                     if source and n == 1:
+                        # Upgrade copied the whole first legacy body. Restore only its own fields.
+                        check(db_path, binary, did, "partial-legacy-result", current_report=str(report),
+                              damage="UPDATE dispatch_round SET result=json_remove(result,'$.report','$.dirty');",
+                              repair="UPDATE dispatch_round SET result=(SELECT body FROM message WHERE type='done' ORDER BY id LIMIT 1);")
                         # The same original report can be completed again after Python upgrades the database.
                         subprocess.run([sys.executable, "-B", source / "router.py", "done", "--report", str(report)],
                                        env={**settings, "WFC_DISPATCH": did}, check=True, capture_output=True)

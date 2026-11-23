@@ -512,7 +512,10 @@ pub fn candidates(db: &Connection) -> Result<Vec<String>> {
           OR coalesce(scope,'')='' OR coalesce(role,'')=''
           OR NOT EXISTS(SELECT 1 FROM dispatch_round r WHERE r.dispatch=d.id)
           OR EXISTS(SELECT 1 FROM dispatch_round r WHERE r.dispatch=d.id AND r.round=d.current_round
-              AND r.attempt=d.current_attempt AND ((r.report IS NOT NULL AND nullif(d.report,'') IS NULL)
+              AND r.attempt=d.current_attempt AND ((nullif(r.report,'') IS NOT nullif(d.report,''))
+              OR (r.state='running' AND nullif(d.report,'') IS NULL AND
+                  ((r.callback_hash<>'' AND r.callback_channel<>'') OR EXISTS(
+                  SELECT 1 FROM attested e WHERE e.id=d.id AND e.n=r.round AND e.a=r.attempt)))
               OR (nullif(r.task,'') IS NOT nullif(d.task,''))))
           OR EXISTS(SELECT 1 FROM dispatch_round r WHERE r.dispatch=d.id
               AND (r.round IS NULL OR r.attempt IS NULL OR coalesce(r.state,'')='' OR r.round>d.current_round))
