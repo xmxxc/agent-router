@@ -180,6 +180,7 @@ impl<'a> Resume<'a> {
         next["tmuxLaunchProtocol"] = json!(backend::LAUNCH_PROTOCOL);
         for field in [
             "create",
+            controller::CALLBACK_REF_HASH,
             "legacyExecutionId",
             "legacyLaunchId",
             "legacyWorkerPane",

@@ -73,6 +73,16 @@ def composer(mode, logfile, reply_worker=False):
         draw()
         while True:
             if reply_worker:
+                if Path("replace-reply-draft").exists():
+                    draft = Path("replace-reply-draft").read_bytes()
+                    Path("replace-reply-draft").unlink()
+                    draw()
+                if Path("ask-second").exists():
+                    Path("ask-second").unlink()
+                    receipt = subprocess.check_output([wfc, "ask", "Second question?",
+                                                       "--attempt", attempt, "--message-id", "second-question"])
+                    Path("second-question.tmp").write_bytes(receipt)
+                    Path("second-question.tmp").rename("second-question.json")
                 if Path("clear-draft").exists():
                     Path("clear-draft").unlink()
                     draft = b""
@@ -89,7 +99,7 @@ def composer(mode, logfile, reply_worker=False):
                 if notice == banner and Path("enable-input").exists():
                     notice = ""
                     draw()
-                if (accepted or mode == "finish-alone") and Path("finish").exists():
+                if (accepted or mode == "finish-alone" or Path("finish-without-answer").exists()) and Path("finish").exists():
                     report = Path(os.environ["WFC_REPORT"])
                     Path("finish").unlink()
                     report.write_text("original worker received the answer\n")
@@ -615,15 +625,40 @@ os.execv({TMUX!r}, [{TMUX!r}, *args])
         resumed = self.resume_cli("resume", dispatch, "--task", "task2", "--report", "reports/r2.md", **owner)
         self.assertEqual((resumed["session"], resumed["round"], resumed["launchResult"]), (session, 2, "accepted"))
         self.assertNotEqual(resumed["attempt"], attempt)
-        self.assertEqual(self.resumed_host(resumed["attempt"])["argv"][-2], session)
-        self.assertIn("attempt is no longer accepted",
-                      self.resume_callback(first, "done", "--report", str(report), code=1))
+        current = self.resumed_host(resumed["attempt"])
+        self.assertEqual((current["argv"][-2], current["WFC_ROUND"], current["WFC_ATTEMPT"]),
+                         (session, "2", resumed["attempt"]))
+        self.assertTrue(first["WFC_WORKER_CALLBACK"] and current["WFC_WORKER_CALLBACK"]
+                        and first["WFC_WORKER_CALLBACK"] != current["WFC_WORKER_CALLBACK"])
+        current_report = Path(current["WFC_REPORT"])
+        self.assertEqual(current_report, self.work / "reports" / "r2.md")
+        current_report.write_text("unsubmitted second round report")
+        ledger = self.state / "messages.json"
+        assignment = self.state / "dispatches" / f"{dispatch}.json"
+        before = (ledger.read_bytes(), assignment.read_bytes())
+        cases = (
+            ("round", first, report, f"Error: round mismatch for {dispatch}"),
+            ("attempt", {**current, "WFC_ATTEMPT": attempt}, current_report,
+             f"Error: attempt is no longer accepted for {dispatch}"),
+            ("callback", {**current, "WFC_WORKER_CALLBACK": first["WFC_WORKER_CALLBACK"]}, current_report,
+             {"error": "invalid_worker_callback", "operation": "done"}),
+        )
+        for boundary, worker, candidate_report, expected in cases:
+            with self.subTest(boundary=boundary):
+                error = self.resume_callback(worker, "done", "--report", str(candidate_report), code=1)
+                self.assertEqual(json.loads(error) if boundary == "callback" else error.strip(), expected)
+                self.assertEqual((ledger.read_bytes(), assignment.read_bytes()), before)
         row = self.resume_status(dispatch)
         self.assertNotIn("reclaimed", row)
-        self.assertEqual([m["messageId"] for m in row["messages"]], [done["messageId"], event["messageId"]])
+        self.assertEqual([(m["id"], m["messageId"]) for m in row["messages"]],
+                         [(done["message"], done["messageId"]), (event["id"], event["messageId"])])
         self.assertEqual([(r["round"], r["attempt"], r["state"]) for r in row["rounds"]],
                          [(1, attempt, "completed"), (2, resumed["attempt"], "running")])
         self.assertEqual(report.read_text(), "original round report")
+        print(json.dumps({"callbackRejections": [boundary for boundary, *_ in cases],
+                          "dispatch": dispatch, "round": row["round"], "attempt": row["attempt"],
+                          "history": [{"id": m["id"], "messageId": m["messageId"]} for m in row["messages"]],
+                          "ledgerAndAssignmentUnchanged": True}), flush=True)
 
     def test_read_only_unowned_close_replays_confirmed_archive(self):
         self.assertNotEqual(os.geteuid(), 0, "read-only fixture requires an ordinary user")
@@ -1390,6 +1425,40 @@ os.execv({TMUX!r}, [{TMUX!r}, *a])
         self.assertEqual((notice["kind"], notice["type"], notice["to"], notice["delivered"]),
                          ("startup_failure", "blocked", "controller", False))
         self.assertEqual(detail["startupFailure"], notice["fault"])
+        self.assertNotEqual(detail["state"], "done")
+        # Exercise the same-attempt classification with stored worker receipts
+        # and the real #13 notice in a single public CLI ledger.
+        ledger = self.state / "messages.json"
+        records = json.loads(ledger.read_text())
+        raw_notice = next(m for m in records if m["messageId"] == notice["messageId"])
+        identity = {key: raw_notice[key] for key in ("dispatch", "scope", "role", "round", "attempt")}
+        raw_reply = next(m for m in records if m["messageId"] == accepted["messageId"])
+        raw_reclaim = next(m for m in records if m["messageId"] == event["messageId"])
+        mixed = (
+            {"type": "reclaimed", "report": raw_notice["report"], "tmux": raw_reclaim["tmux"]},
+            {"reply_payload": raw_reply["reply_payload"]},
+            {"worker_input": {"type": "nudge", "text": "historical nudge"},
+             "inputEvidence": "appended-user-entry", "state": "received", "statusVersion": 2},
+            {"worker_input": {"type": "continue", "task": str(self.work / "task"),
+                              "report": raw_notice["report"]},
+             "inputEvidence": "appended-user-entry", "state": "received", "statusVersion": 2},
+        )
+        extra_ids = []
+        for i, payload in enumerate(mixed, len(records) + 1):
+            extra_ids.append(i)
+            records.append({**identity, "id": i, "messageId": f"m-same-attempt-fixture-{i}",
+                            "request_key": None, "state": "unsent", "statusVersion": 1, **payload})
+        ledger.write_text(json.dumps(records))
+        mixed_detail, = self.reply_cli("status", "--dispatch", failed["dispatch"])["dispatches"]
+        self.assertEqual(mixed_detail["state"], detail["state"])
+        self.assertEqual(mixed_detail["rounds"], detail["rounds"])
+        seen = mixed_detail["messages"]
+        by_id = {entry["id"]: entry for entry in seen}
+        self.assertEqual([by_id[i]["type"] for i in extra_ids], ["reclaimed", "reply", "nudge", "continue"])
+        self.assertEqual([by_id[i]["to"] for i in extra_ids],
+                         ["worker", accepted["to"], "worker", "worker"])
+        self.assertEqual(by_id[notice["id"]], notice)
+        status = self.reply_cli("status")
         self.assertIn("no question with id", self.reply_cli("reply", notice["id"], "ignored", expected=1))
         identities = [(m["id"], m["messageId"]) for m in (question, done, notice)]
         for batch in (status["undelivered"], self.reply_cli("wait", "--timeout", "0")["messages"]):
@@ -1403,7 +1472,7 @@ os.execv({TMUX!r}, [{TMUX!r}, *a])
         self.assertFalse(self.reply_cli("status")["undelivered"])
         self.assertIn("no question with id", self.reply_cli("reply", done["id"], "ignored", expected=1))
         self.assertIn("no question with id", self.reply_cli("reply", event["id"], "ignored", expected=1))
-        for entry in (refused, accepted, event):
+        for entry in (refused, accepted, event, *(by_id[i] for i in extra_ids)):
             for selector in (str(entry["id"]), entry["messageId"]):
                 self.assertIn("no controller message", self.reply_cli("ack", selector, expected=1))
                 self.assertIn("no controller message", self.reply_cli(
@@ -1495,9 +1564,11 @@ if any("capture-pane -p -e -t " in arg for arg in args):
             screen = empty.read_bytes()
         with trace.open("a") as log:
             print("empty" if first_read else "draft", file=log)
-    else:
+    elif not empty.exists():
         assert b"Ask Codex to do anything" in screen, screen
         empty.write_bytes(screen)
+    else:
+        assert {text!r} in screen, screen
     sys.stdout.buffer.write(owner + newline + screen + confirmed)
     sys.exit(0)
 os.execv(argv[0], argv)
@@ -1515,6 +1586,44 @@ os.execv(argv[0], argv)
         self.assertEqual((reply["inputResult"], reply["category"]), ("uncertain", "input_uncertain"))
         question, = self.reply_cli("wait", "--dispatch", self.reply_dispatch, "--timeout", "0")["messages"]
         self.assertEqual((question["type"], question["messageId"]), ("question", self.question["messageId"]))
+
+    def test_public_reply_rechecks_first_enter_after_inbox_wait(self):
+        self.setup_reply("empty")
+        pane = self.active_pane(self.reply_dispatch)
+        answer = "intended reply"
+        text = f"[router] Answer to question {self.number}: {answer}".encode()
+        gate = self.public_input_gate(self.reply_env, "reply-before-enter")
+        argv = [WFC, "reply", self.number, answer]
+
+        def draft_replaced():
+            # The public reply holds the dispatch's native lock while waiting for Inbox.
+            screen = subprocess.check_output(self.tmux + ["capture-pane", "-p", "-t", pane],
+                                             env=self.env, text=True, timeout=2)
+            return "› different draft" in screen
+
+        with subprocess.Popen(argv, cwd=self.work, env={**self.reply_env, **gate}, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as pending:
+            try:
+                self.await_input_value(lambda: (self.work / "input-boundary").exists())
+                with (self.state / "messages.lock").open("a+") as inbox:
+                    fcntl.flock(inbox, fcntl.LOCK_EX)
+                    (self.work / "release-input-boundary").touch()
+                    self.await_input_value(
+                        lambda: "lock_inode_wait" in Path(f"/proc/{pending.pid}/wchan").read_text())
+                    self.assert_reply_bytes(text)
+                    replacement = self.work / "replacement-draft"
+                    replacement.write_text("different draft")
+                    replacement.replace(self.work / "replace-reply-draft")
+                    self.await_input_value(draft_replaced)
+            finally:
+                (self.work / "release-input-boundary").touch()
+                out, error = pending.communicate(timeout=15)
+        self.assertEqual((pending.returncode, out), (1, ""))
+        self.assertIn("complete reply before Enter", error)
+        self.assert_reply_bytes(text)
+        self.assertFalse((self.work / "accepted").exists())
+        reply, = self.reply_attempts()
+        self.assertEqual(reply["inputResult"], "uncertain")
 
     def test_public_reply_requires_confirmed_tmux_chat_composer(self):
         self.setup_reply("upstream-reply")
@@ -3555,6 +3664,1354 @@ time.sleep(45)
                 self.assertEqual(finish(ask("First question?", "original")), {**confirmed, "duplicate": True})
                 owner = self.call("inspect", dispatch=other["dispatch"], executionId=other["attempt"])
                 self.assertTrue(owner["alive"] and owner["owned"] and owner["workerBound"], owner)
+
+    def public_input_worker(self, scope="rounds", legacy=False, codex_home=None):
+        worker = self.work / "round-worker.py"
+        worker.write_text(r"""import json, os, select, shlex, subprocess, sys, time, tty
+from pathlib import Path
+
+legacy = Path("legacy-worker").exists()
+if legacy and "WFC_WORKER_CALLBACK" in os.environ:
+    env = {key: val for key, val in os.environ.items() if key != "WFC_WORKER_CALLBACK"}
+    os.execve(sys.executable, [sys.executable, __file__], env)
+tty.setraw(0)
+assert bool(os.environ.get("WFC_WORKER_CALLBACK")) != legacy
+assert not any(os.environ.get(key) for key in ("WFC_CONTROLLER_TOKEN", "WFC_OWNER_TOKEN"))
+binary = os.environ["WFC_BIN"]
+original = os.environ["WFC_ATTEMPT"]
+report = os.environ["WFC_REPORT"]
+draft = b""
+local_draft = False
+assignment = None
+transcript = "Previous assistant output\r\n\r\n"
+old_text = "› [router] Message from the controller: historical"
+old_refusal = "This conversation is read-only or unavailable; no operation was sent."
+history_row = 6 if Path("stable-transcript").exists() else None
+
+def write_json(name, value):
+    tmp = Path(name + ".tmp")
+    tmp.write_text(json.dumps(value))
+    tmp.replace(name)
+
+def archive_history_head(rows):
+    global history_row
+    bottom = os.get_terminal_size(0).lines
+    print(f"\x1b[{bottom};1H" + "\r\n" * rows, end="")
+    history_row -= rows
+
+def append_entry(entry):
+    global transcript
+    if Path("scroll-event").exists():
+        Path("scroll-event").unlink()
+        archive_history_head(2)
+    transcript += entry + "\r\n\r\n"
+
+def draw():
+    shown = "Ask Codex to do anything" if local_draft else draft.decode(errors="replace")
+    if draft and Path("change-draft").exists():
+        shown = shown[:8]
+    if draft and Path("hard-wrap-draft").exists():
+        shown += "\r\n  model · not a footer"
+    if Path("swallow-draft").exists():
+        shown = ""
+    if draft and Path("unknown-draft").exists():
+        print("\x1b[2J\x1b[Hunknown shell mode", end="", flush=True)
+        return
+    visible = "Changed assistant output\r\n\r\n" + transcript if draft and Path("change-history").exists() else transcript
+    prompt = "›"
+    if Path("styled-reply").exists():
+        prompt = "\x1b[1m›\x1b[0m"
+        if not shown:
+            shown = "\x1b[2mAsk Codex to do anything\x1b[0m"
+    start = "\x1b[2J\x1b[H" if history_row is None else f"\x1b[{history_row};1H\x1b[J"
+    print(f"{start}{visible}{prompt} {shown}\r\n\r\n  model · cwd", end="", flush=True)
+    display = "draft" if local_draft else "partial" if draft and Path("change-draft").exists() else "ready"
+    Path("screen").write_text(display)
+
+def callback(*args):
+    return subprocess.run([binary, *args], text=True, capture_output=True, timeout=10)
+
+def done(path, attempt, *extra):
+    return callback("done", "--report", path, "--attempt", attempt, *extra)
+
+draw()
+write_json("launch-argv", sys.argv[1:])
+Path("worker-pid").write_text(str(os.getpid()))
+deadline = time.monotonic() + 45
+while time.monotonic() < deadline:
+    if Path("exit-worker").exists():
+        Path("exit-worker").unlink()
+        break
+    if Path("redraw-worker").exists():
+        Path("redraw-worker").unlink()
+        draw()
+    if Path("draft").exists() != local_draft:
+        local_draft = not local_draft
+        draw()
+    if draft and Path("refresh-draft").exists():
+        Path("refresh-draft").unlink()
+        draw()
+    if Path("seed-history").exists():
+        mode = Path("seed-history").read_text()
+        Path("seed-history").unlink()
+        old = old_refusal if mode == "refusal" else old_text
+        if mode != "visible":
+            print("\x1b[2J\x1b[H" + old + "\r\n\r\n"
+                  + "".join(f"history {i}\r\n" for i in range(35)), end="")
+        top = old + "\r\n" if mode == "visible" else ""
+        print("\x1b[2J\x1b[H" + top + "history head 0\r\nhistory head 1", end="")
+        history_row = 6
+        draw()
+        Path("history-ready").touch()
+    if Path("fill-transcript").exists():
+        Path("fill-transcript").unlink()
+        if Path("seed-capped").exists():
+            print("\x1b[2J\x1b[H" + "".join(f"capped history {i}\r\n" for i in range(185)),
+                  end="", flush=True)
+        transcript += "".join(f"scroll anchor {i}\r\n" for i in range(10)) + "\r\n"
+        draw()
+        Path("filled-transcript").touch()
+    if Path("finish-first-externally").exists():
+        Path("finish-first-externally").unlink()
+        Path(report).write_text("first report")
+        owner = Path("legacy-owner")
+        result = done(report, original, *(["--owner-token", owner.read_text()] if legacy else []))
+        write_json("first-done", json.loads(result.stdout))
+    if Path("ask-twice").exists():
+        Path("ask-twice").unlink()
+        write_json("questions", [json.loads(callback("ask", question, "--attempt", original).stdout)
+                                 for question in ("First question?", "Second question?")])
+    if assignment and Path("ask-current-round").exists():
+        Path("ask-current-round").unlink()
+        _, attempt, reference = assignment
+        write_json("current-question", json.loads(callback("ask", "Current question?", "--attempt", attempt,
+                                                           "--callback-ref", reference).stdout))
+    if assignment and legacy and Path("legacy-finish").exists():
+        Path("legacy-finish").unlink()
+        target, attempt, reference = assignment
+        assert reference is None
+        Path(target).write_text("legacy second report")
+        no_owner = done(target, attempt)
+        previous = done(target, original, "--owner-token", Path("legacy-owner").read_text())
+        done_current = done(target, attempt, "--owner-token", Path("legacy-owner").read_text())
+        write_json("legacy-results", [no_owner.returncode, previous.returncode, json.loads(done_current.stdout)])
+    if assignment and Path("finish-next").exists():
+        Path("finish-next").unlink()
+        target, attempt, reference = assignment
+        Path(target).write_text("second report")
+        late = done(report, original, "--message-id", "late-first")
+        wrong = done(target, attempt, "--callback-ref", "0" * 64)
+        no_ref = done(target, attempt)
+        question = callback("ask", "What next?", "--attempt", attempt, "--callback-ref", reference)
+        complete = done(target, attempt, "--callback-ref", reference)
+        write_json("callbacks", {
+            "late": late.returncode, "wrong": wrong.returncode, "no_ref": no_ref.returncode,
+            "ask": json.loads(question.stdout), "done": json.loads(complete.stdout),
+        })
+    if not select.select([0], [], [], .02)[0]:
+        continue
+    data = os.read(0, 4096)
+    if not data:
+        break
+    with open("input-bytes", "ab") as log:
+        log.write(data)
+    for byte in data:
+        if byte != 13:
+            draft += bytes([byte])
+            continue
+        line = draft.decode()
+        with open("typed", "a") as log:
+            print(json.dumps(line), file=log)
+        if Path("hold-input").exists():
+            draw()
+            continue
+        draft = b""
+        if Path("refuse-input").exists():
+            append_entry(old_refusal)
+            draw()
+            continue
+        replay = Path("expose-history").read_text() if Path("expose-history").exists() else ""
+        if replay == "same-text":
+            append_entry(old_text)
+            draw()
+            continue
+        with open("formal-input", "a") as log:
+            print(json.dumps(line), file=log)
+        if replay == "submitted":
+            append_entry(old_refusal)
+        elif not Path("omit-transcript").exists():
+            append_entry(f"› {line}")
+        draw()
+        if line == "[router] Message from the controller: finish first":
+            Path(report).write_text("first report")
+            result = done(report, original)
+            write_json("first-done", json.loads(result.stdout))
+        elif line.startswith("[router] New task for you"):
+            args = shlex.split(line)
+            assignment = tuple(args[args.index(flag) + 1].rstrip(".") if flag in args else None
+                               for flag in ("--report", "--attempt", "--callback-ref"))
+            write_json("accepted-round", assignment)
+            if Path("fast-r2-complete").exists():
+                target, attempt, reference = assignment
+                Path(target).write_text("second report")
+                Path("r2-done-started").touch()
+                result = done(target, attempt, "--callback-ref", reference)
+                write_json("r2-done", json.loads(result.stdout))
+    if draft:
+        if history_row is not None and Path("scroll-draft").exists():
+            scroll = Path("scroll-draft")
+            rows = int(scroll.read_text())
+            scroll.unlink()
+            archive_history_head(rows)
+        replay_refusal = Path("expose-history").exists() and Path("expose-history").read_text() == "refusal"
+        if (Path("refuse-draft").exists() or replay_refusal) and draft.endswith(b"and end your turn."):
+            draft = b""
+            append_entry(old_refusal)
+        draw()
+""")
+        config = self.work / "launch.json"
+        if legacy:
+            (self.work / "legacy-worker").touch()
+        settings = {"hosts": {"codex": {"command": [sys.executable, str(worker)]}}}
+        if codex_home is not None:
+            settings["env"] = {"CODEX_HOME": str(codex_home)}
+        config.write_text(json.dumps(settings))
+        for name in ("task", "next-task"):
+            (self.work / name).write_text(name)
+        env = {**self.env, "WFC_STATE": str(self.state)}
+        env.pop("WFC_OWNER_TOKEN", None)
+
+        def cli(*args, token=None, expected=0, **overrides):
+            argv = [WFC, *args, *(["--owner-token", token] if token else [])]
+            proc = subprocess.run(argv, cwd=self.work, env={**env, **overrides},
+                                  capture_output=True, text=True, timeout=15)
+            self.assertEqual(proc.returncode, expected, (args, proc.stdout, proc.stderr))
+            return json.loads(proc.stdout) if expected == 0 else proc.stderr
+
+        owner = cli("acquire", "--scope", scope, "--owner", "A")["token"]
+        first = cli("dispatch", "--host", "codex", "--scope", scope, "--task", "task",
+                    "--cwd", ".", "--report", "report1", "--launch-config", str(config), token=owner)
+        self.await_input_value(lambda: (self.work / "worker-pid").exists())
+        if legacy:
+            # Reproduce the pre-credential assignment without changing its launch.
+            path = self.state / "dispatches" / f"{first['dispatch']}.json"
+            row = json.loads(path.read_text())
+            row.pop("workerCallbackHash")
+            path.write_text(json.dumps(row))
+            owner_file = self.work / "legacy-owner"
+            owner_file.touch(mode=0o600)
+            owner_file.write_text(owner)
+        return cli, first, owner, env
+
+    def public_input_gate(self, env, mode):
+        shim = self.work / "tmux"
+        shim.write_text(f"""#!{sys.executable}
+import json, os, subprocess, sys, time
+from pathlib import Path
+
+args = sys.argv[1:]
+real = {TMUX!r}
+root = Path({str(self.work)!r})
+mode = os.environ["INPUT_TEST_GATE"]
+read = any("capture-pane -p -J -t " in arg for arg in args)
+enter = any("send-keys -t " in arg and " Enter" in arg for arg in args)
+literal = any("send-keys -t " in arg and " -l -- " in arg for arg in args)
+if read and mode == "trace-redraw":
+    result = subprocess.run([real, *args], close_fds=False, capture_output=True)
+    trace = root / "redraw-frames"
+    if result.returncode == 0:
+        expected = "› [router] Message from the controller: finish first"
+        def summarize(kind, out):
+            rows = [line.rstrip() for line in out if line.strip()]
+            prompt = next((i for i in range(len(rows) - 1, -1, -1)
+                           if rows[i] == "›" or rows[i].startswith("› ")), None)
+            draft = "unrecognized" if prompt is None else "empty" if rows[prompt] == "›" else (
+                "exact" if rows[prompt] == expected else "different")
+            return {{"kind": kind, "draft": draft, "rows_before_prompt": prompt,
+                    "exact_entries": rows[:prompt].count(expected) if prompt is not None else 0}}
+
+        rows = result.stdout.decode(errors="replace").splitlines()[1:-1]
+        cut = next(i for i, row in enumerate(rows) if row.startswith("wfc-input-viewport-"))
+        frame = summarize("viewport", rows[cut + 1:])
+        history = summarize("redraw-history" if frame["draft"] == "exact" else "history", rows[:cut])
+        prior = trace.read_text().splitlines() if trace.exists() else []
+        with trace.open("a") as log:
+            if len(prior) < 11:
+                print(json.dumps(frame), file=log)
+                print(json.dumps(history), file=log)
+    sys.stdout.buffer.write(result.stdout)
+    sys.stderr.buffer.write(result.stderr)
+    sys.exit(result.returncode)
+if mode == "lose-enter-response" and enter:
+    result = subprocess.run([real, *args], close_fds=False, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    if result.returncode == 0:
+        (root / "enter-sent").touch()
+    sys.exit(1)
+if ((read and mode in ("before-text", "before-enter")) or
+        (literal and mode == "reply-before-enter")) and not (root / "input-boundary").exists():
+    byte_log = root / "input-bytes"
+    typed = byte_log.exists() and byte_log.stat().st_size > int(os.environ.get("INPUT_TEST_TYPED_BASELINE", "0"))
+    if mode == "reply-before-enter" or typed == (mode == "before-enter"):
+        # Pause the backend after the guarded command and before it can check Inbox.
+        result = subprocess.run([real, *args], close_fds=False, capture_output=True)
+        (root / "input-boundary").touch()
+        deadline = time.monotonic() + 12
+        while not (root / "release-input-boundary").exists():
+            if time.monotonic() >= deadline:
+                sys.exit(2)
+            time.sleep(.02)
+        sys.stdout.buffer.write(result.stdout)
+        sys.stderr.buffer.write(result.stderr)
+        sys.exit(result.returncode)
+if read and (mode == "first-read" or
+             (mode == "after-enter" and (root / "accepted-round").exists())):
+    (root / "input-boundary").touch()
+    deadline = time.monotonic() + 12
+    while not (root / "release-input-boundary").exists():
+        if time.monotonic() >= deadline:
+            sys.exit(2)
+        time.sleep(.02)
+os.execv(real, [real, *args])
+""")
+        shim.chmod(0o700)
+        return {"PATH": str(self.work) + ":" + env["PATH"], "INPUT_TEST_GATE": mode}
+
+    def await_input_value(self, predicate):
+        deadline = time.monotonic() + 8
+        while not (value := predicate()):
+            self.assertLess(time.monotonic(), deadline, "timed out waiting for the input fixture")
+            time.sleep(.02)
+        return value
+
+    def test_public_continue_and_nudge_share_live_worker(self):
+        cli, first, token, env = self.public_input_worker()
+        dispatch, attempt = first["dispatch"], first["attempt"]
+        pane = self.active_pane(dispatch)
+        pid = (self.work / "worker-pid").read_text()
+
+        def status():
+            return cli("status", "--dispatch", dispatch)["dispatches"][0]
+
+        def advance(report):
+            return ("continue", dispatch, "--task", "next-task", "--report", report)
+
+        self.assertIn("has not done", cli(*advance("report2"), token=token, expected=1))
+        lock = self.state / "close-locks" / f"{dispatch}.{attempt}"
+        with lock.open("a+") as execution:
+            fcntl.flock(execution, fcntl.LOCK_EX)
+            stale = subprocess.Popen([WFC, "nudge", dispatch, "--text", "stale",
+                                      "--owner-token", token], cwd=self.work, env=env,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.addCleanup(stale.wait, timeout=15)
+            time.sleep(.15)
+            self.assertIsNone(stale.poll(), "input did not wait for the execution lock")
+            token = cli("takeover", "--scope", "rounds", "--owner", "B")["token"]
+        out, error = stale.communicate(timeout=15)
+        self.assertEqual((stale.returncode, out), (1, ""))
+        self.assertEqual(json.loads(error)["error"], "stale_controller_owner")
+        self.assertFalse((self.work / "typed").exists())
+
+        trace = self.work / "redraw-frames"
+        try:
+            nudged = cli("nudge", dispatch, "--text", "finish\r\nfirst", token=token,
+                         **self.public_input_gate(env, "trace-redraw"))
+        finally:
+            frames = [json.loads(line) for line in trace.read_text().splitlines()] if trace.exists() else []
+            byte_log = self.work / "input-bytes"
+            data = byte_log.read_bytes() if byte_log.exists() else b""
+            formal = self.work / "formal-input"
+            formal_count = len(formal.read_text().splitlines()) if formal.exists() else 0
+            print("R17 synthetic redraw " + json.dumps({
+                "frames": frames, "literal_bytes": len(data) - data.count(b"\r"),
+                "enter_count": data.count(b"\r"), "formal_count": formal_count,
+            }), flush=True)
+        baseline = next(frame for frame in frames if frame["kind"] == "viewport" and frame["draft"] == "empty")
+        drafts = [frame for frame in frames if frame["kind"] == "viewport" and frame["draft"] == "exact"]
+        self.assertGreaterEqual(len(drafts), 2)
+        self.assertTrue(all(frame["rows_before_prompt"] == baseline["rows_before_prompt"] for frame in drafts))
+        redraw = next(frame for frame in frames if frame["kind"] == "redraw-history")
+        self.assertEqual(redraw["draft"], "exact")
+        self.assertGreater(redraw["rows_before_prompt"], baseline["rows_before_prompt"])
+        self.assertEqual(data, b"[router] Message from the controller: finish first\r")
+        self.assertEqual(formal_count, 1)
+        self.assertEqual((nudged["round"], nudged["attempt"]), (1, attempt))
+        self.await_input_value(lambda: (self.work / "first-done").exists())
+        finished = status()
+        self.assertEqual(finished["state"], "done")
+        self.assertEqual(finished["audit"][-1]["text"], "finish first")
+        sent = [message for message in finished["messages"] if message["to"] == "worker"]
+        self.assertEqual([(m["id"], m["type"], m["text"]) for m in sent],
+                         [(nudged["message"], "nudge", "finish first")])
+        self.assertIsInstance(nudged["message"], int)
+        self.assertIn("no controller message", cli("ack", str(nudged["message"]), token=token, expected=1))
+        received = cli("wait", "--scope", "rounds", "--timeout", "0", token=token)
+        self.assertEqual([message["type"] for message in received["messages"]], ["done"])
+        self.assertIn("with continue", cli("nudge", dispatch, "--text", "late", token=token, expected=1))
+        self.assertIn("already used", cli(*advance("report1"), token=token, expected=1))
+        (self.root / "other-report").mkdir()
+        self.assertIn("original report directory",
+                      cli(*advance("../other-report/report2"), token=token, expected=1))
+
+        (self.work / "draft").touch()
+        screen = self.work / "screen"
+        received = self.work / "input-bytes"
+        before = received.read_bytes()
+        self.await_input_value(lambda: screen.read_text() == "draft")
+        self.assertIn("definitely-not-sent", cli(*advance("report2"), token=token, expected=1))
+        rollback = status()
+        self.assertEqual((rollback["state"], rollback["round"], rollback["attempt"]), ("done", 1, attempt))
+        self.assertEqual(rollback["audit"][-1]["result"], "definitely-not-sent")
+        self.assertEqual(received.read_bytes(), before)
+        typed = self.work / "typed"
+        self.assertEqual(typed.read_text().splitlines(), [json.dumps("[router] Message from the controller: finish first")])
+
+        (self.work / "draft").unlink()
+        self.await_input_value(lambda: screen.read_text() == "ready")
+        advances = []
+        for report in ("report2", "report3"):
+            proc = subprocess.Popen([WFC, *advance(report), "--owner-token", token],
+                                    cwd=self.work, env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+            self.addCleanup(proc.wait, timeout=15)
+            advances.append(proc)
+        outputs = [proc.communicate(timeout=15) for proc in advances]
+        self.assertEqual(sorted(proc.returncode for proc in advances), [0, 1], outputs)
+        result = json.loads(next(out for out, _ in outputs if out))
+        current = status()
+        self.assertEqual((result["round"], current["attempt"]), (2, result["attempt"]))
+        self.assertNotEqual(result["attempt"], attempt)
+        self.assertEqual(current["executionId"], first["executionId"])
+        self.assertEqual(current["create"]["receipt"], first["create"]["receipt"])
+        self.assertEqual((self.active_pane(dispatch), (self.work / "worker-pid").read_text()), (pane, pid))
+        self.assertEqual(len(typed.read_text().splitlines()), 2)
+        self.assertEqual([r["state"] for r in current["rounds"]], ["completed", "running"])
+        self.assertNotIn("workerCallbackRefHash", current)
+        self.assertNotIn("workerCallbackHash", current)
+        self.await_input_value(lambda: (self.work / "accepted-round").exists())
+        report, identity, reference = json.loads((self.work / "accepted-round").read_text())
+        self.assertEqual((report, identity), (current["report"], result["attempt"]))
+        invalid = cli("ask", "No secret", "--attempt", identity, "--callback-ref", reference,
+                      token=token, expected=1, WFC_DISPATCH=dispatch)
+        self.assertEqual(json.loads(invalid)["error"], "invalid_worker_callback")
+        (self.work / "finish-next").touch()
+        self.await_input_value(lambda: (self.work / "callbacks").exists())
+        callbacks = json.loads((self.work / "callbacks").read_text())
+        self.assertEqual([callbacks["late"], callbacks["wrong"], callbacks["no_ref"]], [1, 1, 1])
+        completed = status()
+        self.assertEqual([r["state"] for r in completed["rounds"]], ["completed", "completed"])
+        self.assertEqual([r["result"]["attempt"] for r in completed["rounds"]], [attempt, identity])
+        self.assertEqual([m["messageId"] for m in completed["messages"]][-2:],
+                         [callbacks["ask"]["messageId"], callbacks["done"]["messageId"]])
+        closed = cli("close", dispatch, token=token)
+        self.assertEqual((closed["attempt"], closed["resourceCleanup"]), (identity, "confirmed"))
+        self.assertFalse(status()["backendAlive"])
+        self.assertIn("resume", cli(*advance("report4"), token=token, expected=1))
+
+    def test_public_continue_preserves_uncertain_round(self):
+        cli, first, token, env = self.public_input_worker()
+        dispatch = first["dispatch"]
+        cli("nudge", dispatch, "--text", "finish first", token=token)
+        self.await_input_value(lambda: (self.work / "first-done").exists())
+        args = ("continue", dispatch, "--task", "next-task", "--report", "report2")
+        gate = self.public_input_gate(env, "lose-enter-response")
+        self.assertIn("continue uncertain", cli(*args, token=token, expected=1, **gate))
+        self.assertTrue((self.work / "enter-sent").exists())
+        formal = self.work / "formal-input"
+        self.await_input_value(lambda: len(formal.read_text().splitlines()) == 2)
+        row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((row["state"], row["round"], row["audit"][-1]["result"]), ("unknown", 2, "uncertain"))
+        self.assertNotEqual(row["attempt"], first["attempt"])
+        self.assertEqual(row["executionId"], first["executionId"])
+        self.assertIn("pending or uncertain", cli(*args, token=token, expected=1))
+        self.assertIn("pending or uncertain", cli("nudge", dispatch, "--text", "retry", token=token, expected=1))
+        self.assertEqual(len(formal.read_text().splitlines()), 2)
+        self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
+
+    def test_public_continue_rejects_overlap_before_fast_r2_done(self):
+        cli, first, token, env = self.public_input_worker()
+        dispatch = first["dispatch"]
+        cli("nudge", dispatch, "--text", "finish first", token=token)
+        self.await_input_value(lambda: (self.work / "first-done").exists())
+        (self.work / "fast-r2-complete").touch()
+        args = ("continue", dispatch, "--task", "next-task", "--report")
+        gate = self.public_input_gate(env, "after-enter")
+        with subprocess.Popen([WFC, *args, "report2", "--owner-token", token],
+                              cwd=self.work, env={**env, **gate},
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as first_send:
+            try:
+                self.await_input_value(lambda: (self.work / "input-boundary").exists()
+                                       and (self.work / "r2-done-started").exists())
+                error = cli(*args, "report3", token=token, expected=1)
+                self.assertIn("pending or uncertain", error)
+                self.assertFalse((self.work / "r2-done").exists())
+            finally:
+                (self.work / "release-input-boundary").touch()
+                out, error = first_send.communicate(timeout=15)
+        self.assertEqual(first_send.returncode, 0, (out, error))
+        accepted = json.loads(out)
+        self.await_input_value(lambda: (self.work / "r2-done").exists())
+        self.assertEqual(cli(*args, "report2", token=token), {**accepted, "duplicate": True})
+        row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual([round_["state"] for round_ in row["rounds"]], ["completed", "completed"])
+        self.assertEqual((row["round"], row["attempt"]), (2, accepted["attempt"]))
+        sent = [m for m in row["messages"] if m["type"] == "continue" and m["to"] == "worker"]
+        self.assertEqual([m["id"] for m in sent], [accepted["message"]])
+        self.assertEqual(len((self.work / "formal-input").read_text().splitlines()), 2)
+
+    def test_public_nudge_rechecks_completion_and_lease_before_text(self):
+        cli, first, token, env = self.public_input_worker()
+        dispatch = first["dispatch"]
+        args = ("nudge", dispatch, "--text", "must not be sent")
+        gate = self.public_input_gate(env, "first-read")
+        cli("renew", "--scope", "rounds", "--lease", "4", token=token)
+        with subprocess.Popen([WFC, *args, "--owner-token", token],
+                              cwd=self.work, env={**env, **gate},
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as waiting:
+            try:
+                self.await_input_value(lambda: (self.work / "input-boundary").exists())
+                self.assertIsNone(waiting.poll())
+                time.sleep(4.1)
+            finally:
+                (self.work / "release-input-boundary").touch()
+                out, error = waiting.communicate(timeout=15)
+        self.assertEqual((waiting.returncode, out), (1, ""))
+        self.assertEqual(json.loads(error)["error"], "stale_controller_owner")
+        self.assertFalse((self.work / "input-bytes").exists())
+
+        token = cli("takeover", "--scope", "rounds", "--owner", "B")["token"]
+        lock = self.state / f"relay-{hashlib.sha256(b'rounds').hexdigest()}.lock"
+        with lock.open("a+") as scope:
+            fcntl.flock(scope, fcntl.LOCK_EX)
+            with subprocess.Popen(
+                [WFC, *args, "--owner-token", token], cwd=self.work, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            ) as waiting:
+                (self.work / "finish-first-externally").touch()
+                try:
+                    self.await_input_value(lambda: (self.work / "first-done").exists())
+                    self.assertIsNone(waiting.poll())
+                finally:
+                    fcntl.flock(scope, fcntl.LOCK_UN)
+                out, error = waiting.communicate(timeout=15)
+        self.assertEqual((waiting.returncode, out), (1, ""))
+        self.assertIn("finished its task", error)
+        self.assertFalse((self.work / "input-bytes").exists())
+        status = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((status["state"], status["round"]), ("done", 1))
+
+    def test_public_continue_checks_draft_and_does_not_infer_from_empty(self):
+        original = self.work
+        for mode in ("change-draft", "change-history", "hard-wrap-draft", "unknown-draft", "swallow-draft",
+                     "omit-transcript"):
+            with self.subTest(mode=mode):
+                self.work = original / mode
+                self.work.mkdir()
+                cli, first, token, _ = self.public_input_worker(scope=mode)
+                dispatch = first["dispatch"]
+                cli("nudge", dispatch, "--text", "finish first", token=token)
+                self.await_input_value(lambda: (self.work / "first-done").exists())
+                (self.work / mode).touch()
+                result = cli("continue", dispatch, "--task", "next-task", "--report", "report2",
+                             token=token, expected=1)
+                self.assertIn("continue uncertain", result)
+                row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+                self.assertEqual((row["round"], row["audit"][-1]["result"]), (2, "uncertain"))
+                if mode == "omit-transcript":
+                    self.assertIn("did not show the submitted input", result)
+                else:
+                    self.assertIn("Enter was not sent", result)
+                if mode == "change-history":
+                    self.assertIn("visible transcript changed", result)
+                expected = 2 if mode == "omit-transcript" else 1
+                self.assertEqual(len((self.work / "formal-input").read_text().splitlines()), expected)
+                self.assertEqual(len((self.work / "typed").read_text().splitlines()), expected)
+                self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
+        self.work = original
+
+    def test_public_continue_rolls_back_confirmed_refusal(self):
+        cli, first, token, _ = self.public_input_worker()
+        dispatch = first["dispatch"]
+        cli("nudge", dispatch, "--text", "finish first", token=token)
+        self.await_input_value(lambda: (self.work / "first-done").exists())
+        refusal = self.work / "refuse-input"
+        refusal.touch()
+        args = ("continue", dispatch, "--task", "next-task", "--report", "report2")
+        self.assertIn("continue refused", cli(*args, token=token, expected=1))
+        row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((row["round"], row["attempt"], row["audit"][-1]["result"]),
+                         (1, first["attempt"], "refused"))
+        self.assertEqual(row["audit"][-1]["inputEvidence"], "new-host-refusal")
+        formal = self.work / "formal-input"
+        self.assertEqual(len(formal.read_text().splitlines()), 1)
+        refusal.unlink()
+        resumed = cli(*args, token=token)
+        self.assertEqual(resumed["round"], 2)
+        self.assertEqual(len(formal.read_text().splitlines()), 2)
+
+    def test_public_nudge_distinguishes_new_intent_and_keyed_replay(self):
+        (self.work / "stable-transcript").touch()
+        cli, first, token, _ = self.public_input_worker()
+        dispatch = first["dispatch"]
+        args = ("nudge", dispatch, "--text")
+        self.assertIn("trailing scroll arrow", cli(*args, "往上 ↑", token=token, expected=1))
+        self.assertFalse((self.work / "input-bytes").exists())
+        first_a = cli(*args, "甲 ↑ 中", token=token)
+        b = cli(*args, "乙", "--message-id", "intent-b", token=token)
+        second_a = cli(*args, "甲 ↑ 中", token=token)
+        self.assertEqual(len({r["message"] for r in (first_a, b, second_a)}), 3)
+        self.assertEqual(cli(*args, "乙 ", "--message-id", "intent-b", token=token),
+                         {**b, "duplicate": True})
+        self.assertIn("conflicts", cli(*args, "changed", "--message-id", "intent-b",
+                                       token=token, expected=1))
+        expected = ["[router] Message from the controller: " + body for body in ("甲 ↑ 中", "乙", "甲 ↑ 中")]
+        self.assertEqual([json.loads(line) for line in (self.work / "formal-input").read_text().splitlines()],
+                         expected)
+        self.assertEqual((self.work / "input-bytes").read_bytes(),
+                         b"".join(body.encode() + b"\r" for body in expected))
+        status = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual([m["id"] for m in status["messages"] if m["to"] == "worker"],
+                         [first_a["message"], b["message"], second_a["message"]])
+
+    def test_public_continue_confirms_soft_wrap_with_transcript_scroll(self):
+        self.check_public_continue_transcript_scroll()
+
+    def test_public_continue_confirms_scroll_when_history_is_full(self):
+        subprocess.run(self.tmux + ["set-option", "-g", "history-limit", "96"], check=True)
+        self.check_public_continue_transcript_scroll(capped=True)
+
+    def check_public_continue_transcript_scroll(self, capped=False):
+        cli, first, token, env = self.public_input_worker()
+        dispatch = first["dispatch"]
+        cli("nudge", dispatch, "--text", "finish first", token=token)
+        self.await_input_value(lambda: (self.work / "first-done").exists())
+        pane = self.active_pane(dispatch)
+        subprocess.run(self.tmux + ["resize-window", "-t", f"=wfc-{dispatch}:", "-x", "80", "-y", "16"],
+                       check=True)
+        if capped:
+            (self.work / "seed-capped").touch()
+        (self.work / "fill-transcript").touch()
+        self.await_input_value(lambda: (self.work / "filled-transcript").exists())
+        capture = self.tmux + ["capture-pane", "-p", "-J", "-t", pane]
+        def anchors():
+            return [line.strip() for line in subprocess.check_output(capture, text=True).splitlines()
+                    if line.startswith("scroll anchor ")]
+        def oldest():
+            full = subprocess.check_output(capture + ["-S", "-"], text=True)
+            return next(int(line.split()[-1]) for line in full.splitlines()
+                        if line.startswith("capped history "))
+        prior = anchors()
+        self.assertEqual(len(prior), 10)
+        if capped:
+            oldest_before = oldest()
+        gate = self.public_input_gate(env, "before-enter")
+        gate["INPUT_TEST_TYPED_BASELINE"] = str((self.work / "input-bytes").stat().st_size)
+        args = ["continue", dispatch, "--task", "next-task", "--report", "report2"]
+        with subprocess.Popen([WFC, *args, "--owner-token", token], cwd=self.work,
+                              env={**env, **gate}, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) as pending:
+            try:
+                self.await_input_value(lambda: (self.work / "input-boundary").exists())
+                during = anchors()
+                self.assertTrue(during and len(during) < len(prior), (prior, during))
+                self.assertEqual(during, prior[-len(during):])
+                if capped:
+                    oldest_draft = oldest()
+                    self.assertGreater(oldest_draft, oldest_before)
+            finally:
+                (self.work / "release-input-boundary").touch()
+                out, error = pending.communicate(timeout=15)
+        self.assertEqual(pending.returncode, 0, (out, error))
+        result = json.loads(out)
+        after = anchors()
+        self.assertTrue(after and len(after) < len(during), (during, after))
+        self.assertEqual(after, prior[-len(after):])
+        if capped:
+            oldest_submitted = oldest()
+            self.assertGreater(oldest_submitted, oldest_draft)
+            print("R21 archived head evicted " + json.dumps(
+                [oldest_before, oldest_draft, oldest_submitted]), flush=True)
+        self.assertEqual(len((self.work / "formal-input").read_text().splitlines()), 2)
+        self.assertEqual((self.work / "input-bytes").read_bytes().count(b"\r"), 2)
+        row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((result["round"], result["attempt"]), (2, row["attempt"]))
+        self.assertEqual(row["audit"][-1]["inputEvidence"], "appended-user-entry")
+        print("R19 scroll anchors " + json.dumps({"before": len(prior), "draft": len(during),
+                                                  "submitted": len(after), "enter_count": 2}), flush=True)
+
+    def test_public_continue_restores_round_on_unique_refusal_before_enter(self):
+        (self.work / "stable-transcript").touch()
+        cli, first, token, _ = self.public_input_worker()
+        dispatch = first["dispatch"]
+        cli("nudge", dispatch, "--text", "finish first", token=token)
+        self.await_input_value(lambda: (self.work / "first-done").exists())
+        refusal = self.work / "refuse-draft"
+        refusal.touch()
+        args = ("continue", dispatch, "--task", "next-task", "--report", "report2")
+        for count in (1, 2):
+            self.assertIn("continue refused", cli(*args, token=token, expected=1))
+            row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+            self.assertEqual((row["round"], row["attempt"]), (1, first["attempt"]))
+            self.assertEqual(row["audit"][-1]["inputEvidence"], "new-host-refusal")
+            self.assertEqual([m["type"] for m in row["messages"] if m["to"] == "worker"], ["nudge"])
+            data = (self.work / "input-bytes").read_bytes()
+            self.assertEqual(data.count(b"\r"), 1)
+            self.assertEqual(data.count(b"[router] New task for you"), count)
+            self.assertEqual(len((self.work / "formal-input").read_text().splitlines()), 1)
+        refusal.unlink()
+        self.assertEqual(cli(*args, token=token)["round"], 2)
+        self.assertEqual(len((self.work / "formal-input").read_text().splitlines()), 2)
+
+    def test_public_unresolved_reply_blocks_nudge_continue_and_other_question(self):
+        scope = "shared-reply"
+        self.setup_reply("always-drop", scope)
+        dispatch = self.reply_dispatch
+        (self.work / "ask-second").touch()
+        second = self.await_input_value(lambda: (self.work / "second-question.json").exists())
+        self.assertTrue(second)
+        question = json.loads((self.work / "second-question.json").read_text())["message"]
+        self.assertIn("uncertain", self.reply_cli("reply", self.number, "one pending reply", expected=1))
+        text = f"[router] Answer to question {self.number}: one pending reply".encode()
+        self.assert_reply_bytes(text + b"\r" * 3)
+        owner = self.reply_cli("takeover", "--scope", scope, "--owner", "B")["token"]
+        self.reply_env["WFC_CONTROLLER_TOKEN"] = owner
+        self.assertIn("another reply is pending or uncertain",
+                      self.reply_cli("reply", question, "second reply", expected=1))
+        self.assertIn("reply is pending or uncertain",
+                      self.reply_cli("nudge", dispatch, "--text", "blocked", expected=1))
+        (self.work / "finish-without-answer").touch()
+        (self.work / "finish").touch()
+        self.await_input_value(lambda: self.reply_status()["state"] == "done")
+        (self.work / "next-task").write_text("next")
+        self.assertIn("reply is pending or uncertain",
+                      self.reply_cli("continue", dispatch, "--task", "next-task", "--report", "report2", expected=1))
+        self.assert_reply_bytes(text + b"\r" * 3)
+        row = self.reply_status()
+        self.assertEqual([m["inputResult"] for m in row["messages"] if m["type"] == "reply"], ["uncertain"])
+        self.assertEqual(row["round"], 1)
+        self.assertEqual(self.reply_cli("close", dispatch)["result"], "completed")
+
+    def test_public_unresolved_nudge_blocks_reply_for_both_questions(self):
+        cli, first, token, _ = self.public_input_worker()
+        dispatch = first["dispatch"]
+        (self.work / "ask-twice").touch()
+        self.await_input_value(lambda: (self.work / "questions").exists())
+        questions = json.loads((self.work / "questions").read_text())
+        (self.work / "change-draft").touch()
+        self.assertIn("nudge uncertain", cli("nudge", dispatch, "--text", "one pending reminder",
+                                             token=token, expected=1))
+        token = cli("takeover", "--scope", "rounds", "--owner", "B")["token"]
+        for question in questions:
+            self.assertIn("another input is pending or uncertain",
+                          cli("reply", str(question["message"]), "blocked", token=token, expected=1))
+        self.assertEqual((self.work / "input-bytes").read_bytes(),
+                         b"[router] Message from the controller: one pending reminder")
+        self.assertFalse((self.work / "typed").exists())
+        row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertTrue(all(m["type"] == "question" for m in row["messages"]))
+        self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
+
+    def test_public_resume_continue_ignores_reply_from_replaced_physical_attempt(self):
+        self.codex_home = self.root / "codex home"
+        self.codex_home.mkdir()
+        (self.work / "styled-reply").touch()
+        cli, first, token, _ = self.public_input_worker(codex_home=self.codex_home)
+        dispatch = first["dispatch"]
+        args = json.loads((self.work / "launch-argv").read_text())
+        self.rollout("81111111-2222-4333-8444-555555555555", args[-1])
+        (self.work / "ask-twice").touch()
+        self.await_input_value(lambda: (self.work / "questions").exists())
+        question = json.loads((self.work / "questions").read_text())[0]["message"]
+        (self.work / "hold-input").touch()
+        self.assertIn("uncertain", cli("reply", str(question), "old reply", token=token, expected=1))
+        old, = [m for m in cli("status", "--dispatch", dispatch)["dispatches"][0]["messages"]
+                if m["type"] == "reply"]
+        self.assertEqual((old["attempt"], old["inputResult"]), (first["attempt"], "uncertain"))
+        (self.work / "hold-input").unlink()
+        (self.work / "styled-reply").unlink()
+        (self.work / "exit-worker").touch()
+
+        def original_exited():
+            row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+            return row["worker"]["state"] == "exited" and row["backendAlive"] is False
+
+        self.await_input_value(original_exited)
+        resumed = cli("resume", dispatch, token=token, WFC_RESUME_CHECK_SECONDS="0.25")
+        self.assertEqual((resumed["round"], resumed["launchResult"]), (1, "accepted"))
+        self.assertNotEqual(resumed["attempt"], first["attempt"])
+        live = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((live["executionId"], live["round"], live["attempt"], live["state"]),
+                         (resumed["attempt"], 1, resumed["attempt"], "working"))
+        self.assertFalse(any(m["type"] == "done" for m in live["messages"]))
+
+        received = self.work / "input-bytes"
+        before = received.read_bytes()
+        advance = ("continue", dispatch, "--task", "next-task", "--report", "report2")
+        self.assertIn("has not done", cli(*advance, token=token, expected=1))
+        self.assertEqual(received.read_bytes(), before)
+        nudge = cli("nudge", dispatch, "--text", "resumed execution is running", token=token)
+        self.assertEqual((nudge["round"], nudge["attempt"]), (1, resumed["attempt"]))
+        line = "[router] Message from the controller: resumed execution is running"
+        nudged = before + line.encode() + b"\r"
+        self.assertEqual(received.read_bytes(), nudged)
+        self.assertEqual((self.work / "formal-input").read_text().splitlines(), [json.dumps(line)])
+
+        # Release the completion callback only after verifying input on the resumed worker.
+        done_path = self.work / "first-done"
+        self.assertFalse(done_path.exists())
+        (self.work / "finish-first-externally").touch()
+        self.await_input_value(done_path.exists)
+        completed = json.loads(done_path.read_bytes())
+        finished = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((finished["state"], finished["round"], finished["attempt"]),
+                         ("done", 1, resumed["attempt"]))
+        self.assertEqual(finished["rounds"][-1]["result"]["id"], completed["message"])
+        self.assertIn("with continue", cli("nudge", dispatch, "--text", "late", token=token, expected=1))
+        self.assertEqual(received.read_bytes(), nudged)
+
+        continued = cli(*advance, token=token)
+        self.await_input_value(lambda: (self.work / "accepted-round").exists())
+        fresh = cli("nudge", dispatch, "--text", "new execution running", token=token)
+        self.assertEqual((fresh["round"], fresh["attempt"]), (2, continued["attempt"]))
+        (self.work / "ask-current-round").touch()
+        self.await_input_value(lambda: (self.work / "current-question").exists())
+        question = json.loads((self.work / "current-question").read_text())["message"]
+        (self.work / "styled-reply").touch()
+        (self.work / "redraw-worker").touch()
+        self.await_input_value(lambda: not (self.work / "redraw-worker").exists())
+        replied = cli("reply", str(question), "new reply", token=token)
+        self.assertEqual(replied["replied"], question)
+        # An unresolved earlier logical round of the *same* execution still fences R2.
+        ledger = self.state / "messages.json"
+        saved = ledger.read_bytes()
+        records = json.loads(saved)
+        older_reply = next(m for m in records if m["messageId"] == old["messageId"])
+        archived = {**older_reply, "id": len(records) + 1, "messageId": "m-physical-fence-fixture",
+                    "attempt": resumed["attempt"]}
+        archived.pop("body_hash", None)
+        ledger.write_text(json.dumps([*records, archived]))
+        bytes_before = (self.work / "input-bytes").read_bytes()
+        try:
+            self.assertIn("reply is pending or uncertain",
+                          cli("nudge", dispatch, "--text", "blocked", token=token, expected=1))
+            self.assertEqual((self.work / "input-bytes").read_bytes(), bytes_before)
+        finally:
+            ledger.write_bytes(saved)
+        (self.work / "finish-next").touch()
+        self.await_input_value(lambda: (self.work / "callbacks").exists())
+        result, = cli("reclaim", "--yes", "--dispatch", dispatch, token=token)["sessions"]
+        self.assertEqual(result["result"], "reclaimed")
+        row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertFalse(row["backendAlive"])
+        self.assertEqual((row["executionId"], row["round"], row["attempt"]),
+                         (resumed["attempt"], 2, continued["attempt"]))
+        self.assertTrue(any(m["messageId"] == old["messageId"] and m["inputResult"] == "uncertain"
+                            for m in row["messages"] if m["type"] == "reply"))
+        self.assertEqual((self.work / "report1").read_text(), "first report")
+        self.assertEqual((self.work / "report2").read_text(), "second report")
+
+    def test_public_reclaim_after_continue_preserves_reports_and_directions(self):
+        cli, first, token, _ = self.public_input_worker()
+        dispatch = first["dispatch"]
+        first_input = ("nudge", dispatch, "--text", "finish first", "--message-id", "first-input")
+        nudge = cli(*first_input, token=token)
+        self.await_input_value(lambda: (self.work / "first-done").exists())
+        continued = cli("continue", dispatch, "--task", "next-task", "--report", "report2", token=token)
+        self.await_input_value(lambda: (self.work / "accepted-round").exists())
+        self.assertEqual(cli(*first_input, token=token), {**nudge, "duplicate": True})
+        self.assertEqual((self.work / "input-bytes").read_bytes().count(b"\r"), 2)
+        (self.work / "finish-next").touch()
+        self.await_input_value(lambda: (self.work / "callbacks").exists())
+        ledger = self.state / "messages.json"
+        assignment = self.state / "dispatches" / f"{dispatch}.json"
+        before = (ledger.read_bytes(), assignment.read_bytes())
+        preview = cli("reclaim", "--dispatch", dispatch, token=token)["sessions"][0]
+        self.assertEqual((preview["result"], preview["reclaimable"]), ("listed", True))
+        self.assertEqual((ledger.read_bytes(), assignment.read_bytes()), before)
+        owner = cli("takeover", "--scope", "rounds", "--owner", "B")["token"]
+        self.assertIn("stale_controller_owner",
+                      cli("reclaim", "--yes", "--dispatch", dispatch, token=token, expected=1))
+        self.assertTrue(cli("status", "--dispatch", dispatch)["dispatches"][0]["backendAlive"])
+        freed = cli("reclaim", "--yes", "--dispatch", dispatch, token=owner)["sessions"][0]
+        self.assertEqual(freed["result"], "reclaimed")
+        row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertFalse(row["backendAlive"])
+        self.assertEqual((row["attempt"], row["executionId"]), (continued["attempt"], first["executionId"]))
+        self.assertEqual([r["state"] for r in row["rounds"]], ["completed", "completed"])
+        self.assertEqual([(self.work / name).read_text() for name in ("report1", "report2")],
+                         ["first report", "second report"])
+        outgoing = [m for m in row["messages"] if m["to"] == "worker"]
+        self.assertEqual([(m["type"], m["id"]) for m in outgoing],
+                         [("nudge", nudge["message"]), ("continue", continued["message"]),
+                          ("reclaimed", freed["message"])])
+        self.assertEqual(outgoing[-1]["attempt"], continued["attempt"])
+        for m in outgoing:
+            self.assertIn("no controller message", cli("ack", str(m["id"]), token=owner, expected=1))
+        incoming = cli("wait", "--scope", "rounds", "--timeout", "0", token=owner)["messages"]
+        self.assertEqual([m["type"] for m in incoming], ["done", "question", "done"])
+
+    def test_public_nudge_recovers_after_settlement_sync_failure(self):
+        cli, first, token, env = self.public_input_worker()
+        dispatch = first["dispatch"]
+        self.assertIn(" ", str(self.work))
+        # glibc tokenizes LD_PRELOAD on spaces and colons, without an escape.
+        loader = tempfile.TemporaryDirectory(prefix="wfc-settlement-loader-", dir="/tmp")
+        self.addCleanup(loader.cleanup)
+        loader_dir = Path(loader.name)
+        shim = loader_dir / "settlement-sync.so"
+        self.assertFalse(any(char in str(shim) for char in " :\t\r\n"))
+        self.assertEqual(stat.S_IMODE(loader_dir.stat().st_mode), 0o700)
+        source = loader_dir / "settlement-sync.c"
+        source.write_text(r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static void record_event(const char *event, unsigned ordinal, int error) {
+    const char *log = getenv("WFC_TEST_SETTLEMENT_LOG");
+    if (!log) return;
+    FILE *file = fopen(log, "a");
+    if (!file) return;
+    fprintf(file, "%ld %s %u %d\n", (long)getpid(), event, ordinal, error);
+    fclose(file);
+}
+
+__attribute__((constructor)) static void loaded(void) {
+    record_event("loaded", 0, 0);
+}
+
+int fsync(int fd) {
+    static unsigned dispatch_syncs;
+    int (*real_fsync)(int) = dlsym(RTLD_NEXT, "fsync");
+    if (!real_fsync) {
+        errno = ENOSYS;
+        return -1;
+    }
+    const char *directory = getenv("WFC_TEST_SETTLEMENT_DIR");
+    char link[64];
+    char path[4096];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t count = readlink(link, path, sizeof(path) - 1);
+    if (directory && count >= 0) {
+        path[count] = '\0';
+        if (strcmp(directory, path) == 0) {
+            unsigned ordinal = ++dispatch_syncs;
+            if (ordinal == 2) {
+                record_event("directory-sync", ordinal, EIO);
+                errno = EIO;
+                return -1;
+            }
+            int result = real_fsync(fd);
+            int saved_errno = errno;
+            record_event("directory-sync", ordinal, result == 0 ? 0 : saved_errno);
+            errno = saved_errno;
+            return result;
+        }
+    }
+    return real_fsync(fd);
+}
+""")
+        subprocess.run(["cc", "-shared", "-fPIC", "-o", shim, source, "-ldl"], check=True)
+
+        def run_with_loader(phase, args, **extra):
+            log = loader_dir / f"{phase}.log"
+            test_env = {**env, "LC_ALL": "C", "LD_PRELOAD": str(shim),
+                        "WFC_TEST_SETTLEMENT_LOG": str(log), **extra}
+            with subprocess.Popen([WFC, *args], cwd=self.work, env=test_env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child:
+                try:
+                    stdout, stderr = child.communicate(timeout=15)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.communicate()
+                    raise
+            events = []
+            if log.exists():
+                for line in log.read_text().splitlines():
+                    pid, event, ordinal, error = line.split()
+                    if int(pid) == child.pid:
+                        events.append([event, int(ordinal), int(error)])
+            print("R18 settlement loader " + json.dumps({
+                "phase": phase, "exit": child.returncode, "main_process_events": events,
+                "loader_warning": "ld.so" in stderr,
+            }), flush=True)
+            self.assertNotIn("ld.so", stderr)
+            return child.returncode, stdout, stderr, events
+
+        rc, version, error, events = run_with_loader("preflight", ("--version",))
+        self.assertEqual((rc, error, events), (0, "", [["loaded", 0, 0]]))
+        self.assertIn("(Rust,", version)
+        print("R18 settlement shim SHA-256 " + hashlib.sha256(shim.read_bytes()).hexdigest(), flush=True)
+        before = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertFalse(any(message["to"] == "worker" for message in before["messages"]))
+        byte_log = self.work / "input-bytes"
+        typed = self.work / "typed"
+        formal = self.work / "formal-input"
+        self.assertTrue(all(not path.exists() for path in (byte_log, typed, formal)))
+
+        args = ("nudge", dispatch, "--message-id", "settlement-receipt", "--text")
+        rc, output, error, events = run_with_loader(
+            "fault", (*args, "safely repeat   ", "--owner-token", token),
+            WFC_TEST_SETTLEMENT_DIR=str((self.state / "dispatches").resolve()))
+        self.assertEqual(events, [["loaded", 0, 0], ["directory-sync", 1, 0],
+                                  ["directory-sync", 2, errno.EIO]])
+        self.assertEqual((rc, output), (1, ""))
+        self.assertIn(f"os error {errno.EIO}", error)
+
+        status = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        settled = status["audit"][-1]
+        self.assertEqual((settled["result"], settled["text"], settled["inputEvidence"]),
+                         ("accepted", "safely repeat", "appended-user-entry"))
+        receipt = settled["message"]
+        self.assertIsInstance(receipt, int)
+        expected_entry = "[router] Message from the controller: safely repeat"
+        expected_bytes = expected_entry.encode() + b"\r"
+        self.assertEqual(byte_log.read_bytes(), expected_bytes)
+        self.assertEqual([json.loads(line) for line in typed.read_text().splitlines()], [expected_entry])
+        self.assertEqual([json.loads(line) for line in formal.read_text().splitlines()], [expected_entry])
+        self.assertEqual([m["id"] for m in status["messages"] if m["to"] == "worker"], [receipt])
+        ledger = self.state / "messages.json"
+        confirmed_ledger = ledger.read_bytes()
+
+        visible = cli(*args, "safely repeat", token=token)
+        self.assertEqual((visible["message"], visible["audit"], visible["duplicate"]),
+                         (receipt, settled["id"], True))
+        self.assertEqual(byte_log.read_bytes(), expected_bytes)
+        self.assertEqual(ledger.read_bytes(), confirmed_ledger)
+        # Reconstruct the pre-rename disk state while retaining the proven receipt.
+        assignment = self.state / "dispatches" / f"{dispatch}.json"
+        row = json.loads(assignment.read_text())
+        pending = row["audit"][-1]
+        pending["result"] = "pending"
+        pending.pop("message")
+        pending.pop("inputEvidence")
+        assignment.write_text(json.dumps(row))
+        for text in ("safely repeat", "safely repeat  "):
+            result = cli(*args, text, token=token)
+            self.assertEqual((result["message"], result["audit"], result["duplicate"]),
+                             (receipt, settled["id"], True))
+            self.assertEqual(byte_log.read_bytes(), expected_bytes)
+            self.assertEqual(ledger.read_bytes(), confirmed_ledger)
+        self.assertEqual(len(typed.read_text().splitlines()), 1)
+        self.assertEqual(len(formal.read_text().splitlines()), 1)
+        status = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual(status["audit"][-1], settled)
+        self.assertEqual([m["id"] for m in status["messages"] if m["to"] == "worker"], [receipt])
+        print("R18 settlement replay " + json.dumps({
+            "numeric_receipt_preserved": True, "ledger_bytes_preserved": True,
+            "literal_bytes": len(expected_bytes) - 1, "enter_count": 1, "formal_count": 1,
+        }), flush=True)
+
+    def test_public_nudge_rechecks_draft_and_lease_after_inbox_wait(self):
+        original = self.work
+        for mode in ("text-draft", "enter-draft", "enter-lease"):
+            with self.subTest(mode=mode):
+                self.work = original / mode
+                self.work.mkdir()
+                cli, first, token, env = self.public_input_worker(scope=mode)
+                dispatch = first["dispatch"]
+                if mode == "enter-lease":
+                    cli("renew", "--scope", mode, "--lease", "4", token=token)
+                before_text = mode == "text-draft"
+                gate = self.public_input_gate(env, "before-text" if before_text else "before-enter")
+                argv = [WFC, "nudge", dispatch, "--text", "boundary", "--owner-token", token]
+                with subprocess.Popen(argv, cwd=self.work, env={**env, **gate},
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as pending:
+                    self.await_input_value(lambda: (self.work / "input-boundary").exists())
+                    with (self.state / "messages.lock").open("a+") as inbox:
+                        fcntl.flock(inbox, fcntl.LOCK_EX)
+                        (self.work / "release-input-boundary").touch()
+                        self.await_input_value(
+                            lambda: "lock_inode_wait" in Path(f"/proc/{pending.pid}/wchan").read_text())
+                        if before_text:
+                            (self.work / "draft").touch()
+                            self.await_input_value(lambda: (self.work / "screen").read_text() == "draft")
+                        elif mode == "enter-draft":
+                            (self.work / "change-draft").touch()
+                            (self.work / "refresh-draft").touch()
+                            self.await_input_value(lambda: (self.work / "screen").read_text() == "partial")
+                        else:
+                            time.sleep(4.1)
+                        self.assertIsNone(pending.poll())
+                    out, error = pending.communicate(timeout=15)
+                self.assertEqual((pending.returncode, out), (1, ""))
+                self.assertIn("definitely-not-sent" if before_text else "uncertain", error)
+                if mode == "enter-lease":
+                    self.assertIn("stale_controller_owner", error)
+                    token = cli("takeover", "--scope", mode, "--owner", "B")["token"]
+                data = self.work / "input-bytes"
+                if before_text:
+                    self.assertFalse(data.exists())
+                else:
+                    self.assertEqual(data.read_bytes(), b"[router] Message from the controller: boundary")
+                self.assertFalse((self.work / "typed").exists())
+                self.assertFalse((self.work / "formal-input").exists())
+                self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
+        self.work = original
+
+    def seed_public_input_history(self, dispatch, mode):
+        pane = self.active_pane(dispatch)
+        capture = self.tmux + ["capture-pane", "-p", "-J", "-t", pane]
+        hidden = ("› [router] Message from the controller: historical" if mode in {"same-text", "visible"}
+                  else "This conversation is read-only or unavailable; no operation was sent.")
+
+        def screen(*args):
+            text = subprocess.check_output(capture + list(args), text=True, timeout=2)
+            return "\n".join(line.rstrip() for line in text.splitlines()) + "\n"
+
+        def ready():
+            if not (self.work / "history-ready").exists():
+                return False
+            snapshot = screen()
+            return "history head 1" in snapshot and "model · cwd" in snapshot
+
+        seed = self.work / "prepare-history"
+        seed.write_text(mode)
+        seed.replace(self.work / "seed-history")
+        self.await_input_value(ready)
+        self.assertEqual(hidden in screen(), mode == "visible")
+        self.assertEqual(screen("-S", "-").count(hidden), 1)
+        return hidden, screen
+
+    def test_public_input_does_not_attribute_reappearing_history(self):
+        original = self.work
+        cases = {
+            "hidden-redraw": ("same-text", 0, False),
+            "hidden-draft-scroll": ("same-text", 2, False),
+            "visible-draft-scroll": ("visible", 1, False),
+            "hidden-enter-scroll": ("same-text", 0, True),
+            "refusal-before-enter-scroll": ("refusal", 0, True),
+            "ambiguous-new-refusal": ("refusal", 0, True),
+        }
+        for scope, (mode, draft_scroll, event_scroll) in cases.items():
+            with self.subTest(scope=scope):
+                self.work = original / scope
+                self.work.mkdir()
+                cli, first, token, _ = self.public_input_worker(scope=scope)
+                dispatch = first["dispatch"]
+                if mode == "refusal":
+                    (self.work / "finish-first-externally").touch()
+                    done_path = self.work / "first-done"
+                    self.await_input_value(done_path.exists)
+                    done = json.loads(done_path.read_text())
+                hidden, screen = self.seed_public_input_history(dispatch, mode)
+                if draft_scroll:
+                    (self.work / "scroll-draft").write_text(str(draft_scroll))
+                if event_scroll:
+                    (self.work / "scroll-event").touch()
+                refuse = mode == "refusal"
+                if scope == "ambiguous-new-refusal":
+                    (self.work / "refuse-draft").touch()
+                else:
+                    (self.work / "expose-history").write_text("refusal" if refuse else "same-text")
+                args = (("continue", dispatch, "--task", "next-task", "--report", "report2") if refuse
+                        else ("nudge", dispatch, "--text", "historical", "--message-id", "redraw"))
+                result = cli(*args, token=token, expected=1)
+                self.assertIn(f"{args[0]} uncertain", result)
+                diagnostic = "Enter was not sent" if refuse else "no entry attributable"
+                self.assertIn(diagnostic, result)
+                current = screen()
+                self.assertIn(f"{hidden}\n\n", current)
+                full = screen("-S", "-")
+                self.assertEqual("history head 0" in current, not (draft_scroll == 2 or event_scroll))
+                self.assertIn("history head 0\nhistory head 1", full)
+                self.assertEqual(full.count(hidden), 2)
+                self.assertFalse((self.work / "scroll-event").exists())
+                row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+                audit = row["audit"][-1]
+                self.assertEqual((audit["fromRound"], audit["fromAttempt"], audit["result"]),
+                                 (1, first["attempt"], "uncertain"))
+                self.assertNotIn("inputEvidence", audit)
+                self.assertTrue(all(m["to"] != "worker" for m in row["messages"]))
+                received = (self.work / "input-bytes").read_bytes()
+                ledger = (self.state / "dispatches" / f"{dispatch}.json").read_bytes()
+                self.assertIn("pending or uncertain", cli(*args, token=token, expected=1))
+                self.assertEqual((self.work / "input-bytes").read_bytes(), received)
+                self.assertEqual((self.state / "dispatches" / f"{dispatch}.json").read_bytes(), ledger)
+                if not refuse:
+                    self.assertEqual((row["round"], row["attempt"]), (1, first["attempt"]))
+                    self.assertEqual(received, hidden.removeprefix("› ").encode() + b"\r")
+                    self.assertEqual(len((self.work / "typed").read_text().splitlines()), 1)
+                else:
+                    self.assertEqual((row["round"], row["attempt"]), (2, audit["attempt"]))
+                    self.assertNotEqual(row["attempt"], first["attempt"])
+                    completed, = [m for m in row["messages"] if m["type"] == "done"]
+                    self.assertEqual((completed["id"], completed["attempt"]),
+                                     (done["message"], first["attempt"]))
+                    self.assertTrue(received.startswith(b"[router] New task for you"))
+                    self.assertNotIn(b"\r", received)
+                    self.assertFalse((self.work / "typed").exists())
+                self.assertFalse((self.work / "formal-input").exists())
+                self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
+                print("R24 redraw " + json.dumps({
+                    "case": scope, "result": audit["result"],
+                    "round": row["round"], "enter_count": received.count(b"\r"), "formal_count": 0,
+                }), flush=True)
+        self.work = original
+
+    def test_public_input_keeps_real_delivery_pending_when_lookalike_is_archived(self):
+        hidden_input = "[router] Message from the controller: historical"
+        original = self.work
+        for scroll in (False, True):
+            with self.subTest(scroll=scroll):
+                scope = "native-scroll" if scroll else "spare-viewport"
+                self.work = original / scope
+                self.work.mkdir()
+                cli, first, token, _ = self.public_input_worker(scope=scope)
+                dispatch = first["dispatch"]
+                hidden, screen = self.seed_public_input_history(dispatch, "same-text")
+                if scroll:
+                    (self.work / "scroll-event").touch()
+                args = ("nudge", dispatch, "--text", "historical", "--message-id", "new-intent")
+                rejected = cli(*args, token=token, expected=1)
+                self.assertIn("nudge uncertain", rejected)
+                self.assertIn("no entry attributable", rejected)
+                self.assertIn(f"{hidden}\n\n", screen())
+                self.assertEqual("history head 0" in screen(), not scroll)
+                self.assertEqual(screen("-S", "-").count(hidden), 2)
+                received = self.work / "input-bytes"
+                formal = self.work / "formal-input"
+                self.assertEqual(received.read_bytes(), hidden_input.encode() + b"\r")
+                self.assertEqual(formal.read_text().splitlines(), [json.dumps(hidden_input)])
+                row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+                audit = row["audit"][-1]
+                self.assertEqual((row["round"], row["attempt"], audit["result"]),
+                                 (1, first["attempt"], "uncertain"))
+                self.assertFalse(any(m["to"] == "worker" for m in row["messages"]))
+                before = (received.read_bytes(), formal.read_bytes())
+                self.assertIn("pending or uncertain", cli(*args, token=token, expected=1))
+                self.assertEqual((received.read_bytes(), formal.read_bytes()), before)
+                self.assertEqual(cli("status", "--dispatch", dispatch)["dispatches"][0]["audit"][-1], audit)
+                self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
+                print("R24 unconfirmed delivery " + json.dumps({
+                    "case": scope, "result": audit["result"], "enter_count": 1, "formal_count": 1,
+                }), flush=True)
+        self.work = original
+
+    def test_public_continue_reconciles_redrawn_refusal_only_after_authenticated_callback(self):
+        cli, first, token, _ = self.public_input_worker()
+        dispatch = first["dispatch"]
+        (self.work / "finish-first-externally").touch()
+        done_path = self.work / "first-done"
+        self.await_input_value(done_path.exists)
+        done = json.loads(done_path.read_text())
+        hidden, screen = self.seed_public_input_history(dispatch, "refusal")
+        (self.work / "expose-history").write_text("submitted")
+        (self.work / "scroll-event").touch()
+        args = ("continue", dispatch, "--task", "next-task", "--report", "report2")
+        result = cli(*args, token=token, expected=1)
+        self.assertIn("continue uncertain", result)
+        self.assertIn("no entry attributable", result)
+        self.assertIn(f"{hidden}\n\n", screen())
+        self.assertNotIn("history head 0", screen())
+        self.assertEqual(screen("-S", "-").count(hidden), 2)
+        accepted_path = self.work / "accepted-round"
+        self.await_input_value(accepted_path.exists)
+        _, attempt, _ = json.loads(accepted_path.read_text())
+        received, formal = (self.work / name for name in ("input-bytes", "formal-input"))
+        previous = (received.read_bytes(), formal.read_bytes())
+        self.assertEqual(previous[0].count(b"\r"), 1)
+        self.assertEqual(len(previous[1].splitlines()), 1)
+        pending = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        audit = pending["audit"][-1]
+        self.assertEqual((pending["round"], pending["attempt"], pending["state"], audit["result"]),
+                         (2, attempt, "unknown", "uncertain"))
+        self.assertEqual(pending["executionId"], first["executionId"])
+        self.assertEqual([m["id"] for m in pending["messages"]], [done["message"]])
+        self.assertIn("pending or uncertain", cli(*args, token=token, expected=1))
+        self.assertEqual((received.read_bytes(), formal.read_bytes()), previous)
+
+        # Wait for actual worker callbacks carrying the reference from the submitted brief.
+        (self.work / "finish-next").touch()
+        callbacks_path = self.work / "callbacks"
+        self.await_input_value(callbacks_path.exists)
+        callbacks = json.loads(callbacks_path.read_text())
+        self.assertEqual([callbacks[key] for key in ("late", "wrong", "no_ref")], [1, 1, 1])
+        before_replay = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual(before_replay["audit"][-1], audit)
+        self.assertFalse(any(m["to"] == "worker" for m in before_replay["messages"]))
+        assignment = self.state / "dispatches" / f"{dispatch}.json"
+        unsettled = assignment.read_bytes()
+        receipt = cli(*args, token=token)
+        self.assertEqual((receipt["round"], receipt["attempt"], receipt["audit"], receipt["duplicate"]),
+                         (2, attempt, audit["id"], True))
+        # Recreate an interruption after the inbox receipt but before saving the audit.
+        assignment.write_bytes(unsettled)
+        self.assertEqual(cli(*args, token=token), receipt)
+        final = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual(final["audit"][-1]["inputEvidence"], "authenticated-round-callback")
+        self.assertEqual((final["state"], final["attempt"]), ("done", attempt))
+        self.assertEqual([m["id"] for m in final["messages"] if m["to"] == "worker"], [receipt["message"]])
+        self.assertEqual([m["id"] for m in final["messages"] if m["type"] == "done"],
+                         [done["message"], callbacks["done"]["message"]])
+        self.assertEqual((received.read_bytes(), formal.read_bytes()), previous)
+        self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
+        print("R24 callback reconciliation " + json.dumps({
+            "round": final["round"], "enter_count": 1, "formal_count": 1,
+            "prior_status": audit["result"], "evidence": final["audit"][-1]["inputEvidence"],
+        }), flush=True)
+
+    def test_public_nudge_reads_confirmed_key_while_other_input_is_unresolved(self):
+        cli, first, token, _ = self.public_input_worker()
+        dispatch = first["dispatch"]
+        original = ("nudge", dispatch, "--text", "first", "--message-id", "confirmed-key")
+        accepted = cli(*original, token=token)
+        (self.work / "change-draft").touch()
+        self.assertIn("uncertain", cli("nudge", dispatch, "--text", "other", "--message-id", "pending-key",
+                                      token=token, expected=1))
+        observed = [self.state / "messages.json", self.state / "dispatches" / f"{dispatch}.json",
+                    self.work / "input-bytes", self.work / "formal-input"]
+        before = [path.read_bytes() for path in observed]
+        self.assertEqual(cli(*original, token=token), {**accepted, "duplicate": True})
+        self.assertIn("pending or uncertain", cli("nudge", dispatch, "--text", "new input",
+                                                  token=token, expected=1))
+        self.assertEqual([path.read_bytes() for path in observed], before)
+        self.assertEqual(before[2].count(b"\r"), 1)
+
+    def test_public_continue_verifies_legacy_worker_and_current_owner(self):
+        cli, first, token, _ = self.public_input_worker(legacy=True)
+        dispatch = first["dispatch"]
+        pane = self.active_pane(dispatch)
+        (self.work / "finish-first-externally").touch()
+        self.await_input_value(lambda: (self.work / "first-done").exists())
+        args = ("continue", dispatch, "--task", "next-task", "--report", "report2")
+        self.assertEqual(json.loads(cli(*args, expected=1))["error"], "stale_controller_owner")
+        accepted = cli(*args, token=token)
+        self.assertEqual(self.active_pane(dispatch), pane)
+        self.assertEqual(accepted["round"], 2)
+        self.await_input_value(lambda: (self.work / "accepted-round").exists())
+        _, attempt, reference = json.loads((self.work / "accepted-round").read_text())
+        self.assertEqual((attempt, reference), (accepted["attempt"], None))
+        (self.work / "legacy-finish").touch()
+        self.await_input_value(lambda: (self.work / "legacy-results").exists())
+        unowned, old_attempt, done = json.loads((self.work / "legacy-results").read_text())
+        self.assertEqual((unowned, old_attempt), (1, 1))
+        row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual(row["executionId"], first["executionId"])
+        self.assertEqual(row["rounds"][-1]["result"]["id"], done["message"])
+        self.assertEqual(row["state"], "done")
+        (self.work / "next-task").unlink()
+        self.assertEqual(cli(*args, token=token), {**accepted, "duplicate": True})
+
+        # A missing JSON hash is insufficient when the actual worker has a secret.
+        self.work = self.root / "unverified worker"
+        self.work.mkdir()
+        cli, first, token, _ = self.public_input_worker(scope="unverified")
+        dispatch = first["dispatch"]
+        (self.work / "finish-first-externally").touch()
+        self.await_input_value(lambda: (self.work / "first-done").exists())
+        assignment = self.state / "dispatches" / f"{dispatch}.json"
+        old_row = json.loads(assignment.read_text())
+        old_row.pop("workerCallbackHash")
+        assignment.write_text(json.dumps(old_row))
+        error = cli("continue", dispatch, "--task", "next-task", "--report", "report2",
+                    token=token, expected=1)
+        self.assertIn("verify the original worker callback authorization", error)
+        self.assertFalse((self.work / "input-bytes").exists())
 
     def test_lifecycle(self):
         # Keep the worker alive across Ctrl-C so close tests the active-session path.

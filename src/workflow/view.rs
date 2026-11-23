@@ -183,6 +183,7 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
                 _ if unconfirmed_resume => "unknown",
                 Some("exited" | "not_started") if startup_failure.is_some() => "failed",
                 _ if unresolved_worker => "unknown",
+                _ if super::assignment::input_unresolved(row) && alive == Some(true) => "unknown",
                 _ if unconfirmed_create && row["worker"]["state"] != "cancelled" => {
                     round["result"] = row["create"].clone();
                     "unknown"
