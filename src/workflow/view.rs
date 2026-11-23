@@ -21,7 +21,17 @@ pub fn merged_history(row: &Value, ledger: Vec<Value>) -> Result<Vec<Value>> {
         if let Some(key) = message["messageId"].as_str() {
             if let Some(&pos) = positions.get(key) {
                 let original = &mut history[pos];
-                let identity_fields = ["round", "attempt", "report", "type", "question", "options"];
+                let identity_fields = [
+                    "round",
+                    "attempt",
+                    "report",
+                    "type",
+                    "question",
+                    "options",
+                    "to",
+                    "questionMessageId",
+                    "answer",
+                ];
                 for field in identity_fields {
                     ensure!(
                         original[field].is_null()
@@ -30,7 +40,15 @@ pub fn merged_history(row: &Value, ledger: Vec<Value>) -> Result<Vec<Value>> {
                         "conflicting {field} for message {key}"
                     );
                 }
-                let delivery_fields = ["state", "statusVersion", "delivered", "resolution"];
+                let delivery_fields = [
+                    "state",
+                    "statusVersion",
+                    "delivered",
+                    "resolution",
+                    "inputResult",
+                    "diagnostic",
+                    "category",
+                ];
                 if message["statusVersion"].as_u64().unwrap_or(0)
                     >= original["statusVersion"].as_u64().unwrap_or(0)
                 {
@@ -44,10 +62,12 @@ pub fn merged_history(row: &Value, ledger: Vec<Value>) -> Result<Vec<Value>> {
                 }
                 // Older archived views can omit this derived flag. Derive it
                 // from the chosen version, never from another delivery snapshot.
-                match original["state"].as_str() {
-                    Some("received" | "processed") => original["delivered"] = json!(true),
-                    Some("unsent" | "unknown") => original["delivered"] = json!(false),
-                    _ => {}
+                if original["type"] != "reply" {
+                    match original["state"].as_str() {
+                        Some("received" | "processed") => original["delivered"] = json!(true),
+                        Some("unsent" | "unknown") => original["delivered"] = json!(false),
+                        _ => {}
+                    }
                 }
                 for (k, v) in message.as_object().unwrap() {
                     if !delivery_fields.contains(&k.as_str())
@@ -161,11 +181,24 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
             current = round["state"].as_str().unwrap_or("unknown").to_owned();
         }
     }
+    let answered: std::collections::HashSet<_> = history
+        .iter()
+        .filter(|m| {
+            m["type"] == "reply"
+                && m["round"] == row["round"]
+                && m["attempt"] == row["attempt"]
+                && m["inputResult"] == "accepted"
+        })
+        .filter_map(|m| m["questionMessageId"].as_str())
+        .collect();
     let awaiting_answer = history.iter().any(|m| {
         m["type"] == "question"
             && m["dispatch"] == row["dispatch"]
             && m["round"] == row["round"]
             && m["attempt"] == row["attempt"]
+            && m["messageId"]
+                .as_str()
+                .is_none_or(|id| !answered.contains(id))
     });
     let (state, status) = match current.as_str() {
         "completed" => ("done", "completed"),

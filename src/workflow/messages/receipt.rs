@@ -170,7 +170,9 @@ impl<'a> Confirm<'a> {
         let index = inbox
             .messages
             .iter()
-            .position(|m| Some(m.id) == numeric || m.message_id == self.id)
+            .position(|m| {
+                m.reply_payload.is_none() && (Some(m.id) == numeric || m.message_id == self.id)
+            })
             .with_context(|| format!("no controller message with id {}", self.id))?;
         let (earlier, tail) = inbox.messages.split_at_mut(index);
         let message = &mut tail[0];

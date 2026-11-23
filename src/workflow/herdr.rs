@@ -68,6 +68,19 @@ impl<'a> Assignment<'a> {
     }
 
     fn lock(state: &'a Path, id: &str, new: Option<Value>) -> Result<Self> {
+        Self::lock_with(state, id, new, |file| {
+            file.lock()?;
+            Ok(true)
+        })?
+        .context("missing locked Herdr assignment")
+    }
+
+    fn lock_with(
+        state: &'a Path,
+        id: &str,
+        new: Option<Value>,
+        take_lock: impl FnOnce(&File) -> Result<bool>,
+    ) -> Result<Option<Self>> {
         ensure!(valid_id(id), "invalid dispatch ID");
         native_state(state)?;
         let path = state.join("dispatches").join(format!("{id}.json"));
@@ -81,7 +94,9 @@ impl<'a> Assignment<'a> {
         } else {
             File::open(lock_path).context("missing native Herdr assignment lock")?
         };
-        lock.lock()?;
+        if !take_lock(&lock)? {
+            return Ok(None);
+        }
         let row = match new {
             Some(row) => {
                 ensure!(!path.try_exists()?, "dispatch already published");
@@ -101,12 +116,12 @@ impl<'a> Assignment<'a> {
             row["controllerOwner"].is_null(),
             "controller owner authorization required"
         );
-        Ok(Self {
+        Ok(Some(Self {
             _lock: lock,
             state,
             path,
             row,
-        })
+        }))
     }
 
     fn bound_record(&self) -> Result<&Value> {
@@ -214,16 +229,22 @@ impl<'a> Assignment<'a> {
 
 enum InputAction<'a> {
     Submit(&'a str),
+    Reply(&'a str),
     ActivatePrefill(&'a str),
 }
 
 impl Assignment<'_> {
-    fn input(&mut self, action: InputAction<'_>) -> Result<Value> {
+    fn input(
+        &mut self,
+        action: InputAction<'_>,
+        begin: impl FnOnce() -> Result<()>,
+    ) -> Result<Value> {
         ensure!(self.row["pendingInput"] == false, "input still pending");
         let mut h = self.tracked_handle()?;
         ensure!(h.stopped_evidence.is_none(), "Herdr writer stopped");
         let mut next = self.row.clone();
         next["pendingInput"] = json!(true);
+        begin()?;
         self.save(next)?;
         let result = match action {
             InputAction::ActivatePrefill(text) => {
@@ -231,6 +252,9 @@ impl Assignment<'_> {
             }
             InputAction::Submit(text) => {
                 h.submit(text, self.row["host"] == "codex", |h| self.checkpoint(h))
+            }
+            InputAction::Reply(text) => {
+                h.submit_reply(text, self.row["host"] == "codex", |h| self.checkpoint(h))
             }
         };
         if !matches!(result,Err(e) if e.kind == FailureKind::Uncertain) {
@@ -291,7 +315,9 @@ pub(super) fn create(state: &Path, row: &Value, launch: host::Launch) -> Result<
                 if evidence["category"] == "started" {
                     break match unit.tracked_handle() {
                         Ok(_) => match &prefill {
-                            Some(text) => unit.input(InputAction::ActivatePrefill(text))?,
+                            Some(text) => {
+                                unit.input(InputAction::ActivatePrefill(text), || Ok(()))?
+                            }
                             None => json!({"result":"accepted"}),
                         },
                         Err(e) => json!({"result":"uncertain","diagnostic":e.to_string()}),
@@ -566,8 +592,17 @@ pub fn submit(input: Input) -> Result<Value> {
     controller::require_controller("submit")?;
     let state = state_dir()?;
     let (mut unit, _scope) = Assignment::lock_unowned(&state, &input.dispatch, "submit")?;
+    writable_input(&unit, input.round, &input.attempt)?;
+    let mut response = unit.input(InputAction::Submit(&input.text), || Ok(()))?;
+    response["dispatch"] = json!(input.dispatch);
+    response["round"] = json!(input.round);
+    response["attempt"] = json!(input.attempt);
+    Ok(response)
+}
+
+fn writable_input(unit: &Assignment<'_>, round: u64, attempt: &str) -> Result<()> {
     ensure!(
-        unit.row["round"] == input.round && unit.row["attempt"] == input.attempt,
+        unit.row["round"] == round && unit.row["attempt"] == attempt,
         "stale Herdr input assignment"
     );
     ensure!(
@@ -579,11 +614,34 @@ pub fn submit(input: Input) -> Result<Value> {
         unit.row["create"]["result"] == "accepted",
         "Herdr launch is not active"
     );
-    let mut response = unit.input(InputAction::Submit(&input.text))?;
-    response["dispatch"] = json!(input.dispatch);
-    response["round"] = json!(input.round);
-    response["attempt"] = json!(input.attempt);
-    Ok(response)
+    Ok(())
+}
+
+// The caller holds the scope lock and must release it when the assignment
+// lock is busy so close and takeover can proceed in the same lock order.
+pub(super) fn try_submit_reply(
+    state: &Path,
+    row: &Value,
+    text: &str,
+    begin: impl FnOnce() -> Result<()>,
+) -> Result<Option<Value>> {
+    let Some(mut unit) = Assignment::lock_with(
+        state,
+        row["dispatch"].as_str().context("missing dispatch")?,
+        None,
+        super::assignment::try_input_lock,
+    )?
+    else {
+        return Ok(None);
+    };
+    writable_input(
+        &unit,
+        row["round"].as_u64().context("missing round")?,
+        row["attempt"].as_str().context("missing attempt")?,
+    )?;
+    // The Herdr assignment lock covers the recheck and the existing input
+    // checkpoint through the RPC result, just as it does for a private submit.
+    unit.input(InputAction::Reply(text), begin).map(Some)
 }
 
 pub struct Reconcile {
