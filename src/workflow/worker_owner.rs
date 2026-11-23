@@ -157,7 +157,15 @@ pub fn close(id: &str, explicit_token: Option<&str>) -> Result<Value> {
     let scope = record_scope(&record).context("invalid dispatch scope")?;
     let token = controller::token(explicit_token);
     let authorize = || controller::Owners::read(&state)?.require(scope, token.as_deref(), "close");
-    authorize()?;
+    if !authorize()? && record["host"].is_string() {
+        // A confirmed archive can be read before taking a write lock. Any
+        // inconclusive or failed read goes through the usual locked path.
+        if let Ok(Some(receipt)) = super::backend::read_only_close(&state, &record) {
+            if !authorize()? {
+                return Ok(receipt);
+            }
+        }
+    }
     let _scope_lock = controller::lock_scope(&state, scope)?;
     authorize()?;
     if record["host"].is_string() {

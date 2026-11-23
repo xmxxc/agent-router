@@ -1,4 +1,5 @@
 """Exercise the private backend interface with a fresh tmux server and state roots."""
+from contextlib import contextmanager
 import fcntl
 import json
 import os
@@ -13,6 +14,18 @@ import tempfile
 import time
 import tty
 import unittest
+
+
+@contextmanager
+def read_only_tree(root):
+    modes = [(path, path.stat().st_mode & 0o777) for path in [root, *root.rglob("*")]]
+    try:
+        for path, mode in reversed(modes):
+            path.chmod(mode & ~0o222)
+        yield
+    finally:
+        for path, mode in modes:
+            path.chmod(mode)
 
 
 def composer(mode, logfile):
@@ -96,6 +109,80 @@ class Backend(unittest.TestCase):
     def active_pane(self, dispatch="d-abc12345"):
         return subprocess.check_output(self.tmux + ["display-message", "-pt", f"=wfc-{dispatch}:", "#{pane_id}"],
                                        env=self.env, text=True).strip()
+
+    def test_read_only_unowned_close_replays_confirmed_archive(self):
+        self.assertNotEqual(os.geteuid(), 0, "read-only fixture requires an ordinary user")
+        scope = "archive"
+
+        def cli(*args, state=None):
+            return subprocess.run([WFC, *args], cwd=self.work,
+                                  env={**self.env, "WFC_STATE": str(state or self.state)},
+                                  text=True, capture_output=True, timeout=15)
+
+        def data(*args, state=None):
+            result = cli(*args, state=state)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+
+        (self.work / "task").write_text("controlled worker")
+        config = self.work / "launch.json"
+        config.write_text(json.dumps({"hosts": {"codex": {"command": [
+            sys.executable, "-c", "import time; time.sleep(30)",
+        ]}}}))
+        worker = data("dispatch", "--scope", scope, "--host", "codex", "--cwd", ".",
+                      "--task", "task", "--report", "report", "--launch-config", str(config))
+        close = ("close", worker["dispatch"])
+        with read_only_tree(self.state):
+            first = cli(*close)
+            self.assertEqual((first.returncode, first.stdout), (1, ""), first.stderr)
+            self.assertIn("Permission denied", first.stderr)
+        self.active_pane(worker["dispatch"])
+        first = data(*close)
+        self.assertEqual((first["result"], first["closeEffect"]), ("completed", "session_closed"))
+        self.assertTrue(list(self.state.glob("relay-*.lock")))
+
+        history = self.root / "history"
+        (history / "dispatches").mkdir(parents=True)
+        (history / "launches").mkdir()
+        assignment = f"{worker['dispatch']}.json"
+        archive_name = f"{worker['dispatch']}.{worker['attempt']}.closed"
+        for name in (assignment, archive_name):
+            shutil.copyfile(self.state / "dispatches" / name, history / "dispatches" / name)
+        launch = Path(worker["create"]["receipt"])
+        shutil.copyfile(launch, history / "launches" / launch.name)
+        self.assertFalse((history / "controller-owners.json").exists())
+        archive = history / "dispatches" / archive_name
+        saved = archive.read_bytes()
+        with read_only_tree(history):
+            replay = data(*close, state=history)
+            for field in ("dispatch", "round", "attempt", "result", "closeOperationId", "closeEffect"):
+                self.assertEqual(replay[field], first[field])
+            self.assertEqual(replay["diagnostic"], "session was already gone")
+            self.assertEqual(archive.read_bytes(), saved)
+            self.assertFalse(list(history.glob("relay-*.lock")))
+
+        ambiguous = json.loads(saved)
+        ambiguous["round"] += 1
+        archive.write_text(json.dumps(ambiguous))
+        with read_only_tree(history):
+            refused = cli(*close, state=history)
+            self.assertEqual((refused.returncode, refused.stdout), (1, ""), refused.stderr)
+            self.assertIn("Permission denied", refused.stderr)
+
+        a = data("acquire", "--scope", scope, "--owner", "A")
+        b = data("takeover", "--scope", scope, "--owner", "B")
+        stale = cli(*close, "--owner-token", a["token"])
+        self.assertEqual((stale.returncode, stale.stdout), (1, ""), stale.stderr)
+        self.assertEqual(json.loads(stale.stderr)["error"], "stale_controller_owner")
+        with read_only_tree(self.state):
+            locked = cli(*close, "--owner-token", b["token"])
+            self.assertEqual((locked.returncode, locked.stdout), (1, ""), locked.stderr)
+            self.assertIn("Permission denied", locked.stderr)
+        self.assertEqual(data(*close, "--owner-token", b["token"])["closeOperationId"],
+                         replay["closeOperationId"])
+        print(json.dumps({"readOnlyClose": replay, "unlockedFirstCloseRefused": True,
+                          "ambiguousArchiveRefused": True, "managedReplayRequiresLock": True,
+                          "staleTokenRefused": True, "euid": os.geteuid()}), flush=True)
 
     def test_managed_dispatch_callback_survives_takeover(self):
         env = {**self.env, "WFC_STATE": str(self.state)}

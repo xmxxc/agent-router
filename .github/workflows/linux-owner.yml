@@ -92,7 +92,9 @@ jobs:
         if: ${{ !cancelled() && steps.tmux.outcome == 'success' }}
         working-directory: product
         run: |
-          python -Bu tools/check_tmux.py target/release/wfc -v Backend.test_managed_dispatch_callback_survives_takeover \
+          python -Bu tools/check_tmux.py target/release/wfc -v \
+            Backend.test_managed_dispatch_callback_survives_takeover \
+            Backend.test_read_only_unowned_close_replays_confirmed_archive \
             2>&1 | tee -a "$EVIDENCE/tmux.log"
       - name: Checksum evidence
         if: always()
