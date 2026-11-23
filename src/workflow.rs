@@ -20,6 +20,8 @@ mod backend;
 #[cfg(target_os = "linux")]
 pub mod herdr;
 pub mod host;
+#[cfg(target_os = "linux")]
+pub(crate) mod startup;
 mod view;
 
 pub const DISPATCH_USAGE: &str =
@@ -270,7 +272,13 @@ impl<'a> Dispatch<'a> {
             if let Some(launch) = launch {
                 let mut answer = backend::create(&state, &record, launch)?;
                 let accepted = answer["result"] == "accepted";
-                if accepted || answer["result"] == "uncertain" {
+                if accepted
+                    || answer["result"] == "uncertain"
+                    || matches!(
+                        answer["category"].as_str(),
+                        Some("executable_missing" | "permission_denied" | "spawn_failed")
+                    )
+                {
                     preserve_binding = true;
                     // Bind the launch receipt to the assignment that requested it.
                     answer["dispatch"] = record["dispatch"].clone();
@@ -331,9 +339,15 @@ impl<'a> Dispatch<'a> {
             if preserve_binding {
                 return Err(err);
             }
-            fs::remove_file(&pending).with_context(|| {
-                format!("{err:#}; removing unpublished dispatch {dispatch} also failed")
-            })?;
+            match fs::remove_file(&pending) {
+                Ok(()) => (),
+                Err(e) if e.kind() == ErrorKind::NotFound => (),
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("{err:#}; removing unpublished dispatch {dispatch} also failed")
+                    })
+                }
+            }
             return Err(err);
         }
         #[cfg(not(target_os = "linux"))]

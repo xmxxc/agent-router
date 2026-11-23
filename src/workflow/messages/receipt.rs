@@ -1,6 +1,6 @@
 //! Receipt transitions and operator evidence. The caller holds the inbox lock
 //! from lookup until the updated receipt and its evidence are published.
-use super::{options, Completion, Inbox};
+use super::{options, Inbox, Message};
 use crate::workflow::state_dir;
 use anyhow::{bail, ensure, Context, Result};
 use chrono::Local;
@@ -180,7 +180,7 @@ impl<'a> Confirm<'a> {
 }
 
 impl Confirmation<'_> {
-    fn apply(self, message: &mut Completion, earlier: &[Completion]) -> Result<bool> {
+    fn apply(self, message: &mut Message, earlier: &[Message]) -> Result<bool> {
         match self {
             Self::Ack { body } => {
                 ensure!(message.delivery.delivered(), "ACK requires received");

@@ -77,6 +77,24 @@ sys.exit(1 if mode else 0)
             time.sleep(.025)
         self.fail("timed out waiting for " + repr(check))
 
+    def test_startup_failure_uses_the_existing_scope_and_ack(self):
+        self.cli("dispatch", "--task", "task", "--role", "启动验证", "--scope", "failure",
+                 "--report", "task", "--cwd", ".", "--", str(self.root / "missing"), code=1)
+        unrelated = self.publish("other")
+        self.cli("relay", "--codex", "--scope", "failure", "--for", "1.5")
+        command, = self.calls()
+        notice, = json.loads(command[4][len(PREFIX):])["messages"]
+        self.assertEqual((notice["scope"], notice["kind"], notice["type"]),
+                         ("failure", "startup_failure", "blocked"))
+        self.assertEqual(notice["fault"]["category"], "executable_missing")
+        ack = self.data("ack", notice["messageId"])
+        self.assertEqual((ack["state"], ack["statusVersion"]), ("processed", 4))
+        self.assertTrue(self.data("ack", notice["messageId"])["duplicate"])
+        empty = self.data("wait", "--scope", "failure", "--timeout", "0", code=3)
+        self.assertFalse(empty["messages"])
+        other, = self.data("wait", "--scope", "other", "--timeout", "0")["messages"]
+        self.assertEqual((other["messageId"], other["type"]), (unrelated["messageId"], "done"))
+
     def test_detached_scope(self):
         other = self.publish("other")
         args = ["relay", "--scope", "ours", "--codex", "--detach", "--for", "1.5"]

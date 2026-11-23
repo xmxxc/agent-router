@@ -686,6 +686,7 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
             sleep(Duration::from_millis(10));
         }
     }
+    let startup = crate::workflow::startup::Startup::hosted(&spec.env, id);
     fs::remove_file(spec_path)?;
     super::binding::record_server(&dir, id)?;
     let mut cmd = Command::new(spec.argv.first().context("empty launch argv")?);
@@ -701,6 +702,9 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
+            if let Some(startup) = &startup {
+                startup.spawn_failed(err.kind());
+            }
             let category = match err.kind() {
                 ErrorKind::NotFound => "executable_missing",
                 ErrorKind::PermissionDenied => "permission_denied",
@@ -710,6 +714,7 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
             return Ok(ExitCode::FAILURE);
         }
     };
+    let watching = startup.as_ref().map(|startup| startup.watch(child.id()));
     // Ctrl-C addresses the terminal foreground group. Let the worker handle it
     // and keep its receipt writer alive to record the actual exit.
     unsafe {
@@ -720,6 +725,9 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
         &json!({"category":"started","pid":child.id(),"launchId":id}),
     );
     let status = child.wait()?;
+    if let Some(watching) = watching {
+        watching.exited(status);
+    }
     let code = status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));

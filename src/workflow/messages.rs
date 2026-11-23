@@ -132,13 +132,16 @@ impl Assignment {
 }
 
 #[derive(Serialize, Deserialize)]
-struct Completion {
+struct Message {
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    message_type: Option<String>,
     id: u64,
     #[serde(rename = "messageId")]
     message_id: String,
     #[serde(flatten)]
     worker: Identity,
-    report: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    report: Option<PathBuf>,
     request_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     body_hash: Option<String>,
@@ -159,26 +162,71 @@ fn body_hash(body: &str) -> String {
 
 fn canonical_body(body: Map<String, Value>) -> String {
     // Python #40 uses sorted keys, UTF-8, and a space after each separator.
-    // All done payload fields are scalar. Map iterates in sorted key order.
+    // Map iterates in sorted key order.
     let fields: Vec<_> = body
         .into_iter()
-        .map(|(key, value)| format!("{}: {value}", json!(key)))
+        .map(|(key, value)| format!("{}: {}", json!(key), canonical_value(value)))
         .collect();
     format!("{{{}}}", fields.join(", "))
 }
 
-impl Completion {
+fn canonical_value(value: Value) -> String {
+    match value {
+        Value::Object(fields) => canonical_body(fields),
+        Value::Array(values) => format!(
+            "[{}]",
+            values
+                .into_iter()
+                .map(canonical_value)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        scalar => scalar.to_string(),
+    }
+}
+
+impl Message {
+    fn kind(&self) -> &str {
+        self.message_type.as_deref().unwrap_or_else(|| {
+            if self
+                .additional_fields
+                .get("question_payload")
+                .is_some_and(Value::is_object)
+            {
+                "question"
+            } else {
+                "done"
+            }
+        })
+    }
+
     fn original_body(&self) -> Map<String, Value> {
-        Map::from_iter([
+        let mut body = Map::from_iter([
             ("attempt".into(), json!(self.worker.attempt)),
-            ("report".into(), json!(self.report)),
             ("role".into(), json!(self.worker.role)),
             ("round".into(), json!(self.worker.round)),
-        ])
+        ]);
+        if let Some(report) = &self.report {
+            body.insert("report".into(), json!(report));
+        }
+        body
     }
 
     fn body(&self) -> Map<String, Value> {
         let mut body = self.original_body();
+        if self.kind() != "done" {
+            body.insert("scope".into(), json!(self.worker.scope()));
+            if let Some(question) = self.additional_fields.get("question_payload") {
+                body.insert("question".into(), question["text"].clone());
+                body.insert("options".into(), question["options"].clone());
+            }
+            for key in ["kind", "host", "message", "fault"] {
+                if let Some(value) = self.additional_fields.get(key) {
+                    body.insert(key.into(), value.clone());
+                }
+            }
+            return body;
+        }
         for key in ["head", "dirty"] {
             if let Some(value) = self.additional_fields.get(key) {
                 body.insert(key.into(), value.clone());
@@ -208,7 +256,8 @@ impl Completion {
         // request key on every row. Its rewrite dropped newer fields. Only
         // publication-time values count: later claims can bind a digest or
         // add null Git fields even on a genuine legacy row.
-        self.request_key.is_some()
+        self.kind() == "done"
+            && self.request_key.is_some()
             && self.worker.scope.is_none()
             && self.created_at.is_none()
             && self
@@ -261,7 +310,7 @@ impl Completion {
             ("id".into(), json!(self.id)),
             ("messageId".into(), json!(self.message_id)),
             ("dispatch".into(), json!(self.worker.dispatch)),
-            ("type".into(), json!("done")),
+            ("type".into(), json!(self.kind())),
             ("state".into(), json!(state)),
             ("statusVersion".into(), json!(version)),
         ]);
@@ -287,7 +336,7 @@ fn private_file() -> OpenOptions {
 
 struct Inbox {
     dir: PathBuf,
-    messages: Vec<Completion>,
+    messages: Vec<Message>,
     // The lock lives on a stable file because save replaces the data file.
     _lock: File,
 }
@@ -307,11 +356,11 @@ pub(super) fn lock_for_publish(dir: &Path) -> Result<File> {
 }
 
 impl Inbox {
-    fn snapshot(dir: &Path) -> Result<Vec<Completion>> {
+    fn snapshot(dir: &Path) -> Result<Vec<Message>> {
         let path = dir.join("messages.json");
         match File::open(&path) {
             Ok(file) => {
-                let mut messages: Vec<Completion> = serde_json::from_reader(BufReader::new(file))
+                let mut messages: Vec<Message> = serde_json::from_reader(BufReader::new(file))
                     .context("read controller messages")?;
                 // The first scoped wait on an unclaimed pre-snapshot completion
                 // supplies an unknown Git snapshot. Preserve an already bound
@@ -390,17 +439,20 @@ impl Inbox {
         attempt: Option<&str>,
     ) -> Result<Option<Value>> {
         let worker = &assignment.worker;
-        let history = || {
+        let for_dispatch = || {
             self.messages
                 .iter()
                 .filter(|m| m.worker.dispatch == worker.dispatch)
         };
-        let prior = key.and_then(|key| history().find(|m| m.request_key.as_deref() == Some(key)));
+        let history = || for_dispatch().filter(|m| m.kind() == "done");
+        let prior =
+            key.and_then(|key| for_dispatch().find(|m| m.request_key.as_deref() == Some(key)));
         if let (Some(key), Some(prior)) = (key, prior) {
             ensure!(
-                prior.worker.attempt == worker.attempt
+                prior.kind() == "done"
+                    && prior.worker.attempt == worker.attempt
                     && prior.worker.round == worker.round
-                    && prior.report == report,
+                    && prior.report.as_deref() == Some(report),
                 "message request {key} conflicts with an existing receipt"
             );
         }
@@ -409,7 +461,7 @@ impl Inbox {
         if let Some(bound) = assignment
             .report
             .as_deref()
-            .or_else(|| previous.map(|m| m.report.as_path()))
+            .or_else(|| previous.and_then(|m| m.report.as_deref()))
         {
             ensure!(
                 report == bound,
@@ -431,7 +483,7 @@ impl Inbox {
             ensure!(
                 !history().any(|m| (m.worker.round != worker.round
                     || m.worker.attempt != worker.attempt)
-                    && m.report == report),
+                    && m.report.as_deref() == Some(report)),
                 "ambiguous report for {}; supply --attempt",
                 worker.dispatch
             );
@@ -472,6 +524,63 @@ impl Inbox {
         File::open(&self.dir)?.sync_all()?;
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn publish_startup_failure(
+    state: &Path,
+    dispatch: &str,
+    attempt: &str,
+    failure: &super::startup::Failure<'_>,
+) -> Result<()> {
+    ensure!(
+        valid_id(dispatch) && super::valid_identity(attempt, "a-"),
+        "invalid startup identity"
+    );
+    let mut inbox = Inbox::open(state)?;
+    let dir = state.join("dispatches");
+    let (file, path) = super::assignment::open_assignment(&dir, dispatch)?;
+    let row = super::decode_record(file, &path)?;
+    let assignment = Assignment::deserialize(&row)?;
+    let worker = assignment.worker;
+    ensure!(
+        worker.attempt == attempt && worker.round > 0 && assignment.controller_owner.is_none(),
+        "startup failure does not match the current assignment"
+    );
+    let key = format!("startup:{dispatch}:{}:{attempt}", worker.round);
+    if inbox.messages.iter().any(|m| {
+        m.worker.dispatch == worker.dispatch
+            && m.worker.attempt == worker.attempt
+            && m.worker.round == worker.round
+            && (m.request_key.as_deref() == Some(&key)
+                || m.additional_fields
+                    .get("kind")
+                    .is_some_and(|kind| kind == "startup_failure")
+                || matches!(m.kind(), "done" | "question"))
+    }) {
+        return Ok(());
+    }
+    let mut message = Message {
+        message_type: Some(failure.message_type().into()),
+        id: inbox.messages.len() as u64 + 1,
+        message_id: format!("m-{}", Uuid::new_v4().simple()),
+        worker,
+        report: assignment.report,
+        request_key: Some(key),
+        body_hash: None,
+        delivery: Delivery::unsent(),
+        resolution: None,
+        created_at: Some(receipt::timestamp()),
+        additional_fields: Map::from_iter([
+            ("kind".into(), json!("startup_failure")),
+            ("host".into(), row["host"].clone()),
+            ("message".into(), json!(failure.diagnostic())),
+            ("fault".into(), json!(failure)),
+        ]),
+    };
+    message.body_hash = Some(message.computed_hash());
+    inbox.messages.push(message);
+    inbox.save().context("publish startup failure")
 }
 
 // Writers publish complete snapshots by rename. A status reader can open
@@ -565,11 +674,12 @@ impl<'a> Done<'a> {
         if let Some(receipt) = duplicate {
             return Ok(receipt);
         }
-        let mut message = Completion {
+        let mut message = Message {
+            message_type: None,
             id: inbox.messages.len() as u64 + 1,
             message_id: format!("m-{}", Uuid::new_v4().simple()),
             worker: current.worker,
-            report,
+            report: Some(report),
             request_key: key,
             body_hash: None,
             delivery: Delivery::unsent(),

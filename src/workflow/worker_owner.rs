@@ -240,29 +240,48 @@ fn supervise(args: &[OsString]) -> Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(&path)?;
-    let start = (|| -> Result<_> {
-        file.lock()?;
-        file.write_all_at(header.as_bytes(), 0)?;
-        Command::new(program)
-            .args(argv)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("spawn worker")
-    })();
-    let child = match start {
+    if let Err(err) = file
+        .lock()
+        .and_then(|()| file.write_all_at(header.as_bytes(), 0))
+    {
+        fs::remove_file(path)?;
+        return Err(err.into());
+    }
+    let state = dir.parent().context("missing state directory")?;
+    let startup = super::startup::Startup::new(
+        state,
+        &id,
+        record["attempt"].as_str().context("missing attempt")?,
+        None,
+    );
+    let child = match Command::new(program)
+        .args(argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
         Ok(child) => child,
         Err(err) => {
-            fs::remove_file(path)?;
-            return Err(err);
+            let outcome = json!({"state":"not_started","exit_code":null,"signal":null});
+            file.write_all_at(outcome.to_string().as_bytes(), header.len() as u64)?;
+            file.sync_data()?;
+            fs::rename(&pending, dir.join(format!("{id}.json")))?;
+            startup.spawn_failed(err.kind());
+            return Err(err).context("spawn worker");
         }
     };
+    let watching = startup.watch(child.id());
     let published = fs::rename(&pending, dir.join(format!("{id}.json")));
     if published.is_ok() {
         let _ = writeln!(io::stdout().lock(), "ready");
     }
-    let result = watch_tree(&file, child.id() as i32, published.is_err())?;
+    let result = watch_tree(
+        &file,
+        child.id() as i32,
+        published.is_err(),
+        published.is_ok().then_some(watching),
+    )?;
     if let Err(err) = published {
         fs::remove_file(path)?;
         return Err(err).context("publish dispatch record");
@@ -272,7 +291,12 @@ fn supervise(args: &[OsString]) -> Result<()> {
     Ok(())
 }
 
-fn watch_tree(file: &File, root: i32, mut closing: bool) -> Result<Value> {
+fn watch_tree(
+    file: &File,
+    root: i32,
+    mut closing: bool,
+    mut startup: Option<super::startup::Running<'_>>,
+) -> Result<Value> {
     let mut root_exit = None;
     let mut killed_root = false;
     loop {
@@ -280,7 +304,15 @@ fn watch_tree(file: &File, root: i32, mut closing: bool) -> Result<Value> {
         let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::__WALL) };
         if pid > 0 {
             if pid == root && root_exit.is_none() {
-                root_exit = Some(ExitStatus::from_raw(status));
+                let exit = ExitStatus::from_raw(status);
+                root_exit = Some(exit);
+                if let Some(startup) = startup.take() {
+                    let mut flag = [0];
+                    file.read_exact_at(&mut flag, 0)?;
+                    if !closing && flag == *b"0" {
+                        startup.exited(exit);
+                    }
+                }
             }
             continue;
         }
