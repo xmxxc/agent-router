@@ -58,6 +58,7 @@ run_startup_units() {
         2>&1 | tee "$log" || status=$?
     for selector in \
         workflow::backend::tests::startup_terminal_notice_requires_the_selected_launch_and_outcome \
+        workflow::messages::recovery::tests::startup_recovery_advances_past_history_in_small_slices \
         workflow::messages::startup_recovery_tests::startup_recovery_rejects_replaced_assignment_and_preserves_existing_question \
         workflow::messages::tests::startup_receipt_with_report_does_not_count_as_done \
         workflow::startup::tests::startup_publication_uses_the_current_attempt_and_one_durable_key \
@@ -68,14 +69,14 @@ run_startup_units() {
             checked=$((checked + 1))
         fi
     done
-    if (( status != 0 || checked != 6 )) ||
+    if (( status != 0 || checked != 7 )) ||
         ! grep -Fxq 'Own descendants reaped: ECHILD, extra cleanup signals: 0' "$log"; then
         verdict=fail
         if [[ "$first_failure" == none ]]; then
             first_failure=startup-unit
         fi
     fi
-    printf 'startup-unit exit=%s expected=6 confirmed=%s verdict=%s\n' "$status" "$checked" "$verdict" |
+    printf 'startup-unit exit=%s expected=7 confirmed=%s verdict=%s\n' "$status" "$checked" "$verdict" |
         tee -a "$EVIDENCE/results.log"
 }
 
@@ -84,12 +85,15 @@ run_startup_opencode_suites() {
     run_suite startup-ledger-write tests/startup_failure.py StartupFailure.test_startup_notice_recovers_after_ledger_write_failure 1
     run_suite startup-confirmation tests/startup_failure.py StartupFailure.test_tmux_exit_follows_the_create_confirmation 1
     run_suite startup-managed tests/startup_failure.py StartupFailure.test_managed_startup_recovery_rechecks_owner 1
+    run_suite startup-generations tests/startup_failure.py StartupFailure.test_startup_recovery_ignores_conflicting_reservations_and_keeps_neighbors 1
     run_startup_units
     sha256sum --check --strict "$EVIDENCE/binary.sha256"
     run_suite receipt-legacy tests/receipts.py Receipts.test_mixed_legacy_inbox 1
     run_suite receipt-scoped tests/receipts.py Receipts.test_scoped_snapshot_survives_confirmation 1
     run_suite codex-envelope tests/relay.py Relay.test_question_envelope_matches_python_json_separators 1
     run_suite codex-budget tests/relay.py Relay.test_escaped_single_over_limit_leaves_legal_messages_available 1
+    run_suite codex-deadline tests/relay.py Relay.test_deadline_bounds_locked_inbox_and_slow_queue 1
+    run_suite codex-legacy-owner tests/relay.py Relay.test_conflicting_complete_generations_preserve_owner_and_identity 1
     run_suite opencode-order tests/opencode_relay.py OpenCodeRelay.test_204_detached_preserves_batch_order_scope_and_session 1
     run_suite opencode-target tests/opencode_relay.py OpenCodeRelay.test_invalid_host_or_port_is_rejected_before_claiming 1
     run_suite opencode-refused tests/opencode_relay.py OpenCodeRelay.test_connection_refused_is_unsent_and_can_retry_original_id 1
