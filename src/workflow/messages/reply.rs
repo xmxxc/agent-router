@@ -157,7 +157,7 @@ impl<'a> Reply<'a> {
             Ok(())
         };
 
-        let result = submit(&state, &row, &text, begin);
+        let result = submit(&state, &row, &uid, &text, begin);
         let (outcome, diagnostic, category) = match result {
             Ok(result) => {
                 let outcome = match (result["result"].as_str(), result["inputResult"].as_str()) {
@@ -231,6 +231,7 @@ fn validate(state: &Path, inbox: &Inbox, question: &Message) -> Result<Value> {
 fn submit(
     state: &Path,
     row: &Value,
+    message_id: &str,
     text: &str,
     begin: impl FnOnce() -> Result<()>,
 ) -> Result<Value> {
@@ -246,7 +247,7 @@ fn submit(
             begin()?;
             backend::submit(state, row, text)
         }
-        Some("herdr") => herdr::submit_reply(state, row, text, begin),
+        Some("herdr") => herdr::submit_reply(state, row, message_id, text, begin),
         _ => bail!("dispatch has no supported worker input backend"),
     }
 }

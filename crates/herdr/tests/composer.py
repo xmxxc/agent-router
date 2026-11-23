@@ -9,6 +9,7 @@ import tty
 
 
 reply_worker = '--reply-worker' in sys.argv[2:]
+reply_mode = sys.argv[sys.argv.index('--reply-worker') + 1] if reply_worker else None
 if not reply_worker:
     while not Path('show-history').exists():
         time.sleep(.02)
@@ -21,22 +22,25 @@ if reply_worker:
     Path('question.tmp').rename('question.json')
 else:
     os.write(1, b'old history\r\n' * 260)
-draft = b'original draft' if reply_worker else b''
-ambiguous = reply_worker
+draft = {
+    'ambiguous-footer': b'original draft',
+    'compact-placeholder': b'AskCodextodoanything',
+}.get(reply_mode, b'')
+protect_draft = reply_worker
 accepted = False
 submit_first = '--submit-first' in sys.argv[2:]
 
 
 def draw():
     body = draft.replace(b' tail ', b'\r\n  tail ')
-    if ambiguous:
+    if protect_draft and reply_mode != 'compact-placeholder':
         body += '\r\n  tail · value'.encode()
     elif reply_worker and not body:
-        body = b'Ask Codex to do anything'
+        body = b'Ask Codex to do\r\n  anything' if reply_mode == 'compact-placeholder' else b'Ask Codex to do anything'
     footer = '\r\n  model · dir\r\n'
     if sys.argv[1] == 'two':
         footer += '  keys · help\r\n'
-    if not draft and (reply_worker or not submit_first):
+    if not protect_draft and not draft and (reply_worker or not submit_first):
         footer = '\r\n' + footer
     os.write(1, '\x1b[2J\x1b[H› '.encode() + body + footer.encode())
 
@@ -48,7 +52,7 @@ while True:
         if Path('clear-draft').exists():
             Path('clear-draft').unlink()
             draft = b''
-            ambiguous = False
+            protect_draft = False
             draw()
         if accepted and Path('finish').exists():
             Path('finish').unlink()

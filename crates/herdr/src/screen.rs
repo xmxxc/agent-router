@@ -44,13 +44,33 @@ struct Composer<'a> {
     footer: Option<Vec<&'a str>>,
 }
 
+fn shows_placeholder(lines: &[&str]) -> bool {
+    let Some((prompt, continuation)) = lines.split_first() else {
+        return false;
+    };
+    let Some(first) = prompt.strip_prefix("› ") else {
+        return false;
+    };
+    // Remove only the composer prefix and the indentation of displayed
+    // continuation lines. Join a word wrap with one space.
+    let text = std::iter::once(first)
+        .chain(
+            continuation
+                .iter()
+                .map(|line| line.strip_prefix("  ").unwrap_or(line)),
+        )
+        .collect::<Vec<_>>()
+        .join(" ");
+    text == "Ask Codex to do anything"
+}
+
 fn complete_draft(lines: &[&str]) -> Option<String> {
     if lines.iter().any(|s| s.ends_with(['↑', '↓'])) {
         return None;
     }
     let body = lines.join(" ");
     let draft = body.strip_prefix('›')?.trim();
-    Some(if compact(draft) == "AskCodextodoanything" {
+    Some(if shows_placeholder(lines) {
         String::new()
     } else {
         draft.to_owned()
@@ -63,7 +83,12 @@ fn codex_box<'a>(
     expected: Option<&str>,
 ) -> Option<Composer<'a>> {
     // Herdr can truncate old scrollback even when the entire bottom composer is visible.
-    let lines: Vec<_> = screen.text.trim_end().lines().map(str::trim_end).collect();
+    let lines: Vec<_> = screen
+        .text
+        .trim_end()
+        .lines()
+        .map(|line| line.trim_end_matches(' '))
+        .collect();
     let start = lines
         .iter()
         .rposition(|s| *s == "›" || s.starts_with("› "))?;
@@ -91,10 +116,10 @@ fn codex_box<'a>(
                         .into_iter()
                         .flatten()
                         .find(|draft| !draft.is_empty() && compact(draft) == expected),
-                    // Before typing, use only the text present with either
-                    // footer boundary. A scroll marker still means occupied.
+                    // Before typing, protect any visible text that may belong
+                    // to the composer. A scroll marker still means occupied.
                     None if scrolled => None,
-                    None => shorter,
+                    None => longer,
                 };
                 return (scrolled || draft.is_some()).then_some(Composer {
                     draft,
@@ -271,11 +296,26 @@ mod tests {
             assert!(codex_box(&screen, footer, Some("unrelated")).is_none());
         }
         assert!(has_codex_draft(&screen));
-        let empty = Screen {
-            text: "› Ask Codex to do anything\n  model · dir\n  keys · help".into(),
+        let view = |text: &str| Screen {
+            text: text.into(),
             ..screen
         };
-        assert!(!has_codex_draft(&empty));
+        for text in [
+            "›\n\n  model · dir",
+            "› Ask Codex to do anything\n\n  model · dir\n  keys · help",
+            "› Ask Codex to do\n  anything\n\n  model · dir",
+        ] {
+            assert!(!has_codex_draft(&view(text)), "{text}");
+        }
+        for text in [
+            "› AskCodextodoanything\n\n  model · dir",
+            "› Ask  Codex to do anything\n\n  model · dir",
+            "› Ask Codex to do anything\t\n\n  model · dir",
+            "›\n  tail · value\n  model · dir",
+            "› Ask Codex to do anything\n  note · value\n  model · dir",
+        ] {
+            assert!(has_codex_draft(&view(text)), "{text}");
+        }
     }
 
     #[test]

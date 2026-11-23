@@ -144,18 +144,21 @@ for line in sys.stdin:
 
     def setup_reply_worker(self, endpoint=None, mode='empty'):
         repo = Path(__file__).resolve().parents[1]
-        if mode == 'ambiguous-footer':
-            args = [repo/'crates/herdr/tests/composer.py', 'one', '--submit-first', '--reply-worker']
+        draft_screens = {
+            'ambiguous-footer': '› original draft\n  tail · value\n  model · dir',
+            'ambiguous-continuation': '›\n  tail · value\n  model · dir',
+            'compact-placeholder': '› AskCodextodoanything\n  model · dir',
+        }
+        if mode in draft_screens:
+            args = [repo/'crates/herdr/tests/composer.py', 'one', '--submit-first', '--reply-worker', mode]
         else:
             args = [repo/'tools/check_tmux.py', '--reply-worker', mode, self.root/'reply.log']
         self.dispatch(endpoint=endpoint, command=[sys.executable, *map(str, args)])
         question = self.root/'question.json'
         receipt = json.loads(live.wait_for(lambda: question.exists() and question.read_bytes()))
-        prompt = {
-            'existing-scroll': 'original draft ↑',
-            'ambiguous-footer': '› original draft\n  tail · value\n  model · dir',
-        }.get(mode, 'Ask Codex to do anything')
-        live.wait_for(lambda: prompt in self.reply_screen())
+        prompt = draft_screens.get(mode, 'original draft ↑' if mode == 'existing-scroll'
+                                   else 'Ask Codex to do anything')
+        live.wait_for(lambda: prompt in '\n'.join(line.rstrip() for line in self.reply_screen().splitlines()))
         return receipt
 
     def reply_screen(self):
@@ -377,6 +380,96 @@ for line in sys.stdin:
             self.cli('reply', number, 'once', error='uncertain')
             self.assertTrue(self.status()['pendingInput'])
             self.assert_reply_worker_finished(question, 'uncertain', earlier=('definitely-not-sent',))
+            self.assertEqual(sends, ['pane.send_input'])
+
+    def test_public_reply_protects_herdr_placeholder_like_and_ambiguous_drafts(self):
+        sends = []
+
+        def count(req, reply):
+            if req['method'] in ('pane.send_input', 'pane.send_keys'):
+                sends.append(req['method'])
+            return reply
+
+        with self.service.fault_proxy(count) as proxy:
+            for mode in ('compact-placeholder', 'ambiguous-continuation'):
+                sends.clear()
+                for filename in ('accepted', 'question.json'):
+                    (self.root/filename).unlink(missing_ok=True)
+                question = self.setup_reply_worker(proxy, mode=mode)
+                screen = self.reply_screen()
+                self.cli('reply', question['message'], 'unsent', error='definitely-not-sent')
+                self.assertEqual(sends, [], mode)
+                self.assertEqual(self.reply_screen(), screen, mode)
+                self.assertFalse((self.root/'accepted').exists(), mode)
+                self.assertFalse(self.status()['pendingInput'], mode)
+                attempt, = self.reply_attempts()
+                self.assertEqual(attempt['inputResult'], 'definitely-not-sent', mode)
+                self.assertIn('composer already contains a draft', attempt['diagnostic'], mode)
+                (self.root/'clear-draft').touch()
+                prompt = ('Ask Codex to do\n  anything' if mode == 'compact-placeholder'
+                          else 'Ask Codex to do anything')
+                live.wait_for(lambda: prompt in self.reply_screen())
+                self.cli('reply', question['message'], 'once')
+                self.assert_reply_worker_finished(question, 'accepted', earlier=('definitely-not-sent',))
+                self.assertEqual(sends, ['pane.send_input'], mode)
+
+    def test_public_reply_retries_after_herdr_presend_checkpoint_failure(self):
+        self.assertNotEqual(os.geteuid(), 0, 'the dispatch permission fault requires a non-root runner')
+        sends = []
+        lose_receipt = False
+
+        def observe(req, reply):
+            if req['method'] in ('pane.send_input', 'pane.send_keys'):
+                sends.append(req['method'])
+                if lose_receipt:
+                    return None
+            return reply
+
+        with self.service.fault_proxy(observe) as proxy:
+            question = self.setup_reply_worker(proxy)
+            number = str(question['message'])
+            self.assertFalse(self.status()['pendingInput'])
+            state = Path(self.env['WFC_STATE'])
+            dispatches = state/'dispatches'
+            assignment = dispatches/f'{self.dispatch_id}.json'
+            initial = assignment.read_bytes()
+            permissions = dispatches.stat().st_mode & 0o777
+            try:
+                dispatches.chmod(permissions & ~0o222)
+                self.assertFalse(os.access(dispatches, os.W_OK))
+                self.assertTrue(os.access(state, os.W_OK))
+                diagnostic = self.cli('reply', number, 'permission fault', error='definitely-not-sent')
+                self.assertIn('could not persist Herdr pending input before submission', diagnostic)
+                self.assertEqual(assignment.read_bytes(), initial)
+                self.assertEqual(sends, [])
+            finally:
+                dispatches.chmod(permissions)
+            attempt, = self.reply_attempts()
+            self.assertEqual(attempt['inputResult'], 'definitely-not-sent')
+            self.assertFalse(self.status()['pendingInput'])
+
+            # The reply ledger reserve and start each sync file + directory
+            # (1–4). Fail the dispatch directory sync (6) after publishing.
+            trace = self.root/'reply-fsync.log'
+            result = subprocess.run([
+                'strace', '-e', 'trace=fsync', '-e', 'inject=fsync:error=EIO:when=6',
+                '-o', trace, '--', live.DRIVER, 'reply', number, 'sync fault',
+            ], env=self.env, text=True, capture_output=True, timeout=12)
+            self.assertEqual((result.returncode, result.stdout), (1, ''), result.stderr)
+            self.assertIn('definitely-not-sent: could not persist Herdr pending input before submission',
+                          result.stderr, trace.read_text())
+            pending = json.loads(assignment.read_bytes())
+            self.assertTrue(pending['pendingInput'])
+            attempts = self.reply_attempts()
+            self.assertEqual([row['inputResult'] for row in attempts], ['definitely-not-sent'] * 2)
+            self.assertEqual(pending['pendingReplyMessageId'], attempts[-1]['messageId'])
+            self.assertEqual(sends, [])
+            self.assertFalse((self.root/'accepted').exists())
+
+            lose_receipt = True
+            self.cli('reply', number, 'once', error='uncertain')
+            self.assertTrue(self.status()['pendingInput'])
+            self.assert_reply_worker_finished(question, 'uncertain', earlier=('definitely-not-sent',) * 2)
             self.assertEqual(sends, ['pane.send_input'])
 
     def drop_close(self, calls):
