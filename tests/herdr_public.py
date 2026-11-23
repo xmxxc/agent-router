@@ -154,6 +154,13 @@ for line in sys.stdin:
             'unknown': '❯ Ask Codex to do anything',
             'ultra-empty': '» Ask Codex to do anything',
             'ultra-draft': '» original Ultra draft',
+            'codex-footer': '100% context left',
+            'codex-image': '100% context left',
+            'codex-image-unstyled': '100% context left',
+            'opencode-draft': '┃  keep OpenCode draft',
+            'opencode-shell': 'esc exit shell mode',
+            'claude-draft': '❯ keep Claude draft',
+            'claude-disabled': '⏵⏵ auto mode',
         }
         compact = '›\n  model · dir\n  keys · help'
         draft_screens.update({mode: compact for mode in (
@@ -638,11 +645,116 @@ for line in sys.stdin:
                     drop_ansi = False
                     self.assertEqual(dropped, ['ansi'] if mode == 'empty' else [])
                     if mode == 'plain-after-send':
-                        self.assertIn('Codex composer did not confirm the reply', diagnostic)
+                        self.assertIn('chat composer did not confirm the reply', diagnostic)
                         self.assertIn('› Ask Codex to do anything', self.reply_screen())
                         self.assertNotIn('\x1b[2m', self.reply_screen('ansi'))
                     self.assertTrue(self.status()['pendingInput'])
                     self.assert_reply_worker_finished(question, 'uncertain')
+                    self.assertEqual(writes, ['pane.send_input'])
+
+    def test_public_reply_uses_upstream_codex_footer_and_protects_attachments(self):
+        writes = []
+
+        def observe(req, reply):
+            if req['method'] in ('pane.send_input', 'pane.send_keys'):
+                writes.append(req['method'])
+            return reply
+
+        with self.service.fault_proxy(observe) as proxy:
+            for mode in ('codex-footer', 'codex-image', 'codex-image-unstyled'):
+                with self.subTest(mode=mode):
+                    writes.clear()
+                    for name in ('accepted', 'question.json'):
+                        (self.root/name).unlink(missing_ok=True)
+                    question = self.setup_reply_worker(proxy, mode=mode)
+                    plain, styled = self.reply_screen(), self.reply_screen('ansi')
+                    self.assertRegex(plain, r'\? for shortcuts +100% context left')
+                    earlier = ()
+                    if mode != 'codex-footer':
+                        self.assertIn('[Image #1]', plain)
+                        self.cli('reply', question['message'], 'unsent',
+                                 error='composer already contains a draft')
+                        self.assertEqual(writes, [])
+                        self.assertEqual((self.reply_screen(), self.reply_screen('ansi')), (plain, styled))
+                        self.assertFalse(self.status()['pendingInput'])
+                        self.assertFalse((self.root/'accepted').exists())
+                        (self.root/'clear-draft').touch()
+                        live.wait_for(lambda: self.reply_screen('ansi') != styled)
+                        if mode == 'codex-image':
+                            self.assertEqual(self.reply_screen(), plain)
+                        else:
+                            self.assertIn('assistant response', self.reply_screen())
+                        earlier = ('definitely-not-sent',)
+                    self.cli('reply', question['message'], 'once')
+                    self.assertFalse(self.status()['pendingInput'])
+                    self.assert_reply_worker_finished(question, 'accepted', earlier=earlier)
+                    self.assertEqual(writes, ['pane.send_input'])
+
+    def test_public_reply_only_retries_enter_for_the_exact_visible_codex_line(self):
+        writes = []
+
+        def observe(req, reply):
+            if req['method'] in ('pane.send_input', 'pane.send_keys'):
+                writes.append(req['method'])
+            return reply
+
+        with self.service.fault_proxy(observe) as proxy:
+            for mode in ('changed-reply', 'folded-reply', 'exact-reply'):
+                with self.subTest(mode=mode):
+                    writes.clear()
+                    for name in ('accepted', 'question.json'):
+                        (self.root/name).unlink(missing_ok=True)
+                    question = self.setup_reply_worker(proxy, mode=mode)
+                    if mode == 'exact-reply':
+                        self.cli('reply', question['message'], 'once')
+                        self.assert_reply_worker_finished(question, 'accepted')
+                        self.assertEqual(writes, ['pane.send_input', 'pane.send_keys'])
+                        continue
+                    self.cli('reply', question['message'], 'a b', error='uncertain')
+                    self.assertIn(': ab' if mode == 'changed-reply' else ': a\n  b', self.reply_screen())
+                    self.assertEqual(writes, ['pane.send_input'])
+                    self.assertFalse((self.root/'accepted').exists())
+                    self.assertTrue(self.status()['pendingInput'])
+                    self.assertEqual(self.reply_attempts()[-1]['inputResult'], 'uncertain')
+                    self.cli('reply', question['message'], 'again', error='already answered')
+                    self.assertEqual(writes, ['pane.send_input'])
+                    self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+
+    def test_public_reply_uses_native_opencode_and_claude_composer_shapes(self):
+        writes = []
+
+        def observe(req, reply):
+            if req['method'] in ('pane.send_input', 'pane.send_keys'):
+                writes.append(req['method'])
+            return reply
+
+        with self.service.fault_proxy(observe) as proxy:
+            for mode in ('opencode-shell', 'claude-disabled', 'opencode-draft', 'claude-draft'):
+                with self.subTest(mode=mode):
+                    writes.clear()
+                    for name in ('accepted', 'question.json'):
+                        (self.root/name).unlink(missing_ok=True)
+                    host, variant = mode.split('-', 1)
+                    question = self.setup_reply_worker(proxy, mode=mode, host=host)
+                    plain, styled = self.reply_screen(), self.reply_screen('ansi')
+                    diagnostic = ('composer already contains a draft' if variant == 'draft'
+                                  else 'writable chat composer could not be verified')
+                    self.cli('reply', question['message'], 'unsent', error=diagnostic)
+                    self.assertEqual(writes, [])
+                    self.assertEqual((self.reply_screen(), self.reply_screen('ansi')), (plain, styled))
+                    self.assertFalse(self.status()['pendingInput'])
+                    self.assertFalse((self.root/'accepted').exists())
+                    self.assertEqual(self.reply_attempts()[-1]['inputResult'], 'definitely-not-sent')
+                    if variant != 'draft':
+                        first, = self.cli('wait', '--scope', self.row['scope'], '--timeout', 0)['messages']
+                        self.assertEqual(first['messageId'], question['messageId'])
+                        self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+                        continue
+                    (self.root/'clear-draft').touch()
+                    live.wait_for(lambda: 'keep ' not in self.reply_screen())
+                    self.cli('reply', question['message'], 'once')
+                    self.assertFalse(self.status()['pendingInput'])
+                    self.assert_reply_worker_finished(question, 'accepted', earlier=('definitely-not-sent',))
                     self.assertEqual(writes, ['pane.send_input'])
 
     def drop_close(self, calls):
