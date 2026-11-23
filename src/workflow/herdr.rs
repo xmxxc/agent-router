@@ -39,6 +39,37 @@ fn valid_close_worker(worker: &Value) -> bool {
     worker["state"] == "cancelled" || (worker["state"] == "exited" && worker["exit_code"].is_i64())
 }
 
+fn assignment_path(state: &Path, id: &str) -> Result<PathBuf> {
+    ensure!(valid_id(id), "invalid dispatch ID");
+    native_state(state)?;
+    Ok(state.join("dispatches").join(format!("{id}.json")))
+}
+
+pub(super) fn open_runtime_lock(state: &Path, row: &Value) -> Result<File> {
+    let id = row["dispatch"].as_str().context("missing dispatch")?;
+    Ok(File::open(
+        assignment_path(state, id)?.with_extension("herdr-lock"),
+    )?)
+}
+
+fn bound_record(row: &Value) -> Result<&Value> {
+    let h = &row["backendHandle"];
+    ensure!(
+        h["dispatch"] == row["dispatch"]
+            && h["round"] == row["round"]
+            && h["attempt"] == row["attempt"]
+            && h["endpoint"] == row["endpoint"]
+            && h["receipt"] == row["create"]["receipt"],
+        "Herdr execution identity mismatch"
+    );
+    Ok(h)
+}
+
+pub(super) fn runtime_receipt(state: &Path, row: &Value) -> Result<Value> {
+    bound_record(row)?;
+    launch_receipt(state, &row["create"])
+}
+
 struct Assignment<'a> {
     state: &'a Path,
     _lock: File,
@@ -48,9 +79,7 @@ struct Assignment<'a> {
 
 impl<'a> Assignment<'a> {
     fn lock(state: &'a Path, id: &str, new: Option<Value>) -> Result<Self> {
-        ensure!(valid_id(id), "invalid dispatch ID");
-        native_state(state)?;
-        let path = state.join("dispatches").join(format!("{id}.json"));
+        let path = assignment_path(state, id)?;
         let lock_path = path.with_extension("herdr-lock");
         let lock = if new.is_some() {
             OpenOptions::new()
@@ -89,21 +118,8 @@ impl<'a> Assignment<'a> {
         })
     }
 
-    fn bound_record(&self) -> Result<&Value> {
-        let h = &self.row["backendHandle"];
-        ensure!(
-            h["dispatch"] == self.row["dispatch"]
-                && h["round"] == self.row["round"]
-                && h["attempt"] == self.row["attempt"]
-                && h["endpoint"] == self.row["endpoint"]
-                && h["receipt"] == self.row["create"]["receipt"],
-            "Herdr execution identity mismatch"
-        );
-        Ok(h)
-    }
-
     fn handle(&self) -> Result<Handle> {
-        Handle::deserialize(self.bound_record()?).context("incomplete native Herdr binding")
+        Handle::deserialize(bound_record(&self.row)?).context("incomplete native Herdr binding")
     }
 
     fn current(&self) -> Result<()> {
@@ -309,25 +325,51 @@ pub(super) fn create(state: &Path, row: &Value, launch: host::Launch) -> Result<
     Ok(unit.row)
 }
 
-pub(super) fn runtime_screen(state: &Path, row: &Value) -> Result<Option<String>> {
+pub(super) fn runtime_closing(state: &Path, row: &Value) -> Result<bool> {
+    let current = backend::herdr_closes(row).rfind(|e| {
+        ["dispatch", "round", "attempt"]
+            .iter()
+            .all(|&key| row[key] == e[key])
+    });
+    if current.is_some_and(|event| {
+        matches!(
+            event["result"].as_str(),
+            Some("pending" | "uncertain" | "completed")
+        ) && backend::verify_herdr_close_target(row, event).is_ok()
+    }) {
+        return Ok(true);
+    }
+    // The legacy archive alone cannot establish that the bound writers stopped.
+    if backend::archive(state, row)?.is_some() {
+        let handle = Handle::deserialize(&row["backendHandle"])?;
+        return Ok(handle.verified_stopped().is_ok_and(|stopped| stopped));
+    }
+    Ok(false)
+}
+
+pub(super) fn runtime_screen(state: &Path, row: &mut Value) -> Result<Option<String>> {
     let id = row["dispatch"].as_str().context("missing dispatch")?;
-    let unit = Assignment::lock(state, id, None)?;
-    if ["scope", "round", "attempt", "backendHandle"]
-        .iter()
-        .any(|&field| unit.row[field] != row[field])
-        || unit.pending_close()
-        || unit.completed_close().is_some()
-    {
+    let mut unit = Assignment::lock(state, id, None)?;
+    if unit.row != *row || runtime_closing(state, &unit.row)? {
         return Ok(None);
     }
-    Ok(unit.handle()?.read().ok().map(|screen| screen.text))
+    let inspection = unit.inspect()?;
+    let screen = if inspection["result"] == "accepted" && inspection["alive"] == true {
+        unit.handle()?.read().ok().map(|screen| screen.text)
+    } else {
+        None
+    };
+    // Inspection may have checkpointed a writer. The publishing side validates
+    // the generation that was actually read.
+    *row = unit.row;
+    Ok(screen)
 }
 
 pub(super) fn observe(state: &Path, row: &mut Value) -> Result<(Value, Value)> {
     let observed = (|| -> Result<_> {
         let id = row["dispatch"].as_str().context("missing dispatch")?;
         let mut unit = Assignment::lock(state, id, None)?;
-        let bound = unit.bound_record().is_ok();
+        let bound = bound_record(&unit.row).is_ok();
         let mut close_pending = unit.pending_close();
         let mut invalid_close_worker = false;
         let observed = (|| -> Result<_> {

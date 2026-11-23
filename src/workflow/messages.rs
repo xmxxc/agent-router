@@ -7,6 +7,8 @@ pub mod relay;
 pub(super) mod runtime;
 pub use receipt::{Confirm, ACK_USAGE, RESOLVE_USAGE};
 use receipt::{Delivery, Resolution, State};
+#[cfg(target_os = "linux")]
+pub(crate) use runtime::run_runtime_probe;
 
 use super::{git_snapshot::Snapshot, resolve_report_path, state_dir, valid_id};
 use anyhow::{ensure, Context, Result};
@@ -68,7 +70,7 @@ fn options<'a, const N: usize>(
     Ok(values)
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Identity {
     dispatch: String,
     round: u64,
@@ -754,14 +756,13 @@ impl<'a> Wait<'a> {
                 return Ok(batch);
             }
             #[cfg(target_os = "linux")]
-            if runtime.poll(&state, self.dispatch, self.scope)? {
+            if runtime.poll(&state, self.dispatch, self.scope, remaining)? {
                 continue;
             }
-            std::thread::sleep(
-                self.timeout
-                    .saturating_sub(start.elapsed())
-                    .min(Duration::from_millis(100)),
-            );
+            let delay = Duration::from_millis(100);
+            #[cfg(target_os = "linux")]
+            let delay = runtime.delay(delay);
+            std::thread::sleep(self.timeout.saturating_sub(start.elapsed()).min(delay));
         }
     }
 }

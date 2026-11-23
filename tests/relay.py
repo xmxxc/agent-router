@@ -96,8 +96,7 @@ sys.exit(1 if mode else 0)
         other, = self.data("wait", "--scope", "other", "--timeout", "0")["messages"]
         self.assertEqual((other["messageId"], other["type"]), (unrelated["messageId"], "done"))
 
-    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
-    def test_runtime_notice_through_the_private_queue(self):
+    def start_private_tmux(self):
         socket = self.root / "socket"
         tmux = [shutil.which("tmux"), "-S", str(socket), "-f", "/dev/null"]
         self.env.update(PATH=os.pathsep.join((str(self.root), os.environ["PATH"])),
@@ -106,6 +105,10 @@ sys.exit(1 if mode else 0)
                        env=self.env, check=True, timeout=10)
         self.addCleanup(subprocess.run, [*tmux, "kill-server"], env=self.env,
                         capture_output=True, timeout=10)
+
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_runtime_notice_through_the_private_queue(self):
+        self.start_private_tmux()
         secret = "private-queue-fixture-token"
         config = self.root / "launch.json"
         fixture = f"import time; print('Quota exceeded: {secret}', flush=True); time.sleep(20)"
@@ -132,6 +135,82 @@ sys.exit(1 if mode else 0)
                           "dispatch": notice["dispatch"], "attempt": notice["attempt"],
                           "messageId": notice["messageId"], "fault": notice["fault"],
                           "queueCalls": 1, "ack": ack}), flush=True)
+
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_slow_runtime_clients_share_the_wait_and_relay_budget(self):
+        self.start_private_tmux()
+        config = self.root / "launch.json"
+        config.write_text(json.dumps({"hosts": {"codex": {"command": [sys.executable, "-c", "import time; time.sleep(60)"]}}}))
+        jobs = [self.data("dispatch", "--task", "task", "--role", "worker", "--scope", "ours",
+                          "--report", "task", "--cwd", ".", "--host", "codex", "--launch-config", str(config))
+                for _ in range(2)]
+        real_tmux = shutil.which("tmux")
+        trace = self.root / "slow-probes"
+        shim = self.root / "tmux"
+        shim.write_text(f"#!{sys.executable}\n" + """
+import json, os, subprocess, sys
+from pathlib import Path
+argv = sys.argv[1:]
+if "list-panes" not in argv:
+    os.execv(REAL_TMUX, [REAL_TMUX, *argv])
+child = subprocess.Popen(["/bin/sleep", "25"])
+with Path(TRACE).open("a") as log:
+    print(json.dumps(dict(shim=os.getpid(), descendant=child.pid, group=os.getpgrp(),
+                          target=argv[argv.index("-t") + 1])), file=log)
+sys.exit(child.wait())
+""".replace("REAL_TMUX", repr(real_tmux)).replace("TRACE", repr(str(trace))))
+        shim.chmod(0o700)
+
+        def probes():
+            return [json.loads(line) for line in trace.read_text().splitlines()] if trace.exists() else []
+
+        def exited(pid):
+            stat = Path(f"/proc/{pid}/stat")
+            try:
+                return stat.read_text().rsplit(")", 1)[1].split()[0] == "Z"
+            except FileNotFoundError:
+                return True
+
+        start = time.monotonic()
+        self.assertFalse(self.data("wait", "--scope", "ours", "--timeout", "2.4", code=3)["messages"])
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 4)
+        first = probes()
+        for job in jobs:
+            self.assertTrue(any(job["dispatch"] in item["target"] for item in first), first)
+
+        wait = subprocess.Popen([WFC, "wait", "--scope", "ours", "--timeout", "3"],
+                                cwd=self.root, env=self.env, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.until(lambda: len(probes()) > len(first))
+            receipt = self.publish("ours")
+            out, err = wait.communicate(timeout=4)
+            self.assertEqual(wait.returncode, 0, err)
+            [message] = json.loads(out)["messages"]
+            self.assertEqual(message["messageId"], receipt["messageId"])
+        finally:
+            if wait.poll() is None:
+                wait.kill()
+                wait.communicate(timeout=5)
+
+        before_relay = len(probes())
+        relay = self.foreground(2.5)
+        self.until(lambda: len(probes()) > before_relay)
+        expected = self.publish("ours")
+        logs = relay.communicate(timeout=4)
+        self.assertEqual(relay.returncode, 0, logs)
+        [call] = self.calls()
+        [notice] = json.loads(call[4][len(PREFIX):])["messages"]
+        self.assertEqual((notice["messageId"], notice["type"]), (expected["messageId"], "done"))
+        final = probes()
+        for item in final:
+            self.until(lambda: all(exited(item[key]) for key in ("shim", "descendant", "group")))
+        print(json.dumps({"case": "slow-runtime-budget", "waitMs": int(elapsed * 1000),
+                          "targets": sorted({item["target"] for item in first}),
+                          "cancelledGroups": sorted({item["group"] for item in final}),
+                          "waitMessage": receipt["messageId"], "relayMessage": expected["messageId"],
+                          "allProbeClientsStopped": True}), flush=True)
 
     def test_detached_scope(self):
         other = self.publish("other")

@@ -156,6 +156,7 @@ impl<'a> Relay<'a> {
                 None => None,
             };
             if let Some((batch, text)) = batch {
+                runtime.cancel_probe();
                 let outcome = codex::queue(&thread, &batch, &text, remaining().min(timeout))?;
                 if outcome != Outcome::Uncertain {
                     loop {
@@ -184,10 +185,10 @@ impl<'a> Relay<'a> {
                 }
             }
             drop(order);
-            if !remaining().is_zero() && runtime.poll(&state, None, self.scope)? {
+            if runtime.poll(&state, None, self.scope, remaining())? {
                 continue;
             }
-            std::thread::sleep(remaining().min(Duration::from_millis(500)));
+            std::thread::sleep(remaining().min(runtime.delay(Duration::from_millis(500))));
         }
         Ok(())
     }

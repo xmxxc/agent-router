@@ -1,5 +1,6 @@
 """Public Linux startup failure reports, delivered through the existing inbox."""
 from concurrent.futures import ThreadPoolExecutor
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -439,9 +440,10 @@ class StartupFailure(unittest.TestCase):
                     break
                 if view == "exit":
                     sys.exit(23)
-                if view != previous or view == "refresh":
+                if view != previous or view in ("refresh", "quota-refresh"):
                     frame += 1
-                    text = f"Working: frame {frame}" if view == "refresh" else view
+                    text = {"refresh": f"Working: frame {frame}",
+                            "quota-refresh": f"Quota exceeded: frame {frame}"}.get(view, view)
                     print("\x1b[2J\x1b[H" + text, flush=True)
                     previous = view
                 time.sleep(.05)
@@ -509,7 +511,7 @@ class StartupFailure(unittest.TestCase):
                 write(command, f"{screen}: {SECRET}-updated")
                 self.assertFalse(observe(job, timeout="1.25", code=3, stall=".1"))
 
-                write(command, f"Working: {SECRET}")
+                write(command, f"A new result is ready: {SECRET}")
                 recovery, = observe(job)
                 assert_notice(job, recovery, "recovered", "recovered", "changed_activity", "active")
                 self.assertFalse(observe(job, timeout=".25", code=3))
@@ -531,15 +533,56 @@ class StartupFailure(unittest.TestCase):
         assert_notice(idle, stalled, "stalled", "timeout", "unchanged_screen", "stalled")
         self.assertIsInstance(stalled["fault"]["elapsedSeconds"], int)
         self.assertFalse(observe(idle, stall=".5", timeout="1.25", code=3))
-        write(idle_command, f"Working: {SECRET}")
+        write(idle_command, f"Step two is ready: {SECRET}")
         recovery, = observe(idle)
         assert_notice(idle, recovery, "recovered", "recovered", "changed_activity", "active")
+        stalled_again, = observe(idle, stall=".5")
+        assert_notice(idle, stalled_again, "stalled", "timeout", "unchanged_screen", "stalled")
+        self.assertNotEqual(stalled["messageId"], stalled_again["messageId"])
 
         _, refreshing = launch("claude", "refreshing", "refresh")
         deadline, = observe(refreshing, stall=".5", deadline="2")
         assert_notice(refreshing, deadline, "unknown", "timeout", "turn_deadline", "timed_out")
         self.assertGreaterEqual(deadline["fault"]["elapsedSeconds"], 2)
         self.assertFalse(observe(refreshing, stall=".5", deadline="2", timeout="1.25", code=3))
+
+        _, quota_refresh = launch("claude", "quota-refresh", "quota-refresh")
+        quota, = observe(quota_refresh, deadline="3")
+        assert_notice(quota_refresh, quota, "blocked", "quota", "screen_notice", "blocked")
+        deadline, = observe(quota_refresh, deadline="3", timeout="6")
+        assert_notice(quota_refresh, deadline, "unknown", "timeout", "turn_deadline", "timed_out")
+        self.assertFalse(observe(quota_refresh, deadline="3", timeout="1.25", code=3))
+
+        command, alternating = launch("codex", "alternating-faults", "Quota exceeded")
+        quota, = observe(alternating)
+        assert_notice(alternating, quota, "blocked", "quota", "screen_notice", "blocked")
+        write(command, "Connection reset")
+        disconnect, = observe(alternating)
+        assert_notice(alternating, disconnect, "unknown", "protocol_disconnected", "screen_notice", "disconnected")
+        for repeated in ("Quota exceeded: updated", "Connection reset: updated"):
+            write(command, repeated)
+            self.assertFalse(observe(alternating, timeout="1.25", code=3))
+        write(command, "The response has arrived.")
+        recovered, = observe(alternating)
+        assert_notice(alternating, recovered, "recovered", "recovered", "changed_activity", "active")
+        write(command, "Quota exceeded")
+        quota_again, = observe(alternating)
+        assert_notice(alternating, quota_again, "blocked", "quota", "screen_notice", "blocked")
+        self.assertNotEqual(quota_again["messageId"], quota["messageId"])
+
+        banner, readonly = launch("codex", "readonly-banner",
+            f"■ This chat uses {SECRET}, but Codex now uses other,\n"
+            "  so this chat is read-only.")
+        fault, = observe(readonly)
+        assert_notice(readonly, fault, "blocked", "permission_required", "screen_notice", "awaiting_permission")
+        write(banner, "This conversation is read-only or unavailable; no operation was sent.\n"
+                      "The current output has arrived.")
+        recovered, = observe(readonly)
+        assert_notice(readonly, recovered, "recovered", "recovered", "changed_activity", "active")
+        write(banner, "• This conversation is unavailable. Its cached transcript\n"
+                      "  and draft remain here; input is paused.")
+        fault, = observe(readonly)
+        assert_notice(readonly, fault, "blocked", "permission_required", "screen_notice", "awaiting_permission")
 
         command, blocked = launch("codex", "other-faults", "Login required")
         for screen, kind, category, state in (
@@ -560,7 +603,7 @@ class StartupFailure(unittest.TestCase):
         self.assertEqual({key: message["fault"][key] for key in identity}, identity)
         self.assertFalse(observe(blocked, timeout="1.25", code=3))
 
-        _, awaiting = launch("opencode", "awaiting", f"Quota exceeded: {SECRET}")
+        command, awaiting = launch("opencode", "awaiting", f"Quota exceeded: {SECRET}")
         # The Rust base reserves ask/reply. Seed a private question receipt of
         # the existing shape and exercise the real controller read and wait.
         ledger = self.state / "messages.json"
@@ -579,6 +622,45 @@ class StartupFailure(unittest.TestCase):
         status = self.cli("status", "--dispatch", awaiting["dispatch"])["dispatches"][0]
         self.assertEqual(status["hostActivity"]["state"], "awaiting_answer")
         self.assertNotEqual(status["state"], "done")
+        write(command, "Ordinary output while awaiting the answer")
+        self.assertFalse(observe(awaiting, stall=".2", deadline=".2", timeout="1.25", code=3))
+        write(command, "Approval required")
+        permission, = observe(awaiting, deadline=".1")
+        assert_notice(awaiting, permission, "blocked", "permission_required", "screen_notice", "awaiting_permission")
+        write(command, "exit")
+        terminal, = observe(awaiting)
+        assert_notice(awaiting, terminal, "exited", "process_exited", "verified_exit", "exited")
+        self.assertEqual(terminal["fault"]["exitCode"], 23)
+        self.assertFalse(observe(awaiting, timeout="1.25", code=3))
+
+        _, fenced = launch("codex", "close-fence", "Quota exceeded")
+        lock_dir = self.state / "close-locks"
+        lock_dir.mkdir(exist_ok=True)
+        close_lock = lock_dir / f'{fenced["dispatch"]}.{fenced["attempt"]}'
+        archive = self.state / "dispatches" / f'{fenced["dispatch"]}.{fenced["attempt"]}.closed'
+        with close_lock.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertFalse(observe(fenced, timeout="1.25", code=3))
+            write(archive, json.dumps({**{key: fenced[key] for key in ("dispatch", "round", "attempt")},
+                                       "resourceCleanup": "uncertain", "closeEffect": "already_absent",
+                                       "worker": {"state": "exited", "exit_code": 0}}))
+        fault, = observe(fenced)
+        assert_notice(fenced, fault, "blocked", "quota", "screen_notice", "blocked")
+        view = self.cli("status", "--dispatch", fenced["dispatch"])["dispatches"][0]
+        self.assertEqual(view["worker"]["state"], "running")
+
+        _, archived = launch("codex", "archive-done", "Quota exceeded")
+        record = self.state / "dispatches" / f'{archived["dispatch"]}.json'
+        row = json.loads(record.read_text())
+        done = {key: archived[key] for key in ("scope", "dispatch", "round", "attempt", "role", "report")}
+        row["messages"] = [{**done, "type": "done", "messageId": "m-archived-done", "state": "processed"}]
+        write(record, json.dumps(row))
+        self.assertFalse(observe(archived, timeout="1.25", code=3))
+        completed = self.cli("status", "--dispatch", archived["dispatch"])["dispatches"][0]
+        self.assertEqual(completed["state"], "done")
+        self.assertEqual([m["messageId"] for m in completed["messages"]], ["m-archived-done"])
+        print(json.dumps({"case": "runtime-history-close-fence", "uncertainArchiveNotice": fault["messageId"],
+                          "archivedCompletion": "m-archived-done", "closeLockSuppressed": True}), flush=True)
         self.assertNotIn(SECRET, ledger.read_text())
         for path in (self.state / "dispatches").glob("*.host-watch"):
             self.assertNotIn(SECRET, path.read_text())

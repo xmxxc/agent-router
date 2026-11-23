@@ -169,9 +169,18 @@ fn existing(state: &Path, row: &Value, op: &str) -> Result<Value> {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn runtime_screen(state: &Path, row: &Value) -> Result<Option<String>> {
+pub(super) fn runtime_screen(state: &Path, row: &mut Value) -> Result<Option<String>> {
     if row["backend"] == "herdr" {
         return super::herdr::runtime_screen(state, row);
+    }
+    if runtime_closing(state, row)? {
+        return Ok(None);
+    }
+    // An uncertain old archive is not process evidence. Inspect the registered
+    // execution directly rather than projecting the archive's worker shape.
+    let (worker, _) = inspect_worker(state, row, &Value::Null)?;
+    if worker["state"] != "running" {
+        return Ok(None);
     }
     let mut reply = existing(state, row, "observe-screen")?;
     Ok(match reply["screen"].take() {
@@ -181,15 +190,26 @@ pub(super) fn runtime_screen(state: &Path, row: &Value) -> Result<Option<String>
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn runtime_exit(
-    state: &Path,
-    row: &Value,
-    inspection: &Value,
-) -> Result<Option<Map<String, Value>>> {
+pub(super) fn runtime_closing(state: &Path, row: &Value) -> Result<bool> {
+    if row["backend"] == "herdr" {
+        return super::herdr::runtime_closing(state, row);
+    }
+    Ok(archive(state, row)?.is_some_and(|saved| confirmed(row, &saved)))
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn runtime_exit(state: &Path, row: &Value) -> Result<Option<Map<String, Value>>> {
     let receipt = if row["backend"] == "herdr" {
-        row["launch"].clone()
+        super::herdr::runtime_receipt(state, row)?
     } else {
-        private_receipt(state, inspect_launch(state, row, inspection)?)?
+        let Some(id) = receipt_id(row)?.filter(|id| valid_launch(id)) else {
+            return Ok(None);
+        };
+        let receipt = private_receipt(state, Some(id))?;
+        if receipt["launchId"] != id {
+            return Ok(None);
+        }
+        receipt
     };
     let Some(code) = receipt["exitCode"].as_u64().filter(|code| *code <= 255) else {
         return Ok(None);
@@ -715,8 +735,6 @@ fn inspect_worker(state: &Path, row: &Value, saved: &Value) -> Result<(Value, Va
     };
     let worker = if let Some(exit) = exited(&evidence) {
         exit
-    } else if archived_exit(saved) || saved_revocation(row, saved).is_some() {
-        saved["worker"].clone()
     } else if matches!(evidence["category"].as_str(), Some("started") | None)
         && inspection["result"] == "accepted"
         && inspection["alive"] == true
@@ -724,6 +742,8 @@ fn inspect_worker(state: &Path, row: &Value, saved: &Value) -> Result<(Value, Va
         && inspection["workerBound"] == true
     {
         json!({"state":"running"})
+    } else if archived_exit(saved) || saved_revocation(row, saved).is_some() {
+        saved["worker"].clone()
     } else {
         json!({"state":"unknown"})
     };

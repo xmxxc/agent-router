@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
+import time
 import unittest
 
 # Both suites use the same isolated Herdr server, fault proxy and child reaper.
@@ -145,6 +147,34 @@ for line in sys.stdin:
                           'scope': notice['scope'], 'pane': self.h['pane'],
                           'messageId': notice['messageId'], 'fault': notice['fault'],
                           'ack': ack, 'closed': True}), flush=True)
+
+    def test_slow_runtime_pane_read_releases_the_assignment(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def hold_read(req, reply):
+            if req["method"] == "pane.read" and not release.is_set():
+                entered.set()
+                release.wait(5)
+                return None  # the cancelled probe closed this connection
+            return reply
+
+        with self.service.fault_proxy(hold_read) as endpoint:
+            self.dispatch(endpoint=endpoint)
+            start = time.monotonic()
+            try:
+                quiet = self.cli("wait", "--scope", self.row["scope"], "--dispatch", self.dispatch_id,
+                                 "--timeout", ".65", error='"timedOut":true')
+                elapsed = time.monotonic() - start
+                self.assertTrue(entered.is_set(), "the bound pane read did not reach the fixture")
+                self.assertFalse(json.loads(quiet)["messages"])
+                self.assertLess(elapsed, 2)
+            finally:
+                release.set()
+            self.assertEqual(self.cli("close", self.dispatch_id)["result"], "completed")
+            print(json.dumps({"case": "slow-herdr-probe", "elapsedMs": int(elapsed * 1000),
+                              "dispatch": self.dispatch_id, "attempt": self.row["attempt"],
+                              "pane": self.h["pane"], "closeAfterDeadline": "completed"}), flush=True)
 
     def test_claim_survives_lost_ack_and_reconcile(self):
         sends = []

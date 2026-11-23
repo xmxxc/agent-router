@@ -140,6 +140,10 @@ fn main() -> anyhow::Result<ExitCode> {
             println!("{usage}");
         }
         #[cfg(target_os = "linux")]
+        Some("--observe-host-runtime") if args.len() == 3 => {
+            workflow::messages::run_runtime_probe(&args)?;
+        }
+        #[cfg(target_os = "linux")]
         Some("--relay-queue") if args.len() == 4 => {
             return workflow::messages::relay::queue_owner::run(
                 &args[0], &args[1], &args[2], &args[3],

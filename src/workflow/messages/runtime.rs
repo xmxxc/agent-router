@@ -1,16 +1,23 @@
 //! Observe the existing worker binding while a controller is waiting.
 use super::{body_hash, receipt, Assignment, Delivery, Identity, Inbox, Message};
-use crate::workflow::{assignment, backend, valid_id, write_json};
+use crate::workflow::{assignment, backend, herdr, valid_id, view, write_json};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
-    env, fs,
+    collections::VecDeque,
+    env,
+    fs::{self, TryLockError},
     io::ErrorKind,
     path::Path,
+    task::Poll,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
+
+mod probe;
+pub(crate) use probe::run_runtime_probe;
+use probe::{Observation, Probe};
 
 const OBSERVATION: &str = "host_runtime";
 
@@ -22,6 +29,8 @@ pub(super) struct Monitor {
     next: Instant,
     stall: Duration,
     deadline: Duration,
+    pending: VecDeque<String>,
+    probe: Option<Probe>,
 }
 
 impl Monitor {
@@ -36,7 +45,21 @@ impl Monitor {
             next: Instant::now(),
             stall,
             deadline,
+            pending: VecDeque::new(),
+            probe: None,
         }
+    }
+
+    pub(super) fn delay(&self, default: Duration) -> Duration {
+        if self.probe.is_some() {
+            default.min(Duration::from_millis(25))
+        } else {
+            default
+        }
+    }
+
+    pub(super) fn cancel_probe(&mut self) {
+        self.probe = None;
     }
 
     pub(super) fn poll(
@@ -44,85 +67,140 @@ impl Monitor {
         state: &Path,
         dispatch: Option<&str>,
         scope: Option<&str>,
+        remaining: Duration,
     ) -> Result<bool> {
-        if Instant::now() < self.next
-            || env::var_os("WFC_WORKER_CALLBACK").is_some_and(|v| !v.is_empty())
+        let entered = Instant::now();
+        if remaining.is_zero() || env::var_os("WFC_WORKER_CALLBACK").is_some_and(|v| !v.is_empty())
         {
             return Ok(false);
         }
-        self.next = Instant::now() + Duration::from_secs(1);
-        let dir = state.join("dispatches");
-        let history = Inbox::snapshot(state)?;
-        let ids = match dispatch {
-            Some(id) => [id.to_owned()].into(),
-            None => assignment::ids(&dir)?,
-        };
-        for id in ids {
-            let Some(mut row) = candidate(&dir, &id, scope) else {
-                continue;
-            };
-            let Ok(assignment) = Assignment::deserialize(&row) else {
-                continue;
-            };
-            let worker = assignment.worker;
-            if blocked(&history, &worker) {
-                continue;
-            }
-            let path = dir.join(format!("{id}.host-watch"));
-            let previous = watch(&path)?;
-            let baseline = previous.as_ref().filter(|w| {
-                w.attempt == worker.attempt && w.round == worker.round && w.scope == worker.scope()
-            });
-            let sample = sample(state, &mut row, baseline.is_some());
-            let Some(sample) = sample else {
-                continue;
-            };
-            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
-            let Some(mut inbox) = Inbox::try_open(state)? else {
-                continue;
-            };
-            // Do not carry a pane observation across a changed assignment,
-            // a completed close, another poller, or a worker callback.
-            let Some(current) = candidate(&dir, &id, scope) else {
-                continue;
-            };
-            if !same_execution(&row, &current)
-                || blocked(&inbox.messages, &worker)
-                || watch(&path)? != previous
-                || (current["backend"] == "tmux" && backend::archive(state, &current)?.is_some())
-            {
-                continue;
-            }
-            let matching = || inbox.messages.iter().filter(|m| matches_worker(m, &worker));
-            let last = matching()
-                .rfind(|m| {
-                    m.additional_fields
-                        .get("kind")
-                        .is_some_and(|k| k == OBSERVATION)
-                })
-                .and_then(|m| m.additional_fields.get("fault"));
-            let deadline_reported = matching().any(|m| {
-                m.additional_fields
-                    .get("fault")
-                    .is_some_and(|f| f["evidence"] == "turn_deadline")
-            });
-            let (next, notice) =
-                self.evaluate(&current, baseline, sample, last, deadline_reported, now);
-            let sent = if let Some(notice) = notice {
-                publish(&mut inbox, worker, &current, notice)?;
-                true
-            } else {
-                false
-            };
-            if let Some(next) = next {
-                write_json(&path, &serde_json::to_value(next)?, None)?;
-                fs::File::open(&dir)?.sync_all()?;
-            }
-            if sent {
-                return Ok(true);
+        if let Some(mut running) = self.probe.take() {
+            match running.poll()? {
+                Poll::Pending => {
+                    self.probe = Some(running);
+                    return Ok(false);
+                }
+                Poll::Ready(Some(observed)) if entered.elapsed() < remaining => {
+                    if self.commit(
+                        state,
+                        scope,
+                        &running.id,
+                        running.previous.as_ref(),
+                        observed,
+                    )? {
+                        return Ok(true);
+                    }
+                }
+                Poll::Ready(_) => (),
             }
         }
+        let dir = state.join("dispatches");
+        if self.pending.is_empty() {
+            if Instant::now() < self.next {
+                return Ok(false);
+            }
+            self.next = Instant::now() + Duration::from_secs(1);
+            self.pending = match dispatch {
+                Some(id) => [id.to_owned()].into(),
+                None => assignment::ids(&dir)?.into_iter().collect(),
+            };
+        }
+        let ledger = Inbox::snapshot(state)?;
+        while let Some(id) = self.pending.pop_front() {
+            let Some(row) = candidate(&dir, &id, scope) else {
+                continue;
+            };
+            if finished(&row, &history(&row, &ledger)?) {
+                continue;
+            }
+            let previous = watch(&dir.join(format!("{id}.host-watch")))?;
+            let salt = watch_for(&row, previous.as_ref())
+                .map_or_else(|| Uuid::new_v4().simple().to_string(), |w| w.salt.clone());
+            let budget = remaining.saturating_sub(entered.elapsed());
+            if budget.is_zero() {
+                break;
+            }
+            self.probe = Some(Probe::start(state, &row, previous, &salt, budget)?);
+            break;
+        }
         Ok(false)
+    }
+
+    fn commit(
+        &self,
+        state: &Path,
+        scope: Option<&str>,
+        id: &str,
+        previous: Option<&Watch>,
+        observed: Observation,
+    ) -> Result<bool> {
+        let dir = state.join("dispatches");
+        let path = dir.join(format!("{id}.host-watch"));
+        let Some(row) = candidate(&dir, id, scope) else {
+            return Ok(false);
+        };
+        if binding(&row) != observed.binding {
+            return Ok(false);
+        }
+        // Same lock order as Herdr close: execution first, then its messages.
+        // Contention defers an observation while the controller can keep polling.
+        let close_guard = if row["backend"] == "herdr" {
+            herdr::open_runtime_lock(state, &row)?
+        } else {
+            assignment::open_close_lock(state, &row)?
+        };
+        match close_guard.try_lock() {
+            Ok(()) => (),
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Error(e)) => return Err(e.into()),
+        }
+        let Some(mut inbox) = Inbox::try_open(state)? else {
+            return Ok(false);
+        };
+        let Some(row) = candidate(&dir, id, scope) else {
+            return Ok(false);
+        };
+        if binding(&row) != observed.binding
+            || watch(&path)?.as_ref() != previous
+            || backend::runtime_closing(state, &row)?
+        {
+            return Ok(false);
+        }
+        let history = history(&row, &inbox.messages)?;
+        if finished(&row, &history) {
+            return Ok(false);
+        }
+        let Ok(assignment) = Assignment::deserialize(&row) else {
+            return Ok(false);
+        };
+        let watch = watch_for(&row, previous);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
+        // A verified local terminal receipt takes priority over an older
+        // screen. Neither terminal checks nor the commit perform backend I/O.
+        let (next, notices) = if let Some(exit) = backend::runtime_exit(state, &row)? {
+            let exit = Notice::Exited(exit);
+            (
+                None,
+                (!reported(&row, &history, &exit))
+                    .then_some(exit)
+                    .into_iter()
+                    .collect(),
+            )
+        } else {
+            self.evaluate(&row, watch, observed.sample, &history, now)
+        };
+        let sent = !notices.is_empty();
+        for notice in notices {
+            append(&mut inbox, assignment.worker.clone(), &row, notice);
+        }
+        if sent {
+            inbox.save().context("publish host observation")?;
+        }
+        if let Some(next) = next {
+            write_json(&path, &serde_json::to_value(next)?, None)?;
+            fs::File::open(&dir)?.sync_all()?;
+        }
+        Ok(sent)
     }
 
     fn evaluate(
@@ -130,75 +208,76 @@ impl Monitor {
         row: &Value,
         previous: Option<&Watch>,
         sample: Sample,
-        last: Option<&Value>,
-        deadline_reported: bool,
+        history: &[Value],
         now: f64,
-    ) -> (Option<Watch>, Option<Notice>) {
-        let (next, notice) = match sample {
-            Sample::Unavailable => (None, Some(Notice::Disconnected("backend_unavailable"))),
-            Sample::Exited(evidence) => (None, Some(Notice::Exited(evidence))),
-            Sample::Screen(screen) => {
-                let start = screen.ceil_char_boundary(screen.len().saturating_sub(4096));
-                let tail = screen[start..].trim();
-                let reading = classify(tail);
-                let salt = previous
-                    .map_or_else(|| Uuid::new_v4().simple().to_string(), |w| w.salt.clone());
-                let fingerprint = body_hash(&format!("{salt}{tail}"));
-                let changed = previous.is_none_or(|w| w.fingerprint != fingerprint);
-                let since = previous.filter(|_| !changed).map_or(now, |w| w.since);
-                let total = (now - row["created"].as_f64().unwrap_or(now)).max(0.0);
-                let idle = (now - since).max(0.0);
-                let fault_open = last.is_some_and(|fault| fault["category"] != "recovered");
-                let notice = match reading {
-                    Reading::Fault(notice) => Some(notice),
-                    _ if !deadline_reported
-                        && !self.deadline.is_zero()
-                        && total >= self.deadline.as_secs_f64() =>
-                    {
-                        Some(Notice::Deadline(total as u64))
-                    }
-                    Reading::Active
-                        if changed
-                            && fault_open
-                            && last.is_some_and(|fault| fault["evidence"] != "turn_deadline") =>
-                    {
-                        Some(Notice::Recovered)
-                    }
-                    _ if !fault_open
-                        && !self.stall.is_zero()
-                        && idle >= self.stall.as_secs_f64() =>
-                    {
-                        Some(Notice::Stalled(idle as u64))
-                    }
-                    _ => None,
-                };
-                let next = Watch {
-                    at: now,
-                    attempt: row["attempt"].as_str().unwrap_or_default().into(),
-                    round: row["round"].as_u64().unwrap_or_default(),
-                    scope: row["scope"]
-                        .as_str()
-                        .or_else(|| row["dispatch"].as_str())
-                        .unwrap_or_default()
-                        .into(),
-                    salt,
-                    fingerprint,
-                    since,
-                };
-                // Preserve an ordering token across meaningful changes, avoiding
-                // a write on each poll of a screen that is still identical.
-                (if changed { Some(next) } else { None }, notice)
-            }
+    ) -> (Option<Watch>, Vec<Notice>) {
+        let episode: Vec<_> = current_messages(row, history)
+            .rev()
+            .filter(|m| m["kind"] == OBSERVATION)
+            .take_while(|m| m["fault"]["category"] != "recovered")
+            .collect();
+        let seen = |n: &Notice| episode.iter().any(|m| same_fault(m, n));
+        let fault_open = episode
+            .iter()
+            .any(|m| m["fault"]["evidence"] != "turn_deadline");
+        let Sample::Screen {
+            fingerprint,
+            salt,
+            fault,
+            nonblank,
+        } = sample
+        else {
+            let notice = Notice::Unavailable;
+            return (
+                None,
+                (previous.is_some() && !seen(&notice))
+                    .then_some(notice)
+                    .into_iter()
+                    .collect(),
+            );
         };
-        (
-            next,
-            notice.filter(|n| {
-                last.is_none_or(|old| {
-                    old["category"] != n.category()
-                        || (n.category() == "timeout" && old["evidence"] != n.evidence())
-                })
-            }),
-        )
+        let paused = current_messages(row, history).any(|m| m["type"] == "question");
+        let changed = previous.is_none_or(|w| w.fingerprint != fingerprint);
+        let reset = changed || previous.is_some_and(|w| w.paused != paused);
+        let since = if reset {
+            now
+        } else {
+            previous.map_or(now, |w| w.since)
+        };
+        let idle = (now - since).max(0.0);
+        let total = (now - row["created"].as_f64().unwrap_or(now)).max(0.0);
+        let mut notices = Vec::new();
+        if let Some(notice) = fault {
+            if !seen(&notice) {
+                notices.push(notice);
+            }
+        } else if !paused {
+            if changed && nonblank && previous.is_some() && fault_open {
+                notices.push(Notice::Recovered);
+            } else if !fault_open && !self.stall.is_zero() && idle >= self.stall.as_secs_f64() {
+                notices.push(Notice::Stalled(idle as u64));
+            }
+        }
+        // A changing quota/error banner does not suspend the total timer.
+        let deadline = Notice::Deadline(total as u64);
+        if !paused
+            && !self.deadline.is_zero()
+            && total >= self.deadline.as_secs_f64()
+            && !reported(row, history, &deadline)
+        {
+            notices.push(deadline);
+        }
+        let next = reset.then(|| Watch {
+            at: now,
+            attempt: row["attempt"].as_str().unwrap_or_default().into(),
+            round: row["round"].as_u64().unwrap_or_default(),
+            scope: row_scope(row).unwrap_or_default().into(),
+            salt,
+            fingerprint,
+            since,
+            paused,
+        });
+        (next, notices)
     }
 }
 
@@ -216,13 +295,7 @@ fn candidate(dir: &Path, id: &str, scope: Option<&str>) -> Option<Value> {
         || !scope.is_none_or(|scope| scope == row["scope"].as_str().unwrap_or(id))
         || !match row["backend"].as_str() {
             Some("tmux") => row["executionId"] == row["attempt"] && row["tmuxSocket"].is_string(),
-            Some("herdr") => {
-                row["backendHandle"].is_object()
-                    && backend::pending_herdr_close(&row).is_none()
-                    && !backend::herdr_closes(&row)
-                        .next_back()
-                        .is_some_and(|event| event["result"] == "completed")
-            }
+            Some("herdr") => row["backendHandle"].is_object(),
             _ => false,
         }
     {
@@ -231,8 +304,8 @@ fn candidate(dir: &Path, id: &str, scope: Option<&str>) -> Option<Value> {
     Some(row)
 }
 
-fn same_execution(a: &Value, b: &Value) -> bool {
-    [
+fn binding(row: &Value) -> String {
+    let fields = [
         "dispatch",
         "round",
         "attempt",
@@ -245,28 +318,59 @@ fn same_execution(a: &Value, b: &Value) -> bool {
         "executionId",
         "backendHandle",
         "create",
-    ]
-    .iter()
-    .all(|&k| a[k] == b[k])
+        "endpoint",
+        "report",
+    ];
+    let values = Value::Array(fields.iter().map(|&key| row[key].clone()).collect());
+    body_hash(&values.to_string())
 }
 
-fn matches_worker(m: &Message, w: &Identity) -> bool {
-    m.worker.dispatch == w.dispatch
-        && m.worker.round == w.round
-        && m.worker.attempt == w.attempt
-        && m.worker.scope() == w.scope()
+fn row_scope(row: &Value) -> Option<&str> {
+    row["scope"].as_str().or_else(|| row["dispatch"].as_str())
 }
 
-fn blocked(messages: &[Message], worker: &Identity) -> bool {
-    // This base has no reply command. A question receipt for the current
-    // attempt stays outstanding until the reply path is integrated.
-    messages.iter().any(|m| {
-        matches_worker(m, worker)
-            && (matches!(m.kind(), "done" | "question")
-                || m.additional_fields
-                    .get("kind")
-                    .is_some_and(|k| k == "startup_failure"))
+fn current_messages<'a>(
+    row: &'a Value,
+    history: &'a [Value],
+) -> impl DoubleEndedIterator<Item = &'a Value> {
+    history.iter().filter(|m| {
+        m["dispatch"] == row["dispatch"]
+            && m["round"] == row["round"]
+            && m["attempt"] == row["attempt"]
+            && row_scope(m) == row_scope(row)
     })
+}
+
+fn history(row: &Value, ledger: &[Message]) -> Result<Vec<Value>> {
+    view::merged_history(
+        row,
+        ledger
+            .iter()
+            .filter(|m| row["dispatch"] == m.worker.dispatch.as_str())
+            .map(Message::view)
+            .collect(),
+    )
+}
+
+fn finished(row: &Value, history: &[Value]) -> bool {
+    let round = row["rounds"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|r| r["round"] == row["round"] && r["attempt"] == row["attempt"]);
+    round.is_some_and(|r| matches!(r["state"].as_str(), Some("completed" | "cancelled")))
+        || view::round_completion(row, round.unwrap_or(row), history).is_some()
+        || current_messages(row, history).any(|m| m["kind"] == "startup_failure")
+}
+
+fn same_fault(message: &Value, notice: &Notice) -> bool {
+    message["kind"] == OBSERVATION
+        && message["fault"]["category"] == notice.category()
+        && message["fault"]["evidence"] == notice.evidence()
+}
+
+fn reported(row: &Value, history: &[Value], notice: &Notice) -> bool {
+    current_messages(row, history).any(|m| same_fault(m, notice))
 }
 
 #[derive(Deserialize, PartialEq, Serialize)]
@@ -278,6 +382,16 @@ struct Watch {
     salt: String,
     fingerprint: String,
     since: f64,
+    #[serde(default)]
+    paused: bool,
+}
+
+fn watch_for<'a>(row: &Value, watch: Option<&'a Watch>) -> Option<&'a Watch> {
+    watch.filter(|w| {
+        row["attempt"] == w.attempt.as_str()
+            && row["round"] == w.round
+            && row_scope(row) == Some(w.scope.as_str())
+    })
 }
 
 fn watch(path: &Path) -> Result<Option<Watch>> {
@@ -290,47 +404,21 @@ fn watch(path: &Path) -> Result<Option<Watch>> {
     }
 }
 
+#[derive(Deserialize, Serialize)]
 enum Sample {
-    Screen(String),
+    Screen {
+        fingerprint: String,
+        salt: String,
+        fault: Option<Notice>,
+        nonblank: bool,
+    },
     Unavailable,
-    Exited(Map<String, Value>),
 }
 
-fn sample(state: &Path, row: &mut Value, observed: bool) -> Option<Sample> {
-    let (worker, inspection) = backend::observe(state, row).ok()?;
-    if row["closePending"] == true
-        || inspection["result"] == "completed"
-        || worker["state"] == "cancelled"
-        || worker["state"] == "not_started"
-    {
-        return None;
+fn classify(host: &str, screen: &str) -> Option<Notice> {
+    if host == "codex" && crate::tmux::codex_read_only(screen) {
+        return Some(Notice::Permission);
     }
-    if worker["state"] == "exited" {
-        // An early exit already in the #13 inbox suppresses this observation.
-        return backend::runtime_exit(state, row, &inspection)
-            .ok()
-            .flatten()
-            .map(Sample::Exited);
-    }
-    if inspection["result"] == "accepted"
-        && inspection["alive"] == true
-        && inspection["owned"] == true
-        && worker["state"] == "running"
-    {
-        if let Ok(Some(screen)) = backend::runtime_screen(state, row) {
-            return Some(Sample::Screen(screen));
-        }
-    }
-    observed.then_some(Sample::Unavailable)
-}
-
-enum Reading {
-    Fault(Notice),
-    Active,
-    Other,
-}
-
-fn classify(screen: &str) -> Reading {
     for line in screen
         .lines()
         .rev()
@@ -368,7 +456,7 @@ fn classify(screen: &str) -> Reading {
             "connection lost",
             "broken pipe",
         ]) {
-            Notice::Disconnected("screen_notice")
+            Notice::Disconnected
         } else if prefix(&["login required", "authentication failed", "unauthorized"]) {
             Notice::Authentication
         } else if prefix(&["policy rejected", "policy denied", "forbidden by policy"]) {
@@ -376,21 +464,23 @@ fn classify(screen: &str) -> Reading {
         } else if prefix(&["request timed out", "operation timed out", "host timeout"]) {
             Notice::HostTimeout
         } else if prefix(&["working", "processing", "resumed activity"]) {
-            return Reading::Active;
+            return None;
         } else {
             continue;
         };
-        return Reading::Fault(notice);
+        return Some(notice);
     }
-    Reading::Other
+    None
 }
 
+#[derive(Deserialize, Serialize)]
 enum Notice {
     Quota,
     Authentication,
     Policy,
     Permission,
-    Disconnected(&'static str),
+    Disconnected,
+    Unavailable,
     HostTimeout,
     Stalled(u64),
     Deadline(u64),
@@ -405,7 +495,7 @@ impl Notice {
             Self::Authentication => "authentication",
             Self::Policy => "policy_rejected",
             Self::Permission => "permission_required",
-            Self::Disconnected(_) => "protocol_disconnected",
+            Self::Disconnected | Self::Unavailable => "protocol_disconnected",
             Self::HostTimeout | Self::Stalled(_) | Self::Deadline(_) => "timeout",
             Self::Exited(_) => "process_exited",
             Self::Recovered => "recovered",
@@ -414,7 +504,7 @@ impl Notice {
 
     fn evidence(&self) -> &'static str {
         match self {
-            Self::Disconnected(source) => source,
+            Self::Unavailable => "backend_unavailable",
             Self::Stalled(_) => "unchanged_screen",
             Self::Deadline(_) => "turn_deadline",
             Self::Exited(_) => "verified_exit",
@@ -429,7 +519,9 @@ impl Notice {
             Self::Authentication => ("blocked", "Host reported an authentication problem"),
             Self::Policy => ("blocked", "Host reported a policy rejection"),
             Self::Permission => ("blocked", "Host is waiting for permission"),
-            Self::Disconnected(_) => ("unknown", "Host connection or observation was lost"),
+            Self::Disconnected | Self::Unavailable => {
+                ("unknown", "Host connection or observation was lost")
+            }
             Self::HostTimeout => ("unknown", "Host reported a timeout"),
             Self::Stalled(_) => ("stalled", "Host screen has stayed unchanged"),
             Self::Deadline(_) => ("unknown", "Host turn exceeded its time limit"),
@@ -439,7 +531,7 @@ impl Notice {
     }
 }
 
-fn publish(inbox: &mut Inbox, worker: Identity, row: &Value, notice: Notice) -> Result<()> {
+fn append(inbox: &mut Inbox, worker: Identity, row: &Value, notice: Notice) {
     let (kind, diagnostic) = notice.description();
     let mut fault = Map::from_iter([
         ("category".into(), json!(notice.category())),
@@ -476,25 +568,35 @@ fn publish(inbox: &mut Inbox, worker: Identity, row: &Value, notice: Notice) -> 
     };
     message.body_hash = Some(message.computed_hash());
     inbox.messages.push(message);
-    inbox.save().context("publish host observation")
 }
 
 pub(in crate::workflow) fn project(row: &mut Value, history: &[Value]) {
-    if matches!(row["status"].as_str(), Some("completed" | "cancelled")) {
+    if !row["host"].is_string() || matches!(row["status"].as_str(), Some("completed" | "cancelled"))
+    {
         return;
     }
-    let current = || {
-        history.iter().filter(|m| {
-            m["dispatch"] == row["dispatch"]
-                && m["round"] == row["round"]
-                && m["attempt"] == row["attempt"]
-                && m["scope"].as_str().or_else(|| m["dispatch"].as_str())
-                    == row["scope"].as_str().or_else(|| row["dispatch"].as_str())
-        })
+    let current = || current_messages(row, history);
+    if row["worker"]["state"] == "exited" {
+        let terminal = current().rfind(|m| m["fault"]["category"] == "process_exited");
+        row["hostActivity"] = json!({"state":"exited","fault":terminal.map(|m| &m["fault"])});
+        return;
+    }
+    let pending = current().any(|m| m["type"] == "question");
+    let latest = if pending {
+        current()
+            .rev()
+            .take_while(|m| m["type"] != "question")
+            .find(|m| {
+                m["kind"] == OBSERVATION
+                    && matches!(
+                        m["fault"]["evidence"].as_str(),
+                        Some("screen_notice" | "backend_unavailable" | "verified_exit")
+                    )
+            })
+    } else {
+        current().rfind(|m| m["kind"] == OBSERVATION)
     };
-    if current().any(|m| m["type"] == "question") {
-        row["hostActivity"] = json!({"state":"awaiting_answer"});
-    } else if let Some(latest) = current().rfind(|m| m["kind"] == OBSERVATION) {
+    if let Some(latest) = latest {
         let state = match latest["fault"]["category"].as_str() {
             Some("recovered") => "active",
             Some("permission_required") => "awaiting_permission",
@@ -505,5 +607,10 @@ pub(in crate::workflow) fn project(row: &mut Value, history: &[Value]) {
             _ => "blocked",
         };
         row["hostActivity"] = json!({"state":state,"fault":latest["fault"]});
+        if pending {
+            row["hostActivity"]["awaitingAnswer"] = json!(true);
+        }
+    } else if pending {
+        row["hostActivity"] = json!({"state":"awaiting_answer"});
     }
 }

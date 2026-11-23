@@ -3,6 +3,7 @@
 mod binding;
 mod history;
 mod input;
+pub(crate) use input::codex_read_only;
 pub(crate) mod launch;
 
 use anyhow::{ensure, Context, Result};

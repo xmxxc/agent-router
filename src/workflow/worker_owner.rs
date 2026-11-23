@@ -425,7 +425,7 @@ fn close_killed_root(killed_root: bool, exit: ExitStatus) -> bool {
     killed_root && exit.signal() == Some(libc::SIGKILL)
 }
 
-fn exit_pending(pid: i32) -> io::Result<bool> {
+pub(super) fn exit_pending(pid: i32) -> io::Result<bool> {
     // A successful kill can also target an unreaped zombie. Check for a
     // waitable natural exit before treating this as an active close.
     loop {
