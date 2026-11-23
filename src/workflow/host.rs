@@ -260,7 +260,7 @@ impl Options<'_> {
             #[cfg(target_os = "linux")]
             "claude" => {
                 claude::prepare_initial(state, self, record, &mut launch, brief, &writable)?;
-                claude::apply_existing_trust(record)?;
+                claude::apply_existing_trust(record, &launch)?;
             }
             _ => bail!("unsupported host"),
         }

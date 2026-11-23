@@ -1,8 +1,11 @@
 use super::*;
 
-const TOKEN: &str = workflow::controller::WORKER_CALLBACK;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
+
+const TOKEN: &str = workflow::controller::WORKER_CALLBACK;
 
 struct Fixture(PathBuf);
 
@@ -15,12 +18,14 @@ impl Fixture {
 
     fn assignment(&self, attempt: &str) -> Value {
         json!({
-            "host": "claude", "dispatch": "d-12345678", "attempt": attempt,
+            "host": "claude", "backend": "tmux", "dispatch": "d-12345678",
+            "round": 1, "attempt": attempt,
             "cwd": self.0, "label": "Claude worker"
         })
     }
 
     fn publish(&self, row: &mut Value, launch: &mut Launch) {
+        let _ledger = workflow::messages::lock_for_publish(&self.0).unwrap();
         workflow::bind_worker_callback(row, Some(launch));
         let dir = self.0.join("dispatches");
         fs::create_dir_all(&dir).unwrap();
@@ -35,6 +40,20 @@ impl Fixture {
                 .collect(),
         }
     }
+}
+
+fn pending_resume(previous: &Value, next: &mut Value, launch: &mut Launch) {
+    workflow::bind_worker_callback(next, Some(launch));
+    next["audit"] = json!([{
+        "operation": "resume", "result": "pending", "dispatch": previous["dispatch"],
+        "fromAttempt": previous["attempt"], "toAttempt": next["attempt"],
+        "round": next["round"], "session": previous["hostSession"]
+    }]);
+}
+
+fn has_adoption(f: &Fixture, row: &Value) -> bool {
+    let ledger = workflow::messages::lock_for_publish(&f.0).unwrap();
+    adoption(&ledger, row).is_ok()
 }
 
 impl Drop for Fixture {
@@ -166,7 +185,7 @@ fn resume_requires_adoption_and_persisted_session_and_reuses_original_options() 
         &dirs
     )
     .is_err());
-    prepare_resume(
+    let proof = prepare_resume(
         &f.0,
         &original,
         &mut next,
@@ -175,7 +194,13 @@ fn resume_requires_adoption_and_persisted_session_and_reuses_original_options() 
         &dirs,
     )
     .unwrap();
-    f.publish(&mut next, &mut resume);
+    pending_resume(&original, &mut next, &mut resume);
+    {
+        let ledger = workflow::messages::lock_for_publish(&f.0).unwrap();
+        proof
+            .publish(&ledger, &original, &mut next, &resume)
+            .unwrap();
+    }
     assert_eq!(argv_value(&resume, "--resume"), id.to_string());
     assert_eq!(argv_value(&resume, "--permission-mode"), "auto");
     assert_eq!(argv_value(&resume, "--model"), "sonnet");
@@ -205,7 +230,7 @@ fn resume_requires_adoption_and_persisted_session_and_reuses_original_options() 
         json!(f.0.join(format!("profile/projects/another/{id}.jsonl")));
     assert!(submit(&f, &next, &resume, &different_project).is_err());
     submit(&f, &next, &resume, &resumed).unwrap();
-    assert!(adoption(&f.0, &next).is_ok());
+    assert!(has_adoption(&f, &next));
     let path = attempt_dir(&f.0, "d-12345678", "a-000000000001").unwrap();
     assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o700);
     let receipt = path.join("adopted.json");
@@ -239,16 +264,260 @@ fn conflicting_start_receipts_block_adoption() {
         "transcript_path": f.0.join(format!("profile/projects/project/{id}.jsonl"))
     });
     submit(&f, &row, &launch, &event).unwrap();
-    assert!(adoption(&f.0, &row).is_ok());
+    assert!(has_adoption(&f, &row));
     event["transcript_path"] = json!(f.0.join(format!("profile/projects/alternate/{id}.jsonl")));
     assert!(submit(&f, &row, &launch, &event).is_err());
-    assert!(adoption(&f.0, &row).is_err());
+    assert!(!has_adoption(&f, &row));
+}
+
+struct ResumeRace {
+    previous: Value,
+    next: Value,
+    start: Launch,
+    resume: Launch,
+    proof: ResumeProof,
+    conflict: Value,
+}
+
+fn prepared_resume(f: &Fixture) -> ResumeRace {
+    let mut previous = f.assignment("a-123456789abc");
+    let mut start = f.launch();
+    prepare_initial(
+        &f.0,
+        &Options::default(),
+        &mut previous,
+        &mut start,
+        "first brief".into(),
+        &[],
+    )
+    .unwrap();
+    f.publish(&mut previous, &mut start);
+    let id = argv_value(&start, "--session-id");
+    let original = f.0.join(format!("profile/projects/first/{id}.jsonl"));
+    fs::create_dir_all(original.parent().unwrap()).unwrap();
+    fs::write(&original, b"synthetic session").unwrap();
+    let mut event = json!({
+        "session_id": id, "cwd": f.0, "source": "startup", "hook_event_name": "SessionStart",
+        "transcript_path": original
+    });
+    submit(f, &previous, &start, &event).unwrap();
+    let mut next = f.assignment("a-000000000001");
+    let mut resume = f.launch();
+    let proof = prepare_resume(
+        &f.0,
+        &previous,
+        &mut next,
+        &mut resume,
+        "next brief".into(),
+        &[],
+    )
+    .unwrap();
+    pending_resume(&previous, &mut next, &mut resume);
+    event["transcript_path"] = json!(f.0.join(format!("profile/projects/other/{id}.jsonl")));
+    ResumeRace {
+        previous,
+        next,
+        start,
+        resume,
+        proof,
+        conflict: event,
+    }
+}
+
+#[test]
+fn resume_publication_wins_over_queued_old_hook() {
+    struct NotifyAtEof<'a> {
+        data: &'a [u8],
+        ready: Option<mpsc::Sender<()>>,
+    }
+
+    impl Read for NotifyAtEof<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let count = self.data.read(buffer)?;
+            if count == 0 {
+                if let Some(ready) = self.ready.take() {
+                    ready.send(()).unwrap();
+                }
+            }
+            Ok(count)
+        }
+    }
+
+    let f = Fixture::new();
+    let ResumeRace {
+        previous,
+        mut next,
+        start,
+        resume,
+        proof,
+        conflict,
+    } = prepared_resume(&f);
+    let receipt = attempt_dir(&f.0, "d-12345678", "a-123456789abc")
+        .unwrap()
+        .join("adopted.json");
+    let before = fs::read(&receipt).unwrap();
+    let conflict = serde_json::to_vec(&conflict).unwrap();
+    thread::scope(|scope| {
+        let ledger = workflow::messages::lock_for_publish(&f.0).unwrap();
+        let (ready, reading) = mpsc::channel();
+        let (finished, result) = mpsc::channel();
+        let state = &f.0;
+        let callback = start.env[TOKEN].as_str().unwrap();
+        let input = &conflict;
+        let pending = scope.spawn(move || {
+            finished
+                .send(record_start(
+                    state,
+                    "d-12345678",
+                    "a-123456789abc",
+                    callback,
+                    NotifyAtEof {
+                        data: input,
+                        ready: Some(ready),
+                    },
+                ))
+                .unwrap();
+        });
+        reading.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            result.recv_timeout(Duration::from_millis(150)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+        ));
+        proof
+            .publish(&ledger, &previous, &mut next, &resume)
+            .unwrap();
+        drop(ledger);
+        let err = result
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid Claude attempt capability"),
+            "{err}"
+        );
+        pending.join().unwrap();
+    });
+    assert_eq!(fs::read(&receipt).unwrap(), before);
+    let published = workflow::read_record(&f.0.join("dispatches/d-12345678.json")).unwrap();
+    assert_eq!(published["attempt"], next["attempt"]);
+    assert_eq!(published["audit"][0]["claudeAdoption"]["source"], "startup");
+    let receipt: Adoption = serde_json::from_slice(&before).unwrap();
+    assert_eq!(
+        published["audit"][0]["claudeAdoption"]["receiptHash"],
+        workflow::messages::body_hash(&serde_json::to_string(&receipt).unwrap())
+    );
+}
+
+#[test]
+fn hook_conflict_after_preparation_blocks_resume_publication() {
+    let f = Fixture::new();
+    let ResumeRace {
+        previous,
+        mut next,
+        start,
+        resume,
+        proof,
+        conflict,
+    } = prepared_resume(&f);
+    thread::scope(|scope| {
+        let state = &f.0;
+        let ledger = workflow::messages::lock_for_publish(state).unwrap();
+        let (started, waiting) = mpsc::channel();
+        let old = &previous;
+        let publication = scope.spawn(move || {
+            started.send(()).unwrap();
+            let ledger = workflow::messages::lock_for_publish(state).unwrap();
+            let result = proof.publish(&ledger, old, &mut next, &resume);
+            (result, next)
+        });
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        let err = record_start_locked(
+            &ledger,
+            "d-12345678",
+            "a-123456789abc",
+            start.env[TOKEN].as_str().unwrap(),
+            serde_json::from_value(conflict).unwrap(),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("conflicting Claude SessionStart receipt"));
+        drop(ledger);
+        let (result, next) = publication.join().unwrap();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Claude session adoption not verified"));
+        assert!(next["audit"][0]["claudeAdoption"].is_null());
+    });
+    assert_eq!(
+        workflow::read_record(&f.0.join("dispatches/d-12345678.json")).unwrap(),
+        previous
+    );
+}
+
+#[test]
+fn trust_stays_in_effective_worker_home_and_defers_custom_profiles() {
+    let f = Fixture::new();
+    let router_home = f.0.join("router-home");
+    let worker_home = f.0.join("worker-home");
+    let profile = worker_home.join("private profile");
+    let parent = f.0.join("repo");
+    let cwd = parent.join("worker");
+    for dir in [&router_home, &profile, &cwd] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let router_config = router_home.join(".claude.json");
+    let worker_config = worker_home.join(".claude.json");
+    let custom_config = profile.join(".claude.json");
+    let user_hooks = profile.join("settings.json");
+    let initial = serde_json::to_vec(&json!({
+        "projects": {(parent.to_str().unwrap()): {"hasTrustDialogAccepted": true}}
+    }))
+    .unwrap();
+    let hooks = b"{\"hooks\":{}}\n";
+    for config in [&router_config, &worker_config, &custom_config] {
+        fs::write(config, &initial).unwrap();
+    }
+    fs::write(&user_hooks, hooks).unwrap();
+    for (alternate, requested) in [
+        (Some(profile.as_path()), Some(router_config.as_path())),
+        (Some(profile.as_path()), Some(custom_config.as_path())),
+        (None, Some(router_config.as_path())),
+        (None, Some(Path::new(".claude.json"))),
+    ] {
+        assert_eq!(
+            trust(&cwd, Some(&worker_home), alternate, requested).unwrap(),
+            None
+        );
+    }
+    for config in [&router_config, &worker_config, &custom_config] {
+        assert_eq!(fs::read(config).unwrap(), initial);
+    }
+    let same_worker_config = worker_home.join("alias.json");
+    std::os::unix::fs::symlink(&worker_config, &same_worker_config).unwrap();
+    assert_eq!(
+        trust(&cwd, Some(&worker_home), None, Some(&same_worker_config)).unwrap(),
+        Some(parent.clone())
+    );
+    let worker: Value = serde_json::from_slice(&fs::read(&worker_config).unwrap()).unwrap();
+    assert_eq!(
+        worker["projects"][cwd.to_str().unwrap()]["hasTrustDialogAccepted"],
+        true
+    );
+    fs::remove_file(&worker_config).unwrap();
+    std::os::unix::fs::symlink(&router_config, &worker_config).unwrap();
+    assert_eq!(trust(&cwd, Some(&worker_home), None, None).unwrap(), None);
+    assert_eq!(fs::read(&router_config).unwrap(), initial);
+    assert_eq!(fs::read(&custom_config).unwrap(), initial);
+    assert_eq!(fs::read(&user_hooks).unwrap(), hooks);
 }
 
 #[test]
 fn trust_keeps_untrusted_or_invalid_configuration_bytes() {
     let f = Fixture::new();
-    let config = f.0.join("global.json");
+    let config = f.0.join(".claude.json");
     let ancestor = f.0.join("tree");
     let cwd = f.0.join("tree-other").join("child");
     fs::create_dir_all(&ancestor).unwrap();
@@ -258,10 +527,10 @@ fn trust_keeps_untrusted_or_invalid_configuration_bytes() {
     }))
     .unwrap();
     fs::write(&config, &original).unwrap();
-    assert_eq!(trust_file(&config, &cwd).unwrap(), None);
+    assert_eq!(trust(&cwd, Some(&f.0), None, Some(&config)).unwrap(), None);
     assert_eq!(fs::read(&config).unwrap(), original);
     fs::write(&config, b"{invalid").unwrap();
-    assert!(trust_file(&config, &cwd).is_err());
+    assert!(trust(&cwd, Some(&f.0), None, Some(&config)).is_err());
     assert_eq!(fs::read(&config).unwrap(), b"{invalid");
 }
 
@@ -275,7 +544,7 @@ fn trust_updates_children_under_lock_and_keeps_mode_and_other_settings() {
     for dir in [&a, &b] {
         fs::create_dir_all(dir).unwrap();
     }
-    let config = f.0.join("global.json");
+    let config = f.0.join(".claude.json");
     let alias = f.0.join("settings link");
     std::os::unix::fs::symlink(&config, &alias).unwrap();
     let original = json!({
@@ -293,9 +562,13 @@ fn trust_updates_children_under_lock_and_keeps_mode_and_other_settings() {
         for (path, cwd) in [(&config, &a), (&alias, &b)] {
             let probe = &barrier;
             let nested = &nested;
+            let home = &f.0;
             scope.spawn(move || {
                 probe.wait();
-                assert_eq!(trust_file(path, cwd).unwrap().as_ref(), Some(nested));
+                assert_eq!(
+                    trust(cwd, Some(home), None, Some(path)).unwrap().as_ref(),
+                    Some(nested)
+                );
             });
         }
     });
@@ -312,7 +585,7 @@ fn trust_updates_children_under_lock_and_keeps_mode_and_other_settings() {
             true
         );
     }
-    assert_eq!(trust_file(&config, &a).unwrap(), Some(a));
+    assert_eq!(trust(&a, Some(&f.0), None, None).unwrap(), Some(a));
     assert_eq!(fs::read(&config).unwrap(), bytes);
     assert_eq!(
         config.metadata().unwrap().permissions().mode() & 0o777,

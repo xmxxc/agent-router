@@ -3,6 +3,7 @@
 //! The local Claude runtime, its hooks, and WFC state share the Unix account.
 use super::{Launch, Options};
 use crate::workflow;
+use crate::workflow::messages::PublishLock;
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -50,7 +51,7 @@ struct Identity {
     source: Source,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Eq, PartialEq, Serialize)]
 struct Expected {
     identity: Identity,
     profile: PathBuf,
@@ -92,19 +93,20 @@ fn private_directory(path: &Path) -> io::Result<()> {
     DirBuilder::new().mode(0o700).create(path)
 }
 
+fn worker_path(launch: &Launch, key: &str) -> Option<PathBuf> {
+    launch
+        .env
+        .get(key)
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .or_else(|| env::var_os(key).map(PathBuf::from))
+}
+
 fn effective_profile(cwd: &Path, launch: &Launch) -> Result<PathBuf> {
-    let path_for = |key| {
-        launch
-            .env
-            .get(key)
-            .and_then(Value::as_str)
-            .map(PathBuf::from)
-            .or_else(|| env::var_os(key).map(PathBuf::from))
-            .filter(|value| !value.as_os_str().is_empty())
-    };
-    let path = match path_for("CLAUDE_CONFIG_DIR") {
+    let nonempty = |key| worker_path(launch, key).filter(|p| !p.as_os_str().is_empty());
+    let path = match nonempty("CLAUDE_CONFIG_DIR") {
         Some(path) => path,
-        None => path_for("HOME")
+        None => nonempty("HOME")
             .or_else(env::home_dir)
             .context("missing Claude home directory")?
             .join(".claude"),
@@ -271,8 +273,16 @@ pub(super) fn prepare_initial(
     )
 }
 
-pub(super) fn apply_existing_trust(record: &mut Value) -> Result<()> {
-    match trust(Path::new(field(record, "cwd")?)) {
+pub(super) fn apply_existing_trust(record: &mut Value, launch: &Launch) -> Result<()> {
+    let home = worker_path(launch, "HOME");
+    let profile = worker_path(launch, "CLAUDE_CONFIG_DIR");
+    let requested = worker_path(launch, "WFC_CLAUDE_CONFIG");
+    match trust(
+        Path::new(field(record, "cwd")?),
+        home.as_deref(),
+        profile.as_deref(),
+        requested.as_deref(),
+    ) {
         Ok(Some(ancestor)) => record["trustedBy"] = json!(ancestor),
         Ok(None) => {}
         Err(_) => eprintln!("wfc: could not confirm Claude worktree trust"),
@@ -280,9 +290,97 @@ pub(super) fn apply_existing_trust(record: &mut Value) -> Result<()> {
     Ok(())
 }
 
-/// The shared resume entry calls this after fencing and checking the old worker.
-/// It supplies the launch built from the stored launch config, then publishes
-/// the new assignment and callback before passing the returned argv to tmux.
+#[allow(dead_code, reason = "shared resume admission is integrated separately")]
+pub(in crate::workflow) struct ResumeProof {
+    state: PathBuf,
+    next_attempt: String,
+    expected: Expected,
+    adopted: Adoption,
+}
+
+#[allow(dead_code, reason = "shared resume admission is integrated separately")]
+impl ResumeProof {
+    /// Called after the owner's CAS, with scope, execution and Inbox locks held.
+    /// The new callback and the pending resume audit must already be in `next`.
+    /// Adoption consumption and assignment publication share one atomic write.
+    pub(in crate::workflow) fn publish(
+        self,
+        ledger: &PublishLock,
+        previous: &Value,
+        next: &mut Value,
+        launch: &Launch,
+    ) -> Result<()> {
+        let identity = &self.adopted.identity;
+        ensure!(
+            ledger.dir() == self.state.as_path()
+                && previous["host"] == "claude"
+                && previous["dispatch"] == identity.dispatch
+                && previous["attempt"] == identity.attempt
+                && next["dispatch"] == previous["dispatch"]
+                && next["host"] == "claude"
+                && next["attempt"] == self.next_attempt
+                && next["cwd"] == previous["cwd"]
+                && next["hostSession"] == previous["hostSession"]
+                && launch
+                    .env
+                    .get(workflow::controller::WORKER_CALLBACK)
+                    .and_then(Value::as_str)
+                    .is_some_and(|secret| {
+                        !secret.is_empty()
+                            && next[workflow::controller::CALLBACK_HASH]
+                                == workflow::messages::body_hash(secret)
+                    })
+                && next[workflow::controller::CALLBACK_HASH]
+                    != previous[workflow::controller::CALLBACK_HASH],
+            "Claude resume publication mismatch"
+        );
+        let dir = ledger.dir().join("dispatches");
+        let (file, path) = workflow::assignment::open_assignment(&dir, &identity.dispatch)?;
+        ensure!(
+            path.extension() == Some(OsStr::new("json"))
+                && &workflow::decode_record(file, &path)? == previous,
+            "Claude assignment changed while preparing resume"
+        );
+        let (expected, adopted) = adoption(ledger, previous)?;
+        ensure!(
+            expected == self.expected
+                && adopted == self.adopted
+                && identity.cwd.canonicalize()? == identity.cwd
+                && effective_profile(&identity.cwd, launch)? == expected.profile,
+            "Claude adoption changed while preparing resume"
+        );
+        persisted_transcript(&adopted)?;
+        let round = next["round"].clone();
+        let event = next["audit"]
+            .as_array_mut()
+            .and_then(|events| events.last_mut())
+            .context("missing pending Claude resume audit")?;
+        ensure!(
+            event["operation"] == "resume"
+                && event["result"] == "pending"
+                && event["dispatch"] == identity.dispatch
+                && event["fromAttempt"] == identity.attempt
+                && event["toAttempt"] == self.next_attempt
+                && event["round"] == round
+                && event["session"] == identity.session
+                && event["claudeAdoption"].is_null(),
+            "pending audit does not match Claude resume"
+        );
+        let receipt = serde_json::to_string(&adopted)?;
+        event["claudeAdoption"] = json!({
+            "source": identity.source,
+            "receiptHash": workflow::messages::body_hash(&receipt)
+        });
+        workflow::write_json(&path, next, None)?;
+        workflow::messages::sync_directory(&dir)
+            .context("Claude resume may already be published; inspect the pending audit")
+    }
+}
+
+/// The shared resume entry calls this under the scope and execution locks,
+/// after checking the old worker and before taking the Inbox lock. Preparation
+/// snapshots adoption under its own short Inbox lock. The caller then binds the
+/// new callback and uses the proof to publish under its Inbox lock before launch.
 #[allow(dead_code, reason = "shared resume admission is integrated separately")]
 pub(in crate::workflow) fn prepare_resume(
     state: &Path,
@@ -291,7 +389,7 @@ pub(in crate::workflow) fn prepare_resume(
     launch: &mut Launch,
     brief: String,
     writable: &[PathBuf],
-) -> Result<()> {
+) -> Result<ResumeProof> {
     ensure!(
         previous["host"] == "claude"
             && next["host"] == "claude"
@@ -305,26 +403,15 @@ pub(in crate::workflow) fn prepare_resume(
         cwd.canonicalize()? == cwd,
         "Claude resume directory changed"
     );
-    let (expected, saved) = adoption(state, previous)?;
+    let (expected, saved) = {
+        let ledger = workflow::messages::lock_for_publish(state)?;
+        adoption(&ledger, previous)?
+    };
     ensure!(
         expected.profile == effective_profile(cwd, launch)?,
         "Claude resume profile changed"
     );
-    let transcript = saved
-        .transcript
-        .canonicalize()
-        .context("Claude session is not persisted")?;
-    ensure!(
-        transcript == saved.transcript,
-        "Claude persisted session path changed"
-    );
-    let metadata = transcript
-        .metadata()
-        .context("Claude session is not persisted")?;
-    ensure!(
-        metadata.is_file() && metadata.len() > 0,
-        "Claude session is not persisted"
-    );
+    persisted_transcript(&saved)?;
     for key in [
         "label",
         "model",
@@ -344,20 +431,44 @@ pub(in crate::workflow) fn prepare_resume(
         launch,
         brief,
         writable,
-        saved.identity.session,
-        Some(saved.transcript),
-    )
+        saved.identity.session.clone(),
+        Some(saved.transcript.clone()),
+    )?;
+    Ok(ResumeProof {
+        state: state.to_owned(),
+        next_attempt: field(next, "attempt")?.to_owned(),
+        expected,
+        adopted: saved,
+    })
+}
+
+fn persisted_transcript(saved: &Adoption) -> Result<()> {
+    let transcript = saved
+        .transcript
+        .canonicalize()
+        .context("Claude session is not persisted")?;
+    ensure!(
+        transcript == saved.transcript,
+        "Claude persisted session path changed"
+    );
+    let metadata = transcript
+        .metadata()
+        .context("Claude session is not persisted")?;
+    ensure!(
+        metadata.is_file() && metadata.len() > 0,
+        "Claude session is not persisted"
+    );
+    Ok(())
 }
 
 // This can also be checked immediately after startup. The transcript can be
 // created later, so only resume preparation requires a regular file on disk.
-fn adoption(state: &Path, row: &Value) -> Result<(Expected, Adoption)> {
+fn adoption(ledger: &PublishLock, row: &Value) -> Result<(Expected, Adoption)> {
     let dispatch = field(row, "dispatch")?;
     let attempt = field(row, "attempt")?;
-    let dir = attempt_dir(state, dispatch, attempt)?;
+    let dir = attempt_dir(ledger.dir(), dispatch, attempt)?;
     let error = "Claude session adoption not verified";
     let binding = open_binding(&dir).context(error)?;
-    binding.lock_shared()?;
     let expected: Expected = serde_json::from_reader(&binding).context(error)?;
     let saved: Adoption =
         serde_json::from_reader(File::open(dir.join("adopted.json")).context(error)?)
@@ -396,7 +507,6 @@ fn check_transcript(path: &Path, expected: &Expected) -> Result<()> {
 fn open_binding(dir: &Path) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
-        .write(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(dir.join("expected.json"))?;
     ensure!(file.metadata()?.is_file(), "invalid Claude launch binding");
@@ -410,7 +520,6 @@ fn record_start(
     callback: &str,
     stdin: impl Read,
 ) -> Result<()> {
-    let dir = attempt_dir(state, dispatch, attempt)?;
     let mut data = Vec::new();
     stdin.take(MAX_EVENT + 1).read_to_end(&mut data)?;
     ensure!(
@@ -418,9 +527,20 @@ fn record_start(
         "Claude SessionStart event too large"
     );
     let event: HookEvent = serde_json::from_slice(&data)?;
+    let ledger = workflow::messages::lock_for_publish(state)?;
+    record_start_locked(&ledger, dispatch, attempt, callback, event)
+}
 
+fn record_start_locked(
+    ledger: &PublishLock,
+    dispatch: &str,
+    attempt: &str,
+    callback: &str,
+    event: HookEvent,
+) -> Result<()> {
+    let state = ledger.dir();
+    let dir = attempt_dir(state, dispatch, attempt)?;
     let file = open_binding(&dir)?;
-    file.lock()?;
     let expected: Expected = serde_json::from_reader(&file)?;
     let (row, path) = workflow::assignment::open_assignment(&state.join("dispatches"), dispatch)?;
     let row = workflow::decode_record(row, &path)?;
@@ -488,22 +608,34 @@ pub(crate) fn session_start() -> Result<()> {
 
 // Match the host's existing trust decision for this directory or a real
 // ancestor. Serialize router updates to the config, including symlinked files.
-fn trust(cwd: &Path) -> Result<Option<PathBuf>> {
-    let Some(config) = env::var_os("WFC_CLAUDE_CONFIG")
-        .map(PathBuf::from)
-        .or_else(|| env::home_dir().map(|p| p.join(".claude.json")))
-    else {
+fn trust(
+    cwd: &Path,
+    home: Option<&Path>,
+    profile: Option<&Path>,
+    requested: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    // Claude documents the default global trust file separately from profile
+    // settings. A custom profile keeps Claude's own trust decision.
+    let Some(home) = home.filter(|home| profile.is_none() && home.is_absolute()) else {
         return Ok(None);
     };
-    trust_file(&config, cwd)
+    let home = home.canonicalize()?;
+    let path = home.join(".claude.json");
+    match path.canonicalize() {
+        Ok(canonical) if canonical == path => {}
+        Ok(_) => return Ok(None),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    }
+    if requested.is_some_and(|requested| {
+        !requested.is_absolute() || requested.canonicalize().ok().as_ref() != Some(&path)
+    }) {
+        return Ok(None);
+    }
+    trust_file(&path, cwd)
 }
 
-fn trust_file(config: &Path, cwd: &Path) -> Result<Option<PathBuf>> {
-    let path = match config.canonicalize() {
-        Ok(p) => p,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
+fn trust_file(path: &Path, cwd: &Path) -> Result<Option<PathBuf>> {
     let name = path
         .file_name()
         .context("missing Claude config filename")?
@@ -514,10 +646,17 @@ fn trust_file(config: &Path, cwd: &Path) -> Result<Option<PathBuf>> {
         .create(true)
         .truncate(false)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path.with_file_name(format!(".{name}.wfc.lock")))?;
+    ensure!(lock.metadata()?.is_file(), "invalid Claude trust lock");
     lock.lock()?;
-    let f = fs::File::open(&path)?;
-    let permissions = f.metadata()?.permissions();
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = f.metadata()?;
+    ensure!(metadata.is_file(), "invalid Claude global config");
+    let permissions = metadata.permissions();
     let mut config: Value = serde_json::from_reader(f)?;
     let Some(projects) = config.get_mut("projects").and_then(Value::as_object_mut) else {
         return Ok(None);
@@ -539,7 +678,7 @@ fn trust_file(config: &Path, cwd: &Path) -> Result<Option<PathBuf>> {
         let project = projects.entry(key.to_owned()).or_insert_with(|| json!({}));
         ensure!(project.is_object(), "invalid Claude project");
         project["hasTrustDialogAccepted"] = json!(true);
-        workflow::write_json(&path, &config, Some(permissions))?;
+        workflow::write_json(path, &config, Some(permissions))?;
     }
     Ok(ancestor)
 }

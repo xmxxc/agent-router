@@ -500,10 +500,27 @@ fn lock_file(dir: &Path) -> Result<File> {
         .context("open message lock")
 }
 
-pub(super) fn lock_for_publish(dir: &Path) -> Result<File> {
+pub(super) struct PublishLock {
+    file: File,
+    #[cfg(target_os = "linux")]
+    dir: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl PublishLock {
+    pub(super) fn dir(&self) -> &Path {
+        &self.dir
+    }
+}
+
+pub(super) fn lock_for_publish(dir: &Path) -> Result<PublishLock> {
     let lock = lock_file(dir)?;
     lock.lock().context("lock controller messages")?;
-    Ok(lock)
+    Ok(PublishLock {
+        file: lock,
+        #[cfg(target_os = "linux")]
+        dir: dir.to_owned(),
+    })
 }
 
 pub(super) fn sync_directory(_dir: &Path) -> Result<()> {
@@ -546,7 +563,7 @@ impl Inbox {
     }
 
     fn open(dir: &Path) -> Result<Self> {
-        Self::read_locked(dir, lock_for_publish(dir)?)
+        Self::read_locked(dir, lock_for_publish(dir)?.file)
     }
 
     fn read_locked(dir: &Path, lock: File) -> Result<Self> {

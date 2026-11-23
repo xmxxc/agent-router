@@ -44,6 +44,8 @@ def controlled_claude():
     )
     result = {
         "argv": argv,
+        "home": os.environ["HOME"],
+        "profile": str(profile),
         "rejected": rejected.returncode,
         "accepted": accepted.returncode,
         "hook_stdout": rejected.stdout + accepted.stdout,
@@ -66,37 +68,46 @@ class ClaudeDispatch(unittest.TestCase):
     def test_public_first_launch_keeps_user_hooks_and_binds_private_adoption(self):
         with tempfile.TemporaryDirectory(prefix="wfc-claude-tmux-") as tmp:
             root = Path(tmp).resolve()
-            home = root / "home"
+            router_home = root / "router home"
+            worker_home = root / "worker home"
             parent = root / "trusted"
             cwd = parent / "work tree"
-            profile = home / "custom Claude profile"
+            profile = worker_home / "custom Claude profile"
             profile.mkdir(parents=True)
+            router_home.mkdir()
             cwd.mkdir(parents=True)
             state = root / "state"
             socket = root / "sock"
             # Make the hook traverse a shell-quoted, nontrivial executable path.
             wfc = root / "worker's wfc"
             shutil.copy2(WFC, wfc)
-            config = home / ".claude.json"
-            config.write_text(
-                json.dumps({"projects": {str(parent): {"hasTrustDialogAccepted": True}}}),
-                encoding="utf-8",
-            )
-            config.chmod(0o640)
+            router_config = router_home / ".claude.json"
+            worker_config = worker_home / ".claude.json"
+            profile_config = profile / ".claude.json"
+            configs = {
+                path: json.dumps({"domain": name, "projects": {
+                    str(parent): {"hasTrustDialogAccepted": True},
+                }}).encode()
+                for name, path in [("router", router_config), ("worker", worker_config),
+                                   ("profile", profile_config)]
+            }
+            for path, data in configs.items():
+                path.write_bytes(data)
+                path.chmod(0o640)
             settings = profile / "settings.json"
             existing_hooks = b'{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"true"}]}]}}\n'
             settings.write_bytes(existing_hooks)
             launch = root / "launch.json"
             launch.write_text(json.dumps({"hosts": {"claude": {
                 "command": [sys.executable, str(Path(__file__).resolve()), "--controlled-claude"],
-                "env": {"CLAUDE_CONFIG_DIR": str(profile)},
+                "env": {"HOME": str(worker_home), "CLAUDE_CONFIG_DIR": str(profile)},
             }}}), encoding="utf-8")
             task = root / "task.md"
             task.write_text("Synthetic dispatch for the SessionStart fixture.\n", encoding="utf-8")
             env = {
-                "HOME": str(home), "PATH": os.environ["PATH"], "TERM": "xterm-256color",
+                "HOME": str(router_home), "PATH": os.environ["PATH"], "TERM": "xterm-256color",
                 "WFC_STATE": str(state), "WFC_TMUX_SOCKET": str(socket),
-                "WFC_CLAUDE_CONFIG": str(config),
+                "WFC_CLAUDE_CONFIG": str(router_config),
             }
             tmux = ["tmux", "-f", "/dev/null", "-S", str(socket)]
             try:
@@ -113,7 +124,7 @@ class ClaudeDispatch(unittest.TestCase):
                 )
                 self.assertEqual(dispatch.returncode, 0, dispatch.stderr)
                 row = json.loads(dispatch.stdout)
-                self.assertEqual(row["trustedBy"], str(parent))
+                self.assertNotIn("trustedBy", row)
                 self.assertNotIn("workerCallbackHash", row)
                 self.assertEqual(len(row["ignored"]), 2)
                 self.assertTrue(any(item.startswith("--git:") for item in row["ignored"]))
@@ -123,6 +134,8 @@ class ClaudeDispatch(unittest.TestCase):
                 while not result.exists() and time.monotonic() < deadline:
                     time.sleep(0.02)
                 trace = json.loads(result.read_text(encoding="utf-8"))
+                self.assertEqual(trace["home"], str(worker_home))
+                self.assertEqual(trace["profile"], str(profile))
                 self.assertEqual(trace["accepted"], 0, trace["hook_stderr"])
                 self.assertNotEqual(trace["rejected"], 0)
                 self.assertEqual(trace["hook_stdout"], "")
@@ -145,9 +158,10 @@ class ClaudeDispatch(unittest.TestCase):
                 self.assertEqual(evidence.stat().st_mode & 0o777, 0o700)
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600)
                 self.assertEqual(settings.read_bytes(), existing_hooks)
-                self.assertEqual(config.stat().st_mode & 0o777, 0o640)
-                updated = json.loads(config.read_text(encoding="utf-8"))
-                self.assertTrue(updated["projects"][str(cwd)]["hasTrustDialogAccepted"])
+                for path, data in configs.items():
+                    self.assertEqual(path.read_bytes(), data)
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+                    self.assertFalse(path.with_name(f".{path.name}.wfc.lock").exists())
             finally:
                 subprocess.run(tmux + ["kill-server"], env=env, capture_output=True, timeout=5)
 
