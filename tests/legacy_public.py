@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -42,16 +43,16 @@ def run(binary, cwd, home, setting, args, code=0):
     return json.loads(result.stdout)
 
 
-def seed_legacy(state):
+def seed_legacy(state, dispatch=DISPATCH):
     state.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(state / "router.db")) as db:
         db.executescript(f"""
             CREATE TABLE dispatch(id TEXT PRIMARY KEY, current_round INTEGER, current_attempt TEXT);
-            INSERT INTO dispatch VALUES('{DISPATCH}',1,'a-000000000030');
+            INSERT INTO dispatch VALUES('{dispatch}',1,'a-000000000030');
             CREATE TABLE dispatch_round(dispatch TEXT, round INTEGER, attempt TEXT, state TEXT);
-            INSERT INTO dispatch_round VALUES('{DISPATCH}',1,'a-000000000030','completed');
+            INSERT INTO dispatch_round VALUES('{dispatch}',1,'a-000000000030','completed');
             CREATE TABLE message(id INTEGER PRIMARY KEY, dispatch TEXT, recipient TEXT, type TEXT, body TEXT);
-            INSERT INTO message VALUES(30,'{DISPATCH}','controller','done','{{"report":"/old/report"}}');
+            INSERT INTO message VALUES(30,'{dispatch}','controller','done','{{"report":"/old/report"}}');
         """)
 
 
@@ -146,6 +147,49 @@ def native_precedence(binary):
             print(setting, "native status selected", state, "when both paths contain records")
 
 
+def native_dispatch_traverse_only(binary):
+    assert os.geteuid() != 0, "run the directory permissions fixture as an ordinary user"
+    with tempfile.TemporaryDirectory(prefix="wfc-public-traverse-") as tmp:
+        root = Path(tmp).resolve()
+        dispatch = "d-00000000000000000000000000000024"
+        seed_legacy(root, dispatch)
+        ledger = root / "router.db"
+        ledger.chmod(0o400)
+        dispatches = root / "dispatches"
+        dispatches.mkdir(mode=0o700)
+        record = dispatches / f"{dispatch}.json"
+        native = {"dispatch": dispatch, "attempt": "a-000000000024", "round": 1, "label": "native"}
+        record.write_text(json.dumps(native))
+        record.chmod(0o400)
+        before = snapshot(root)
+        dispatches.chmod(0o100)
+        try:
+            assert json.loads(record.read_text()) == native
+            try:
+                os.listdir(dispatches)
+            except PermissionError as error:
+                assert error.errno == errno.EACCES
+            else:
+                raise AssertionError("the fixture unexpectedly allows directory enumeration")
+
+            args = ("status", "--dispatch", dispatch)
+            view = run(binary, root, root, str(root), args)
+            entry, = view["dispatches"]
+            assert entry["label"] == "native" and entry["attempt"] == native["attempt"], view
+            assert "schema" not in view, view
+            preview = run(binary, root, root, str(root), ("reclaim", "--dispatch", dispatch))
+            assert preview["sessions"][0]["dispatch"] == dispatch and "schema" in preview, preview
+            for flags in ((), ("--active",)):
+                error = run(binary, root, root, str(root), ("status", *flags), code=1)
+                assert "list dispatch records" in error and f"os error {errno.EACCES}" in error, error
+            assert stat.S_IMODE(dispatches.stat().st_mode) == 0o100
+            assert stat.S_IMODE(ledger.stat().st_mode) == stat.S_IMODE(record.stat().st_mode) == 0o400
+        finally:
+            dispatches.chmod(0o700)
+        assert snapshot(root) == before
+        print("ordinary UID", os.geteuid(), "named status keeps Rust priority with traversal only; lists report EACCES")
+
+
 def native_literal_path(binary):
     with tempfile.TemporaryDirectory(prefix="wfc-public-literal-") as tmp:
         root = Path(tmp).resolve()
@@ -199,6 +243,22 @@ def native_ledger_and_relay(binary):
         print("a Rust message ledger or held relay registration selects the native view")
 
 
+def native_ledger_directory(binary):
+    with tempfile.TemporaryDirectory(prefix="wfc-public-message-directory-") as tmp:
+        root = Path(tmp).resolve()
+        seed_legacy(root)
+        native = root / "messages.json"
+        native.mkdir()
+        before = snapshot(root)
+        for args in COMMANDS[:3]:
+            error = run(binary, root, root, str(root), args, code=1)
+            assert "messages.json" in error and "not a regular file" in error, error
+        preview = run(binary, root, root, str(root), ("reclaim", "--dispatch", DISPATCH))
+        assert preview["sessions"][0]["dispatch"] == DISPATCH and "schema" in preview, preview
+        assert snapshot(root) == before
+        print("a messages.json directory reports the path type error; the legacy ledger is unchanged")
+
+
 def wal_refusal(binary):
     with tempfile.TemporaryDirectory(prefix="wfc-public-wal-") as tmp:
         root = Path(tmp).resolve()
@@ -218,7 +278,9 @@ if __name__ == "__main__":
     for label, setting in LEGACY_INPUTS:
         legacy_case(wfc, label, setting)
     native_precedence(wfc)
+    native_dispatch_traverse_only(wfc)
     native_literal_path(wfc)
     broken_legacy_path(wfc)
     native_ledger_and_relay(wfc)
+    native_ledger_directory(wfc)
     wal_refusal(wfc)

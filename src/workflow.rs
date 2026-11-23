@@ -447,7 +447,7 @@ fn decode_record(file: File, path: &Path) -> Result<Value> {
 
 pub fn status(id: Option<&OsStr>, active: bool) -> Result<Value> {
     #[cfg(target_os = "linux")]
-    if let Some(state) = legacy_status_state()? {
+    if let Some(state) = legacy_status_state(id)? {
         let dispatch = id
             .map(|id| id.to_str().context("invalid dispatch ID"))
             .transpose()?;
@@ -457,7 +457,7 @@ pub fn status(id: Option<&OsStr>, active: bool) -> Result<Value> {
 }
 
 #[cfg(target_os = "linux")]
-fn legacy_status_state() -> Result<Option<PathBuf>> {
+fn legacy_status_state(id: Option<&OsStr>) -> Result<Option<PathBuf>> {
     let configured = env::var_os("WFC_STATE");
     if configured.as_ref().is_some_and(|value| value.is_empty()) {
         return Ok(Some(wfc_legacy_state::state_dir()?));
@@ -468,12 +468,32 @@ fn legacy_status_state() -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let native = state_dir()?;
+    let ledger = native.join("messages.json");
+    match fs::metadata(&ledger) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_file(),
+                "{} is not a regular file",
+                ledger.display()
+            );
+            return Ok(None);
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", ledger.display())),
+    }
+    let dispatches = native.join("dispatches");
+    // Opening a known assignment only requires traversal permission. A list
+    // still needs to enumerate the directory and reports permission errors.
+    if let Some(id) = id.and_then(OsStr::to_str).filter(|id| valid_id(id)) {
+        match assignment::open_assignment(&dispatches, id) {
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("open dispatch record {id}")),
+        }
+    }
     // Prefer the original Rust view when both stores have records. Their dispatch
     // and receipt IDs are independent, so one query must use a single store.
-    if native.join("messages.json").try_exists()?
-        || !assignment::ids(&native.join("dispatches"))?.is_empty()
-        || !messages::relay::waiters(&native)?.is_empty()
-    {
+    if !assignment::ids(&dispatches)?.is_empty() || !messages::relay::waiters(&native)?.is_empty() {
         return Ok(None);
     }
     // ~account/dir is also a valid literal Rust path. A missing account is
