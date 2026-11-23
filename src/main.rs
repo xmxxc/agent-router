@@ -10,7 +10,14 @@ use std::process::ExitCode;
 use workflow::messages::{Confirm, Done, Wait, ACK_USAGE, DONE_USAGE, RESOLVE_USAGE, WAIT_USAGE};
 
 const RESERVED_COMMANDS: &[&str] = &[
-    "ask", "reply", "continue", "nudge", "resume", "reclaim", "relay",
+    "ask",
+    "reply",
+    "continue",
+    "nudge",
+    "resume",
+    "reclaim",
+    #[cfg(not(target_os = "linux"))]
+    "relay",
 ];
 
 const UNEXPECTED_ARGUMENTS: &str = "wfc: unexpected arguments. See wfc --help";
@@ -41,6 +48,8 @@ fn main() -> anyhow::Result<ExitCode> {
             println!("{}", workflow::worker_owner::CLOSE_USAGE);
             println!("{DONE_USAGE}");
             println!("{WAIT_USAGE}");
+            #[cfg(target_os = "linux")]
+            println!("{}", workflow::messages::relay::USAGE);
             println!("{ACK_USAGE}");
             println!("{RESOLVE_USAGE}");
             println!(
@@ -91,6 +100,12 @@ fn main() -> anyhow::Result<ExitCode> {
                 _ => RESOLVE_USAGE,
             };
             println!("{usage}");
+        }
+        #[cfg(target_os = "linux")]
+        Some("--relay-queue") if args.len() == 4 => {
+            return workflow::messages::relay::queue_owner::run(
+                &args[0], &args[1], &args[2], &args[3],
+            );
         }
         #[cfg(target_os = "linux")]
         Some("--worker-owner") => workflow::worker_owner::run(&args)?,
@@ -153,6 +168,22 @@ fn main() -> anyhow::Result<ExitCode> {
                 }
             };
             println!("{}", request.run()?);
+        }
+        #[cfg(target_os = "linux")]
+        Some("relay") => {
+            use workflow::messages::relay::{Relay, USAGE};
+            if args == ["--help"] || args == ["-h"] {
+                println!("{USAGE}");
+            } else {
+                let relay = match Relay::parse(&args) {
+                    Ok(relay) => relay,
+                    Err(err) => {
+                        eprintln!("wfc: {err}. {USAGE}");
+                        return Ok(ExitCode::from(2));
+                    }
+                };
+                relay.run()?;
+            }
         }
         Some("wait") => {
             let request = match Wait::parse(&args) {

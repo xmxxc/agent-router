@@ -30,7 +30,7 @@ struct Spec {
     env: BTreeMap<String, String>,
 }
 
-pub(super) fn router_credential(key: &str) -> bool {
+pub(crate) fn router_credential(key: &str) -> bool {
     [
         "WFC_CONTROLLER_TOKEN",
         "WFC_OWNER_TOKEN",

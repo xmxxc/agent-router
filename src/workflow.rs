@@ -533,7 +533,9 @@ fn status_with_history(
         undelivered.extend(
             messages
                 .iter()
-                .filter(|m| m["to"] == "controller" && m["state"] == "unsent")
+                .filter(|m| {
+                    m["to"] == "controller" && (m["state"] == "unsent" || m["state"] == "unknown")
+                })
                 .cloned(),
         );
         let alive = record["backendAlive"].as_bool();
@@ -558,6 +560,10 @@ fn status_with_history(
     undelivered.sort_by_key(|v| v["id"].as_u64());
     let mut response =
         json!({"state":state,"dispatches":dispatches,"undelivered":undelivered,"waiters":[]});
+    #[cfg(target_os = "linux")]
+    {
+        response["waiters"] = json!(messages::relay::waiters(&state)?);
+    }
     if active {
         response["reclaimable"] = json!(reclaimable);
     }

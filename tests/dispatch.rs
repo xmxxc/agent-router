@@ -914,3 +914,14 @@ fn unresolved_reservations_stay_visible_without_claiming_other_assignments() {
     assert!(all["dispatches"][0].get("createPending").is_none());
     assert_eq!(all["dispatches"][0]["attempt"], published["attempt"]);
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn codex_relay_contracts() {
+    let status = Command::new("python3")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/relay.py"))
+        .arg(env!("CARGO_BIN_EXE_wfc"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
