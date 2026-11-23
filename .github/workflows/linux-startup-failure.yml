@@ -8,18 +8,18 @@ permissions:
 
 jobs:
   linux-startup-failure:
-    name: '#13 hosted tmux process creation identity'
+    name: '#13 startup failure review regressions'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     defaults:
       run:
         shell: bash
     env:
-      PRODUCT_SHA: 905190d1b50f23ff47a3e3e0f66550640ac65e8c
-      PRODUCT_TREE: ba52ae46da4a850a6b1652c411c6b2b7787544ae
+      PRODUCT_SHA: ba7f5f793a68d08103b9ee363105cb754e394ec6
+      PRODUCT_TREE: 3e1d63ceea177803ca1a9226fe6d7eada564a278
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TARGET: x86_64-unknown-linux-gnu
-      TEST_GROUP: hosted-tmux
+      TEST_GROUP: startup-review
       BASELINE_RUN: '45219721058'
       PREVIOUS_HOSTED_RUN: '45222227720'
       CARGO_BUILD_JOBS: '2'
@@ -129,7 +129,7 @@ jobs:
             [[ "$version" == *"(Rust, $TARGET, release, build $PRODUCT_SHA)" ]]
             sha256sum "$binary"
           } 2>&1 | tee "$EVIDENCE/build.log"
-      - name: Verify hosted tmux process creation identity
+      - name: Verify startup failure review regressions
         working-directory: product
         env:
           WFC_BUILD_ID: ${{ env.PRODUCT_SHA }}
@@ -144,7 +144,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: linux-startup-failure-${{ env.TEST_GROUP }}-process-start-${{ github.run_id }}-${{ github.run_attempt }}
+          name: linux-startup-failure-${{ env.TEST_GROUP }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14

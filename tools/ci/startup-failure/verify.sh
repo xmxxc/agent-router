@@ -3,7 +3,9 @@
 set -euo pipefail
 selection=${1:-all}
 case "$selection" in
-    all|hosted-tmux) ;;
+    all) groups='controlled hosted-tmux scope-relay workspace' ;;
+    hosted-tmux) groups='hosted-tmux' ;;
+    startup-review) groups='controlled hosted-tmux startup-unit' ;;
     *) printf 'Unsupported test group: %s\n' "$selection" >&2; exit 2 ;;
 esac
 fixtures=$(cd "$(dirname "$0")" && pwd)
@@ -18,7 +20,7 @@ failed=0
 run_group() {
     local group=$1 status=0
     shift
-    if [[ "$selection" != all && "$selection" != "$group" ]]; then
+    if [[ " $groups " != *" $group "* ]]; then
         return 0
     fi
     python3 "$reap" "$@" 2>&1 | tee "$EVIDENCE/$group.log" || status=$?
@@ -29,9 +31,12 @@ run_group() {
 }
 
 run_group controlled python3 -Bu tests/startup_failure.py "$binary" -v \
-    StartupFailure.test_controlled_failures_and_completion
+    StartupFailure.test_controlled_failures_and_completion \
+    StartupFailure.test_close_distinguishes_natural_exit_and_cancellation
 run_group hosted-tmux python3 -Bu tests/startup_failure.py "$binary" -v \
     StartupFailure.test_hosted_failures
+run_group startup-unit cargo test --locked --release --target "$TARGET" --bin wfc \
+    workflow::startup::tests -- --test-threads=1
 run_group scope-relay python3 -Bu tests/relay.py "$binary" -v \
     Relay.test_startup_failure_uses_the_existing_scope_and_ack
 
