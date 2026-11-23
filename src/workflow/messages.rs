@@ -88,7 +88,11 @@ struct Assignment {
 }
 
 impl Assignment {
-    fn current(state: &Path, dispatch: &str, expected_attempt: Option<&str>) -> Result<Self> {
+    fn current(
+        state: &Path,
+        dispatch: &str,
+        expected_attempt: Option<&str>,
+    ) -> Result<(Self, Value)> {
         let dir = state.join("dispatches");
         // Foreground dispatch writes and syncs .pending before launching us,
         // then renames it to .json. This order of opens also covers the rename.
@@ -99,7 +103,8 @@ impl Assignment {
             result => result,
         }
         .with_context(|| format!("open dispatch {dispatch}"))?;
-        let assignment: Self = serde_json::from_reader(file).context("read worker assignment")?;
+        let row: Value = serde_json::from_reader(file).context("read worker assignment")?;
+        let assignment = Self::deserialize(&row).context("read worker assignment identity")?;
         let worker = &assignment.worker;
         ensure!(
             worker.dispatch == dispatch,
@@ -120,7 +125,7 @@ impl Assignment {
                 && expected_attempt.is_none_or(|id| id == worker.attempt),
             "attempt is no longer accepted for {dispatch}"
         );
-        Ok(assignment)
+        Ok((assignment, row))
     }
 }
 
@@ -264,6 +269,12 @@ fn lock_file(dir: &Path) -> Result<File> {
         .context("open message lock")
 }
 
+pub(super) fn lock_for_publish(dir: &Path) -> Result<File> {
+    let lock = lock_file(dir)?;
+    lock.lock().context("lock controller messages")?;
+    Ok(lock)
+}
+
 impl Inbox {
     fn snapshot(dir: &Path) -> Result<Vec<Completion>> {
         let path = dir.join("messages.json");
@@ -293,9 +304,7 @@ impl Inbox {
     }
 
     fn open(dir: &Path) -> Result<Self> {
-        let lock = lock_file(dir)?;
-        lock.lock().context("lock controller messages")?;
-        Self::read_locked(dir, lock)
+        Self::read_locked(dir, lock_for_publish(dir)?)
     }
 
     fn read_locked(dir: &Path, lock: File) -> Result<Self> {
@@ -447,7 +456,7 @@ impl<'a> Done<'a> {
         ensure!(valid_id(&dispatch), "invalid dispatch ID");
         let check = || {
             let inbox = Inbox::open(&state)?;
-            let assignment = Assignment::current(&state, &dispatch, self.attempt)?;
+            let (assignment, row) = Assignment::current(&state, &dispatch, self.attempt)?;
             // R1 dispatches had neither field and derived the default key from
             // the worker's launch environment. Assignment::current checked it.
             let r1_worker = assignment.report.is_none()
@@ -463,6 +472,13 @@ impl<'a> Done<'a> {
                 .or_else(|| keyed_attempt.map(|id| format!("done:{dispatch}:{id}")));
             let receipt =
                 inbox.validate_done(&assignment, &report, key.as_deref(), self.attempt)?;
+            if receipt.is_none() && row["backend"] == "herdr" {
+                ensure!(
+                    !super::backend::herdr_close_blocks_done(&state, &row)?,
+                    "attempt {} is no longer accepted for {dispatch}; its execution resources are closing or closed",
+                    assignment.worker.attempt
+                );
+            }
             Ok::<_, anyhow::Error>((assignment, inbox, receipt, key))
         };
         let (initial, inbox, duplicate, _) = check()?;

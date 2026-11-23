@@ -15,6 +15,22 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
         rounds.push(json!({"round":row["round"],"attempt":row["attempt"],"task":row["task"],"report":row["report"],
             "created":row["created"],"completed":null,"state":"running","result":null}));
     }
+    let pending_close = row["closePending"] == true;
+    #[cfg(target_os = "linux")]
+    let prior_exit = super::backend::pending_herdr_close(row)
+        .filter(|event| {
+            pending_close && super::backend::verify_herdr_close_target(row, event).is_ok()
+        })
+        .map(|event| &event["workerOnClose"])
+        .filter(|worker| worker["state"] == "exited" && worker["exit_code"].is_i64())
+        .cloned();
+    #[cfg(not(target_os = "linux"))]
+    let prior_exit: Option<Value> = None;
+    let unresolved_worker =
+        (pending_close || row["closeWorkerDiagnostic"].is_string()) && prior_exit.is_none();
+    if let Some(exit) = prior_exit {
+        row["worker"] = exit;
+    }
     let mut current = "unknown".to_owned();
     for round in &mut rounds {
         ensure!(round.is_object(), "invalid stored round");
@@ -56,7 +72,14 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
                 Some("completed" | "failed" | "cancelled")
             )
         {
+            let unconfirmed_create =
+                row["backend"] == "herdr" && row["create"]["result"] != "accepted";
             let state = match row["worker"]["state"].as_str() {
+                _ if unresolved_worker => "unknown",
+                _ if unconfirmed_create && row["worker"]["state"] != "cancelled" => {
+                    round["result"] = row["create"].clone();
+                    "unknown"
+                }
                 Some("running") => "running",
                 Some("cancelled") => "cancelled",
                 Some("exited") => "failed", // An exit without a done receipt is unfinished work.

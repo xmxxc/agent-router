@@ -645,6 +645,17 @@ dependencies = [
  "serde_json",
  "sha2",
  "uuid",
+ "wfc-herdr",
+]
+
+[[package]]
+name = "wfc-herdr"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

@@ -91,7 +91,7 @@ impl Tmux<'_> {
             .env_remove("WFC_DISPATCH")
             .env_remove("WFC_TMUX_LAUNCH");
         for (key, _) in env::vars_os() {
-            if launch::router_credential(&key.to_string_lossy()) {
+            if crate::host_launch::router_credential(&key.to_string_lossy()) {
                 command.env_remove(key);
             }
         }

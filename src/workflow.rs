@@ -16,6 +16,8 @@ use uuid::Uuid;
 pub mod worker_owner;
 
 mod backend;
+#[cfg(target_os = "linux")]
+pub mod herdr;
 pub mod host;
 mod view;
 
@@ -215,20 +217,33 @@ impl<'a> Dispatch<'a> {
             record["model"] = json!(host.model);
             record["git"] = json!(host.git);
             record["tmux"] = json!(format!("wfc-{dispatch}"));
-            if let Some(endpoint) = host.endpoint {
-                record["endpoint"] = json!(endpoint);
-            }
             ensure!(
                 cfg!(target_os = "linux"),
                 "public backend is unavailable on this platform"
             );
             ensure!(
-                host.backend == "tmux",
+                matches!(host.backend, "tmux" | "herdr"),
                 "{} backend adapter is unavailable in this build",
                 host.backend
             );
             #[cfg(target_os = "linux")]
-            {
+            if host.backend == "herdr" {
+                let endpoint = host
+                    .endpoint
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        env::var_os("WFC_HERDR_ENDPOINT")
+                            .filter(|p| !p.is_empty())
+                            .map(PathBuf::from)
+                    })
+                    .context("Herdr requires --herdr-endpoint or WFC_HERDR_ENDPOINT")?;
+                ensure!(
+                    endpoint.is_absolute(),
+                    "Herdr requires an absolute socket path"
+                );
+                record["endpoint"] =
+                    json!(endpoint.to_str().context("Herdr endpoint must be UTF-8")?);
+            } else {
                 record["tmuxSocket"] = json!(backend::tmux_socket()?);
             }
             Some(host.prepare(&state, &mut record)?)
@@ -238,6 +253,13 @@ impl<'a> Dispatch<'a> {
         #[cfg(target_os = "linux")]
         {
             record["worker"] = json!({"state":"running"});
+        }
+
+        // Herdr publishes its assignment (including the nonce) before its first
+        // remote effect. This same file is authoritative for early callbacks.
+        #[cfg(target_os = "linux")]
+        if record["backend"] == "herdr" {
+            return herdr::create(&state, &record, launch.context("missing Herdr launch")?);
         }
 
         // Reserve and write the record before starting the worker. Status sees it
@@ -332,7 +354,11 @@ impl<'a> Dispatch<'a> {
 }
 
 // Publish a complete generation while callback readers can still use .pending.
-fn write_json(path: &Path, value: &Value, permissions: Option<fs::Permissions>) -> Result<()> {
+pub(crate) fn write_json(
+    path: &Path,
+    value: &Value,
+    permissions: Option<fs::Permissions>,
+) -> Result<()> {
     let temp = path.with_extension(format!("{}.tmp", Uuid::new_v4().simple()));
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
@@ -463,20 +489,22 @@ fn status_with_history(
     let state = state_dir()?;
     let dir = state.join("dispatches");
     let mut dispatches = Vec::new();
-    let mut named_history = None;
     if let Some(id) = id {
         let id = id
             .to_str()
             .filter(|s| valid_id(s))
             .context("invalid dispatch ID")?;
-        let messages = history(&state, id)?;
         let not_found = |err: &anyhow::Error| {
             err.downcast_ref::<std::io::Error>()
                 .is_some_and(|e| e.kind() == ErrorKind::NotFound)
         };
         let row = match read_record(&dir.join(format!("{id}.json"))) {
             Ok(r) => r,
-            Err(e) if not_found(&e) && !messages.is_empty() => {
+            Err(e) if not_found(&e) => {
+                let messages = history(&state, id)?;
+                if messages.is_empty() {
+                    return Err(e);
+                }
                 // A worker can report before its launcher publishes the assignment.
                 match read_record(&dir.join(format!("{id}.pending"))) {
                     Ok(r) => r,
@@ -490,7 +518,6 @@ fn status_with_history(
             Err(e) => return Err(e),
         };
         dispatches.push(row);
-        named_history = Some(messages);
     } else {
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => Some(entries),
@@ -521,6 +548,9 @@ fn status_with_history(
             let (worker, inspection) = backend::observe(&state, record)?;
             record["worker"] = worker;
             record["backendResult"] = inspection["result"].clone();
+            if record["backend"] == "herdr" && inspection["diagnostic"].is_string() {
+                record["backendDiagnostic"] = inspection["diagnostic"].clone();
+            }
             record["backendAlive"] = if inspection["alive"] == true && inspection["owned"] != true {
                 Value::Null
             } else {
@@ -537,13 +567,12 @@ fn status_with_history(
                 _ => json!(false),
             };
         }
-        let messages = match named_history.take() {
-            Some(messages) => messages,
-            None => history(
-                &state,
-                record["dispatch"].as_str().context("missing dispatch")?,
-            )?,
-        };
+        // A worker can publish done and then exit during backend observation.
+        // Read the ledger after the process evidence used by this projection.
+        let messages = history(
+            &state,
+            record["dispatch"].as_str().context("missing dispatch")?,
+        )?;
         let messages = if messages.is_empty() {
             record["messages"].as_array().cloned().unwrap_or_default()
         } else {
@@ -557,12 +586,19 @@ fn status_with_history(
         );
         let alive = record["backendAlive"].as_bool();
         view::project(record, &messages, alive, id.is_some())?;
-        if active && record["state"] == "done" && alive == Some(true) {
-            reclaimable.push(json!({"dispatch":record["dispatch"],"label":record["label"],"tmux":record["tmux"]}));
-        }
     }
     if active {
-        dispatches.retain(|r| r["state"] != "done");
+        dispatches.retain(|row| {
+            if row["state"] != "done" || row["closePending"] == true {
+                return true;
+            }
+            if row["backendAlive"] == true {
+                reclaimable.push(
+                    json!({"dispatch":row["dispatch"],"label":row["label"],"tmux":row["tmux"]}),
+                );
+            }
+            false
+        });
     }
     undelivered.sort_by_key(|v| v["id"].as_u64());
     let mut response =
