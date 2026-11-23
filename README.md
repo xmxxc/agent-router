@@ -61,9 +61,9 @@ wfc status --active
 }
 ```
 
-使用原生 Codex 可执行文件时，在 `command` 中填入该文件并省略 `runtime`。worker 先继承调用进程的环境，再依次叠加顶层 `env`、宿主 `env` 和 wfc 的本轮身份、状态及报告路径。Codex 默认以 `workspace-write` 和 `never` 审批策略启动。
+使用原生 Codex 可执行文件时，在 `command` 中填入该文件并省略 `runtime`。worker 先继承调用进程的环境，再依次叠加顶层 `env`、宿主 `env` 和 wfc 的本轮身份、状态及报告路径。wfc 会过滤继承环境和启动配置中的 `WFC_CONTROLLER_TOKEN`、`WFC_OWNER_TOKEN` 和旧 `WFC_WORKER_CALLBACK`（名称不区分大小写）。专用 worker 回调由调度层提供。tmux 会使用当前终端的 `TMUX`、`TMUX_PANE` 和 `TERM`。Codex 默认以 `workspace-write` 和 `never` 审批策略启动。
 
-Linux 真实宿主验收需要 tmux、已登录的 Codex 或可用的 `OPENAI_API_KEY`，以及能执行 Codex 沙箱命令的主机。下面的命令使用私有临时 HOME、状态目录和 tmux socket，启动模型执行一项写报告的任务，从 Rust `wait` 返回的路径读回报告，并核对 `status` 中的同一条回执。把路径和模型替换成当前机器的值。使用 API 密钥时可省略 `--auth-file`。
+Linux 真实宿主验收需要 tmux、已登录的 Codex 或可用的 `OPENAI_API_KEY`，以及能执行 Codex 沙箱命令的主机。下面的命令使用私有临时 HOME、状态目录和 tmux socket，启动模型执行一项写报告的任务，从 Rust `wait` 返回的路径读回报告，并核对 `status` 中的同一条回执。把路径和模型替换成当前机器的值。传入 `--auth-file` 时使用已有登录文件的临时副本。仅设置 `OPENAI_API_KEY` 时省略该选项，脚本通过标准输入运行 `codex login --with-api-key`，把登录信息写入私有 profile。外部发送 `SIGTERM` 取消验收时，脚本回收自建进程并删除该临时目录，随后以同一信号退出。
 
 ```sh
 python3 tools/check_codex.py target/x86_64-unknown-linux-gnu/release/wfc \

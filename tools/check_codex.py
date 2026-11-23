@@ -3,6 +3,7 @@ import argparse
 import ctypes
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import secrets
@@ -70,7 +71,7 @@ def exercise(args, root):
         '"$WFC_BIN" done --report "$WFC_REPORT" --attempt "$WFC_ATTEMPT"\n',
         encoding='utf-8')
     env = {k: v for k, v in os.environ.items() if k.lower() in
-           ('path', 'http_proxy', 'https_proxy', 'no_proxy', 'all_proxy', 'openai_api_key',
+           ('path', 'http_proxy', 'https_proxy', 'no_proxy', 'all_proxy',
             'ssl_cert_file', 'ssl_cert_dir')}
     private_runtime = root / 'runtime'
     private_runtime.mkdir(mode=0o700)
@@ -79,6 +80,13 @@ def exercise(args, root):
                WFC_STATE=str(state), WFC_TMUX_SOCKET=str(socket), WFC_SAMPLE='inherited',
                WFC_PARENT_SAMPLE='inherited', WFC_SHARED_SAMPLE='inherited',
                WFC_LAUNCH_CONFIG=str(root / 'unselected.json'))
+    if not args.auth_file:
+        key = os.environ.get('OPENAI_API_KEY')
+        check(key, 'provide --auth-file or OPENAI_API_KEY for the private Codex profile')
+        login = subprocess.run([executable, '-c', 'cli_auth_credentials_store="file"',
+                                'login', '--with-api-key'], input=key.encode(), env=env, cwd=work,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        check(login.returncode == 0, f'private Codex login exited {login.returncode}')
     fixed = ['-c', f'projects.{json.dumps(str(work))}.trust_level="trusted"',
              '-c', 'tui.screen_reader_detection_done=true', '-c', 'check_for_update_on_startup=false']
     runtime = [shutil.which('env'), '--', 'WFC_RUNTIME_SAMPLE=runtime argument']
@@ -196,16 +204,37 @@ def main():
     config = Path(os.getenv('CODEX_HOME', Path.home() / '.codex')) / 'config.toml'
     before = digest(config)
     os.umask(0o077)
+    cancelled = False
+
+    def cancel(signum, frame):
+        nonlocal cancelled
+        cancelled = True
+
+    # The supervisor owns the directory and adopts daemonized descendants. A
+    # TERM only sets its flag, even during fork, wait, reaping or file removal.
+    signal.signal(signal.SIGTERM, cancel)
     try:
         with tempfile.TemporaryDirectory(prefix='wfc codex ') as tmp:
+            job = multiprocessing.get_context('fork').Process(target=exercise, args=(args, Path(tmp)))
             try:
-                exercise(args, Path(tmp))
+                job.start()
+                while job.is_alive():
+                    if cancelled:
+                        job.kill()
+                    job.join(.1)
+                if job.exitcode:
+                    raise SystemExit(job.exitcode if job.exitcode > 0 else 128 - job.exitcode)
             finally:
                 reap()
                 record(descendants='all exited')
     finally:
-        check(digest(config) == before, 'global Codex config changed')
-        record(globalConfigUnchanged=True)
+        try:
+            check(digest(config) == before, 'global Codex config changed')
+            record(globalConfigUnchanged=True)
+        finally:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            if cancelled:
+                signal.raise_signal(signal.SIGTERM)
 
 
 if __name__ == '__main__':
