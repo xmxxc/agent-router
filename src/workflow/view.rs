@@ -56,7 +56,13 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
                 Some("completed" | "failed" | "cancelled")
             )
         {
+            let unconfirmed_create =
+                row["backend"] == "herdr" && row["create"]["result"] != "accepted";
             let state = match row["worker"]["state"].as_str() {
+                _ if unconfirmed_create && row["worker"]["state"] != "cancelled" => {
+                    round["result"] = row["create"].clone();
+                    "unknown"
+                }
                 Some("running") => "running",
                 Some("cancelled") => "cancelled",
                 Some("exited") => "failed", // An exit without a done receipt is unfinished work.

@@ -16,6 +16,8 @@ use uuid::Uuid;
 pub mod worker_owner;
 
 mod backend;
+#[cfg(target_os = "linux")]
+pub mod herdr;
 pub mod host;
 mod view;
 
@@ -215,20 +217,32 @@ impl<'a> Dispatch<'a> {
             record["model"] = json!(host.model);
             record["git"] = json!(host.git);
             record["tmux"] = json!(format!("wfc-{dispatch}"));
-            if let Some(endpoint) = host.endpoint {
-                record["endpoint"] = json!(endpoint);
-            }
             ensure!(
                 cfg!(target_os = "linux"),
                 "public backend is unavailable on this platform"
             );
             ensure!(
-                host.backend == "tmux",
+                matches!(host.backend, "tmux" | "herdr"),
                 "{} backend adapter is unavailable in this build",
                 host.backend
             );
             #[cfg(target_os = "linux")]
-            {
+            if host.backend == "herdr" {
+                let endpoint = host
+                    .endpoint
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        env::var_os("WFC_HERDR_ENDPOINT")
+                            .filter(|p| !p.is_empty())
+                            .map(PathBuf::from)
+                    })
+                    .context("Herdr requires --herdr-endpoint or WFC_HERDR_ENDPOINT")?;
+                ensure!(
+                    endpoint.is_absolute(),
+                    "Herdr requires an absolute socket path"
+                );
+                record["endpoint"] = json!(endpoint);
+            } else {
                 record["tmuxSocket"] = json!(backend::tmux_socket()?);
             }
             Some(host.prepare(&state, &mut record)?)
@@ -238,6 +252,13 @@ impl<'a> Dispatch<'a> {
         #[cfg(target_os = "linux")]
         {
             record["worker"] = json!({"state":"running"});
+        }
+
+        // Herdr publishes its assignment (including the nonce) before its first
+        // remote effect. This same file is authoritative for early callbacks.
+        #[cfg(target_os = "linux")]
+        if record["backend"] == "herdr" {
+            return herdr::create(&state, &record, launch.context("missing Herdr launch")?);
         }
 
         // Reserve and write the record before starting the worker. Status sees it
@@ -332,7 +353,11 @@ impl<'a> Dispatch<'a> {
 }
 
 // Publish a complete generation while callback readers can still use .pending.
-fn write_json(path: &Path, value: &Value, permissions: Option<fs::Permissions>) -> Result<()> {
+pub(crate) fn write_json(
+    path: &Path,
+    value: &Value,
+    permissions: Option<fs::Permissions>,
+) -> Result<()> {
     let temp = path.with_extension(format!("{}.tmp", Uuid::new_v4().simple()));
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);

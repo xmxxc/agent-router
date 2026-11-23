@@ -1,4 +1,4 @@
-//! Public lifecycle client for the tmux create/inspect/close protocol (#31).
+//! Public host lifecycle and launch receipts for Linux backend adapters.
 use super::{host::Launch, valid_identity, write_json};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
@@ -71,7 +71,7 @@ pub fn create(state: &Path, row: &Value, launch: Launch) -> Result<Value> {
     )
 }
 
-fn private_receipt(state: &Path, create: &Value) -> Result<Value> {
+pub(super) fn private_receipt(state: &Path, create: &Value) -> Result<Value> {
     let Some(name) = create["receipt"].as_str() else {
         return Ok(Value::Null);
     };
@@ -104,7 +104,7 @@ fn closed_path(state: &Path, row: &Value) -> Result<PathBuf> {
     )))
 }
 
-fn closed(state: &Path, row: &Value) -> Result<Option<Value>> {
+pub(super) fn closed(state: &Path, row: &Value) -> Result<Option<Value>> {
     match File::open(closed_path(state, row)?) {
         Ok(f) => {
             let saved: Value = serde_json::from_reader(f)?;
@@ -121,11 +121,19 @@ fn closed(state: &Path, row: &Value) -> Result<Option<Value>> {
     }
 }
 
-pub fn observe(state: &Path, row: &Value) -> Result<(Value, Value)> {
+pub fn observe(state: &Path, row: &mut Value) -> Result<(Value, Value)> {
+    #[cfg(target_os = "linux")]
+    if row["backend"] == "herdr" {
+        return super::herdr::observe(state, row);
+    }
     if let Some(result) = closed(state, row)? {
         return Ok((result, json!({"result":"completed","alive":false})));
     }
-    let evidence = private_receipt(state, &row["create"])?;
+    let inspection = inspect_tmux(state, row);
+    Ok((worker(state, row, &inspection)?, inspection))
+}
+
+fn inspect_tmux(state: &Path, row: &Value) -> Value {
     let mut inspection = call(state, row, json!({"op":"inspect"}))
         .unwrap_or_else(|e| json!({"result":"uncertain","diagnostic":e.to_string()}));
     // An unbound legacy row can find a positively owned live pane on today's
@@ -133,7 +141,12 @@ pub fn observe(state: &Path, row: &Value) -> Result<(Value, Value)> {
     if row["tmuxSocket"].is_null() && inspection["alive"] == false {
         inspection = json!({"result":"uncertain","diagnostic":"original tmux socket is unknown"});
     }
-    let worker = match evidence["category"].as_str() {
+    inspection
+}
+
+pub(super) fn worker(state: &Path, row: &Value, inspection: &Value) -> Result<Value> {
+    let evidence = private_receipt(state, &row["create"])?;
+    Ok(match evidence["category"].as_str() {
         Some("process_exited") => {
             json!({"state":"exited","exit_code":evidence["exitCode"],"signal":null})
         }
@@ -141,40 +154,64 @@ pub fn observe(state: &Path, row: &Value) -> Result<(Value, Value)> {
             json!({"state":"running"})
         }
         _ => json!({"state":"unknown"}),
-    };
-    Ok((worker, inspection))
+    })
 }
 
 pub fn close(state: &Path, row: &Value) -> Result<Value> {
+    #[cfg(target_os = "linux")]
+    if row["backend"] == "herdr" {
+        return super::herdr::close(state, row);
+    }
     let id = row["dispatch"].as_str().context("missing dispatch")?;
     // This immutable assignment file serializes competing closes, including
     // across a restart. Completed archives need only read access.
     let lock = File::open(state.join("dispatches").join(format!("{id}.json")))?;
     lock.lock()?;
+    let receipt = close_locked(state, row, |op| {
+        if op == "inspect" {
+            Ok(inspect_tmux(state, row))
+        } else {
+            call(state, row, json!({"op":op}))
+        }
+    })?;
+    ensure!(
+        receipt["result"] == "completed",
+        "close {}: {}",
+        receipt["result"],
+        receipt["diagnostic"]
+    );
+    Ok(receipt)
+}
+
+pub(super) fn close_locked(
+    state: &Path,
+    row: &Value,
+    mut operation: impl FnMut(&str) -> Result<Value>,
+) -> Result<Value> {
+    let id = &row["dispatch"];
     let mut receipt = json!({"dispatch":id,"operation":"close","result":"completed","round":row["round"],"attempt":row["attempt"]});
     if closed(state, row)?.is_some() {
         receipt["diagnostic"] = json!("session was already gone");
         return Ok(receipt);
     }
-    let (before, observed) = observe(state, row)?;
-    ensure!(
-        observed["result"] == "accepted",
-        "backend inspection could not confirm ownership: {}",
-        observed["diagnostic"]
-    );
-    if observed["alive"] == true {
-        ensure!(
-            observed["owned"] == true,
-            "tmux session is not owned by this dispatch"
-        );
+    let observed = operation("inspect")?;
+    if observed["result"] != "accepted" {
+        receipt["result"] = observed["result"].clone();
+        receipt["diagnostic"] = observed["diagnostic"].clone();
+        return Ok(receipt);
     }
-    let answer = call(state, row, json!({"op":"close"}))?;
-    ensure!(
-        answer["result"] == "completed",
-        "close {}: {}",
-        answer["result"],
-        answer["diagnostic"]
-    );
+    if observed["alive"] == true && observed["owned"] != true {
+        receipt["result"] = json!("refused");
+        receipt["diagnostic"] = json!("session is not owned by this dispatch");
+        return Ok(receipt);
+    }
+    let before = worker(state, row, &observed)?;
+    let outcome = operation("close")?;
+    if outcome["result"] != "completed" {
+        receipt["result"] = outcome["result"].clone();
+        receipt["diagnostic"] = outcome["diagnostic"].clone();
+        return Ok(receipt);
+    }
     // The close operation itself can cause an exit receipt. Retain a
     // previously observed terminal outcome; confirmed closure cancels any
     // remaining work. A completed business round is projected separately.

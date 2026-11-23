@@ -10,8 +10,8 @@ pub struct Process {
 }
 
 impl Process {
-    // None is positive evidence of exit. Permission, parse and procfs errors stay unknown.
-    pub(super) fn observe(pid: u32) -> Result<Option<Self>> {
+    /// None is positive evidence of exit. Permission, parse and procfs errors stay unknown.
+    pub fn observe(pid: u32) -> Result<Option<Self>> {
         let unknown = Failure::unknown("cannot observe Linux process creation identity");
         let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|_| unknown)?;
         if uuid::Uuid::parse_str(boot.trim()).is_err() || pid == 0 {
@@ -36,7 +36,7 @@ impl Process {
         }))
     }
 
-    pub(super) fn alive(&self) -> Result<bool> {
+    pub fn alive(&self) -> Result<bool> {
         Ok(Self::observe(self.pid)?.as_ref() == Some(self))
     }
 }

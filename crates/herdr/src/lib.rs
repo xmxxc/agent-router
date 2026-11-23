@@ -99,6 +99,9 @@ pub struct Mapping {
 
 #[derive(Debug, Serialize)]
 pub struct Binding {
+    /// The original launch receipt can still describe this bound process.
+    #[serde(skip)]
+    pub same_live_unit: bool,
     pub handle: Handle,
     pub audit: Value,
 }
@@ -550,6 +553,7 @@ impl Handle {
             "inputReplayed": false,
         });
         Ok(Binding {
+            same_live_unit: same_unit,
             handle: next,
             audit,
         })
