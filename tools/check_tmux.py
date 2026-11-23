@@ -1,5 +1,6 @@
 """Exercise the private backend interface with a fresh tmux server and state roots."""
 from contextlib import contextmanager
+import errno
 import fcntl
 import hashlib
 import json
@@ -436,6 +437,87 @@ time.sleep(120)
         for name in (neighbor["tmux"], "sibling"):
             subprocess.run(self.tmux + ["has-session", "-t", "=" + name], env=self.env, check=True)
         print(json.dumps({"historyPreflight": checks, "reclaimedAfterRepair": item}), flush=True)
+
+    @unittest.skipUnless(os.environ.get("WFC_TEST_STICKY_OWNERSHIP") == "1",
+                         "requires CI setup for private fixture ownership")
+    def test_public_reclaim_requires_sticky_ownership(self):
+        uid = os.geteuid()
+        self.assertNotEqual(uid, 0, "reclaim must run as an ordinary user")
+        sudo = shutil.which("sudo")
+        chown = shutil.which("chown")
+        self.assertIsNotNone(sudo)
+        self.assertIsNotNone(chown)
+        directory_case = self.reclaim_dispatch("sticky directory owner", finished=True)
+        ledger_case = self.reclaim_dispatch("sticky ledger owner", finished=True)
+        neighbor = self.reclaim_dispatch("sticky neighbor")
+        ledger = self.state / "messages.json"
+        foreign = self.state / "fixture-foreign-entry"
+        scratch = self.state / "fixture-owned-entry"
+        original = ledger.read_bytes()
+        state_mode = stat.S_IMODE(self.state.stat().st_mode)
+        foreign.write_bytes(b"fixture entry")
+        scratch.write_bytes(b"fixture scratch")
+        ledger.chmod(0o644)
+        self.state.chmod(0o1777)
+
+        def set_owner(owner, *paths):
+            for path in paths:
+                self.assertIn(path, (self.state, ledger, foreign))
+                self.assertFalse(path.is_symlink())
+                self.assertTrue(path.resolve().is_relative_to(self.root.resolve()))
+            subprocess.run([sudo, "-n", "--", chown, "--no-dereference", "--",
+                            str(owner), *map(str, paths)], check=True, timeout=10)
+
+        def alive(*sessions):
+            for name in sessions:
+                subprocess.run(self.tmux + ["has-session", "-t", "=" + name],
+                               env=self.env, check=True, timeout=10)
+
+        def reclaim_owned(row, expected):
+            result = self.reclaim_cli("reclaim", "--yes", "--dispatch", row["dispatch"])
+            item, = json.loads(result.stdout)["sessions"]
+            self.assertEqual(item["result"], "reclaimed")
+            self.assertIn("message", item)
+            status = self.reclaim_status(row)
+            self.assertEqual([m["type"] for m in status["messages"]], ["done", "reclaimed"])
+            self.assertFalse(status["backendAlive"])
+            return {"ownership": expected, "item": item}
+
+        try:
+            # Only the fixture metadata is changed with sudo. All WFC and tmux
+            # commands use the ordinary runner account.
+            set_owner(0, self.state, ledger, foreign)
+            self.assertEqual((self.state.stat().st_uid, ledger.stat().st_uid), (0, 0))
+            with self.assertRaises(OSError) as denied:
+                scratch.replace(foreign)
+            self.assertIn(denied.exception.errno, (errno.EPERM, errno.EACCES))
+            scratch.unlink()
+            failed = self.reclaim_cli("reclaim", "--yes", "--dispatch", directory_case["dispatch"], code=1)
+            item, = json.loads(failed.stdout)["sessions"]
+            self.assertEqual((item["dispatch"], item["result"]), (directory_case["dispatch"], "failed"))
+            self.assertNotIn("message", item)
+            self.assertIn("preflight reclaim history", item["error"])
+            self.assertIn("sticky directory ownership", failed.stderr)
+            self.assertEqual(ledger.read_bytes(), original)
+            alive(directory_case["tmux"], ledger_case["tmux"], neighbor["tmux"], "sibling")
+            status = self.reclaim_status(directory_case)
+            self.assertTrue(status["backendAlive"])
+            self.assertEqual([m["type"] for m in status["messages"]], ["done"])
+
+            set_owner(uid, self.state)
+            self.assertEqual((self.state.stat().st_uid, ledger.stat().st_uid), (uid, 0))
+            directory_ok = reclaim_owned(directory_case, "directory owner")
+            set_owner(0, self.state)
+            self.assertEqual((self.state.stat().st_uid, ledger.stat().st_uid), (0, uid))
+            ledger_ok = reclaim_owned(ledger_case, "ledger owner")
+            alive(neighbor["tmux"], "sibling")
+            print(json.dumps({"stickyUnproven": item, "exit": failed.returncode,
+                              "stderr": failed.stderr, "kernelRenameErrno": denied.exception.errno,
+                              "confirmedDirectory": directory_ok, "confirmedLedger": ledger_ok,
+                              "targetAndNeighborsAliveOnRefusal": True}), flush=True)
+        finally:
+            set_owner(uid, self.state, ledger, foreign)
+            self.state.chmod(state_mode)
 
     def test_public_reclaim_stops_on_scope_authority_loss(self):
         first = self.reclaim_dispatch("first")

@@ -375,6 +375,11 @@ pub(super) fn sync_directory(_dir: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn sticky_owner_matches(fsuid: u32, directory_uid: u32, entry_uid: u32, overflow_uid: u32) -> bool {
+    fsuid != overflow_uid && (fsuid == directory_uid || fsuid == entry_uid)
+}
+
+#[cfg(target_os = "linux")]
 fn check_ledger_replacement(dir: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -401,18 +406,17 @@ fn check_ledger_replacement(dir: &Path) -> Result<()> {
             .and_then(|uids| uids.split_whitespace().nth(3))
             .context("missing filesystem UID")?
             .parse()?;
-        if uid != parent.uid() && uid != metadata.uid() {
-            const CAP_FOWNER: u64 = 1 << 3;
-            let capabilities = credentials
-                .lines()
-                .find_map(|line| line.strip_prefix("CapEff:"))
-                .context("missing effective file capability")?;
-            ensure!(
-                u64::from_str_radix(capabilities.trim(), 16)? & CAP_FOWNER != 0,
-                "sticky directory prevents replacing {}",
-                path.display()
-            );
-        }
+        // A capability bit alone cannot establish the inode's UID/GID
+        // mappings. The overflow UID can also stand for an unmapped owner.
+        let overflow_uid = fs::read_to_string("/proc/sys/kernel/overflowuid")
+            .context("read filesystem UID overflow value")?
+            .trim()
+            .parse()?;
+        ensure!(
+            sticky_owner_matches(uid, parent.uid(), metadata.uid(), overflow_uid),
+            "cannot verify sticky directory ownership for replacing {}",
+            path.display()
+        );
     }
 
     // A named mount root or immutable/append-only entry cannot be replaced.
@@ -891,5 +895,20 @@ impl<'a> Wait<'a> {
             }
             std::thread::sleep(remaining.min(Duration::from_millis(100)));
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::sticky_owner_matches;
+
+    #[test]
+    fn sticky_replacement_requires_confirmed_owner() {
+        assert!(sticky_owner_matches(1001, 1001, 0, 65534));
+        assert!(sticky_owner_matches(1001, 0, 1001, 65534));
+        assert!(!sticky_owner_matches(1001, 0, 0, 65534));
+        assert!(!sticky_owner_matches(65534, 65534, 0, 65534));
+        assert!(!sticky_owner_matches(65534, 0, 65534, 65534));
+        assert!(!sticky_owner_matches(1001, 1001, 1001, 1001));
     }
 }
