@@ -163,7 +163,7 @@ impl Tmux<'_> {
                     .saturating_sub(start.elapsed())
                     .min(Duration::from_millis(250)),
             );
-            check_notice(&self.capture(t, &t.worker_pane)?, before)?;
+            check_notice(&self.capture(t, t.worker_pane()?)?, before)?;
             if start.elapsed() >= window {
                 return Ok(());
             }
@@ -174,7 +174,7 @@ impl Tmux<'_> {
         if text.contains('\0') {
             return Err(failure("definitely-not-sent", "tmux input contains NUL"));
         }
-        let before = notices(&self.capture(t, &t.worker_pane).map_err(|e| {
+        let before = notices(&self.capture(t, t.worker_pane()?).map_err(|e| {
             if e["result"] == "refused" {
                 e
             } else {
@@ -191,7 +191,7 @@ impl Tmux<'_> {
         let literal = text.replace('\'', "'\\''");
         self.worker_command(
             t,
-            &format!("send-keys -t {} -l -- '{literal}'", t.worker_pane),
+            &format!("send-keys -t {} -l -- '{literal}'", t.worker_pane()?),
         )
         .map_err(|mut err| {
             if err["result"] == "uncertain" {
@@ -203,7 +203,7 @@ impl Tmux<'_> {
         let window = setting("WFC_TYPED_CHECK_SECONDS", 1.5);
         let mut earlier_refusals = before.refusals;
         for retry in 0..=2 {
-            self.worker_command(t, &format!("send-keys -t {} Enter", t.worker_pane))
+            self.worker_command(t, &format!("send-keys -t {} Enter", t.worker_pane()?))
                 .map_err(|_| uncertain("text was typed but Enter was not confirmed"))?;
             let after_text = |err: Value| {
                 if err["category"] == "permission_required" {
@@ -217,13 +217,13 @@ impl Tmux<'_> {
             if host != Some("codex") {
                 break;
             }
-            let first = self.capture(t, &t.worker_pane).map_err(after_text)?;
+            let first = self.capture(t, t.worker_pane()?).map_err(after_text)?;
             check_notice(&first, earlier_refusals)?;
             let Some(draft) = codex_draft(&first).filter(|d| matches_input(d, text)) else {
                 break;
             };
             sleep(Duration::from_millis(300));
-            let second = self.capture(t, &t.worker_pane).map_err(after_text)?;
+            let second = self.capture(t, t.worker_pane()?).map_err(after_text)?;
             check_notice(&second, earlier_refusals)?;
             if Some(draft) != codex_draft(&second) {
                 break;
@@ -246,7 +246,7 @@ impl Tmux<'_> {
             let start = Instant::now();
             let mut last = String::new();
             while start.elapsed() < Duration::from_secs(30) {
-                let screen = self.capture(t, &t.worker_pane).map_err(|_| {
+                let screen = self.capture(t, t.worker_pane()?).map_err(|_| {
                     failure(
                         "definitely-not-sent",
                         "resumed worker started but its prompt could not be observed",

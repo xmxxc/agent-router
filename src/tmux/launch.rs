@@ -89,7 +89,8 @@ pub(super) fn cancelled(state: &Path, id: &str) -> bool {
 
 impl Tmux<'_> {
     pub(super) fn revoke_pending_launch(&self) -> Reply<()> {
-        if let Some(super::binding::Claim::Launch(id)) = self.claim()? {
+        use super::binding::Claim;
+        if let Some(Claim::Launch(id) | Claim::Registered { id, .. }) = self.claim()? {
             let id =
                 Uuid::parse_str(&id).map_err(|_| failure("uncertain", "invalid tmux launch ID"))?;
             let prefix = self.state.join("launches").join(id.simple().to_string());
@@ -223,7 +224,9 @@ impl Tmux<'_> {
                         if binding.trim_end()
                             != format!(
                                 "{} {} {}",
-                                target.session, target.worker_pane, target.server_pid
+                                target.session,
+                                target.worker_pane()?,
+                                target.server_pid
                             )
                         {
                             return Err(started_unverified());
