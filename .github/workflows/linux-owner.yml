@@ -75,19 +75,23 @@ jobs:
             python -Bu "tests/$fixture.py" target/release/wfc 2>&1 | tee "$EVIDENCE/$fixture.log" || failed=1
           done
           exit "$failed"
-      - name: Run the Rust CLI and dispatch regressions
+      - name: Ensure native tmux is available
+        id: tmux
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: product
-        run: cargo test --workspace --release --locked 2>&1 | tee "$EVIDENCE/workspace-tests.log"
-      - name: Verify the callback through an isolated tmux server
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: product
         run: |
           if ! command -v tmux >/dev/null; then
             sudo apt-get update 2>&1 | tee "$EVIDENCE/tmux-install.log"
             sudo apt-get install -y --no-install-recommends tmux 2>&1 | tee -a "$EVIDENCE/tmux-install.log"
           fi
           tmux -V | tee "$EVIDENCE/tmux.log"
+      - name: Run the Rust CLI and dispatch regressions
+        if: ${{ !cancelled() && steps.tmux.outcome == 'success' }}
+        working-directory: product
+        run: cargo test --workspace --release --locked 2>&1 | tee "$EVIDENCE/workspace-tests.log"
+      - name: Verify the callback through an isolated tmux server
+        if: ${{ !cancelled() && steps.tmux.outcome == 'success' }}
+        working-directory: product
+        run: |
           python -Bu tools/check_tmux.py target/release/wfc -v Backend.test_managed_dispatch_callback_survives_takeover \
             2>&1 | tee -a "$EVIDENCE/tmux.log"
       - name: Checksum evidence
