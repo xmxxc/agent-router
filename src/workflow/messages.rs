@@ -1,10 +1,10 @@
-//! A worker posts one completion for its attempt. A controller claims a batch
+//! A worker can retry a keyed completion. A controller claims a batch
 //! before printing it, so another waiter cannot deliver the same messages.
 mod receipt;
 pub use receipt::{Confirm, ACK_USAGE, RESOLVE_USAGE};
 use receipt::{Delivery, Resolution, State};
 
-use super::{state_dir, valid_id};
+use super::{git_snapshot::Snapshot, state_dir, valid_id};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub const DONE_USAGE: &str = "wfc done --report FILE [--attempt ID] [--message-id KEY]";
-pub const WAIT_USAGE: &str = "wfc wait [--timeout SECONDS] [--dispatch ID]";
+pub const WAIT_USAGE: &str = "wfc wait [--timeout SECONDS] [--scope NAME] [--dispatch ID]";
 
 fn options<'a, const N: usize>(
     args: &'a [OsString],
@@ -66,18 +66,29 @@ struct Identity {
     round: u64,
     attempt: String,
     role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
 }
 
 impl Identity {
-    fn from_worker(state: &Path, expected_attempt: Option<&str>) -> Result<Self> {
-        let dispatch = env::var("WFC_DISPATCH")
-            .context("run done inside a dispatched worker (WFC_DISPATCH)")?;
-        ensure!(valid_id(&dispatch), "invalid dispatch ID");
-        let round: u64 = env::var("WFC_ROUND")
-            .context("missing worker round")?
-            .parse()
-            .context("invalid worker round")?;
-        let attempt = env::var("WFC_ATTEMPT").context("missing worker attempt")?;
+    fn scope(&self) -> &str {
+        // Pre-scope receipts still have a stable, per-dispatch scope.
+        self.scope.as_deref().unwrap_or(&self.dispatch)
+    }
+}
+
+#[derive(Deserialize)]
+struct Assignment {
+    #[serde(flatten)]
+    worker: Identity,
+    report: Option<PathBuf>,
+    cwd: PathBuf,
+    #[serde(rename = "controllerOwner")]
+    controller_owner: Option<Value>,
+}
+
+impl Assignment {
+    fn current(state: &Path, dispatch: &str, expected_attempt: Option<&str>) -> Result<Self> {
         let dir = state.join("dispatches");
         // Foreground dispatch writes and syncs .pending before launching us,
         // then renames it to .json. This order of opens also covers the rename.
@@ -88,16 +99,28 @@ impl Identity {
             result => result,
         }
         .with_context(|| format!("open dispatch {dispatch}"))?;
-        let identity: Self = serde_json::from_reader(file).context("read worker identity")?;
+        let assignment: Self = serde_json::from_reader(file).context("read worker assignment")?;
+        let worker = &assignment.worker;
         ensure!(
-            identity.dispatch == dispatch && identity.round == round,
-            "dispatch or round mismatch for {dispatch}"
+            worker.dispatch == dispatch,
+            "dispatch mismatch for {dispatch}"
         );
         ensure!(
-            identity.attempt == attempt && expected_attempt.is_none_or(|id| id == attempt),
+            assignment.controller_owner.is_none(),
+            "controller owner authorization required for {dispatch}"
+        );
+        if let Some(round) = env::var_os("WFC_ROUND") {
+            ensure!(
+                round.to_str().and_then(|s| s.parse::<u64>().ok()) == Some(worker.round),
+                "round mismatch for {dispatch}"
+            );
+        }
+        ensure!(
+            env::var_os("WFC_ATTEMPT").is_none_or(|v| v.to_str() == Some(worker.attempt.as_str()))
+                && expected_attempt.is_none_or(|id| id == worker.attempt),
             "attempt is no longer accepted for {dispatch}"
         );
-        Ok(identity)
+        Ok(assignment)
     }
 }
 
@@ -137,15 +160,15 @@ impl Completion {
             ("role".into(), json!(self.worker.role)),
             ("round".into(), json!(self.worker.round)),
         ]);
-        for key in ["scope", "head", "dirty"] {
+        for key in ["head", "dirty"] {
             if let Some(value) = self.additional_fields.get(key) {
                 body.insert(key.into(), value.clone());
             }
         }
         // The scope-aware publisher uses the dispatch ID for older rows
         // without a scope when it writes their (possibly null) Git snapshot.
-        if body.contains_key("head") && !body.contains_key("scope") {
-            body.insert("scope".into(), json!(self.worker.dispatch));
+        if self.worker.scope.is_some() || body.contains_key("head") {
+            body.insert("scope".into(), json!(self.worker.scope()));
         }
         body
     }
@@ -174,7 +197,7 @@ impl Completion {
 
     fn receipt(&self, duplicate: bool) -> Value {
         let mut receipt = json!({"message": self.id, "messageId": self.message_id, "state": self.delivery.state,
-            "statusVersion": self.delivery.status_version, "duplicate": duplicate});
+            "statusVersion": self.delivery.status_version, "duplicate": duplicate, "scope": self.worker.scope()});
         if let Some(resolution) = &self.resolution {
             receipt["resolution"] = json!(resolution);
         }
@@ -228,7 +251,23 @@ impl Inbox {
         let path = dir.join("messages.json");
         match File::open(&path) {
             Ok(file) => {
-                serde_json::from_reader(BufReader::new(file)).context("read controller messages")
+                let mut messages: Vec<Completion> = serde_json::from_reader(BufReader::new(file))
+                    .context("read controller messages")?;
+                // The first scoped wait on an unclaimed pre-snapshot completion
+                // supplies an unknown Git snapshot. Preserve an already bound
+                // body (including the earlier four-field form) byte for byte.
+                for m in &mut messages {
+                    if m.delivery.legacy_unclaimed
+                        && m.body_hash.is_none()
+                        && m.worker.scope.is_none()
+                        && !m.additional_fields.contains_key("head")
+                        && !m.additional_fields.contains_key("dirty")
+                    {
+                        m.additional_fields.insert("head".into(), Value::Null);
+                        m.additional_fields.insert("dirty".into(), Value::Null);
+                    }
+                }
+                Ok(messages)
             }
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e.into()),
@@ -248,6 +287,72 @@ impl Inbox {
             messages,
             _lock: lock,
         })
+    }
+
+    fn validate_done(
+        &self,
+        assignment: &Assignment,
+        report: &Path,
+        key: Option<&str>,
+        attempt: Option<&str>,
+    ) -> Result<Option<Value>> {
+        let worker = &assignment.worker;
+        let history = || {
+            self.messages
+                .iter()
+                .filter(|m| m.worker.dispatch == worker.dispatch)
+        };
+        let prior = key.and_then(|key| history().find(|m| m.request_key.as_deref() == Some(key)));
+        if let (Some(key), Some(prior)) = (key, prior) {
+            ensure!(
+                prior.worker.attempt == worker.attempt
+                    && prior.worker.round == worker.round
+                    && prior.report == report,
+                "message request {key} conflicts with an existing receipt"
+            );
+        }
+        let previous = history()
+            .find(|m| m.worker.round == worker.round && m.worker.attempt == worker.attempt);
+        if let Some(bound) = assignment
+            .report
+            .as_deref()
+            .or_else(|| previous.map(|m| m.report.as_path()))
+        {
+            ensure!(
+                report == bound,
+                "the current round reports to {}",
+                bound.display()
+            );
+        } else {
+            // Pre-binding Rust records carry no intended filename. Only the original
+            // attempt can establish it, and concurrent first submissions recheck it.
+            ensure!(
+                attempt.is_some() || env::var_os("WFC_ATTEMPT").is_some(),
+                "legacy dispatch has no bound report; supply --attempt"
+            );
+        }
+        if let Some(prior) = prior {
+            return Ok(Some(prior.receipt(true)));
+        }
+        if attempt.is_none() {
+            ensure!(
+                !history().any(|m| (m.worker.round != worker.round
+                    || m.worker.attempt != worker.attempt)
+                    && m.report == report),
+                "ambiguous report for {}; supply --attempt",
+                worker.dispatch
+            );
+            let earlier_rounds: std::collections::BTreeSet<_> = history()
+                .map(|m| m.worker.round)
+                .filter(|round| (1..worker.round).contains(round))
+                .collect();
+            ensure!(
+                worker.round.checked_sub(1) == Some(earlier_rounds.len() as u64),
+                "incomplete round history for {}; supply --attempt",
+                worker.dispatch
+            );
+        }
+        Ok(None)
     }
 
     fn save(&self) -> Result<()> {
@@ -316,37 +421,52 @@ impl<'a> Done<'a> {
         ensure!(report.is_file(), "report not found: {}", report.display());
         ensure!(report.to_str().is_some(), "report path must be UTF-8");
         let state = state_dir()?;
-        let mut inbox = Inbox::open(&state)?;
-        let worker = Identity::from_worker(&state, self.attempt)?;
+        let dispatch = env::var("WFC_DISPATCH")
+            .context("run done inside a dispatched worker (WFC_DISPATCH)")?;
+        ensure!(valid_id(&dispatch), "invalid dispatch ID");
         let key = self
             .key
             .map(str::to_owned)
-            .unwrap_or_else(|| format!("done:{}:{}", worker.dispatch, worker.attempt));
-        if let Some(prior) = inbox.messages.iter().find(|m| {
-            m.worker.dispatch == worker.dispatch
-                && (m.request_key.as_deref() == Some(key.as_str())
-                    || m.worker.attempt == worker.attempt)
-        }) {
-            ensure!(
-                prior.worker.attempt == worker.attempt
-                    && prior.worker.round == worker.round
-                    && prior.report == report
-                    && prior.request_key.as_deref() == Some(key.as_str()),
-                "message request {key} conflicts with an existing receipt"
-            );
-            return Ok(prior.receipt(true));
+            .or_else(|| self.attempt.map(|id| format!("done:{dispatch}:{id}")));
+        let check = || {
+            let inbox = Inbox::open(&state)?;
+            let assignment = Assignment::current(&state, &dispatch, self.attempt)?;
+            let receipt =
+                inbox.validate_done(&assignment, &report, key.as_deref(), self.attempt)?;
+            Ok::<_, anyhow::Error>((assignment, inbox, receipt))
+        };
+        let (initial, inbox, duplicate) = check()?;
+        if let Some(receipt) = duplicate {
+            return Ok(receipt);
+        }
+        // Git can block. Let unrelated callbacks and waits proceed while sampling.
+        drop(inbox);
+        let snapshot = Snapshot::read(&initial.cwd);
+        let (current, mut inbox, duplicate) = check()?;
+        ensure!(
+            initial.worker.round == current.worker.round
+                && initial.worker.attempt == current.worker.attempt
+                && initial.cwd == current.cwd
+                && initial.worker.scope() == current.worker.scope(),
+            "assignment changed while sampling {dispatch}"
+        );
+        if let Some(receipt) = duplicate {
+            return Ok(receipt);
         }
         let mut message = Completion {
             id: inbox.messages.len() as u64 + 1,
             message_id: format!("m-{}", Uuid::new_v4().simple()),
-            worker,
+            worker: current.worker,
             report,
-            request_key: Some(key),
+            request_key: key,
             body_hash: None,
             delivery: Delivery::unsent(),
             resolution: None,
             created_at: Some(receipt::timestamp()),
-            additional_fields: Map::new(),
+            additional_fields: Map::from_iter([
+                ("head".into(), json!(snapshot.head)),
+                ("dirty".into(), json!(snapshot.dirty)),
+            ]),
         };
         message.body_hash = Some(message.computed_hash());
         let receipt = message.receipt(false);
@@ -359,11 +479,13 @@ impl<'a> Done<'a> {
 pub struct Wait<'a> {
     timeout: Duration,
     dispatch: Option<&'a str>,
+    scope: Option<&'a str>,
 }
 
 impl<'a> Wait<'a> {
     pub fn parse(args: &'a [OsString]) -> Result<Self> {
-        let [timeout, dispatch] = options(args, ["--timeout", "--dispatch"], None)?;
+        let [timeout, dispatch, scope] =
+            options(args, ["--timeout", "--dispatch", "--scope"], None)?;
         let seconds: f64 = timeout
             .unwrap_or("3600")
             .parse()
@@ -371,7 +493,11 @@ impl<'a> Wait<'a> {
         ensure!(seconds.is_finite(), "expected a finite timeout");
         let timeout = Duration::try_from_secs_f64(seconds.max(0.0)).context("invalid timeout")?;
         ensure!(dispatch.is_none_or(valid_id), "invalid dispatch ID");
-        Ok(Self { timeout, dispatch })
+        Ok(Self {
+            timeout,
+            dispatch,
+            scope,
+        })
     }
 
     fn take(&self, state: &Path) -> Result<Vec<Value>> {
@@ -388,6 +514,7 @@ impl<'a> Wait<'a> {
             .filter(|m| {
                 m.delivery.state == State::Unsent
                     && self.dispatch.is_none_or(|id| id == m.worker.dispatch)
+                    && self.scope.is_none_or(|scope| scope == m.worker.scope())
             })
             .map(Completion::receive)
             .collect::<Result<_>>()?;

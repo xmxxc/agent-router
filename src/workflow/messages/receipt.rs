@@ -26,6 +26,10 @@ pub(super) enum State {
 pub(super) struct Delivery {
     pub state: State,
     pub status_version: u64,
+    // Only the boolean-only publisher predates both status versions and Git
+    // snapshots. Versioned rows may also lack a hash after an inbox rewrite.
+    #[serde(skip)]
+    pub legacy_unclaimed: bool,
 }
 
 #[derive(Deserialize)]
@@ -49,6 +53,7 @@ impl TryFrom<StoredDelivery> for Delivery {
         Ok(Self {
             state,
             status_version: version,
+            legacy_unclaimed: stored.state.is_none() && stored.received == Some(false),
         })
     }
 }
@@ -58,6 +63,7 @@ impl Delivery {
         Self {
             state: State::Unsent,
             status_version: 1,
+            legacy_unclaimed: false,
         }
     }
 

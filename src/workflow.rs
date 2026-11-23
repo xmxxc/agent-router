@@ -1,3 +1,4 @@
+mod git_snapshot;
 pub mod messages;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -11,13 +12,15 @@ use std::process::{Command, Stdio};
 use uuid::Uuid;
 
 pub const DISPATCH_USAGE: &str =
-    "wfc dispatch --role ROLE --task FILE --cwd DIR -- PROGRAM [ARG ...]";
+    "wfc dispatch --role ROLE --task FILE --cwd DIR [--report FILE] [--scope NAME] -- PROGRAM [ARG ...]";
 pub const STATUS_USAGE: &str = "wfc status [--dispatch ID]";
 
 pub struct Dispatch<'a> {
     role: &'a str,
     task: &'a Path,
     cwd: &'a Path,
+    report: Option<&'a Path>,
+    scope: Option<&'a str>,
     worker: &'a [OsString],
 }
 
@@ -34,6 +37,7 @@ impl<'a> Dispatch<'a> {
             "missing worker program"
         );
         let (mut role, mut task, mut cwd) = (None, None, None);
+        let (mut report, mut scope) = (None, None);
         for pair in options.chunks(2) {
             let [flag, value] = pair else {
                 bail!("option requires a value")
@@ -43,6 +47,8 @@ impl<'a> Dispatch<'a> {
                 Some("--role") => &mut role,
                 Some("--task") => &mut task,
                 Some("--cwd") => &mut cwd,
+                Some("--scope") => &mut scope,
+                Some("--report") => &mut report,
                 _ => bail!("unknown dispatch option {:?}", flag),
             };
             ensure!(slot.replace(value).is_none(), "duplicate option {:?}", flag);
@@ -56,6 +62,10 @@ impl<'a> Dispatch<'a> {
             role,
             task: Path::new(task.context("missing --task")?),
             cwd: Path::new(cwd.context("missing --cwd")?),
+            scope: scope
+                .map(|v| v.to_str().context("scope must be UTF-8"))
+                .transpose()?,
+            report: report.map(Path::new),
             worker,
         })
     }
@@ -82,8 +92,23 @@ impl<'a> Dispatch<'a> {
         let dispatch = format!("d-{}", Uuid::new_v4().simple());
         let attempt = format!("a-{}", Uuid::new_v4().simple());
         let round = 1;
+        let scope = self
+            .scope
+            .unwrap_or("")
+            .split(|c: char| c.is_whitespace() || c.is_ascii_control())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let scope = if scope.is_empty() {
+            format!("s-{}", Uuid::new_v4().simple())
+        } else {
+            scope.chars().take(120).collect()
+        };
+        let default_report = cwd.join("report.md");
+        let report = report_destination(self.report.unwrap_or(&default_report))?;
         let record = json!({
             "dispatch": dispatch, "round": round, "attempt": attempt, "role": self.role,
+            "report": report.to_str().context("report path must be UTF-8")?, "scope": scope,
             "task": task.to_str().context("task path must be UTF-8")?,
             "cwd": cwd.to_str().context("worker directory must be UTF-8")?,
         });
@@ -109,6 +134,8 @@ impl<'a> Dispatch<'a> {
                 .env("WFC_ATTEMPT", &attempt)
                 .env("WFC_ROLE", self.role)
                 .env("WFC_TASK", &task)
+                .env("WFC_REPORT", &report)
+                .env("WFC_SCOPE", &scope)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .status()
@@ -126,6 +153,26 @@ impl<'a> Dispatch<'a> {
             format!("worker succeeded but publishing dispatch {dispatch} failed")
         })?;
         Ok(record)
+    }
+}
+
+// The worker usually creates the file later. Bind its resolved parent now so
+// callbacks from another current directory or via a symlink compare equally.
+fn report_destination(path: &Path) -> Result<PathBuf> {
+    let path = std::path::absolute(path)?;
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let report = path.canonicalize().context("resolve report destination")?;
+            ensure!(report.is_file(), "--report must name a file");
+            Ok(report)
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            let parent = path.parent().context("missing report directory")?;
+            let name = path.file_name().context("missing report filename")?;
+            fs::create_dir_all(parent).context("create report directory")?;
+            Ok(parent.canonicalize()?.join(name))
+        }
+        Err(e) => Err(e).context("inspect report destination"),
     }
 }
 

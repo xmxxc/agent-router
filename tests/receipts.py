@@ -22,7 +22,7 @@ class Receipts(unittest.TestCase):
         self.env["WFC_STATE"] = str(self.state)
         (self.root / "task").touch()
         self.dispatch = self.run_cli("dispatch", "--role", '复核 "\\n"\t员', "--task", "task",
-                                     "--cwd", ".", "--", sys.executable, "-c", "pass")
+                                     "--cwd", ".", "--report", "task", "--", sys.executable, "-c", "pass")
         self.id = self.dispatch["dispatch"]
         self.worker = dict(self.env, WFC_DISPATCH=self.id, WFC_ROUND="1",
                            WFC_ATTEMPT=self.dispatch["attempt"])
@@ -118,12 +118,35 @@ class Receipts(unittest.TestCase):
                 dict(legacy, id=2, messageId="m-old2", received=False)]
         path.write_text(json.dumps(rows), encoding="utf-8")
         before = path.read_bytes()
-        self.assertEqual([m["statusVersion"] for m in self.history()], [2, 1])
+        received, pending = self.history()
+        self.assertEqual([received["statusVersion"], pending["statusVersion"]], [2, 1])
+        self.assertNotIn("head", received)
+        self.assertEqual([pending[k] for k in ("scope", "head", "dirty")], [self.id, None, None])
         self.assertEqual(path.read_bytes(), before)
         self.run_cli("ack", "1")
-        self.assertEqual([m["id"] for m in self.run_cli("wait", "--timeout", "0")["messages"]], [2])
+        claimed, = self.run_cli("wait", "--scope", self.id, "--timeout", "0")["messages"]
+        self.assertEqual(claimed["id"], 2)
+        self.assertEqual(self.body(claimed), self.body(pending))
         self.assertEqual([(m["state"], m["statusVersion"]) for m in self.history()],
                          [("processed", 3), ("received", 2)])
+
+    def test_pre_scope_versioned_receipt_keeps_original_body(self):
+        path = self.state / "messages.json"
+        row, = json.loads(path.read_bytes())
+        for field in ("scope", "head", "dirty"):
+            del row[field]
+        canonical = self.body(row)
+        row["body_hash"] = hashlib.sha256(canonical.encode()).hexdigest()
+        unsigned = dict(row, id=2, messageId="m-migrated-unsigned")
+        del unsigned["body_hash"]
+        path.write_text(json.dumps([row, unsigned]), encoding="utf-8")
+        self.assertEqual([self.body(msg) for msg in self.history()], [canonical, canonical])
+        claimed = self.run_cli("wait", "--scope", self.id, "--timeout", "0")["messages"]
+        for msg in claimed:
+            self.assertEqual(self.body(msg), canonical)
+            self.run_cli("ack", msg["messageId"], "--body", self.body(dict(msg, scope=self.id)), code=1)
+            self.run_cli("ack", msg["messageId"], "--body", canonical)
+        self.assertEqual([self.body(msg) for msg in self.history()], [canonical, canonical])
 
     def test_scoped_snapshot_survives_confirmation(self):
         # A revised #6 publisher can omit the request key and store null Git data.
