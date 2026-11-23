@@ -145,15 +145,7 @@ pub fn close(id: &str, explicit_token: Option<&str>) -> Result<Value> {
     let dir = state.join("dispatches");
     let record = super::assignment::public_record(&dir, id)?
         .with_context(|| format!("unknown dispatch {id}"))?;
-    ensure!(
-        record["publicationDiagnostic"].is_null(),
-        "close uncertain: {}",
-        record["publicationDiagnostic"]
-    );
-    ensure!(
-        record.get("controllerOwner").is_none_or(Value::is_null),
-        "controller owner authorization required"
-    );
+    validate_close(&record)?;
     let scope = record_scope(&record).context("invalid dispatch scope")?;
     let token = controller::token(explicit_token);
     let authorize = || controller::Owners::read(&state)?.require(scope, token.as_deref(), "close");
@@ -168,17 +160,37 @@ pub fn close(id: &str, explicit_token: Option<&str>) -> Result<Value> {
     }
     let _scope_lock = controller::lock_scope(&state, scope)?;
     authorize()?;
+    close_locked(&state, &record)
+}
+
+pub(super) fn validate_close(record: &Value) -> Result<()> {
+    ensure!(
+        record["publicationDiagnostic"].is_null(),
+        "close uncertain: {}",
+        record["publicationDiagnostic"]
+    );
+    ensure!(
+        record.get("controllerOwner").is_none_or(Value::is_null),
+        "controller owner authorization required"
+    );
+    Ok(())
+}
+
+// The caller holds the authorized scope lock for this assignment.
+pub(super) fn close_locked(state: &Path, record: &Value) -> Result<Value> {
+    let id = record["dispatch"].as_str().context("missing dispatch")?;
+    let dir = state.join("dispatches");
     if record["host"].is_string() {
-        return super::backend::close(&state, &record);
+        return super::backend::close(state, record);
     }
     // Older foreground records were only published after successful exit.
     let mut already_gone = true;
     if record.get("worker").is_some() {
-        let (reader, unlocked) = open_owner(&dir, &record, false)?;
+        let (reader, unlocked) = open_owner(&dir, record, false)?;
         let (owner, unlocked) = if unlocked {
             (reader, true)
         } else {
-            open_owner(&dir, &record, true)?
+            open_owner(&dir, record, true)?
         };
         already_gone = unlocked;
         if !already_gone {

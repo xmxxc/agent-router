@@ -21,6 +21,8 @@ mod backend;
 #[cfg(target_os = "linux")]
 pub mod herdr;
 pub mod host;
+#[cfg(target_os = "linux")]
+pub mod reclaim;
 mod view;
 
 pub const DISPATCH_USAGE: &str =
@@ -601,6 +603,72 @@ fn legacy_status_state(id: Option<&OsStr>) -> Result<Option<PathBuf>> {
     }
 }
 
+fn observe_dispatch(
+    state: &Path,
+    dir: &Path,
+    record: &mut Value,
+    read_only: bool,
+) -> Result<Value> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = dir;
+    if record["createPending"] == true && record["publicationDiagnostic"].is_string() {
+        record["worker"] = json!({"state":"unknown"});
+        record["backendResult"] = json!("uncertain");
+        record["backendAlive"] = Value::Null;
+        return Ok(json!({"result":"uncertain","diagnostic":record["publicationDiagnostic"]}));
+    } else if record["host"].is_string() {
+        let (worker, inspection) = backend::observe(state, record, read_only)?;
+        backend::copy_close_fields(&inspection, record);
+        record["worker"] = worker;
+        record["backendResult"] = inspection["result"].clone();
+        if record["backend"] == "herdr" && inspection["diagnostic"].is_string() {
+            record["backendDiagnostic"] = inspection["diagnostic"].clone();
+        }
+        record["backendAlive"] = if inspection["alive"] == true && inspection["owned"] != true {
+            Value::Null
+        } else {
+            inspection["alive"].clone()
+        };
+        return Ok(inspection);
+    } else {
+        #[cfg(target_os = "linux")]
+        if record.get("worker").is_some() {
+            record["worker"] = match worker_owner::status(dir, record) {
+                Ok(worker) => worker,
+                Err(_) if record["createPending"] == true => json!({"state":"unknown"}),
+                Err(e) => return Err(e),
+            };
+        }
+        record["backendAlive"] = match record["worker"]["state"].as_str() {
+            Some("running") => json!(true),
+            Some("unknown") => Value::Null,
+            _ => json!(false),
+        };
+    }
+    let alive = &record["backendAlive"];
+    Ok(if alive.is_null() {
+        json!({"result":"uncertain","diagnostic":"worker state is unconfirmed"})
+    } else {
+        json!({"result":"accepted","alive":alive,"owned":true})
+    })
+}
+
+fn project_dispatch(record: &mut Value, messages: &[Value], named: bool) -> Result<()> {
+    let alive = record["backendAlive"].as_bool();
+    if record["createPending"] == true && !assignment::identified(record) {
+        for field in ["state", "status", "lifecycle"] {
+            record[field] = json!("unknown");
+        }
+        record["rounds"] = json!([]);
+        if named {
+            record["messages"] = json!(messages);
+        }
+    } else {
+        view::project(record, messages, alive, named)?;
+    }
+    Ok(())
+}
+
 // The integrated message ledger supplies #7's read-only messages::history.
 fn status_with_history(
     id: Option<&OsStr>,
@@ -640,38 +708,7 @@ fn status_with_history(
     let mut reclaimable = Vec::new();
     let owners = controller::Owners::read(&state)?;
     for record in &mut dispatches {
-        if record["createPending"] == true && record["publicationDiagnostic"].is_string() {
-            record["worker"] = json!({"state":"unknown"});
-            record["backendResult"] = json!("uncertain");
-            record["backendAlive"] = Value::Null;
-        } else if record["host"].is_string() {
-            let (worker, inspection) = backend::observe(&state, record)?;
-            backend::copy_close_fields(&inspection, record);
-            record["worker"] = worker;
-            record["backendResult"] = inspection["result"].clone();
-            if record["backend"] == "herdr" && inspection["diagnostic"].is_string() {
-                record["backendDiagnostic"] = inspection["diagnostic"].clone();
-            }
-            record["backendAlive"] = if inspection["alive"] == true && inspection["owned"] != true {
-                Value::Null
-            } else {
-                inspection["alive"].clone()
-            };
-        } else {
-            #[cfg(target_os = "linux")]
-            if record.get("worker").is_some() {
-                record["worker"] = match worker_owner::status(&dir, record) {
-                    Ok(worker) => worker,
-                    Err(_) if record["createPending"] == true => json!({"state":"unknown"}),
-                    Err(e) => return Err(e),
-                };
-            }
-            record["backendAlive"] = match record["worker"]["state"].as_str() {
-                Some("running") => json!(true),
-                Some("unknown") => Value::Null,
-                _ => json!(false),
-            };
-        }
+        observe_dispatch(&state, &dir, record, false)?;
         record
             .as_object_mut()
             .unwrap()
@@ -699,25 +736,17 @@ fn status_with_history(
                 })
                 .cloned(),
         );
-        let alive = record["backendAlive"].as_bool();
-        if record["createPending"] == true && !assignment::identified(record) {
-            for field in ["state", "status", "lifecycle"] {
-                record[field] = json!("unknown");
-            }
-            record["rounds"] = json!([]);
-            if id.is_some() {
-                record["messages"] = json!(messages);
-            }
-        } else {
-            view::project(record, &messages, alive, id.is_some())?;
-        }
+        project_dispatch(record, &messages, id.is_some())?;
     }
     if active {
         dispatches.retain(|row| {
-            if row["state"] != "done" || row["closePending"] == true {
+            if row["state"] != "done"
+                || row["closePending"] == true
+                || row["resourceCleanup"] == "uncertain"
+            {
                 return true;
             }
-            if row["backendAlive"] == true {
+            if row["backendAlive"] == true && row["reclaimed"].is_null() {
                 reclaimable.push(
                     json!({"dispatch":row["dispatch"],"label":row["label"],"tmux":row["tmux"]}),
                 );

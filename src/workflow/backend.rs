@@ -140,12 +140,15 @@ fn legacy_launch_hint(row: &Value) -> Result<Option<&str>> {
     Ok(hint.or(id))
 }
 
-fn existing(state: &Path, row: &Value, op: &str) -> Result<Value> {
+fn existing(state: &Path, row: &Value, op: &str, read_only: bool) -> Result<Value> {
     let attempt = row["attempt"]
         .as_str()
         .filter(|v| valid_identity(v, "a-"))
         .context("missing existing execution identity")?;
     let mut request = json!({"op":op});
+    if read_only {
+        request["readOnly"] = json!(true);
+    }
     if !row["executionId"].is_null() {
         ensure!(
             row["executionId"] == attempt,
@@ -407,6 +410,7 @@ fn closed_worker(
     row: &Value,
     saved: &Value,
     inspect_legacy: bool,
+    read_only: bool,
 ) -> Result<Option<Value>> {
     let worker = &saved["worker"];
     if saved["closeEffect"] == "session_closed" && worker["state"] == "cancelled" {
@@ -442,7 +446,7 @@ fn closed_worker(
                 if !inspect_legacy {
                     return Ok(None);
                 }
-                match existing(state, row, "inspect") {
+                match existing(state, row, "inspect", read_only) {
                     Ok(reply) if reply["result"] == "accepted" && reply["alive"] == false => known,
                     _ => None,
                 }
@@ -572,20 +576,21 @@ pub(super) fn herdr_worker(evidence: &Value, inspection: &Value) -> Value {
     }
 }
 
-pub fn observe(state: &Path, row: &mut Value) -> Result<(Value, Value)> {
+pub fn observe(state: &Path, row: &mut Value, read_only: bool) -> Result<(Value, Value)> {
     #[cfg(target_os = "linux")]
     if row["backend"] == "herdr" {
-        return super::herdr::observe(state, row);
+        return super::herdr::observe(state, row, read_only);
     }
     let saved = archive(state, row)?.unwrap_or(Value::Null);
     if confirmed(row, &saved) {
         let mut observation = json!({"result":"completed","alive":false});
         copy_close_fields(&saved, &mut observation);
-        let worker = closed_worker(state, row, &saved, true)?.context("missing archived worker")?;
+        let worker = closed_worker(state, row, &saved, true, read_only)?
+            .context("missing archived worker")?;
         return Ok((worker, observation));
     }
 
-    let (worker, mut inspection) = inspect_worker(state, row, &saved)?;
+    let (worker, mut inspection) = inspect_worker(state, row, &saved, read_only)?;
     let revoked = saved_revocation(row, &saved).filter(|_| worker["state"] == "not_started");
     // A legacy release can replay an old absence from the backend's history,
     // even if the public archive never made it to disk.
@@ -625,9 +630,17 @@ pub(super) fn copy_close_fields(saved: &Value, output: &mut Value) {
     }
 }
 
-fn inspect_worker(state: &Path, row: &Value, saved: &Value) -> Result<(Value, Value)> {
-    let mut inspection = existing(state, row, "inspect")
+fn inspect_worker(
+    state: &Path,
+    row: &Value,
+    saved: &Value,
+    read_only: bool,
+) -> Result<(Value, Value)> {
+    let mut inspection = existing(state, row, "inspect", read_only)
         .unwrap_or_else(|e| json!({"result":"uncertain","diagnostic":e.to_string()}));
+    if read_only && inspection["alive"] == true && inspection["owned"] == false {
+        return Ok((json!({"state":"unknown"}), inspection));
+    }
     let evidence = match inspect_launch(state, row, &inspection) {
         Ok(id) => private_receipt(state, id)?,
         Err(e) => {
@@ -657,7 +670,7 @@ fn close_receipt(row: &Value) -> Value {
 }
 
 fn replay(state: &Path, row: &Value, saved: &Value, inspect_legacy: bool) -> Result<Option<Value>> {
-    let Some(worker) = closed_worker(state, row, saved, inspect_legacy)? else {
+    let Some(worker) = closed_worker(state, row, saved, inspect_legacy, false)? else {
         return Ok(None);
     };
     let mut receipt = close_receipt(row);
@@ -701,7 +714,7 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
     }
 
     let mut receipt = close_receipt(row);
-    let (before, observed) = inspect_worker(state, row, &saved)?;
+    let (before, observed) = inspect_worker(state, row, &saved, false)?;
     let previous_revocation = saved_revocation(row, &saved);
     let pending_native = (row["createPending"] == true || row["create"]["result"] == "uncertain")
         && row["executionId"].is_string()
@@ -723,7 +736,7 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
     }
 
     let launch = inspect_launch(state, row, &observed)?;
-    let mut answer = existing(state, row, if recovery { "revoke" } else { "close" })?;
+    let mut answer = existing(state, row, if recovery { "revoke" } else { "close" }, false)?;
     let mut cancellation = revocation_reply(state, row, &answer)?;
     if let Some(previous) = previous_revocation {
         // A legacy archive can preserve the worker fact across disconnection.
@@ -733,7 +746,7 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
             "close uncertain: conflicting worker evidence"
         );
         if answer["result"] == "uncertain" {
-            answer = existing(state, row, "close")?;
+            answer = existing(state, row, "close", false)?;
             cancellation = revocation_reply(state, row, &answer)?;
         }
     }

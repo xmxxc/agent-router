@@ -190,6 +190,12 @@ fn canonical_body(body: Map<String, Value>) -> String {
 }
 
 impl Completion {
+    fn is_done(&self) -> bool {
+        self.additional_fields
+            .get("type")
+            .is_none_or(|kind| kind == "done")
+    }
+
     fn original_body(&self) -> Map<String, Value> {
         Map::from_iter([
             ("attempt".into(), json!(self.worker.attempt)),
@@ -230,7 +236,8 @@ impl Completion {
         // request key on every row. Its rewrite dropped newer fields. Only
         // publication-time values count: later claims can bind a digest or
         // add null Git fields even on a genuine legacy row.
-        self.request_key.is_some()
+        self.is_done()
+            && self.request_key.is_some()
             && self.worker.scope.is_none()
             && self.created_at.is_none()
             && self
@@ -283,10 +290,19 @@ impl Completion {
             ("id".into(), json!(self.id)),
             ("messageId".into(), json!(self.message_id)),
             ("dispatch".into(), json!(self.worker.dispatch)),
-            ("type".into(), json!("done")),
+            (
+                "type".into(),
+                self.additional_fields
+                    .get("type")
+                    .cloned()
+                    .unwrap_or_else(|| json!("done")),
+            ),
             ("state".into(), json!(state)),
             ("statusVersion".into(), json!(version)),
         ]);
+        if let Some(tmux) = self.additional_fields.get("tmux") {
+            view.insert("tmux".into(), tmux.clone());
+        }
         Value::Object(view)
     }
 
@@ -345,7 +361,8 @@ impl Inbox {
                 // supplies an unknown Git snapshot. Preserve an already bound
                 // body (including the earlier four-field form) byte for byte.
                 for m in &mut messages {
-                    if m.delivery.legacy_unclaimed
+                    if m.is_done()
+                        && m.delivery.legacy_unclaimed
                         && m.body_hash.is_none()
                         && m.worker.scope.is_none()
                         && !m.additional_fields.contains_key("head")
@@ -395,7 +412,8 @@ impl Inbox {
             .messages
             .iter_mut()
             .filter(|m| {
-                m.delivery.state == State::Unsent
+                m.is_done()
+                    && m.delivery.state == State::Unsent
                     && dispatch.is_none_or(|id| id == m.worker.dispatch)
                     && scope.is_none_or(|scope| scope == m.worker.scope())
             })
@@ -421,7 +439,7 @@ impl Inbox {
         let history = || {
             self.messages
                 .iter()
-                .filter(|m| m.worker.dispatch == worker.dispatch)
+                .filter(|m| m.is_done() && m.worker.dispatch == worker.dispatch)
         };
         let prior = key.and_then(|key| history().find(|m| m.request_key.as_deref() == Some(key)));
         if let (Some(key), Some(prior)) = (key, prior) {
@@ -508,7 +526,7 @@ pub(super) fn history(state: &Path, dispatch: &str) -> Result<Vec<Value>> {
         .filter(|m| m.worker.dispatch == dispatch)
         .map(|m| {
             let mut view = m.view();
-            view["to"] = json!("controller");
+            view["to"] = json!(if m.is_done() { "controller" } else { "worker" });
             view["delivered"] = json!(m.delivery.delivered());
             view["at"] = json!(m.created_at);
             if let Some(resolution) = &m.resolution {
@@ -517,6 +535,47 @@ pub(super) fn history(state: &Path, dispatch: &str) -> Result<Vec<Value>> {
             view
         })
         .collect())
+}
+
+#[cfg(target_os = "linux")]
+pub(super) struct Reclaimed {
+    worker: Identity,
+    tmux: Value,
+    report: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl Reclaimed {
+    // Validate the ledger identity before closing a resource.
+    pub(super) fn prepare(row: &Value) -> Result<Self> {
+        Ok(Self {
+            worker: Identity::deserialize(row).context("read reclaim assignment identity")?,
+            tmux: row["tmux"].clone(),
+            report: Option::<PathBuf>::deserialize(&row["report"])?.unwrap_or_default(),
+        })
+    }
+
+    pub(super) fn publish(self, state: &Path) -> Result<u64> {
+        let mut inbox = Inbox::open(state)?;
+        let id = inbox.messages.len() as u64 + 1;
+        inbox.messages.push(Completion {
+            id,
+            message_id: format!("m-{}", Uuid::new_v4().simple()),
+            worker: self.worker,
+            report: self.report,
+            request_key: None,
+            body_hash: None,
+            delivery: Delivery::unsent(),
+            resolution: None,
+            created_at: Some(receipt::timestamp()),
+            additional_fields: Map::from_iter([
+                ("type".into(), json!("reclaimed")),
+                ("tmux".into(), self.tmux),
+            ]),
+        });
+        inbox.save().context("publish reclaim history")?;
+        Ok(id)
+    }
 }
 
 pub struct Done<'a> {

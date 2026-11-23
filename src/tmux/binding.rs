@@ -559,6 +559,19 @@ impl Tmux<'_> {
     }
 
     pub(super) fn lock_dispatch(&self) -> Reply<File> {
+        let path = self.claim_path().with_extension("lock");
+        if self.read_only {
+            let lock = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+                .map_err(|_| unknown())?;
+            if !lock.metadata().map_err(|_| unknown())?.is_file() {
+                return Err(unknown());
+            }
+            lock.lock().map_err(|_| unknown())?;
+            return Ok(lock);
+        }
         let dir = self.state.join("tmux");
         DirBuilder::new()
             .recursive(true)
@@ -571,7 +584,7 @@ impl Tmux<'_> {
             .read(true)
             .write(true)
             .mode(0o600)
-            .open(self.claim_path().with_extension("lock"))
+            .open(path)
             .map_err(|_| unknown())?;
         lock.lock().map_err(|_| unknown())?;
         Ok(lock)
@@ -1384,6 +1397,9 @@ impl Tmux<'_> {
         } else {
             hints.pane.clone()
         };
+        if adopting && self.read_only {
+            return Err(unknown());
+        }
         if adopting {
             let token = Uuid::new_v4().simple().to_string();
             self.guarded(
@@ -1394,7 +1410,7 @@ impl Tmux<'_> {
             )?;
             t.token = token;
         }
-        if adopting || newly_verified || saved != hints {
+        if !self.read_only && (adopting || newly_verified || saved != hints) {
             self.replace_claim(&Claim::Observed {
                 execution,
                 hints,

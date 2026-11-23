@@ -1,6 +1,7 @@
 """Exercise the private backend interface with a fresh tmux server and state roots."""
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -233,6 +234,174 @@ subprocess.run([os.environ["WFC_BIN"], "done", "--report", "report", "--attempt"
         self.assertEqual((ack["state"], ack["statusVersion"]), ("processed", 3))
         self.assertEqual(wfc("close", dispatch["dispatch"], "--owner-token", b["token"])["result"], "completed")
         print(json.dumps({"tmuxCallbackReceipt": ack, "attempt": message["attempt"]}), flush=True)
+
+    def reclaim_cli(self, *args, code=0, **env):
+        result = subprocess.run([WFC, *args], cwd=self.work, text=True, capture_output=True,
+                                env={**self.env, "WFC_STATE": str(self.state), **env}, timeout=25)
+        self.assertEqual(result.returncode, code, result)
+        return result
+
+    def reclaim_dispatch(self, label, finished=False, scope=None, token=None):
+        (self.work / "task").write_text("private reclaim test")
+        report = self.work / f"{label}.md"
+        config = self.work / f"{label}.json"
+        script = """
+import os, subprocess, sys, time
+from pathlib import Path
+if sys.argv[1] == "True":
+    Path(os.environ["WFC_REPORT"]).write_text("saved fixture report")
+    subprocess.run([os.environ["WFC_BIN"], "done", "--report", os.environ["WFC_REPORT"],
+                    "--attempt", os.environ["WFC_ATTEMPT"]], check=True, timeout=5)
+time.sleep(120)
+"""
+        config.write_text(json.dumps({"hosts": {"codex": {
+            "command": [sys.executable, "-c", script, str(finished)]
+        }}}))
+        authorization = [] if scope is None else ["--scope", scope, "--owner-token", token]
+        result = self.reclaim_cli("dispatch", "--host", "codex", "--cwd", ".",
+                                  "--task", "task", "--label", label, "--report", str(report),
+                                  "--launch-config", str(config), *authorization)
+        row = json.loads(result.stdout)
+        if finished:
+            deadline = time.monotonic() + 10
+            while self.reclaim_status(row)["state"] != "done":
+                self.assertLess(time.monotonic(), deadline, "worker did not publish done")
+                time.sleep(.025)
+        return row
+
+    def reclaim_status(self, row):
+        return json.loads(self.reclaim_cli("status", "--dispatch", row["dispatch"]).stdout)["dispatches"][0]
+
+    def test_public_reclaim_preview_mixed_results_and_history(self):
+        checkout = self.work / "checkout-marker"
+        checkout.write_text("private workspace contents")
+        finished = self.reclaim_dispatch("finished", finished=True)
+        unfinished = self.reclaim_dispatch("unfinished")
+        gone = self.reclaim_dispatch("gone", finished=True)
+        refused = self.reclaim_dispatch("refused", finished=True)
+        blocked = self.reclaim_dispatch("blocked")
+        self.reclaim_cli("close", gone["dispatch"])
+        self.other.mkdir()
+        subprocess.run(self.tmux + ["set-environment", "-t", "=" + refused["tmux"],
+                                   "WFC_STATE", str(self.other)], env=self.env, check=True)
+        subprocess.run(self.tmux + ["link-window", "-s", "sibling:0", "-t",
+                                   blocked["tmux"] + ":9"], env=self.env, check=True)
+
+        def snapshot_state():
+            return {p.relative_to(self.state): p.read_bytes()
+                    for p in self.state.rglob("*") if p.is_file()}
+
+        before = snapshot_state()
+        preview = self.reclaim_cli("reclaim")
+        self.assertFalse(preview.stderr)
+        self.assertEqual([(r["dispatch"], r["result"]) for r in json.loads(preview.stdout)["sessions"]],
+                         [(finished["dispatch"], "listed"), (refused["dispatch"], "refused")])
+        named = self.reclaim_cli("reclaim", "--dispatch", unfinished["dispatch"],
+                                "--dispatch", unfinished["dispatch"], "--dispatch", refused["dispatch"])
+        self.assertFalse(named.stderr)
+        named_items = json.loads(named.stdout)["sessions"]
+        self.assertEqual([(r["result"], r["reclaimable"]) for r in named_items],
+                         [("listed", False), ("refused", True)])
+        rejected = self.reclaim_cli("reclaim", "--yes", "--dispatch", finished["dispatch"],
+                                   "--dispatch", "d-000000ff", code=1)
+        self.assertFalse(rejected.stdout)
+        self.assertIn("unknown dispatch d-000000ff", rejected.stderr)
+        self.assertEqual(snapshot_state(), before)
+
+        targets = (gone, refused, blocked, finished, unfinished, finished)
+        options = [part for row in targets for part in ("--dispatch", row["dispatch"])]
+        mixed = self.reclaim_cli("reclaim", "--yes", *options, code=1)
+        items = json.loads(mixed.stdout)["sessions"]
+        self.assertEqual([r["result"] for r in items],
+                         ["gone", "refused", "failed", "reclaimed", "reclaimed"])
+        self.assertIn(refused["dispatch"], mixed.stderr)
+        self.assertIn(blocked["dispatch"], mixed.stderr)
+        self.assertNotIn("message", items[0])
+        for item, row in zip(items[-2:], (finished, unfinished)):
+            status = self.reclaim_status(row)
+            self.assertEqual(status["status"], "reclaimed")
+            self.assertFalse(status["backendAlive"])
+            event, = [m for m in status["messages"] if m["type"] == "reclaimed"]
+            self.assertEqual((event["id"], event["attempt"], event["to"], event["tmux"]),
+                             (item["message"], row["attempt"], "worker", row["tmux"]))
+        status = self.reclaim_status(finished)
+        self.assertEqual(status["state"], "done")
+        self.assertEqual(status["rounds"][0]["state"], "completed")
+        self.assertEqual((self.work / "finished.md").read_text(), "saved fixture report")
+        self.assertEqual(checkout.read_text(), "private workspace contents")
+        claimed = self.reclaim_cli("wait", "--dispatch", finished["dispatch"], "--timeout", "0")
+        self.assertEqual([m["type"] for m in json.loads(claimed.stdout)["messages"]], ["done"])
+        repeat = self.reclaim_cli("reclaim", "--yes", "--dispatch", finished["dispatch"])
+        self.assertEqual(json.loads(repeat.stdout)["sessions"][0]["result"], "gone")
+        for row in (gone, refused, blocked):
+            self.assertNotIn("reclaimed", self.reclaim_status(row))
+        for name in ("sibling", refused["tmux"], blocked["tmux"]):
+            subprocess.run(self.tmux + ["has-session", "-t", "=" + name], env=self.env, check=True)
+        print(json.dumps({"reclaimPreview": json.loads(preview.stdout),
+                          "reclaimMixed": json.loads(mixed.stdout),
+                          "mixedStderr": mixed.stderr.splitlines(), "exit": mixed.returncode}), flush=True)
+
+    def test_public_reclaim_stops_on_scope_authority_loss(self):
+        first = self.reclaim_dispatch("first")
+        owner = json.loads(self.reclaim_cli("acquire", "--scope", "managed", "--owner", "A").stdout)
+        middle = self.reclaim_dispatch("managed", scope="managed", token=owner["token"])
+        last = self.reclaim_dispatch("last")
+        current = json.loads(self.reclaim_cli("takeover", "--scope", "managed", "--owner", "B").stdout)
+        result = self.reclaim_cli(
+            "reclaim", "--yes", "--dispatch", first["dispatch"], "--dispatch", middle["dispatch"],
+            "--dispatch", last["dispatch"], "--owner-token", owner["token"], code=1)
+        self.assertFalse(result.stdout)
+        error = json.loads(result.stderr)
+        self.assertEqual((error["error"], error["operation"], error["scope"], error["generation"]),
+                         ("stale_controller_owner", "reclaim", "managed", current["generation"]))
+        self.assertEqual(self.reclaim_status(first)["status"], "reclaimed")
+        for row in (middle, last):
+            status = self.reclaim_status(row)
+            self.assertTrue(status["backendAlive"])
+            self.assertNotIn("reclaimed", status)
+        print(json.dumps({"reclaimScopeFence": error, "priorSuccessPersisted": True,
+                          "laterResourcesPreserved": True}), flush=True)
+
+    def test_public_reclaim_rechecks_selected_execution_under_scope_lock(self):
+        row = self.reclaim_dispatch("selected", finished=True)
+        dispatch = row["dispatch"]
+        scope = self.reclaim_status(row)["scope"]
+        scope_lock = self.state / ("relay-" + hashlib.sha256(scope.encode()).hexdigest() + ".lock")
+        path = self.state / "dispatches" / (dispatch + ".json")
+        saved = path.read_bytes()
+        with scope_lock.open("ab") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with subprocess.Popen([WFC, "reclaim", "--yes"], cwd=self.work, text=True,
+                                  env={**self.env, "WFC_STATE": str(self.state)},
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                try:
+                    deadline = time.monotonic() + 10
+                    fd_dir = Path(f"/proc/{process.pid}/fd")
+                    while not any(os.path.realpath(fd) == str(scope_lock) for fd in fd_dir.iterdir()):
+                        self.assertIsNone(process.poll())
+                        self.assertLess(time.monotonic(), deadline, "reclaim did not take the scope lock")
+                        time.sleep(.025)
+                    replacement = json.loads(saved)
+                    replacement.update(round=2, attempt="a-aaaaaaaaaaaa", executionId="a-aaaaaaaaaaaa")
+                    staging = path.with_suffix(".fixture")
+                    staging.write_text(json.dumps(replacement))
+                    staging.replace(path)
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                    out, err = process.communicate(timeout=15)
+                    self.assertEqual((process.returncode, err), (0, ""), (out, err))
+                    item, = json.loads(out)["sessions"]
+                    self.assertEqual((item["dispatch"], item["result"]), (dispatch, "changed"))
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    path.write_bytes(saved)
+        self.assertTrue(self.reclaim_status(row)["backendAlive"])
+        subprocess.run(self.tmux + ["has-session", "-t", "=" + row["tmux"]], env=self.env, check=True)
+        success = self.reclaim_cli("reclaim", "--yes")
+        item, = json.loads(success.stdout)["sessions"]
+        self.assertEqual((item["dispatch"], item["result"]), (dispatch, "reclaimed"))
+        print(json.dumps({"reclaimChanged": json.loads(out), "reclaimConfirmed": json.loads(success.stdout)}),
+              flush=True)
 
     def launch_composer(self, mode, op="create", expected="accepted", **data):
         log = self.root / (mode + ".log")

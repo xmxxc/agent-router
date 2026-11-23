@@ -178,7 +178,9 @@ def native_dispatch_traverse_only(binary):
             assert entry["label"] == "native" and entry["attempt"] == native["attempt"], view
             assert "schema" not in view, view
             preview = run(binary, root, root, str(root), ("reclaim", "--dispatch", dispatch))
-            assert preview["sessions"][0]["dispatch"] == dispatch and "schema" in preview, preview
+            entry, = preview["sessions"]
+            assert entry["dispatch"] == dispatch and entry["result"] == "gone", preview
+            assert "schema" not in preview, preview
             for flags in ((), ("--active",)):
                 error = run(binary, root, root, str(root), ("status", *flags), code=1)
                 assert "list dispatch records" in error and f"os error {errno.EACCES}" in error, error
