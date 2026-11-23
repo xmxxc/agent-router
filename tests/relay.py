@@ -14,6 +14,8 @@ import time
 import unittest
 import uuid
 
+import runtime_process
+
 WFC = str(Path(sys.argv.pop(1)).resolve())
 PREFIX = "[router] Messages for the controller: "
 
@@ -136,6 +138,30 @@ sys.exit(1 if mode else 0)
                           "messageId": notice["messageId"], "fault": notice["fault"],
                           "queueCalls": 1, "ack": ack}), flush=True)
 
+    def slow_tmux_probe(self):
+        real_tmux = shutil.which("tmux")
+        trace = self.root / "slow-probes"
+        slow = self.root / "slow-probe-gate"
+        shim = self.root / "tmux"
+        shim.write_text(f"#!{sys.executable}\n" + """
+import json, os, subprocess, sys
+from pathlib import Path
+argv = sys.argv[1:]
+if "list-panes" not in argv or not Path(SLOW_GATE).exists():
+    os.execv(REAL_TMUX, [REAL_TMUX, *argv])
+child = subprocess.Popen(["/bin/sleep", "25"])
+with Path(TRACE).open("a") as log:
+    print(json.dumps(dict(shim=os.getpid(), descendant=child.pid, group=os.getpgrp(),
+                          target=argv[argv.index("-t") + 1])), file=log)
+sys.exit(child.wait())
+""".replace("REAL_TMUX", repr(real_tmux)).replace("TRACE", repr(str(trace))).replace("SLOW_GATE", repr(str(slow))))
+        shim.chmod(0o700)
+
+        def probes():
+            return [json.loads(line) for line in trace.read_text().splitlines()] if trace.exists() else []
+
+        return slow, probes
+
     @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
     def test_slow_runtime_clients_share_the_wait_and_relay_budget(self):
         self.start_private_tmux()
@@ -144,25 +170,8 @@ sys.exit(1 if mode else 0)
         jobs = [self.data("dispatch", "--task", "task", "--role", "worker", "--scope", "ours",
                           "--report", "task", "--cwd", ".", "--host", "codex", "--launch-config", str(config))
                 for _ in range(2)]
-        real_tmux = shutil.which("tmux")
-        trace = self.root / "slow-probes"
-        shim = self.root / "tmux"
-        shim.write_text(f"#!{sys.executable}\n" + """
-import json, os, subprocess, sys
-from pathlib import Path
-argv = sys.argv[1:]
-if "list-panes" not in argv:
-    os.execv(REAL_TMUX, [REAL_TMUX, *argv])
-child = subprocess.Popen(["/bin/sleep", "25"])
-with Path(TRACE).open("a") as log:
-    print(json.dumps(dict(shim=os.getpid(), descendant=child.pid, group=os.getpgrp(),
-                          target=argv[argv.index("-t") + 1])), file=log)
-sys.exit(child.wait())
-""".replace("REAL_TMUX", repr(real_tmux)).replace("TRACE", repr(str(trace))))
-        shim.chmod(0o700)
-
-        def probes():
-            return [json.loads(line) for line in trace.read_text().splitlines()] if trace.exists() else []
+        slow, probes = self.slow_tmux_probe()
+        slow.touch()
 
         def exited(pid):
             stat = Path(f"/proc/{pid}/stat")
@@ -211,6 +220,67 @@ sys.exit(child.wait())
                           "cancelledGroups": sorted({item["group"] for item in final}),
                           "waitMessage": receipt["messageId"], "relayMessage": expected["messageId"],
                           "allProbeClientsStopped": True}), flush=True)
+
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_runtime_probe_timeout_and_abandoned_relay(self):
+        self.start_private_tmux()
+        config = self.root / "launch.json"
+        fixture = "import time; print('Ready.', flush=True); time.sleep(60)"
+        config.write_text(json.dumps({"hosts": {"codex": {"command": [sys.executable, "-c", fixture]}}}))
+        job = self.data("dispatch", "--task", "task", "--role", "worker", "--scope", "ours",
+                        "--report", "task", "--cwd", ".", "--host", "codex", "--launch-config", str(config))
+        wait = ("wait", "--scope", "ours", "--dispatch", job["dispatch"], "--stall-after", "0")
+        self.assertFalse(self.data(*wait, "--timeout", ".55", code=3)["messages"])
+        watch = self.root / "state" / "dispatches" / f'{job["dispatch"]}.host-watch'
+        self.assertTrue(json.loads(watch.read_text())["execution"])
+        slow, probes = self.slow_tmux_probe()
+        slow.touch()
+        self.assertFalse(self.data(*wait, "--timeout", ".55", code=3)["messages"])
+        self.assertTrue(probes(), "the clipped invocation reached the slow client")
+
+        [failure] = self.data(*wait, "--timeout", "3")["messages"]
+        self.assertEqual((failure["type"], failure["fault"]["category"], failure["fault"]["evidence"]),
+                         ("unknown", "protocol_disconnected", "backend_unavailable"))
+        for key in ("scope", "round", "attempt", "dispatch"):
+            self.assertEqual(failure[key], job[key])
+        ack = self.data("ack", failure["messageId"])
+        self.assertEqual((ack["state"], ack["statusVersion"]), ("processed", 3))
+        self.assertFalse(self.data(*wait, "--timeout", "1.45", code=3)["messages"])
+        other = self.publish("ours")
+        [answer] = self.data("wait", "--scope", "ours", "--timeout", "0")["messages"]
+        self.assertEqual(answer["messageId"], other["messageId"])
+
+        runtime_process.subreaper(self)
+        before = len(probes())
+        relay = self.foreground(6)
+        item = self.until(lambda: next(iter(probes()[before:]), None))
+        owned = self.until(lambda: runtime_process.capture(relay))
+        shim = runtime_process.process(item["shim"])
+        descendant = runtime_process.process(item["descendant"])
+        self.assertIsNotNone(shim)
+        self.assertIsNotNone(descendant)
+        self.assertEqual(item["group"], owned[1].pid)
+        backend = runtime_process.process(shim.parent)
+        self.assertIsNotNone(backend)
+        self.assertEqual(backend.parent, owned[1].pid)
+        self.assertEqual(descendant.parent, shim.pid)
+        cleanup = runtime_process.abort_and_reap(self, relay, owned, (backend, shim, descendant))
+        self.assertFalse(self.calls(), "cancellation did not send a new queue message")
+
+        slow.unlink()
+        [recovery] = self.data(*wait, "--timeout", "3")["messages"]
+        self.assertEqual((recovery["type"], recovery["fault"]["evidence"]), ("recovered", "read_restored"))
+        self.assertFalse(self.data(*wait, "--timeout", ".55", code=3)["messages"])
+        self.assertTrue(self.data("ack", failure["messageId"])["duplicate"])
+        status, = self.data("status", "--dispatch", job["dispatch"])["dispatches"]
+        self.assertEqual([m["messageId"] for m in status["messages"] if m["kind"] == "host_runtime"],
+                         [failure["messageId"], recovery["messageId"]])
+        self.assertEqual(self.data("close", job["dispatch"])["result"], "completed")
+        print(json.dumps({"case": "abandoned-relay", "scope": job["scope"], "attempt": job["attempt"],
+                          "failure": failure["messageId"], "ack": ack, "recovery": recovery["messageId"],
+                          "otherReceipt": answer["messageId"], "slowClient": shim.pid,
+                          "slowClientStart": shim.started, "descendant": descendant.pid,
+                          "descendantStart": descendant.started, **cleanup}), flush=True)
 
     def test_detached_scope(self):
         other = self.publish("other")

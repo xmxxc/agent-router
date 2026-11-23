@@ -1,4 +1,5 @@
 """Linux integration: python3 tests/herdr_public.py HERDR WFC [-v]."""
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,8 @@ import sys
 import threading
 import time
 import unittest
+
+import runtime_process
 
 # Both suites use the same isolated Herdr server, fault proxy and child reaper.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'crates/herdr/tests'))
@@ -175,6 +178,46 @@ for line in sys.stdin:
             print(json.dumps({"case": "slow-herdr-probe", "elapsedMs": int(elapsed * 1000),
                               "dispatch": self.dispatch_id, "attempt": self.row["attempt"],
                               "pane": self.h["pane"], "closeAfterDeadline": "completed"}), flush=True)
+
+    def test_abandoned_runtime_wait_reaps_the_probe_and_releases_herdr_lock(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def hold_read(req, reply):
+            if req["method"] == "pane.read" and not release.is_set():
+                entered.set()
+                release.wait(6)
+                return None
+            return reply
+
+        with self.service.fault_proxy(hold_read) as endpoint:
+            self.dispatch(endpoint=endpoint)
+            waiter = subprocess.Popen([live.DRIVER, "wait", "--scope", self.row["scope"],
+                                       "--dispatch", self.dispatch_id, "--timeout", "6"],
+                                      env=self.env, text=True,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                self.assertTrue(entered.wait(3), "the private backend did not reach the slow read")
+                owned = live.wait_for(lambda: runtime_process.capture(waiter), seconds=.5)
+                lockfile = Path(self.env["WFC_STATE"]) / "dispatches" / f"{self.dispatch_id}.herdr-lock"
+                with lockfile.open("rb") as lock:
+                    flags = fcntl.LOCK_EX | fcntl.LOCK_NB
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(lock, flags)
+                    cleanup = runtime_process.abort_and_reap(self, waiter, owned)
+                    self.assertFalse(release.is_set())
+                    fcntl.flock(lock, flags)  # lock is free even while the proxy is still holding the read
+            finally:
+                if waiter.poll() is None:
+                    waiter.kill()
+                    waiter.communicate(timeout=6)
+                release.set()
+            self.assertEqual(self.cli("close", self.dispatch_id)["result"], "completed")
+            self.assertNotIn("hostActivity", self.status())
+            print(json.dumps({"case": "abandoned-herdr-wait", "scope": self.row["scope"],
+                              "attempt": self.row["attempt"], "pane": self.h["pane"],
+                              "lockReleasedWhileProxyBlocked": True, "close": "completed",
+                              **cleanup}), flush=True)
 
     def test_claim_survives_lost_ack_and_reconcile(self):
         sends = []

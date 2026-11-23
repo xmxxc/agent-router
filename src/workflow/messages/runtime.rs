@@ -16,7 +16,7 @@ use std::{
 use uuid::Uuid;
 
 mod probe;
-pub(crate) use probe::run_runtime_probe;
+pub(crate) use probe::{run_runtime_owner, run_runtime_probe};
 use probe::{Observation, Probe};
 
 const OBSERVATION: &str = "host_runtime";
@@ -139,7 +139,15 @@ impl Monitor {
         let Some(row) = candidate(&dir, id, scope) else {
             return Ok(false);
         };
-        if binding(&row) != observed.binding {
+        let matches_observation = |row: &Value| {
+            let current = if observed.timed_out {
+                execution_binding(row)
+            } else {
+                binding(row)
+            };
+            current == observed.binding
+        };
+        if !matches_observation(&row) {
             return Ok(false);
         }
         // Same lock order as Herdr close: execution first, then its messages.
@@ -160,7 +168,7 @@ impl Monitor {
         let Some(row) = candidate(&dir, id, scope) else {
             return Ok(false);
         };
-        if binding(&row) != observed.binding
+        if !matches_observation(&row)
             || watch(&path)?.as_ref() != previous
             || backend::runtime_closing(state, &row)?
         {
@@ -238,7 +246,8 @@ impl Monitor {
         };
         let paused = current_messages(row, history).any(|m| m["type"] == "question");
         let changed = previous.is_none_or(|w| w.fingerprint != fingerprint);
-        let reset = changed || previous.is_some_and(|w| w.paused != paused);
+        let read_restored = !paused && fault.is_none() && seen(&Notice::Unavailable);
+        let reset = changed || read_restored || previous.is_some_and(|w| w.paused != paused);
         let since = if reset {
             now
         } else {
@@ -254,6 +263,8 @@ impl Monitor {
         } else if !paused {
             if changed && nonblank && previous.is_some() && fault_open {
                 notices.push(Notice::Recovered);
+            } else if read_restored {
+                notices.push(Notice::ReadRestored);
             } else if !fault_open && !self.stall.is_zero() && idle >= self.stall.as_secs_f64() {
                 notices.push(Notice::Stalled(idle as u64));
             }
@@ -272,6 +283,7 @@ impl Monitor {
             attempt: row["attempt"].as_str().unwrap_or_default().into(),
             round: row["round"].as_u64().unwrap_or_default(),
             scope: row_scope(row).unwrap_or_default().into(),
+            execution: execution_binding(row),
             salt,
             fingerprint,
             since,
@@ -323,6 +335,37 @@ fn binding(row: &Value) -> String {
     ];
     let values = Value::Array(fields.iter().map(|&key| row[key].clone()).collect());
     body_hash(&values.to_string())
+}
+
+// Unlike the publication generation, this identity survives new Herdr
+// writer checkpoints and still ties the last good read to the original pane.
+fn execution_binding(row: &Value) -> String {
+    let fields = [
+        "dispatch",
+        "round",
+        "attempt",
+        "scope",
+        "created",
+        "host",
+        "backend",
+        "tmuxSocket",
+        "executionId",
+        "create",
+        "endpoint",
+    ];
+    let handle_fields = [
+        "service",
+        "workspace",
+        "pane",
+        "terminal",
+        "nonce",
+        "receipt",
+    ];
+    let fields = fields.iter().map(|&key| row[key].clone());
+    let handle_fields = handle_fields
+        .iter()
+        .map(|&key| row["backendHandle"][key].clone());
+    body_hash(&Value::Array(fields.chain(handle_fields).collect()).to_string())
 }
 
 fn row_scope(row: &Value) -> Option<&str> {
@@ -379,6 +422,8 @@ struct Watch {
     attempt: String,
     round: u64,
     scope: String,
+    #[serde(default)]
+    execution: String,
     salt: String,
     fingerprint: String,
     since: f64,
@@ -391,6 +436,7 @@ fn watch_for<'a>(row: &Value, watch: Option<&'a Watch>) -> Option<&'a Watch> {
         row["attempt"] == w.attempt.as_str()
             && row["round"] == w.round
             && row_scope(row) == Some(w.scope.as_str())
+            && execution_binding(row) == w.execution
     })
 }
 
@@ -425,7 +471,18 @@ fn classify(host: &str, screen: &str) -> Option<Notice> {
         .filter(|line| !line.trim().is_empty())
         .take(8)
     {
-        let line = line.trim().to_ascii_lowercase();
+        let line = line.trim();
+        // Codex uses this marker for assistant output. A bare footer, timer or
+        // redraw underneath an older fault is not a new assistant response.
+        let assistant_output = host == "codex"
+            && line.strip_prefix("• ").is_some_and(|text| {
+                text.ends_with(['.', '!', '?']) && text.chars().any(char::is_alphabetic)
+            });
+        let line = line
+            .strip_prefix(['•', '■'])
+            .unwrap_or(line)
+            .trim_start()
+            .to_ascii_lowercase();
         let prefix = |choices: &[&str]| {
             choices.iter().any(|choice| {
                 line.strip_prefix(choice).is_some_and(|rest| {
@@ -463,7 +520,7 @@ fn classify(host: &str, screen: &str) -> Option<Notice> {
             Notice::Policy
         } else if prefix(&["request timed out", "operation timed out", "host timeout"]) {
             Notice::HostTimeout
-        } else if prefix(&["working", "processing", "resumed activity"]) {
+        } else if assistant_output || prefix(&["working", "processing", "resumed activity"]) {
             return None;
         } else {
             continue;
@@ -486,6 +543,7 @@ enum Notice {
     Deadline(u64),
     Exited(Map<String, Value>),
     Recovered,
+    ReadRestored,
 }
 
 impl Notice {
@@ -498,7 +556,7 @@ impl Notice {
             Self::Disconnected | Self::Unavailable => "protocol_disconnected",
             Self::HostTimeout | Self::Stalled(_) | Self::Deadline(_) => "timeout",
             Self::Exited(_) => "process_exited",
-            Self::Recovered => "recovered",
+            Self::Recovered | Self::ReadRestored => "recovered",
         }
     }
 
@@ -509,6 +567,7 @@ impl Notice {
             Self::Deadline(_) => "turn_deadline",
             Self::Exited(_) => "verified_exit",
             Self::Recovered => "changed_activity",
+            Self::ReadRestored => "read_restored",
             _ => "screen_notice",
         }
     }
@@ -527,6 +586,7 @@ impl Notice {
             Self::Deadline(_) => ("unknown", "Host turn exceeded its time limit"),
             Self::Exited(_) => ("exited", "Verified host process exited without completion"),
             Self::Recovered => ("recovered", "Host activity resumed"),
+            Self::ReadRestored => ("recovered", "Host screen reads resumed"),
         }
     }
 }

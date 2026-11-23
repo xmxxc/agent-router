@@ -8,7 +8,7 @@ pub(super) mod runtime;
 pub use receipt::{Confirm, ACK_USAGE, RESOLVE_USAGE};
 use receipt::{Delivery, Resolution, State};
 #[cfg(target_os = "linux")]
-pub(crate) use runtime::run_runtime_probe;
+pub(crate) use runtime::{run_runtime_owner, run_runtime_probe};
 
 use super::{git_snapshot::Snapshot, resolve_report_path, state_dir, valid_id};
 use anyhow::{ensure, Context, Result};

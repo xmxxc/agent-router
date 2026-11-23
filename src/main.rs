@@ -140,6 +140,10 @@ fn main() -> anyhow::Result<ExitCode> {
             println!("{usage}");
         }
         #[cfg(target_os = "linux")]
+        Some("--observe-host-owner") if args.len() == 5 => {
+            return workflow::messages::run_runtime_owner(&args);
+        }
+        #[cfg(target_os = "linux")]
         Some("--observe-host-runtime") if args.len() == 3 => {
             workflow::messages::run_runtime_probe(&args)?;
         }

@@ -444,7 +444,10 @@ class StartupFailure(unittest.TestCase):
                     frame += 1
                     text = {"refresh": f"Working: frame {frame}",
                             "quota-refresh": f"Quota exceeded: frame {frame}"}.get(view, view)
-                    print("\x1b[2J\x1b[H" + text, flush=True)
+                    if view.startswith("append:"):
+                        print(view.removeprefix("append:"), flush=True)
+                    else:
+                        print("\x1b[2J\x1b[H" + text, flush=True)
                     previous = view
                 time.sleep(.05)
             """)
@@ -569,6 +572,20 @@ class StartupFailure(unittest.TestCase):
         quota_again, = observe(alternating)
         assert_notice(alternating, quota_again, "blocked", "quota", "screen_notice", "blocked")
         self.assertNotEqual(quota_again["messageId"], quota["messageId"])
+
+        command, retained = launch("codex", "retained-quota", f"Quota exceeded: {SECRET}")
+        quota, = observe(retained)
+        assert_notice(retained, quota, "blocked", "quota", "screen_notice", "blocked")
+        write(command, "append:Elapsed: 2s")
+        self.assertFalse(observe(retained, timeout="1.25", code=3))
+        write(command, f"append:• The next step is ready. {SECRET}.")
+        recovery, = observe(retained)
+        assert_notice(retained, recovery, "recovered", "recovered", "changed_activity", "active")
+        self.assertFalse(observe(retained, timeout="1.25", code=3))
+        write(command, f"append:Quota exceeded: {SECRET}")
+        later, = observe(retained)
+        assert_notice(retained, later, "blocked", "quota", "screen_notice", "blocked")
+        self.assertNotEqual(later["messageId"], quota["messageId"])
 
         banner, readonly = launch("codex", "readonly-banner",
             f"■ This chat uses {SECRET}, but Codex now uses other,\n"
