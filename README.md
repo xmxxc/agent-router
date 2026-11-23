@@ -135,3 +135,18 @@ timeout 240s python3 tools/check_wfc.py /path/to/workflow-core target/wfc-kernel
 ```
 
 脚本运行 WFC 已有的六个真实进程用例，并检查每个用例都实际执行。首次候选的 Linux x64 独立编译、终端测试和 stdio 往返已实测。Windows 原生和 Linux 委派进程树的验收由总控在冻结候选上执行。[来源、补丁与复建方法](SOURCES.md)
+
+## 在 Linux 将完成回执送回 Codex 聊天
+
+在发起派发的 Codex 会话内，使用同一份 `WFC_STATE` 和派发回执中的 scope 注册 relay。例如，下面的转发进程独立运行 90 秒，启动命令返回它的 PID 和日志路径。
+
+```sh
+wfc relay --codex --scope review --for 90 --detach
+wfc status
+```
+
+`status.waiters` 显示正在运行的 relay、scope 和目标线程。也可以用 `--codex-thread UUID` 指定线程。wfc 在 Codex 的 sessions 目录读取该 UUID 的会话记录，验证它属于顶层聊天；有 `CODEX_THREAD_ID` 时还会与当前会话核对。省略 `--for` 或设为 0 时持续运行。无人认领的 scope 可直接使用。省略 scope 时，当前状态目录内的 scope 须全部无人认领，relay 才会领取各 scope 的回执。
+
+同一批完成回执会随一次 `codex queue --thread … --message … --resume` 发送。聊天收到后按原 `messageId` 执行 `wfc ack MESSAGE`。队列返回成功后回执为 `received`。程序启动失败会恢复为 `unsent`，下次轮询可重试。队列明确报告找不到目标时恢复为 `unsent` 并退出。超时或其他非零退出保留 `unknown`；重启 relay 后仍可查询原消息，核对聊天后使用上述 `resolve` 和 `ack`。队列确认和聊天处理结果分别记录为 `received` 和 `processed`。
+
+每次队列调用都有独立的进程组。队列程序和继承该组的临时辅助进程由同一监督进程清理；队列返回、调用超时、relay 意外退出都会触发清理。已有 Desktop 服务保有自己的进程组。需要在调用结束后继续运行的宿主，应在独立会话或进程组中启动。

@@ -1,6 +1,8 @@
 //! A worker can retry a keyed completion. A controller claims a batch
 //! before printing it, so another waiter cannot deliver the same messages.
 mod receipt;
+#[cfg(target_os = "linux")]
+pub mod relay;
 pub use receipt::{Confirm, ACK_USAGE, RESOLVE_USAGE};
 use receipt::{Delivery, Resolution, State};
 
@@ -245,24 +247,28 @@ impl Completion {
     }
 
     fn view(&self) -> Value {
+        self.view_at(self.delivery.state, self.delivery.status_version)
+    }
+
+    fn view_at(&self, state: State, version: u64) -> Value {
         let mut view = self.body();
         view.extend([
             ("id".into(), json!(self.id)),
             ("messageId".into(), json!(self.message_id)),
             ("dispatch".into(), json!(self.worker.dispatch)),
             ("type".into(), json!("done")),
-            ("state".into(), json!(self.delivery.state)),
-            ("statusVersion".into(), json!(self.delivery.status_version)),
+            ("state".into(), json!(state)),
+            ("statusVersion".into(), json!(version)),
         ]);
         Value::Object(view)
     }
 
-    fn receive(&mut self) -> Result<Value> {
-        self.delivery.advance(State::Received)?;
+    fn claim(&mut self, state: State) -> Result<()> {
+        self.delivery.advance(state)?;
         if self.body_hash.is_none() {
             self.body_hash = Some(self.computed_hash());
         }
-        Ok(self.view())
+        Ok(())
     }
 }
 
@@ -330,6 +336,41 @@ impl Inbox {
             messages,
             _lock: lock,
         })
+    }
+
+    fn try_open(state: &Path) -> Result<Option<Self>> {
+        let lock = lock_file(state)?;
+        match lock.try_lock() {
+            Ok(()) => (),
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Error(e)) => return Err(e).context("lock controller messages"),
+        }
+        Ok(Some(Self::read_locked(state, lock)?))
+    }
+
+    fn claim(
+        &mut self,
+        dispatch: Option<&str>,
+        scope: Option<&str>,
+        state: State,
+    ) -> Result<Vec<Value>> {
+        let batch: Vec<_> = self
+            .messages
+            .iter_mut()
+            .filter(|m| {
+                m.delivery.state == State::Unsent
+                    && dispatch.is_none_or(|id| id == m.worker.dispatch)
+                    && scope.is_none_or(|scope| scope == m.worker.scope())
+            })
+            .map(|m| {
+                m.claim(state)?;
+                Ok(m.view())
+            })
+            .collect::<Result<_>>()?;
+        if !batch.is_empty() {
+            self.save().context("claim controller messages")?;
+        }
+        Ok(batch)
     }
 
     fn validate_done(
@@ -555,35 +596,14 @@ impl<'a> Wait<'a> {
         })
     }
 
-    fn take(&self, state: &Path) -> Result<Vec<Value>> {
-        let lock = lock_file(state)?;
-        match lock.try_lock() {
-            Ok(()) => (),
-            Err(TryLockError::WouldBlock) => return Ok(Vec::new()),
-            Err(TryLockError::Error(e)) => return Err(e).context("lock controller messages"),
-        }
-        let mut inbox = Inbox::read_locked(state, lock)?;
-        let batch: Vec<_> = inbox
-            .messages
-            .iter_mut()
-            .filter(|m| {
-                m.delivery.state == State::Unsent
-                    && self.dispatch.is_none_or(|id| id == m.worker.dispatch)
-                    && self.scope.is_none_or(|scope| scope == m.worker.scope())
-            })
-            .map(Completion::receive)
-            .collect::<Result<_>>()?;
-        if !batch.is_empty() {
-            inbox.save().context("claim controller messages")?;
-        }
-        Ok(batch)
-    }
-
     pub fn run(self) -> Result<Vec<Value>> {
         let state = state_dir()?;
         let start = Instant::now();
         loop {
-            let batch = self.take(&state)?;
+            let batch = match Inbox::try_open(&state)? {
+                Some(mut inbox) => inbox.claim(self.dispatch, self.scope, State::Received)?,
+                None => Vec::new(),
+            };
             let remaining = self.timeout.saturating_sub(start.elapsed());
             if !batch.is_empty() || remaining.is_zero() {
                 return Ok(batch);
