@@ -223,12 +223,12 @@ impl<'a> Dispatch<'a> {
                 "public backend is unavailable on this platform"
             );
             ensure!(
-                host.backend == "tmux",
+                matches!(host.backend, "tmux" | "bundled"),
                 "{} backend adapter is unavailable in this build",
                 host.backend
             );
             #[cfg(target_os = "linux")]
-            {
+            if host.backend == "tmux" {
                 record["tmuxSocket"] = json!(backend::tmux_socket()?);
             }
             Some(host.prepare(&state, &mut record)?)
@@ -256,7 +256,10 @@ impl<'a> Dispatch<'a> {
             if let Some(launch) = launch {
                 let answer = backend::create(&state, &record, launch)?;
                 let accepted = answer["result"] == "accepted";
-                if accepted || answer["result"] == "uncertain" {
+                if accepted
+                    || answer["result"] == "uncertain"
+                    || answer["unstarted"]["group_cleanup"] == "unknown"
+                {
                     preserve_binding = true;
                     record["create"] = answer.clone();
                     let published = records.join(format!("{dispatch}.json"));
@@ -519,6 +522,10 @@ fn status_with_history(
     for record in &mut dispatches {
         if record["host"].is_string() {
             let (worker, inspection) = backend::observe(&state, record)?;
+            if record["backend"] == "bundled" {
+                record["backendHandle"] = inspection["ticket"].clone();
+                record["backendObservation"] = inspection.clone();
+            }
             record["worker"] = worker;
             record["backendResult"] = inspection["result"].clone();
             record["backendAlive"] = if inspection["alive"] == true && inspection["owned"] != true {
@@ -562,7 +569,9 @@ fn status_with_history(
         }
     }
     if active {
-        dispatches.retain(|r| r["state"] != "done");
+        dispatches.retain(|r| {
+            r["state"] != "done" || (r["backend"] == "bundled" && r["backendAlive"].is_null())
+        });
     }
     undelivered.sort_by_key(|v| v["id"].as_u64());
     let mut response =

@@ -357,6 +357,38 @@ fn missing_legacy_host_binding_cannot_confirm_close() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn public_bundled_rejects_an_ordinary_directory_before_launch() {
+    let f = Fixture::new();
+    fs::write(f.0.join("task"), "work").unwrap();
+    let out = f
+        .wfc()
+        .env("WFC_BUNDLED_CGROUP_ROOT", &f.0)
+        .args([
+            "dispatch",
+            "--backend",
+            "bundled",
+            "--host",
+            "codex",
+            "--task",
+            "task",
+            "--cwd",
+            ".",
+            "--report",
+            "report",
+        ])
+        .output()
+        .unwrap();
+    let diagnostic = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        diagnostic.contains("expected cgroup v2 filesystem"),
+        "{diagnostic}"
+    );
+    assert_eq!(run(f.wfc().arg("status"))["dispatches"], json!([]));
+}
+
 #[test]
 fn invalid_public_options_and_launch_config_leave_no_active_dispatch() {
     let f = Fixture::new();
@@ -378,7 +410,7 @@ fn invalid_public_options_and_launch_config_leave_no_active_dispatch() {
         "codex",
     ];
     for (extra, code, diagnostic) in [
-        (vec!["--backend", "bundled"], 1, "unavailable"),
+        (vec!["--backend", "herdr"], 1, "unavailable"),
         (
             vec!["--herdr-endpoint", "socket"],
             2,

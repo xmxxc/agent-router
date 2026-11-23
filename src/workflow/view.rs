@@ -87,7 +87,7 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
         status
     });
     row["backendAlive"] = json!(alive);
-    if row["backend"] == "tmux" {
+    if matches!(row["backend"].as_str(), Some("tmux" | "bundled")) {
         row["tmuxAlive"] = json!(alive);
     }
     row["rounds"] = json!(rounds);

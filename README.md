@@ -45,9 +45,19 @@ wfc dispatch --host codex --task task.md --cwd . --report reports/04-review/r1.m
 wfc status --active
 ```
 
-默认使用 tmux。此组合调用同一可执行文件中的 tmux 后端（#31）。宿主可选 codex、opencode 或 claude，`--launch-config` 或 `WFC_LAUNCH_CONFIG` 指向带有 env、hosts 的 JSON 配置。每个宿主可指定 command、runtime 参数数组及 env。完整参数见 `wfc dispatch --help`。独立的 herdr、bundled 后端和控制器授权由对应工单接入。
+默认使用 tmux。此组合调用同一可执行文件中的 tmux 后端（#31）。宿主可选 codex、opencode 或 claude，`--launch-config` 或 `WFC_LAUNCH_CONFIG` 指向带有 env、hosts 的 JSON 配置。每个宿主可指定 command、runtime 参数数组及 env。完整参数见 `wfc dispatch --help`。Linux 上可显式传入 `--backend bundled`，并将 `WFC_BUNDLED_CGROUP_ROOT` 设为可写的 cgroup v2 委派目录。Herdr 接入和控制器授权由对应工单负责。
 
 回执包含 dispatch、round、attempt、host、backend、scope、role、label、tmux 和报告绝对路径。省略 scope 会分配新值，默认 role 来自报告目录名最后一个连字符后的部分。Codex 的 git/network 开关作用于宿主参数，OpenCode 和 Claude 的回执会说明这些开关的处理结果。tmux 服务地址在派发时绑定，后续查询和关闭沿用原服务。
+
+下面三条公共命令可从不同终端执行，共用同一 `WFC_STATE`。bundled 守护、运行时和 PTY 内核均由派发所用的 Linux `wfc` 启动。
+
+```sh
+wfc dispatch --backend bundled --host codex --task task.md --cwd . --report reports/r1.md
+wfc status --dispatch "$dispatch"
+wfc close "$dispatch"
+```
+
+将 `dispatch` 设为首条命令返回的编号。`create.ticket` 绑定本次执行，`create.identity` 记录实际进程与 cgroup。正常关闭后，`close` 返回 `result=completed` 和经核验的 `proof`。`status` 的 `backendObservation` 提供同样的清理证据。若只能核实原票据的进程树已经清空，观察结果含 `scope=execution`、`execution_cleanup=confirmed` 和 `execution_proof`，单元清理仍为 `cleanup=unknown`，`backendAlive` 为 null。重试未决关闭只读取原执行收据。详见 [Linux bundled 合同](docs/linux-bundled.md)。
 
 点名查询 `wfc status --dispatch ID` 返回当前 worker 进程状态、各轮任务结果及消息。接入 #6/#7 后，首条完成回报固定该轮的报告和 Git 快照，后续领取或进程退出仍能查回。已完成且会话仍存活的任务在 `status --active` 的 reclaimable 数组中。长编号和旧版短编号均可查询、关闭。
 
