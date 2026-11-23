@@ -72,9 +72,11 @@ pub(super) fn unresolved_resume(row: &Value) -> Option<&Value> {
 
 #[cfg(target_os = "linux")]
 pub(super) fn unresolved_lifecycle(row: &Value) -> Option<&Value> {
-    row["audit"].as_array()?.iter().rev().find(|event| {
-        matches!(event["result"].as_str(), Some("pending" | "uncertain"))
-    })
+    row["audit"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|event| matches!(event["result"].as_str(), Some("pending" | "uncertain")))
 }
 
 pub(super) fn public_record(dir: &Path, id: &str) -> Result<Option<Value>> {
@@ -135,6 +137,12 @@ pub(super) fn ids(dir: &Path) -> Result<BTreeSet<String>> {
 // The pending and published files can have different inodes. Close and new
 // questions must still serialize on the same attempt across that transition.
 pub(super) fn close_lock(state: &Path, row: &Value) -> Result<File> {
+    let file = open_close_lock(state, row)?;
+    file.lock()?;
+    Ok(file)
+}
+
+pub(super) fn open_close_lock(state: &Path, row: &Value) -> Result<File> {
     let dir = state.join("close-locks");
     let id = row["dispatch"]
         .as_str()
@@ -149,7 +157,5 @@ pub(super) fn close_lock(state: &Path, row: &Value) -> Result<File> {
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let file = options.open(dir.join(format!("{id}.{attempt}")))?;
-    file.lock()?;
-    Ok(file)
+    Ok(options.open(dir.join(format!("{id}.{attempt}")))?)
 }

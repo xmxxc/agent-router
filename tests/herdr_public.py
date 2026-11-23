@@ -1,10 +1,15 @@
 """Linux integration: python3 tests/herdr_public.py HERDR WFC [-v]."""
+import fcntl
 import json
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
+import threading
+import time
 import unittest
+import uuid
 
 # Both suites use the same isolated Herdr server, fault proxy and child reaper.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'crates/herdr/tests'))
@@ -115,6 +120,189 @@ for line in sys.stdin:
         self.assertEqual(self.service.api('pane.process_info',pane_id=other)['process_info']['shell_pid'],pid)
         os.kill(pid, 0)
         self.assertEqual((self.root/'events').read_text().splitlines(), ['finish'])
+
+    def test_runtime_read_evidence_and_independent_recovery(self):
+        hold = threading.Event()
+        requests = []
+        methods = []
+        withheld = []
+        peer_closed = []
+        trace = []
+        started = time.monotonic()
+        self.addCleanup(lambda: print(json.dumps({"case": "herdr-recovery-request-trace",
+                                                   "events": trace[-64:]}), flush=True))
+        secret = "private-herdr-transport-token"
+        screen = self.root / "screen"
+        screen.write_text("Ready.")
+        self.worker.write_text(r"""
+import time
+from pathlib import Path
+last = None
+while True:
+    text = Path("screen").read_text()
+    if text != last:
+        print("\x1b[2J\x1b[H" + text, flush=True)
+        last = text
+    time.sleep(.025)
+""")
+        self.env["WFC_MAX_TURN_SECONDS"] = "0"
+
+        def record(req, phase):
+            trace.append({"method": req["method"], "requestId": req["id"],
+                          "phase": phase, "ms": int((time.monotonic() - started) * 1000)})
+
+        def read_request(stream):
+            frame = stream.readline()
+            if not frame:
+                return None
+            req = json.loads(frame)
+            methods.append(req["method"])
+            poller = select.poll()
+            poller.register(stream, select.POLLHUP)
+            if any(flags & select.POLLHUP for _, flags in poller.poll(0)):
+                self.assertEqual(stream.read(1), b"", "a closed client carried another frame")
+                record(req, "closed_before_forward")
+                return None
+            if req["method"] != "pane.read":
+                return frame
+            pane = req["params"]["pane_id"]
+            key = (req["id"], pane)
+            requests.append(key)
+            if not hold.is_set():
+                return frame
+            # Forward the actual request once, then withhold only this reply.
+            reply = json.loads(live.exchange(self.service.endpoint, req))
+            self.assertEqual(reply["id"], req["id"])
+            self.assertEqual(reply["result"]["type"], "pane_read")
+            self.assertEqual(reply["result"]["read"]["pane_id"], pane)
+            withheld.append(key)
+            record(req, "withheld")
+
+            # Each probe owns its deadline. Releasing only when the outer
+            # wait exits would queue a later probe behind the withheld reply.
+            poller.modify(stream, select.POLLIN | select.POLLHUP)
+            self.assertTrue(poller.poll(3000), "the timed probe did not close its connection")
+            self.assertEqual(stream.read(1), b"", "a withheld connection carried another frame")
+            peer_closed.append(key)
+            record(req, "peer_closed")
+            return None
+
+        def observe_reply(req, reply):
+            if req["method"] == "pane.read":
+                record(req, "reply")
+            return reply
+
+        def run_wait(timeout, quiet=False):
+            args = ("wait", "--scope", self.row["scope"], "--dispatch", self.dispatch_id,
+                    "--stall-after", "0", "--timeout", timeout)
+            result = self.cli(*args, error='"timedOut":true' if quiet else None)
+            return json.loads(result)["messages"] if quiet else result["messages"]
+
+        def slow_wait(timeout, quiet=False, may_retry=False):
+            start = len(withheld)
+            hold.set()
+            try:
+                messages = run_wait(timeout, quiet)
+            finally:
+                hold.clear()
+            # The proxy serves one connection at a time. A fresh private ping
+            # proves it drained earlier connections before checking their EOFs.
+            ping = {"id": uuid.uuid4().hex, "method": "ping", "params": {}}
+            pong = json.loads(live.exchange(endpoint, ping))
+            self.assertEqual(pong["id"], ping["id"])
+            self.assertEqual(pong["result"]["type"], "pong")
+            record(ping, "proxy_drained")
+            reads = withheld[start:]
+            self.assertTrue(reads, "the bound pane.read reached Herdr")
+            if not may_retry:
+                self.assertEqual(len(reads), 1)
+            self.assertTrue(all(pane == self.h["pane"] for _, pane in reads))
+            self.assertEqual(peer_closed[start:], reads)
+            return messages
+
+        def show(text):
+            tmp = screen.with_suffix(".tmp")
+            tmp.write_text(text)
+            tmp.replace(screen)
+            live.wait_for(lambda: text in self.service.api("pane.read", pane_id=self.h["pane"],
+                source="recent", format="text", strip_ansi=True, lines=10)["read"]["text"])
+
+        def ack(notice):
+            for key in ("scope", "dispatch", "round", "attempt"):
+                self.assertEqual(notice[key], self.row[key])
+            first = self.cli("ack", notice["messageId"])
+            self.assertEqual((first["state"], first["statusVersion"]), ("processed", 3))
+            self.assertTrue(self.cli("ack", notice["messageId"])["duplicate"])
+
+        def verify(notices, expected):
+            self.assertEqual([m["fault"]["evidence"] for m in notices], expected)
+            self.assertNotIn(secret, json.dumps(notices))
+            for message in notices:
+                ack(message)
+
+        with self.service.fault_proxy(observe_reply, read_frame=read_request) as endpoint:
+            self.dispatch(endpoint=endpoint)
+            self.assertFalse(run_wait("1.4", quiet=True))
+            self.assertTrue(requests, "the original bound pane was read successfully")
+            state = Path(self.env["WFC_STATE"])
+            watch = state / "dispatches" / f"{self.dispatch_id}.host-watch"
+            self.assertTrue(json.loads(watch.read_text())["execution"])
+            lockfile = state / "dispatches" / f"{self.dispatch_id}.herdr-lock"
+            start = len(requests)
+            rpc_count = len(methods)
+            with lockfile.open("rb") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                self.assertFalse(run_wait("1.4", quiet=True))
+                self.assertEqual(len(methods), rpc_count)
+                self.assertEqual(len(requests), start)
+            self.assertFalse(run_wait(".55", quiet=True))
+            self.assertGreater(len(requests), start)
+            self.assertFalse(slow_wait(".65", quiet=True))
+            first = slow_wait("3")
+            verify(first, ["backend_unavailable"])
+            self.assertFalse(slow_wait("1.4", quiet=True, may_retry=True))
+
+            show(f"Quota exceeded: {secret}")
+            before = len(trace)
+            quota_restored = run_wait("3")
+            self.assertTrue(any(event["phase"] == "reply" for event in trace[before:]),
+                            "the proxy accepted a fresh pane.read after the clipped retries")
+            verify(quota_restored, ["screen_notice", "read_restored"])
+            quota = self.status()["hostActivity"]
+            self.assertEqual((quota["state"], quota["fault"]["category"], quota["readState"]),
+                             ("blocked", "quota", "readable"))
+            again = slow_wait("3")
+            verify(again, ["backend_unavailable"])
+            self.assertNotEqual(first[0]["messageId"], again[0]["messageId"])
+            self.assertEqual(len({req_id for req_id, _ in requests}), len(requests))
+            self.assertEqual(self.status()["hostActivity"]["readState"], "unavailable")
+
+            ledger = state / "messages.json"
+            messages = json.loads(ledger.read_text())
+            question = {key: self.row[key] for key in ("dispatch", "scope", "round", "attempt", "role")}
+            messages.append(dict(question, type="question", id=len(messages) + 1, messageId="m-test-question",
+                                 state="processed", statusVersion=3,
+                                 question_payload={"text": "private pending answer", "options": []}))
+            pending = ledger.with_suffix(".tmp")
+            pending.write_text(json.dumps(messages))
+            pending.replace(ledger)
+            show(f"Approval required: {secret}")
+            permission_restored = run_wait("3")
+            verify(permission_restored, ["screen_notice", "read_restored"])
+            activity = self.status()["hostActivity"]
+            self.assertEqual((activity["state"], activity["fault"]["category"], activity["readState"],
+                              activity["awaitingAnswer"]),
+                             ("awaiting_permission", "permission_required", "readable", True))
+            self.assertFalse(run_wait(".55", quiet=True))
+            self.assertNotIn(secret, ledger.read_text())
+            self.assertEqual(self.cli("close", self.dispatch_id)["result"], "completed")
+            print(json.dumps({"case": "herdr-transport-classification", "dispatch": self.dispatch_id,
+                              "attempt": self.row["attempt"], "pane": self.h["pane"],
+                              "busyIssuedNoRequest": True, "clippedReadSilent": True,
+                              "slowReadReceipts": [first[0]["messageId"], again[0]["messageId"]],
+                              "quotaRestored": quota_restored[-1]["messageId"],
+                              "permissionRestored": permission_restored[-1]["messageId"],
+                              "pendingAnswerPreserved": True, "close": "completed"}), flush=True)
 
     def test_reclaim_uses_verified_herdr_close_and_keeps_sibling(self):
         self.dispatch()

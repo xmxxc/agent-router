@@ -410,7 +410,10 @@ impl Options<'_> {
         }
         launch.env.insert(
             "WFC_ROUND".into(),
-            json!(record["round"].as_u64().context("missing round")?.to_string()),
+            json!(record["round"]
+                .as_u64()
+                .context("missing round")?
+                .to_string()),
         );
         launch.env.insert("WFC_STATE".into(), json!(state));
         launch

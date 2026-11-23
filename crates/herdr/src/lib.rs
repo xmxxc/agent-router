@@ -400,9 +400,18 @@ impl Handle {
     }
 
     pub fn read(&self) -> Result<Screen> {
+        self.read_with_progress(None)
+    }
+
+    /// Report when the bound pane.read frame is sent and when its exchange ends.
+    pub fn read_with_progress(&self, progress: Option<&mut dyn FnMut(bool)>) -> Result<Screen> {
         let rpc = self.session()?;
         self.guarded(&rpc, false)?;
-        let data = rpc.call("pane.read",json!({"pane_id":self.pane,"source":"recent","format":"text","strip_ansi":true,"lines":200}))?;
+        let data = rpc.call_tracked(
+            "pane.read",
+            json!({"pane_id":self.pane,"source":"recent","format":"text","strip_ansi":true,"lines":200}),
+            progress,
+        )?;
         if data["read"]["pane_id"].as_str() != self.pane.as_deref()
             || data["read"]["workspace_id"].as_str() != self.workspace.as_deref()
         {
