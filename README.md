@@ -45,7 +45,50 @@ wfc dispatch --host codex --task task.md --cwd . --report reports/04-review/r1.m
 wfc status --active
 ```
 
-默认使用 tmux。此组合调用同一可执行文件中的 tmux 后端（#31）。宿主可选 codex、opencode 或 claude，`--launch-config` 或 `WFC_LAUNCH_CONFIG` 指向带有 env、hosts 的 JSON 配置。每个宿主可指定 command、runtime 参数数组及 env。完整参数见 `wfc dispatch --help`。独立的 herdr、bundled 后端和控制器授权由对应工单接入。
+默认使用 tmux。此组合调用同一可执行文件中的 tmux 后端（#31）。宿主可选 codex、opencode 或 claude，`--launch-config` 或 `WFC_LAUNCH_CONFIG` 指向带有 env、hosts 的 JSON 配置。每个宿主可指定 command、runtime 参数数组及 env。完整参数见 `wfc dispatch --help`。bundled 后端与控制器授权由对应工单接入。
+
+Linux 也支持 Herdr 0.9.5（协议 22）。先启动自己的 Herdr 服务，再把仅当前用户可访问的 socket 绝对路径交给派发命令。也可用 `WFC_HERDR_ENDPOINT` 指定，命令行优先。
+
+```sh
+wfc dispatch --host codex --backend herdr --herdr-endpoint "$socket" \
+  --task task.md --cwd . --report reports/review/r1.md
+wfc status --dispatch "$dispatch"
+wfc herdr-reconcile "$dispatch" --pane "$pane" --terminal "$terminal" \
+  --actor operator --evidence "已核对目标工作区和终端"
+wfc close "$dispatch"
+```
+
+`status` 的 `backendHandle` 保存单元标识、原服务和写者的进程身份。服务失联时，`backendAlive` 为 null。显式补绑可附 `--workspace`；服务、映射或根写者改变时还需 `--old-writer-evidence`。成功回执中的 `audit` 对应该 dispatch 的审计事件编号。`status` 可查到经办人、证据和本轮 attempt。补绑保留输入认领，关闭只操作绑定的 pane，并核实已记录写者均已退出。服务重启或仍有写者存活时，Herdr 的关闭回执会给出 `result: uncertain` 及原因。若首次投递回执丢失，进程可能仍在线，本轮状态保持 unknown，等待生命周期裁决。
+
+实际请求关闭前，`wfc` 会在该派发的 `audit` 中持久保存关闭意图、目标 pane 和当时已知的写者。`status --dispatch ID` 中的 `closePending: true` 表示这次关闭仍待确认。此时输入与补绑会被拒绝；再次运行 `close ID` 只查询原单元，确认原 pane 消失且已记录写者全部退出后返回 completed。若连接在任何请求字节写入前失败，该次操作记为 definitely-not-sent，允许下一次关闭重新发送。
+
+关闭意图与新的 `done` 消息串行提交。首次回报按当前 dispatch、round 和 attempt 核对关闭记录。关闭待确认或已经确认时，同一键和报告可重取原消息号，新完成记录会被拒绝。待确认的派发始终列在 `status --active` 的 `dispatches` 中。已确认的任务结果（包括原失败退出码）继续显示，`closePending` 单独表示资源关闭进度。启动回执读取出错时，状态查询在 `launchDiagnostic` 中保留原因；已核实的关闭归档继续提供本轮结果和资源状态。对有根进程的绑定，归档须与当前绑定的根 PID 和创建标识一致，当前绑定可以记录更多后来发现的写者。归档身份异常时，`backendDiagnostic` 说明原因，资源关闭保持待确认。可信的启动回执仍能提供 worker 退出码。停机证明须为非空白文本，且绑定中已无任何写者。旧归档的 worker 结果损坏时，`closeWorkerDiagnostic` 保留原因，已核实的资源状态仍为已关闭。
+
+这组入口支持独立 Rust 状态目录里、本程序创建且未登记 controller owner 的第一轮派发。状态目录中出现 Python `router.db` 时，须先集成旧库和 owner 身份。受控服务联验可用 `python3 tests/herdr_public.py /path/to/herdr target/debug/wfc -v`。通过 `--herdr-backend` 向同一 `wfc` 的标准输入提供 `{"op":"submit","dispatch":"…","round":1,"attempt":"…","text":"…"}`，可验证投递认领与回执丢失后的处理。正式的 `reply`、跨轮复用、owner 接替与旧库身份迁移分别由对应工单集成。
+
+`--launch-config` 优先于 `WFC_LAUNCH_CONFIG`。启动参数依次为宿主的 `runtime` 数组、`command` 数组、wfc 为本次任务生成的 Codex 参数。路径含空格时直接写在同一个 JSON 字符串中。例如 npm 安装的 Codex 可以指定 Node 和脚本各自的绝对路径。
+
+```json
+{
+  "hosts": {
+    "codex": {
+      "runtime": ["/opt/Node bin/node"],
+      "command": ["/opt/Codex CLI/bin/codex.js"],
+      "env": {"CODEX_HOME": "/srv/worker profile"}
+    }
+  }
+}
+```
+
+使用原生 Codex 可执行文件时，在 `command` 中填入该文件并省略 `runtime`。worker 先继承调用进程的环境，再依次叠加顶层 `env`、宿主 `env` 和 wfc 的本轮身份、状态及报告路径。wfc 会过滤继承环境和启动配置中的 `WFC_CONTROLLER_TOKEN`、`WFC_OWNER_TOKEN` 和旧 `WFC_WORKER_CALLBACK`（名称不区分大小写）。专用 worker 回调由调度层提供。tmux 会使用当前终端的 `TMUX`、`TMUX_PANE` 和 `TERM`。Codex 默认以 `workspace-write` 和 `never` 审批策略启动。
+
+Linux 真实宿主验收需要 tmux、已登录的 Codex 或可用的 `OPENAI_API_KEY`，以及能执行 Codex 沙箱命令的主机。下面的命令使用私有临时 HOME、状态目录和 tmux socket，启动模型执行一项写报告的任务，从 Rust `wait` 返回的路径读回报告，并核对 `status` 中的同一条回执。把路径和模型替换成当前机器的值。传入 `--auth-file` 时使用已有登录文件的临时副本。仅设置 `OPENAI_API_KEY` 时省略该选项，脚本通过标准输入运行 `codex login --with-api-key`，把登录信息写入私有 profile。外部发送 `SIGTERM` 取消验收时，脚本回收自建进程并删除该临时目录，随后以同一信号退出。
+
+```sh
+python3 tools/check_codex.py target/x86_64-unknown-linux-gnu/release/wfc \
+  --codex "/path/to/codex" --model "your-model" \
+  --auth-file "$HOME/.codex/auth.json"
+```
 
 回执包含 dispatch、round、attempt、host、backend、scope、role、label、tmux 和报告绝对路径。省略 scope 会分配新值，默认 role 来自报告目录名最后一个连字符后的部分。Codex 的 git/network 开关作用于宿主参数，OpenCode 和 Claude 的回执会说明这些开关的处理结果。tmux 服务地址在派发时绑定，后续查询和关闭沿用原服务。
 

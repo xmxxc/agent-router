@@ -235,10 +235,16 @@ impl Options<'_> {
                 .to_owned(),
         ];
         let task = record["task"].as_str().context("missing task")?;
-        let brief = format!(
+        let mut brief = format!(
             "You are a worker dispatched by the controller (dispatch {}). Read and do the task in {}. Stop any server or background process you started before reporting. Write the report to {}. Run \"$WFC_BIN\" done --report \"$WFC_REPORT\" --attempt \"$WFC_ATTEMPT\". If you need a decision, run \"$WFC_BIN\" ask \"<question>\" [--options a,b] --attempt \"$WFC_ATTEMPT\" and end your turn. The answer arrives as your next message.",
             record["dispatch"].as_str().context("missing dispatch")?, task, report.display()
         );
+        if self.name == "opencode" && self.backend == "herdr" {
+            brief.push_str(&format!(
+                " Current attempt {}.",
+                record["attempt"].as_str().context("missing attempt")?
+            ));
+        }
         let path = self.config.map(PathBuf::from).or_else(|| {
             env::var_os("WFC_LAUNCH_CONFIG")
                 .filter(|p| !p.is_empty())

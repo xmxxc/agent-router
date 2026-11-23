@@ -71,8 +71,10 @@ fn options<'a, const N: usize>(
                 || (question && matches!(flag, "--attempt" | "--message-id" | "--callback-ref")),
             "empty option value"
         );
+        let looks_like_option = value.starts_with("--")
+            || (question && value.starts_with('-') && !short_question(value));
         ensure!(
-            inline.is_some() || positional.is_none() || !value.starts_with("--"),
+            inline.is_some() || positional.is_none() || !looks_like_option,
             "option requires a value"
         );
         ensure!(
@@ -88,11 +90,28 @@ fn short_question(text: &str) -> bool {
     let Some(number) = text.strip_prefix('-') else {
         return false;
     };
-    let digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    let digits = |part: &str| part.chars().all(decimal_digit);
     match number.split_once('.') {
         Some((whole, fraction)) => digits(whole) && !fraction.is_empty() && digits(fraction),
         None => digits(number),
     }
+}
+
+fn decimal_digit(c: char) -> bool {
+    // Unicode 15.0 Nd, as used by Python 3.12's argparse negative-number
+    // matcher. Each start begins a run of exactly ten consecutive digits.
+    const STARTS: &[u32] = &[
+        0x0030, 0x0660, 0x06f0, 0x07c0, 0x0966, 0x09e6, 0x0a66, 0x0ae6, 0x0b66, 0x0be6, 0x0c66,
+        0x0ce6, 0x0d66, 0x0de6, 0x0e50, 0x0ed0, 0x0f20, 0x1040, 0x1090, 0x17e0, 0x1810, 0x1946,
+        0x19d0, 0x1a80, 0x1a90, 0x1b50, 0x1bb0, 0x1c40, 0x1c50, 0xa620, 0xa8d0, 0xa900, 0xa9d0,
+        0xa9f0, 0xaa50, 0xabf0, 0xff10, 0x104a0, 0x10d30, 0x11066, 0x110f0, 0x11136, 0x111d0,
+        0x112f0, 0x11450, 0x114d0, 0x11650, 0x116c0, 0x11730, 0x118e0, 0x11950, 0x11c50, 0x11d50,
+        0x11da0, 0x11f50, 0x16a60, 0x16ac0, 0x16b50, 0x1d7ce, 0x1d7d8, 0x1d7e2, 0x1d7ec, 0x1d7f6,
+        0x1e140, 0x1e2f0, 0x1e4f0, 0x1e950, 0x1fbf0,
+    ];
+    let point = u32::from(c);
+    let next = STARTS.partition_point(|start| *start <= point);
+    next.checked_sub(1).is_some_and(|i| point - STARTS[i] < 10)
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -130,12 +149,14 @@ struct Assignment {
     controller_owner: Option<Value>,
     #[serde(rename = "workerCallbackHash")]
     callback_hash: Option<String>,
-    #[serde(skip)]
-    row: Value,
 }
 
 impl Assignment {
-    fn current(state: &Path, dispatch: &str, expected_attempt: Option<&str>) -> Result<Self> {
+    fn current(
+        state: &Path,
+        dispatch: &str,
+        expected_attempt: Option<&str>,
+    ) -> Result<(Self, Value)> {
         let dir = state.join("dispatches");
         let (file, path) = super::assignment::open_assignment(&dir, dispatch)
             .with_context(|| format!("open dispatch {dispatch}"))?;
@@ -143,8 +164,7 @@ impl Assignment {
         if path.extension().is_some_and(|ext| ext == "pending") {
             row["createPending"] = json!(true);
         }
-        let mut assignment = Self::deserialize(&row).context("read worker assignment")?;
-        assignment.row = row;
+        let assignment = Self::deserialize(&row).context("read worker assignment identity")?;
         let worker = &assignment.worker;
         ensure!(
             assignment.controller_owner.is_none(),
@@ -161,7 +181,7 @@ impl Assignment {
                 && expected_attempt.is_none_or(|id| id == worker.attempt),
             "attempt is no longer accepted for {dispatch}"
         );
-        Ok(assignment)
+        Ok((assignment, row))
     }
 
     fn verify_callback(&self, reference: Option<&str>, attempt: Option<&str>) -> Result<()> {
@@ -179,13 +199,6 @@ impl Assignment {
             );
         }
         Ok(())
-    }
-
-    fn same_execution(&self, current: &Self) -> bool {
-        self.worker == current.worker
-            && ["host", "backend", "tmuxSocket", "executionId"]
-                .iter()
-                .all(|key| self.row[*key] == current.row[*key])
     }
 }
 
@@ -452,6 +465,12 @@ fn lock_file(dir: &Path) -> Result<File> {
         .context("open message lock")
 }
 
+pub(super) fn lock_for_publish(dir: &Path) -> Result<File> {
+    let lock = lock_file(dir)?;
+    lock.lock().context("lock controller messages")?;
+    Ok(lock)
+}
+
 impl Inbox {
     fn snapshot(dir: &Path) -> Result<Vec<Message>> {
         let path = dir.join("messages.json");
@@ -486,9 +505,7 @@ impl Inbox {
     }
 
     fn open(dir: &Path) -> Result<Self> {
-        let lock = lock_file(dir)?;
-        lock.lock().context("lock controller messages")?;
-        Self::read_locked(dir, lock)
+        Self::read_locked(dir, lock_for_publish(dir)?)
     }
 
     fn read_locked(dir: &Path, lock: File) -> Result<Self> {
@@ -607,7 +624,12 @@ impl Inbox {
             .find(|m| m.worker.dispatch == dispatch && m.request_key.as_deref() == Some(key))
     }
 
-    fn require_question_round(&self, assignment: &Assignment, attempt: Option<&str>) -> Result<()> {
+    fn require_question_round(
+        &self,
+        assignment: &Assignment,
+        row: &Value,
+        attempt: Option<&str>,
+    ) -> Result<()> {
         let worker = &assignment.worker;
         let dispatch = worker.dispatch.as_str();
         let messages = || {
@@ -615,7 +637,7 @@ impl Inbox {
                 .iter()
                 .filter(|m| m.worker.dispatch == dispatch)
         };
-        let rounds = assignment.row["rounds"].as_array().into_iter().flatten();
+        let rounds = row["rounds"].as_array().into_iter().flatten();
         ensure!(
             attempt.is_some()
                 || (worker.round == 1
@@ -635,16 +657,12 @@ impl Inbox {
             m.worker.round == worker.round
                 && m.worker.attempt == worker.attempt
                 && m.report.is_some()
-        }) || assignment.row["messages"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|m| {
-                m["type"] == "done"
-                    && m["dispatch"] == dispatch
-                    && m["round"] == worker.round
-                    && m["attempt"] == worker.attempt
-            });
+        }) || row["messages"].as_array().into_iter().flatten().any(|m| {
+            m["type"] == "done"
+                && m["dispatch"] == dispatch
+                && m["round"] == worker.round
+                && m["attempt"] == worker.attempt
+        });
         ensure!(
             !confirmed_done && current_round.map_or(worker.round == 1, |r| r["state"] == "running"),
             "attempt is no longer accepted for {dispatch}; its round is not running"
@@ -734,7 +752,7 @@ impl<'a> Done<'a> {
         ensure!(valid_id(&dispatch), "invalid dispatch ID");
         let check = || {
             let inbox = Inbox::open(&state)?;
-            let assignment = Assignment::current(&state, &dispatch, self.attempt)?;
+            let (assignment, row) = Assignment::current(&state, &dispatch, self.attempt)?;
             assignment.verify_callback(None, self.attempt)?;
             // R1 dispatches had neither field and derived the default key from
             // the worker's launch environment. Assignment::current checked it.
@@ -751,6 +769,13 @@ impl<'a> Done<'a> {
                 .or_else(|| keyed_attempt.map(|id| format!("done:{dispatch}:{id}")));
             let receipt =
                 inbox.validate_done(&assignment, &report, key.as_deref(), self.attempt)?;
+            if receipt.is_none() && row["backend"] == "herdr" {
+                ensure!(
+                    !super::backend::herdr_close_blocks_callback(&state, &row)?,
+                    "attempt {} is no longer accepted for {dispatch}; its execution resources are closing or closed",
+                    assignment.worker.attempt
+                );
+            }
             Ok::<_, anyhow::Error>((assignment, inbox, receipt, key))
         };
         let (initial, inbox, duplicate, _) = check()?;
@@ -828,7 +853,7 @@ impl<'a> Ask<'a> {
             .or_else(|| attempt.map(|id| format!("ask:{dispatch}:{id}:{}", payload.key_suffix())));
         let check = || -> Result<_> {
             let inbox = Inbox::open(&state)?;
-            let assignment = Assignment::current(&state, &dispatch, attempt)?;
+            let (assignment, row) = Assignment::current(&state, &dispatch, attempt)?;
             assignment.verify_callback(self.reference, self.attempt)?;
             ensure!(
                 env::var_os("WFC_SCOPE")
@@ -849,45 +874,59 @@ impl<'a> Ask<'a> {
                 inbox.sync_directory().context("sync question receipt")?;
                 Some(prior.receipt(true))
             } else {
-                inbox.require_question_round(&assignment, attempt)?;
+                inbox.require_question_round(&assignment, &row, attempt)?;
+                // The Herdr close intent is saved under the inbox lock.
+                if row["backend"] == "herdr" {
+                    ensure!(
+                        !super::backend::herdr_close_blocks_callback(&state, &row)?,
+                        "attempt is no longer accepted for {dispatch}; its execution resources are closing or closed"
+                    );
+                }
                 None
             };
-            Ok((inbox, assignment, replay))
+            Ok((inbox, assignment, row, replay))
         };
-        let (mut inbox, mut assignment, replay) = check()?;
+        let (inbox, initial, row, replay) = check()?;
         if let Some(replay) = replay {
             return Ok(replay);
         }
-        let observed = if assignment.row["host"].is_string() {
-            // The tmux inspection can wait on the backend. Recheck the
-            // assignment and ledger after it, including a concurrent retry.
-            drop(inbox);
-            let initial = assignment;
-            let observation = super::backend::observe(&state, &initial.row);
-            let replay;
-            (inbox, assignment, replay) = check()?;
-            if let Some(replay) = replay {
-                return Ok(replay);
-            }
-            ensure!(
-                initial.same_execution(&assignment),
-                "assignment changed while inspecting {dispatch}"
-            );
-            observation?.0
+        // A new tmux or controlled-worker question holds the same attempt lock
+        // as close from observation through publication. Acquire it outside
+        // the inbox so a slow backend or close cannot block other scopes.
+        drop(inbox);
+        let hosted = row["host"].is_string();
+        let controlled = cfg!(target_os = "linux") && !hosted && row["worker"].is_object();
+        let _close_lock = (row["backend"] == "tmux" || controlled)
+            .then(|| super::assignment::close_lock(&state, &row))
+            .transpose()?;
+        let observation = if hosted {
+            let mut inspected = row.clone();
+            super::backend::observe(&state, &mut inspected).map(|(worker, _)| worker)
         } else {
             #[cfg(target_os = "linux")]
-            let outcome = if assignment.row["worker"].is_object() {
-                super::worker_owner::status(&state.join("dispatches"), &assignment.row)?
+            let outcome = if controlled {
+                super::worker_owner::status(&state.join("dispatches"), &row)
             } else {
-                Value::Null
+                Ok(Value::Null)
             };
             #[cfg(not(target_os = "linux"))]
-            let outcome = Value::Null;
+            let outcome = Ok(Value::Null);
             outcome
         };
+        let (mut inbox, assignment, current, replay) = check()?;
+        if let Some(replay) = replay {
+            return Ok(replay);
+        }
+        ensure!(
+            initial.worker == assignment.worker
+                && ["host", "backend", "tmuxSocket", "endpoint", "executionId"]
+                    .iter()
+                    .all(|key| row[*key] == current[*key]),
+            "assignment changed while inspecting {dispatch}"
+        );
         ensure!(
             !matches!(
-                observed["state"].as_str(),
+                observation?["state"].as_str(),
                 Some("exited" | "cancelled" | "not_started")
             ),
             "attempt is no longer accepted for {dispatch}; its round is not running"

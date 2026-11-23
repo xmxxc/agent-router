@@ -112,8 +112,8 @@ pub(super) fn ids(dir: &Path) -> Result<BTreeSet<String>> {
     Ok(ids)
 }
 
-// The pending and published files can have different inodes. Concurrent close
-// requests must still serialize on the same assignment across that transition.
+// The pending and published files can have different inodes. Close and new
+// questions must still serialize on the same attempt across that transition.
 pub(super) fn close_lock(state: &Path, row: &Value) -> Result<File> {
     let dir = state.join("close-locks");
     let id = row["dispatch"]

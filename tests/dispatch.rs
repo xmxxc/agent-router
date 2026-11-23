@@ -842,33 +842,36 @@ fn question_shorthand_accepts_frozen_unowned_argument_shapes() {
         "cwd": f.0,
     });
     fs::write(dir.join(format!("{id}.json")), row.to_string()).unwrap();
-    let questions = ["-", "-1", "-.1", ""];
-    for text in questions {
-        let fresh = run(f
-            .wfc()
+    let questions = ["-", "-1", "-.1", "-１", "-.١", ""];
+    let ask = || {
+        let mut command = f.wfc();
+        command
             .env("WFC_DISPATCH", id)
             .env_remove("WFC_ATTEMPT")
             .env_remove("WFC_ROUND")
             .env_remove("WFC_SCOPE")
             .env_remove("WFC_WORKER_CALLBACK")
-            .args([
-                "ask",
-                text,
-                "--attempt",
-                "",
-                "--message-id=",
-                "--options",
-                "",
-            ]));
+            .arg("ask");
+        command
+    };
+    for text in questions {
+        let fresh = run(ask().args([text, "--attempt", "", "--message-id=", "--options", ""]));
         assert_eq!(fresh["duplicate"], false);
     }
+    for args in [&["choices", "--options", "-why"][..], &["-²"][..]] {
+        let rejected = ask().args(args).output().unwrap();
+        assert_eq!(rejected.status.code(), Some(2));
+        assert!(rejected.stdout.is_empty());
+    }
+    run(ask().args(["choices", "--options=-why"]));
     let batch = run(f.wfc().args(["wait", "--scope", "test", "--timeout", "0"]));
     let messages = batch["messages"].as_array().unwrap();
-    assert_eq!(messages.len(), questions.len());
+    assert_eq!(messages.len(), questions.len() + 1);
     for (message, question) in messages.iter().zip(questions) {
         assert_eq!(message["question"], question);
         assert_eq!(message["options"], json!([]));
     }
+    assert_eq!(messages.last().unwrap()["options"], json!(["-why"]));
 }
 
 #[test]

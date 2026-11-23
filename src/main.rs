@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+mod host_launch;
 mod kernel;
 #[cfg(target_os = "linux")]
 mod tmux;
@@ -40,8 +42,10 @@ fn main() -> anyhow::Result<ExitCode> {
         }
     });
     let args: Vec<_> = args.collect();
-    if let Some(name @ ("dispatch" | "status" | "close" | "wait" | "ack" | "resolve" | "relay")) =
-        command.to_str()
+    if let Some(
+        name @ ("dispatch" | "status" | "close" | "wait" | "ack" | "resolve" | "relay"
+        | "herdr-reconcile"),
+    ) = command.to_str()
     {
         anyhow::ensure!(
             args == ["--help"]
@@ -57,6 +61,8 @@ fn main() -> anyhow::Result<ExitCode> {
             println!("{}", workflow::STATUS_USAGE);
             #[cfg(target_os = "linux")]
             println!("{}", workflow::worker_owner::CLOSE_USAGE);
+            #[cfg(target_os = "linux")]
+            println!("{}", workflow::herdr::USAGE);
             println!("{DONE_USAGE}");
             println!("{ASK_USAGE}");
             println!("{WAIT_USAGE}");
@@ -81,6 +87,36 @@ fn main() -> anyhow::Result<ExitCode> {
             );
         }
         #[cfg(target_os = "linux")]
+        Some("herdr-reconcile") => {
+            use workflow::herdr::{Reconcile, USAGE};
+            if args == ["--help"] || args == ["-h"] {
+                println!("{USAGE}");
+            } else {
+                let request = match Reconcile::parse(&args) {
+                    Ok(request) => request,
+                    Err(e) => {
+                        eprintln!("wfc: {e}. {USAGE}");
+                        return Ok(ExitCode::from(2));
+                    }
+                };
+                println!("{}", request.run()?);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        Some("--herdr-backend") if args.is_empty() => {
+            let request = serde_json::from_reader(std::io::stdin().lock())?;
+            let reply = workflow::herdr::submit(request)?;
+            println!("{reply}");
+            if reply["result"] != "accepted" {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        Some("--herdr-host") if args.len() == 2 => {
+            let spec = host_launch::spec_path(Path::new(&args[0]), Path::new(&args[1]))?;
+            return host_launch::supervise(&spec);
+        }
+        #[cfg(target_os = "linux")]
         Some("--tmux-backend") if args.is_empty() => {
             let request = serde_json::from_reader(std::io::stdin().lock())?;
             println!("{}", tmux::execute(&workflow::state_dir()?, request)?);
@@ -93,6 +129,10 @@ fn main() -> anyhow::Result<ExitCode> {
                 Path::new(&args[2]),
                 args[3].to_str().unwrap_or_default(),
             )?;
+        }
+        #[cfg(target_os = "linux")]
+        Some("--tmux-record-session") if args.len() == 8 => {
+            tmux::record_created_session(&args)?;
         }
         #[cfg(target_os = "linux")]
         Some("--tmux-host") if args.len() == 1 => {

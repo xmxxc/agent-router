@@ -156,6 +156,10 @@ pub fn close(id: &OsStr) -> Result<Value> {
     // Older foreground records were only published after successful exit.
     let mut already_gone = true;
     if record.get("worker").is_some() {
+        let _lock = super::assignment::close_lock(
+            dir.parent().context("missing state directory")?,
+            &record,
+        )?;
         let (reader, unlocked) = open_owner(&dir, &record, false)?;
         let (owner, unlocked) = if unlocked {
             (reader, true)
