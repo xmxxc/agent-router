@@ -1612,13 +1612,20 @@ mod tests {
             assert!(inbox
                 .validate_done(
                     &assignment,
+                    &row,
                     &report,
                     notice.request_key.as_deref(),
                     Some(attempt)
                 )
                 .is_err());
             assert!(inbox
-                .validate_done(&assignment, &report, Some("fresh-done"), Some(attempt))?
+                .validate_done(
+                    &assignment,
+                    &row,
+                    &report,
+                    Some("fresh-done"),
+                    Some(attempt)
+                )?
                 .is_none());
             inbox.require_question_round(&assignment, &row, Some(attempt))?;
             let delivered = inbox.claim(None, Some("notice-scope"), State::Received)?;
