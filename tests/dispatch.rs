@@ -176,7 +176,7 @@ fn live_worker_reports_once_and_wait_returns_the_same_receipt() {
     let worker = r#"
 import json, os, subprocess, sys
 from pathlib import Path
-Path("report.md").write_text("finished")
+Path(os.environ["WFC_REPORT"]).write_text("finished")
 args = [sys.argv[1], "done", "--report", os.environ["WFC_REPORT"], "--attempt", os.environ["WFC_ATTEMPT"]]
 first = json.loads(subprocess.check_output(args))
 assert first["state"] == "unsent" and not first["duplicate"]
@@ -196,7 +196,7 @@ assert first["state"] == "unsent" and not first["duplicate"]
         .args([
             "done",
             "--report",
-            "work/report.md",
+            record["report"].as_str().unwrap(),
             "--attempt",
             record["attempt"].as_str().unwrap(),
         ]));
@@ -207,14 +207,7 @@ assert first["state"] == "unsent" and not first["duplicate"]
     for field in ["dispatch", "round", "attempt", "role"] {
         assert_eq!(message[field], record[field]);
     }
-    assert_eq!(
-        message["report"],
-        f.0.join("work/report.md")
-            .canonicalize()
-            .unwrap()
-            .to_str()
-            .unwrap()
-    );
+    assert_eq!(message["report"], record["report"]);
     assert_eq!(message["messageId"], receipt["messageId"]);
     assert_eq!(message["id"], receipt["message"]);
     assert_eq!(message["state"], "received");
@@ -233,7 +226,8 @@ fn invalid_callbacks_leave_the_queue_empty_and_parallel_retries_share_one_receip
     let record = run(f
         .dispatch("work", "reviewer", "task.md")
         .args([PYTHON, "-c", "pass"]));
-    fs::write(f.0.join("work/report.md"), "done").unwrap();
+    let report = record["report"].as_str().unwrap();
+    fs::write(report, "done").unwrap();
     let id = record["dispatch"].as_str().unwrap();
     let done = |report: &str| {
         let mut cmd = f.wfc();
@@ -246,17 +240,17 @@ fn invalid_callbacks_leave_the_queue_empty_and_parallel_retries_share_one_receip
     for mut cmd in [
         done("absent.md"),
         {
-            let mut c = done("work/report.md");
+            let mut c = done(report);
             c.env("WFC_ROUND", "2");
             c
         },
         {
-            let mut c = done("work/report.md");
+            let mut c = done(report);
             c.env("WFC_ATTEMPT", "stale");
             c
         },
         {
-            let mut c = done("work/report.md");
+            let mut c = done(report);
             c.args(["--attempt", "stale"]);
             c
         },
@@ -276,8 +270,8 @@ fn invalid_callbacks_leave_the_queue_empty_and_parallel_retries_share_one_receip
         Some(3)
     );
     let (a, b) = std::thread::scope(|scope| {
-        let other = scope.spawn(|| run(&mut done("work/report.md")));
-        (run(&mut done("work/report.md")), other.join().unwrap())
+        let other = scope.spawn(|| run(&mut done(report)));
+        (run(&mut done(report)), other.join().unwrap())
     });
     assert_eq!(a["messageId"], b["messageId"]);
     assert_ne!(a["duplicate"], b["duplicate"]);
@@ -287,7 +281,7 @@ fn invalid_callbacks_leave_the_queue_empty_and_parallel_retries_share_one_receip
     assert!(String::from_utf8_lossy(&conflict.stderr).contains("conflicts"));
     let messages = run(f.wfc().args(["wait", "--timeout", "0"]));
     assert_eq!(messages["messages"].as_array().unwrap().len(), 1);
-    let replay = run(&mut done("work/report.md"));
+    let replay = run(&mut done(report));
     assert_eq!(replay["duplicate"], true);
     assert_eq!(replay["state"], "received");
     assert_eq!(replay["statusVersion"], 2);
@@ -431,7 +425,8 @@ fn failed_or_timed_out_git_leaves_both_snapshot_fields_null() {
     let record = run(f
         .dispatch("work", "reviewer", "task")
         .args([PYTHON, "-c", "pass"]));
-    fs::write(f.0.join("work/report.md"), "").unwrap();
+    let report = record["report"].as_str().unwrap();
+    fs::write(report, "").unwrap();
     let git = f.0.join("git");
     let path = std::env::join_paths(
         std::iter::once(f.0.clone())
@@ -445,7 +440,7 @@ fn failed_or_timed_out_git_leaves_both_snapshot_fields_null() {
             .env_remove("WFC_ROUND")
             .env_remove("WFC_ATTEMPT")
             .env("WFC_DISPATCH", record["dispatch"].as_str().unwrap())
-            .args(["done", "--report", "work/report.md", "--message-id", key]))
+            .args(["done", "--report", report, "--message-id", key]))
     };
     fs::write(&git, "#!/bin/sh\nexit 128\n").unwrap();
     fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
@@ -464,4 +459,130 @@ fn failed_or_timed_out_git_leaves_both_snapshot_fields_null() {
     assert!(messages
         .iter()
         .all(|m| m.get("head") == Some(&Value::Null) && m.get("dirty") == Some(&Value::Null)));
+}
+
+#[test]
+fn default_reports_in_shared_cwd_keep_each_scopes_contents() {
+    let f = Fixture::new();
+    fs::write(f.0.join("task"), "").unwrap();
+    let worker = r#"
+import os, subprocess, sys
+from pathlib import Path
+path = Path(os.environ['WFC_REPORT'])
+path.write_text(os.environ['WFC_ROLE'])
+subprocess.run([sys.argv[1], 'done', '--report', path, '--attempt', os.environ['WFC_ATTEMPT']], check=True)
+"#;
+    for scope in ["alpha", "beta"] {
+        run(f.wfc().args([
+            "dispatch",
+            "--cwd",
+            ".",
+            "--task",
+            "task",
+            "--role",
+            scope,
+            "--scope",
+            scope,
+            "--",
+            PYTHON,
+            "-c",
+            worker,
+            env!("CARGO_BIN_EXE_wfc"),
+        ]));
+    }
+    for scope in ["alpha", "beta"] {
+        let batch = run(f.wfc().args(["wait", "--scope", scope, "--timeout", "0"]));
+        let msg = &batch["messages"][0];
+        assert_eq!(
+            fs::read_to_string(msg["report"].as_str().unwrap()).unwrap(),
+            scope
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn explicit_report_link_can_point_to_a_future_file() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    fs::write(f.0.join("task"), "").unwrap();
+    symlink("new/reports/result.md", f.0.join("report-link")).unwrap();
+    let request_path = "missing/../report-link";
+    let write_report = "import os; from pathlib import Path; Path(os.environ['WFC_REPORT']).write_text('finished')";
+    let record = run(f.wfc().args([
+        "dispatch",
+        "--cwd",
+        ".",
+        "--task",
+        "task",
+        "--role",
+        "tester",
+        "--report",
+        request_path,
+        "--",
+        PYTHON,
+        "-c",
+        write_report,
+    ]));
+    let target = f.0.join("new/reports/result.md").canonicalize().unwrap();
+    assert_eq!(record["report"], target.to_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(f.0.join("report-link")).unwrap(),
+        "finished"
+    );
+    run(f
+        .wfc()
+        .env("WFC_DISPATCH", record["dispatch"].as_str().unwrap())
+        .env_remove("WFC_ROUND")
+        .env_remove("WFC_ATTEMPT")
+        .args(["done", "--report", request_path]));
+}
+
+#[test]
+fn r1_bare_retry_preserves_receipt_across_upgrade() {
+    let f = Fixture::new();
+    let dispatch = "d-00000000000000000000000000000001";
+    let attempt = "a-001";
+    let root = f.0.canonicalize().unwrap();
+    let state = root.join("state");
+    fs::create_dir_all(state.join("dispatches")).unwrap();
+    fs::write(root.join("custom"), "finished").unwrap();
+    let record = json!({"dispatch": dispatch, "attempt": attempt, "round": 1, "role": "tester", "cwd": root});
+    fs::write(
+        state.join("dispatches").join(format!("{dispatch}.json")),
+        record.to_string(),
+    )
+    .unwrap();
+    // On disk, R1 stored its environment-derived key even for a bare done.
+    let mut prior = record;
+    prior.as_object_mut().unwrap().remove("cwd");
+    prior["id"] = json!(1);
+    prior["messageId"] = json!("m-original");
+    prior["report"] = json!(root.join("custom"));
+    prior["request_key"] = json!(format!("done:{dispatch}:{attempt}"));
+    prior["received"] = json!(false);
+    fs::write(state.join("messages.json"), json!([prior]).to_string()).unwrap();
+    for (expected_state, version) in [("unsent", 1), ("received", 2)] {
+        let receipt = run(f
+            .wfc()
+            .env("WFC_DISPATCH", dispatch)
+            .env("WFC_ROUND", "1")
+            .env("WFC_ATTEMPT", attempt)
+            .args(["done", "--report", "custom"]));
+        assert_eq!(receipt["message"], 1);
+        assert_eq!(receipt["messageId"], "m-original");
+        assert_eq!(receipt["duplicate"], true);
+        assert_eq!(receipt["state"], expected_state);
+        assert_eq!(receipt["statusVersion"], version);
+        let wait = f.wfc().args(["wait", "--timeout", "0"]).output().unwrap();
+        let batch: Value = serde_json::from_slice(&wait.stdout).unwrap();
+        if expected_state == "unsent" {
+            assert!(wait.status.success());
+            assert_eq!(batch["messages"].as_array().unwrap().len(), 1);
+            assert_eq!(batch["messages"][0]["messageId"], "m-original");
+        } else {
+            assert_eq!(wait.status.code(), Some(3));
+            assert_eq!(batch, json!({"messages":[],"timedOut":true}));
+        }
+    }
 }

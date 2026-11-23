@@ -7,7 +7,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use uuid::Uuid;
 
@@ -104,7 +104,7 @@ impl<'a> Dispatch<'a> {
         } else {
             scope.chars().take(120).collect()
         };
-        let default_report = cwd.join("report.md");
+        let default_report = cwd.join(format!("report-{dispatch}.md"));
         let report = report_destination(self.report.unwrap_or(&default_report))?;
         let record = json!({
             "dispatch": dispatch, "round": round, "attempt": attempt, "role": self.role,
@@ -156,23 +156,52 @@ impl<'a> Dispatch<'a> {
     }
 }
 
-// The worker usually creates the file later. Bind its resolved parent now so
-// callbacks from another current directory or via a symlink compare equally.
+// Resolve links before creating directories: even a link in the middle of the
+// assigned path may point to a directory that the worker does not have yet.
+fn follow_report_links(resolved: &mut PathBuf, path: &Path, remaining: &mut usize) -> Result<()> {
+    for component in path.components() {
+        if matches!(component, Component::ParentDir) {
+            resolved.pop();
+            continue;
+        }
+        resolved.push(component);
+        if matches!(component, Component::Normal(_)) && resolved.is_symlink() {
+            *remaining = remaining
+                .checked_sub(1)
+                .context("too many symbolic links in report path")?;
+            let target = fs::read_link(&*resolved).context("read report link")?;
+            resolved.pop();
+            follow_report_links(resolved, &target, remaining)?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_report_path(path: &Path) -> Result<PathBuf> {
+    let mut resolved = PathBuf::new();
+    let mut remaining_links = 40;
+    follow_report_links(
+        &mut resolved,
+        &std::path::absolute(path)?,
+        &mut remaining_links,
+    )?;
+    Ok(resolved)
+}
+
 fn report_destination(path: &Path) -> Result<PathBuf> {
-    let path = std::path::absolute(path)?;
-    match fs::symlink_metadata(&path) {
-        Ok(_) => {
-            let report = path.canonicalize().context("resolve report destination")?;
+    let resolved = resolve_report_path(path)?;
+    match resolved.canonicalize() {
+        Ok(report) => {
             ensure!(report.is_file(), "--report must name a file");
             Ok(report)
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {
-            let parent = path.parent().context("missing report directory")?;
-            let name = path.file_name().context("missing report filename")?;
+            let parent = resolved.parent().context("missing report directory")?;
+            let name = resolved.file_name().context("missing report filename")?;
             fs::create_dir_all(parent).context("create report directory")?;
             Ok(parent.canonicalize()?.join(name))
         }
-        Err(e) => Err(e).context("inspect report destination"),
+        Err(e) => Err(e).context("resolve report destination"),
     }
 }
 

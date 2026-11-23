@@ -1,6 +1,6 @@
 //! A worker can retry a keyed completion. A controller claims a batch
 //! before printing it, so another waiter cannot deliver the same messages.
-use super::{git_snapshot::Snapshot, state_dir, valid_id};
+use super::{git_snapshot::Snapshot, resolve_report_path, state_dir, valid_id};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -289,8 +289,7 @@ impl<'a> Done<'a> {
     }
 
     pub fn run(self) -> Result<Value> {
-        let report = self
-            .report
+        let report = resolve_report_path(self.report)?
             .canonicalize()
             .with_context(|| format!("report not found: {}", self.report.display()))?;
         ensure!(report.is_file(), "report not found: {}", report.display());
@@ -299,27 +298,36 @@ impl<'a> Done<'a> {
         let dispatch = env::var("WFC_DISPATCH")
             .context("run done inside a dispatched worker (WFC_DISPATCH)")?;
         ensure!(valid_id(&dispatch), "invalid dispatch ID");
-        let key = self
-            .key
-            .map(str::to_owned)
-            .or_else(|| self.attempt.map(|id| format!("done:{dispatch}:{id}")));
         let check = || {
             let lock = lock_file(&state)?;
             lock.lock().context("lock controller messages")?;
             let assignment = Assignment::current(&state, &dispatch, self.attempt)?;
+            // R1 dispatches had neither field and derived the default key from
+            // the worker's launch environment. Assignment::current checked it.
+            let r1_worker = assignment.report.is_none()
+                && assignment.worker.scope.is_none()
+                && env::var_os("WFC_ROUND").is_some()
+                && env::var_os("WFC_ATTEMPT").is_some();
+            let keyed_attempt = self
+                .attempt
+                .or_else(|| r1_worker.then_some(assignment.worker.attempt.as_str()));
+            let key = self
+                .key
+                .map(str::to_owned)
+                .or_else(|| keyed_attempt.map(|id| format!("done:{dispatch}:{id}")));
             let inbox = Inbox::read_locked(&state, lock)?;
             let receipt =
                 inbox.validate_done(&assignment, &report, key.as_deref(), self.attempt)?;
-            Ok::<_, anyhow::Error>((assignment, inbox, receipt))
+            Ok::<_, anyhow::Error>((assignment, inbox, receipt, key))
         };
-        let (initial, inbox, duplicate) = check()?;
+        let (initial, inbox, duplicate, _) = check()?;
         if let Some(receipt) = duplicate {
             return Ok(receipt);
         }
         // Git can block. Let unrelated callbacks and waits proceed while sampling.
         drop(inbox);
         let snapshot = Snapshot::read(&initial.cwd);
-        let (current, mut inbox, duplicate) = check()?;
+        let (current, mut inbox, duplicate, key) = check()?;
         ensure!(
             initial.worker.round == current.worker.round
                 && initial.worker.attempt == current.worker.attempt
