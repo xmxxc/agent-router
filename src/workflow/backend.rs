@@ -154,12 +154,32 @@ pub(super) fn verify_herdr_close_target(row: &Value, event: &Value) -> Result<()
         .iter()
         .all(|&k| target[k] == current[k])
             && same_execution(row, event)
-            && target["writerProcesses"]
-                .as_array()
-                .zip(current["writerProcesses"].as_array())
-                .is_some_and(|(old, known)| old.iter().all(|w| known.contains(w))),
+            && same_execution(row, current)
+            && current["endpoint"] == row["endpoint"]
+            && current["receipt"] == row["create"]["receipt"],
         "close intent target changed"
     );
+    let (archived, known) = target["writerProcesses"]
+        .as_array()
+        .zip(current["writerProcesses"].as_array())
+        .context("close intent target changed: missing Herdr writer list")?;
+    ensure!(
+        archived.first() == known.first(),
+        "close intent target changed: Herdr root writer identity differs or is missing"
+    );
+    ensure!(
+        archived.iter().all(|writer| known.contains(writer)),
+        "close intent target changed: unrecognized Herdr writer"
+    );
+    if known.is_empty() {
+        ensure!(
+            current["writerStoppedEvidence"]
+                .as_str()
+                .is_some_and(|v| !v.trim().is_empty())
+                && target["writerStoppedEvidence"] == current["writerStoppedEvidence"],
+            "close intent target changed: missing or changed Herdr writer stop evidence"
+        );
+    }
     Ok(())
 }
 

@@ -447,6 +447,94 @@ Path('done-received').write_bytes(reply)
             self.assertEqual((view['status'], view['worker']['state'], view['backendAlive']),
                              ('unknown', 'unknown', None))
 
+    def test_close_archive_requires_the_original_root_writer(self):
+        requests = []
+        def count_close(req, reply):
+            if req['method'] == 'pane.close':
+                requests.append(req['id'])
+            return reply
+
+        endpoint = self.enterContext(self.service.fault_proxy(count_close))
+        self.worker.write_text("from pathlib import Path\nimport time\nwhile not Path('exit-now').exists(): time.sleep(.02)\nraise SystemExit(17)")
+        self.dispatch(endpoint=endpoint)
+        sibling, sibling_pid = self.sibling()
+        (self.root/'exit-now').touch()
+        live.wait_for(lambda: self.status()['status'] == 'failed')
+        receipt = Path(self.h['receipt'])
+        exit_receipt = receipt.read_bytes()
+        receipt.write_text(json.dumps({'category':'process_exited', 'exitCode':'invalid'}))
+        self.unconfirmed_close('invalid host launch exit code')
+        view = self.status()
+        self.assertEqual(view['audit'], [])
+        self.assertIn('invalid host launch exit code', view['launchDiagnostic'])
+        self.assertEqual(requests, [])
+        receipt.write_bytes(exit_receipt)
+        self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+        initial_requests = requests.copy()
+        path = Path(self.env['WFC_STATE'])/'dispatches'/(self.dispatch_id+'.json')
+        original = json.loads(path.read_bytes())
+        event, = original['audit']
+        target = event['target']
+        root, other, *_ = target['writerProcesses']
+
+        def archive_with(**changes):
+            path.write_text(json.dumps(original | {'audit':[event | {'target':target | changes}]}))
+
+        # A matching root can be verified even if the current binding learned more writers.
+        archive_with(writerProcesses=[root])
+        receipt.write_text('{')
+        view = self.status()
+        self.assertEqual((view['status'], view['worker']['exit_code'], view['backendAlive']), ('failed', 17, False))
+        self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+
+        for changes, diagnostic in [
+            ({'writerProcesses':[other, root]}, 'root writer'),
+            ({'writerProcesses':[other]}, 'root writer'),
+            ({'writerProcesses':[]}, 'root writer'),
+            ({'writerProcesses':[root | {'creation':'other-birth'}]}, 'root writer'),
+            ({'nonce':'other-execution'}, 'close intent target changed'),
+        ]:
+            with self.subTest(changes=changes):
+                archive_with(**changes)
+                for content in (exit_receipt, b'{'):
+                    receipt.write_bytes(content)
+                    view = self.assert_pending_views('unknown')
+                    listed, = self.cli('status', '--active')['dispatches']
+                    self.assertIsNone(view['backendAlive'])
+                    self.assertEqual(view['backendResult'], 'uncertain')
+                    self.assertIn(diagnostic, view['backendDiagnostic'])
+                    for field in ('worker', 'backendDiagnostic', 'backendAlive', 'launchDiagnostic'):
+                        self.assertEqual(view.get(field), listed.get(field))
+                    if content == exit_receipt:
+                        self.assertEqual((view['worker']['state'], view['worker']['exit_code']), ('exited', 17))
+                        self.assertIsNone(view.get('launchDiagnostic'))
+                    else:
+                        self.assertEqual(view['worker']['state'], 'unknown')
+                        self.assertTrue(view['launchDiagnostic'])
+                self.cli('close', self.dispatch_id, error=diagnostic)
+
+        # The legacy archive carries no target. A rooted binding still requires root evidence.
+        path.write_text(json.dumps(original | {'audit':[]}))
+        legacy = path.with_suffix(f".{self.row['attempt']}.closed")
+        archive = dict(dispatch=self.dispatch_id, round=self.row['round'], attempt=self.row['attempt'],
+                       worker=event['workerOnClose'])
+        legacy.write_text(json.dumps(archive))
+        self.assertIn('legacy archive', self.assert_pending_views('unknown')['backendDiagnostic'])
+        self.cli('close', self.dispatch_id, error='legacy archive')
+
+        stopped = original['backendHandle'] | {'writerProcesses':[], 'writerStoppedEvidence':'   '}
+        path.write_text(json.dumps(original | {'audit':[], 'backendHandle':stopped}))
+        self.cli('close', self.dispatch_id, error='legacy archive')
+        stopped['writerStoppedEvidence'] = 'inspected and stopped'
+        path.write_text(json.dumps(original | {'audit':[], 'backendHandle':stopped}))
+        legacy.write_text(json.dumps(archive | {'worker':{'state':'running'}}))
+        self.cli('close', self.dispatch_id, error='invalid closed worker outcome')
+
+        self.assertEqual(self.service.api('pane.process_info', pane_id=sibling)['process_info']['shell_pid'],
+                         sibling_pid)
+        os.kill(sibling_pid, 0)
+        self.assertEqual(requests, initial_requests)
+
     def test_new_done_selects_only_its_execution_from_close_history(self):
         self.dispatch()
         self.submit('finish')

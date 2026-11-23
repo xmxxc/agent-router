@@ -21,7 +21,7 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
             pending_close && super::backend::verify_herdr_close_target(row, event).is_ok()
         })
         .map(|event| &event["workerOnClose"])
-        .filter(|worker| worker["state"] == "exited")
+        .filter(|worker| worker["state"] == "exited" && worker["exit_code"].is_i64())
         .cloned();
     let unresolved_worker = pending_close && prior_exit.is_none();
     if let Some(exit) = prior_exit {

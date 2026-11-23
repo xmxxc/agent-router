@@ -548,6 +548,9 @@ fn status_with_history(
             let (worker, inspection) = backend::observe(&state, record)?;
             record["worker"] = worker;
             record["backendResult"] = inspection["result"].clone();
+            if record["backend"] == "herdr" && inspection["diagnostic"].is_string() {
+                record["backendDiagnostic"] = inspection["diagnostic"].clone();
+            }
             record["backendAlive"] = if inspection["alive"] == true && inspection["owned"] != true {
                 Value::Null
             } else {
