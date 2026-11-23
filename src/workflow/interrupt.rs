@@ -59,7 +59,7 @@ impl<'a> Interrupt<'a> {
         if let Some(event) =
             assignment::unresolved_lifecycle(&row).or_else(|| assignment::interrupt_fence(&row))
         {
-            return Err(controller::ControllerError(json!({
+            return Err(controller::ControllerError::from_detail(json!({
                 "error":"lifecycle_reconcile_required","dispatch":self.dispatch,
                 "operation":event["operation"],"audit":event["id"],"result":event["result"],
                 "round":row["round"],"attempt":row["attempt"],
