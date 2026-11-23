@@ -164,6 +164,7 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
                 .is_some_and(|event| event["result"] != "accepted");
             let state = match row["worker"]["state"].as_str() {
                 _ if unresolved_worker || unconfirmed_resume => "unknown",
+                _ if super::assignment::input_unresolved(row) && alive == Some(true) => "unknown",
                 _ if unconfirmed_create && row["worker"]["state"] != "cancelled" => {
                     round["result"] = row["create"].clone();
                     "unknown"

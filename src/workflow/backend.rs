@@ -3,6 +3,7 @@ use super::{host::Launch, valid_identity, write_json};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
+    borrow::Cow,
     env,
     fs::File,
     io::ErrorKind,
@@ -12,6 +13,40 @@ use std::{
 
 // Public assignments published with the session-aware tmux protocol.
 pub(super) const LAUNCH_PROTOCOL: u64 = 8;
+
+// Continue changes the public round without changing the tmux writer or its
+// launch receipt. All native lifecycle operations still name that execution.
+pub(super) fn execution_row(row: &Value) -> Result<Cow<'_, Value>> {
+    let execution = &row["executionId"];
+    if row["backend"] != "tmux" || execution.is_null() || execution == &row["attempt"] {
+        return Ok(Cow::Borrowed(row));
+    }
+    let create = &row["create"];
+    ensure!(
+        execution
+            .as_str()
+            .is_some_and(|id| valid_identity(id, "a-"))
+            && create["attempt"] == *execution
+            && create["result"] == "accepted"
+            && create["dispatch"] == row["dispatch"]
+            && create["round"]
+                .as_u64()
+                .zip(row["round"].as_u64())
+                .is_some_and(|(old, new)| old < new)
+            && row["rounds"]
+                .as_array()
+                .is_some_and(|rounds| rounds.iter().any(|round| {
+                    round["attempt"] == *execution
+                        && round["round"] == create["round"]
+                        && round["state"] == "completed"
+                })),
+        "execution identity does not match this attempt or its original launch"
+    );
+    let mut physical = row.clone();
+    physical["attempt"] = execution.clone();
+    physical["round"] = create["round"].clone();
+    Ok(Cow::Owned(physical))
+}
 
 #[cfg(target_os = "linux")]
 pub fn tmux_socket() -> Result<PathBuf> {
@@ -192,21 +227,73 @@ fn existing(state: &Path, row: &Value, op: &str, read_only: bool) -> Result<Valu
     if read_only {
         request["readOnly"] = json!(true);
     }
-    existing_request(state, row, request)
+    call(state, row, existing_request(row, request)?)
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn submit(state: &Path, row: &Value, text: &str) -> Result<Value> {
-    existing_request(
+pub(super) fn submit_checked(
+    state: &Path,
+    row: &Value,
+    text: &str,
+    confirm_transcript: bool,
+    check: &mut dyn FnMut(crate::tmux::InputBoundary) -> std::result::Result<(), Value>,
+) -> Result<Value> {
+    ensure!(row["backend"] == "tmux", "input requires a tmux worker");
+    let row = execution_row(row)?;
+    let request = existing_request(
+        row.as_ref(),
+        json!({"op":"submit","text":text,"host":row["host"],"confirm_reply":true,
+            "confirm_transcript":confirm_transcript}),
+    )?;
+    crate::tmux::execute_checked(
         state,
-        row,
-        json!({
-            "op":"submit", "text":text, "host":row["host"], "confirm_reply":true
-        }),
+        serde_json::from_value(request)?,
+        row["tmuxSocket"].as_str(),
+        check,
     )
 }
 
-fn existing_request(state: &Path, row: &Value, mut request: Value) -> Result<Value> {
+#[cfg(target_os = "linux")]
+pub(super) fn verify_legacy_worker_callback(
+    state: &Path,
+    dispatch: &str,
+    observed: &Value,
+) -> Result<()> {
+    let verify = || -> Result<()> {
+        let launch = observed["launchId"]
+            .as_str()
+            .filter(|id| valid_launch(id))
+            .context("missing launch ID")?;
+        let receipt = private_receipt(state, Some(launch))?;
+        let pid = receipt["pid"]
+            .as_u64()
+            .filter(|pid| *pid > 0)
+            .context("missing worker PID")?;
+        ensure!(receipt["category"] == "started", "worker no longer running");
+        let env = std::fs::read(format!("/proc/{pid}/environ"))?;
+        let field = |prefix: &[u8]| {
+            env.split(|b| *b == 0)
+                .find_map(|entry| entry.strip_prefix(prefix))
+        };
+        ensure!(
+            field(b"WFC_STATE=") == Some(state.canonicalize()?.as_os_str().as_encoded_bytes())
+                && field(b"WFC_DISPATCH=") == Some(dispatch.as_bytes()),
+            "original worker environment does not identify this execution"
+        );
+        ensure!(
+            env.split(|b| *b == 0).all(|entry| {
+                entry
+                    .strip_prefix(b"WFC_WORKER_CALLBACK=")
+                    .is_none_or(|secret| secret.is_empty())
+            }),
+            "original worker has a callback credential absent from the assignment"
+        );
+        Ok(())
+    };
+    verify().context("verify the original worker callback authorization before continuing")
+}
+
+fn existing_request(row: &Value, mut request: Value) -> Result<Value> {
     let attempt = row["attempt"]
         .as_str()
         .filter(|v| valid_identity(v, "a-"))
@@ -229,7 +316,8 @@ fn existing_request(state: &Path, row: &Value, mut request: Value) -> Result<Val
     if matches!(request["op"].as_str(), Some("close" | "revoke")) {
         request["closeOperationId"] = json!(close_operation(row)?);
     }
-    call(state, row, request)
+    request["dispatch"] = row["dispatch"].clone();
+    Ok(request)
 }
 
 fn receipt_id(row: &Value) -> Result<Option<&str>> {
@@ -353,7 +441,8 @@ fn closed_path(state: &Path, row: &Value) -> Result<PathBuf> {
 }
 
 pub(super) fn archive(state: &Path, row: &Value) -> Result<Option<Value>> {
-    match File::open(closed_path(state, row)?) {
+    let row = execution_row(row)?;
+    match File::open(closed_path(state, &row)?) {
         Ok(f) => {
             let saved: Value = serde_json::from_reader(f)?;
             ensure!(
@@ -651,6 +740,11 @@ pub(super) fn observe_with_mode(
     if row["backend"] == "herdr" {
         return super::herdr::observe(state, row, read_only);
     }
+    let physical = execution_row(row)?;
+    observe_tmux(state, physical.as_ref(), read_only)
+}
+
+fn observe_tmux(state: &Path, row: &Value, read_only: bool) -> Result<(Value, Value)> {
     let saved = archive(state, row)?.unwrap_or(Value::Null);
     if confirmed(row, &saved) {
         let mut observation = json!({"result":"completed","alive":false});
@@ -756,8 +850,12 @@ pub(super) fn read_only_close(state: &Path, row: &Value) -> Result<Option<Value>
         return super::herdr::read_only_close(state, row);
     }
     if row["backend"] == "tmux" {
-        if let Some(saved) = archive(state, row)?.filter(|saved| confirmed(row, saved)) {
-            return replay(state, row, &saved, false);
+        let physical = execution_row(row)?;
+        if let Some(saved) = archive(state, &physical)?.filter(|saved| confirmed(&physical, saved))
+        {
+            return Ok(
+                replay(state, &physical, &saved, false)?.map(|result| public_close(result, row))
+            );
         }
     }
     Ok(None)
@@ -768,6 +866,18 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
     if row["backend"] == "herdr" {
         return super::herdr::close(state, row);
     }
+    let physical = execution_row(row)?;
+    let result = close_tmux(state, physical.as_ref())?;
+    Ok(public_close(result, row))
+}
+
+fn public_close(mut result: Value, row: &Value) -> Value {
+    result["round"] = row["round"].clone();
+    result["attempt"] = row["attempt"].clone();
+    result
+}
+
+fn close_tmux(state: &Path, row: &Value) -> Result<Value> {
     let id = row["dispatch"].as_str().context("missing dispatch")?;
     // Archived replay works on read-only state. A first close serializes on a
     // stable per-attempt file regardless of which publication the reader saw.

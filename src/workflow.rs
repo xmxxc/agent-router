@@ -22,6 +22,8 @@ mod backend;
 pub mod herdr;
 pub mod host;
 #[cfg(target_os = "linux")]
+pub mod input;
+#[cfg(target_os = "linux")]
 pub mod reclaim;
 #[cfg(target_os = "linux")]
 pub mod resume;
@@ -812,6 +814,10 @@ fn status_with_history(
             .as_object_mut()
             .unwrap()
             .remove(controller::CALLBACK_HASH);
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove(controller::CALLBACK_REF_HASH);
         if let Some(scope) = record_scope(record) {
             if let Some(owner) = owners.public(scope)? {
                 record["controllerOwner"] = owner;

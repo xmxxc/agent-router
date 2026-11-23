@@ -144,6 +144,8 @@ wfc wait --scope team-a --timeout 30
 
 `ask` 把问题交给派发所属的总控组。`--options` 按逗号拆分并去掉空项，省略时为空列表。显式提供 `--attempt` 时，相同问题和选项重试会取回原编号。也可用 `--message-id` 自定键，同一派发内用同一键提交不同内容会报冲突。任务存活并等待答复时，状态显示 `asking` 和 `waiting-human`。
 
+在 Linux 可用 `wfc nudge DISPATCH --text TEXT [--message-id KEY]` 提醒当前仍在处理任务的 Codex/tmux worker。省略 `--message-id` 时，每次合法调用都是一条新提醒，可以主动再次发送同文。需要在返回丢失或结算报错后精确取回回执时，从首次发送起为该意图使用同一个键。同一派发内，同键同正文会取回原数字 `message`，同键不同正文会报冲突。发送结果仍待核对时，只有匹配且已证实送达的收据可以用于补结算。
+
 在已认领的组中，worker 可用启动时分配的独立回调凭据发问或回报。总控兼容入口使用当前租约的凭据。`ask` 与 `done` 均接受显式的 `--owner-token`。
 
 `wait` 默认等待 3600 秒，`--timeout` 接受小数秒，设为 0 可立即查询。它按提交顺序返回 `messages`，包含派发、轮次、attempt、角色、scope、数字编号 `id` 和 `messageId`。报告消息包含路径和 Git 快照，问题消息包含 `question` 和 `options`。可按 `--scope NAME`、`--dispatch ID` 或两者共同筛选。首次提交为 `unsent`（版本 1），领取为 `received`（版本 2）。消息在输出前标记为已收取，其他等待者可领取剩余消息。超时返回 `{"messages":[],"timedOut":true}`，退出码为 3。

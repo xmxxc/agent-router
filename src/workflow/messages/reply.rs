@@ -93,6 +93,10 @@ impl<'a> Reply<'a> {
                 }),
                 "question {question} was already answered or has a reply pending confirmation"
             );
+            ensure!(
+                !inbox.unresolved_reply(&row, None),
+                "another reply is pending or uncertain on this execution; verify it before input"
+            );
             let mut claim = Message::new(
                 inbox.messages.len() as u64 + 1,
                 original.worker.clone(),
@@ -113,11 +117,16 @@ impl<'a> Reply<'a> {
         };
         let text = format!("[router] Answer to question {question}: {answer}");
         let mut started = false;
-        let begin = || -> Result<()> {
+        let begin = |first: bool| -> Result<()> {
             let mut inbox = Inbox::open(&state)?;
             let claim = reply_record(&mut inbox, &uid)?;
             ensure!(
-                claim.input_result == InputResult::Pending,
+                claim.input_result
+                    == (if first {
+                        InputResult::Pending
+                    } else {
+                        InputResult::Uncertain
+                    }),
                 "reply is no longer pending"
             );
             let original_id = claim.question_message_id.clone();
@@ -132,6 +141,10 @@ impl<'a> Reply<'a> {
                 })
                 .context("question changed while waiting for input")?;
             let current = validate(&state, &inbox, original, token.as_deref())?;
+            ensure!(
+                !inbox.unresolved_reply(&current, Some(&uid)),
+                "another reply is pending or uncertain on this execution; verify it before input"
+            );
             ensure!(
                 [
                     "host",
@@ -157,14 +170,16 @@ impl<'a> Reply<'a> {
                     .all(|key| row["backendHandle"][*key] == current["backendHandle"][*key]),
                 "assignment changed while waiting for input"
             );
-            update(
-                &mut inbox,
-                &uid,
-                InputResult::Uncertain,
-                Some("submission started; no confirmation stored".into()),
-                Some("input_uncertain".into()),
-            )?;
-            started = true;
+            if first {
+                update(
+                    &mut inbox,
+                    &uid,
+                    InputResult::Uncertain,
+                    Some("submission started; no confirmation stored".into()),
+                    Some("input_uncertain".into()),
+                )?;
+                started = true;
+            }
             Ok(())
         };
 
@@ -192,7 +207,7 @@ impl<'a> Reply<'a> {
                 let category = result["category"].as_str().map(str::to_owned);
                 (outcome, diagnostic, category)
             }
-            Err(error) if started => (
+            Err(error) if started && !error.is::<controller::ControllerError>() => (
                 InputResult::Uncertain,
                 Some(format!("{error:#}")),
                 Some("input_uncertain".into()),
@@ -248,6 +263,10 @@ fn validate(state: &Path, inbox: &Inbox, question: &Message, token: Option<&str>
         "question {} belongs to an attempt that is no longer accepted",
         question.id
     );
+    ensure!(
+        !assignment::input_unresolved(&row) && assignment::unresolved_resume(&row).is_none(),
+        "another input is pending or uncertain on this execution; verify it before replying"
+    );
     inbox.require_question_round(&assignment, &row, Some(&worker.attempt))?;
     ensure!(
         row["createPending"] != true
@@ -265,7 +284,7 @@ fn submit(
     token: Option<&str>,
     message_id: &str,
     text: &str,
-    mut begin: impl FnMut() -> Result<()>,
+    mut begin: impl FnMut(bool) -> Result<()>,
 ) -> Result<Value> {
     let start = Instant::now();
     loop {
@@ -280,13 +299,36 @@ fn submit(
                             backend::archive(state, row)?.is_none(),
                             "execution resources are closing or closed"
                         );
-                        begin()?;
-                        return backend::submit(state, row, text);
+                        use crate::tmux::InputBoundary::{Enter, PrepareEnter, PrepareText, Text};
+                        let mut authorization_error = None;
+                        let outcome =
+                            backend::submit_checked(state, row, text, false, &mut |boundary| {
+                                let check = match boundary {
+                                    PrepareText => begin(true),
+                                    PrepareEnter => begin(false),
+                                    Text | Enter => controller::Owners::read(state)
+                                        .and_then(|owners| owners.require(scope, token, "reply"))
+                                        .map(|_| ()),
+                                };
+                                check.map_err(|error| {
+                                let diagnostic = format!("{error:#}");
+                                let first = matches!(boundary, PrepareText | Text);
+                                if first && error.is::<controller::ControllerError>() {
+                                    authorization_error = Some(error);
+                                }
+                                json!({"result":if first {"definitely-not-sent"} else {"uncertain"},
+                                    "diagnostic":diagnostic})
+                            })
+                            });
+                        if let Some(error) = authorization_error {
+                            return Err(error);
+                        }
+                        return outcome;
                     }
                 }
                 Some("herdr") => {
                     if let Some(result) =
-                        herdr::try_submit_reply(state, row, message_id, text, &mut begin)?
+                        herdr::try_submit_reply(state, row, message_id, text, &mut || begin(true))?
                     {
                         return Ok(result);
                     }
