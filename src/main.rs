@@ -13,6 +13,8 @@ const RESERVED_COMMANDS: &[&str] = &[
     "ask", "reply", "continue", "nudge", "resume", "reclaim", "relay",
 ];
 
+const UNEXPECTED_ARGUMENTS: &str = "wfc: unexpected arguments. See wfc --help";
+
 fn main() -> anyhow::Result<ExitCode> {
     let mut args = env::args_os();
     let program = args.next().unwrap_or_default();
@@ -172,7 +174,7 @@ fn main() -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::from(2));
         }
         _ => {
-            eprintln!("wfc: unexpected arguments. See wfc --help");
+            eprintln!("{UNEXPECTED_ARGUMENTS}");
             return Ok(ExitCode::from(2));
         }
     }

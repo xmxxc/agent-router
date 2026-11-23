@@ -254,10 +254,14 @@ impl<'a> Dispatch<'a> {
             file.sync_all()?;
             drop(file);
             if let Some(launch) = launch {
-                let answer = backend::create(&state, &record, launch)?;
+                let mut answer = backend::create(&state, &record, launch)?;
                 let accepted = answer["result"] == "accepted";
                 if accepted || answer["result"] == "uncertain" {
                     preserve_binding = true;
+                    // Bind the launch receipt to the assignment that requested it.
+                    answer["dispatch"] = record["dispatch"].clone();
+                    answer["attempt"] = record["attempt"].clone();
+                    answer["round"] = record["round"].clone();
                     record["create"] = answer.clone();
                     let published = records.join(format!("{dispatch}.json"));
                     if let Err(e) = write_json(&published, &record, None) {
@@ -544,11 +548,7 @@ fn status_with_history(
                 record["dispatch"].as_str().context("missing dispatch")?,
             )?,
         };
-        let messages = if messages.is_empty() {
-            record["messages"].as_array().cloned().unwrap_or_default()
-        } else {
-            messages
-        };
+        let messages = view::merged_history(record, messages)?;
         undelivered.extend(
             messages
                 .iter()

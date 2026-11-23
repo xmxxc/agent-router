@@ -848,3 +848,35 @@ fn r1_bare_retry_preserves_receipt_across_upgrade() {
         }
     }
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn old_host_archive_preserves_known_exit_but_rechecks_session_cleanup() {
+    let f = Fixture::new();
+    let dir = f.0.join("state/dispatches");
+    fs::create_dir_all(&dir).unwrap();
+    let id = "d-abc01234";
+    let attempt = "a-abcdef123456";
+    let row = json!({"dispatch":id,"attempt":attempt,"round":1,"host":"codex","backend":"tmux",
+        "tmuxSocket": f.0.join("offline.sock")});
+    fs::write(dir.join(format!("{id}.json")), row.to_string()).unwrap();
+    let path = dir.join(format!("{id}.{attempt}.closed"));
+    for worker in [
+        json!({"state":"exited","exit_code":37,"signal":null}),
+        json!({"state":"cancelled","exit_code":null,"signal":null}),
+    ] {
+        let saved = json!({"dispatch":id,"attempt":attempt,"round":1,"worker":worker}).to_string();
+        fs::write(&path, &saved).unwrap();
+        let status = run(f.wfc().args(["status", "--dispatch", id]));
+        let current = &status["dispatches"][0];
+        assert_eq!(current["backendResult"], "uncertain");
+        if worker["state"] == "exited" {
+            assert_eq!(current["worker"], worker);
+        } else {
+            assert_eq!(current["worker"]["state"], "unknown");
+        }
+        let close = f.wfc().args(["close", id]).output().unwrap();
+        assert_eq!(close.status.code(), Some(1));
+        assert_eq!(fs::read_to_string(&path).unwrap(), saved);
+    }
+}
