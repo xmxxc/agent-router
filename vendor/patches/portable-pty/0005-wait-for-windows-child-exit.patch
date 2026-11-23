@@ -1,0 +1,134 @@
+diff --git a/vendor/portable-pty/src/win/mod.rs b/vendor/portable-pty/src/win/mod.rs
+index 24f8f53..5c46049 100644
+--- a/vendor/portable-pty/src/win/mod.rs
++++ b/vendor/portable-pty/src/win/mod.rs
+@@ -6,10 +6,10 @@ use std::pin::Pin;
+ use std::sync::Mutex;
+ use std::task::{Context, Poll};
+ use winapi::shared::minwindef::DWORD;
+-use winapi::um::minwinbase::STILL_ACTIVE;
++use winapi::shared::winerror::WAIT_TIMEOUT;
+ use winapi::um::processthreadsapi::*;
+ use winapi::um::synchapi::WaitForSingleObject;
+-use winapi::um::winbase::INFINITE;
++use winapi::um::winbase::{INFINITE, WAIT_OBJECT_0};
+
+ pub mod conpty;
+ mod procthreadattr;
+@@ -23,37 +23,41 @@ pub struct WinChild {
+ }
+
+ impl WinChild {
+-    fn is_complete(&mut self) -> IoResult<Option<ExitStatus>> {
+-        let mut status: DWORD = 0;
+-        let proc = self.proc.lock().unwrap().try_clone().unwrap();
+-        let res = unsafe { GetExitCodeProcess(proc.as_raw_handle() as _, &mut status) };
+-        if res != 0 {
+-            if status == STILL_ACTIVE {
+-                Ok(None)
+-            } else {
++    fn wait_for_exit(&self, timeout: DWORD) -> IoResult<Option<ExitStatus>> {
++        let proc = self.proc.lock().unwrap();
++        let handle = proc.as_raw_handle() as _;
++        // TerminateProcess is asynchronous. The process object signals when exit is complete.
++        match unsafe { WaitForSingleObject(handle, timeout) } {
++            WAIT_OBJECT_0 => {
++                let mut status = 0;
++                if unsafe { GetExitCodeProcess(handle, &mut status) } == 0 {
++                    return Err(IoError::last_os_error());
++                }
+                 Ok(Some(ExitStatus::with_exit_code(status)))
+             }
+-        } else {
+-            Ok(None)
++            WAIT_TIMEOUT => Ok(None),
++            _ => Err(IoError::last_os_error()),
+         }
+     }
++}
+
+-    fn do_kill(&mut self) -> IoResult<()> {
+-        let proc = self.proc.lock().unwrap().try_clone().unwrap();
+-        let res = unsafe { TerminateProcess(proc.as_raw_handle() as _, 1) };
+-        let err = IoError::last_os_error();
+-        if res != 0 {
+-            Err(err)
+-        } else {
+-            Ok(())
+-        }
++fn terminate_process(proc: &OwnedHandle) -> IoResult<()> {
++    let handle = proc.as_raw_handle() as _;
++    if unsafe { TerminateProcess(handle, 1) } != 0 {
++        return Ok(());
++    }
++    let err = IoError::last_os_error();
++    // A natural exit can race the termination request.
++    if unsafe { WaitForSingleObject(handle, 0) } == WAIT_OBJECT_0 {
++        Ok(())
++    } else {
++        Err(err)
+     }
+ }
+
+ impl ChildKiller for WinChild {
+     fn kill(&mut self) -> IoResult<()> {
+-        self.do_kill().ok();
+-        Ok(())
++        terminate_process(&self.proc.lock().unwrap())
+     }
+
+     fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+@@ -69,13 +73,7 @@ pub struct WinChildKiller {
+
+ impl ChildKiller for WinChildKiller {
+     fn kill(&mut self) -> IoResult<()> {
+-        let res = unsafe { TerminateProcess(self.proc.as_raw_handle() as _, 1) };
+-        let err = IoError::last_os_error();
+-        if res != 0 {
+-            Err(err)
+-        } else {
+-            Ok(())
+-        }
++        terminate_process(&self.proc)
+     }
+
+     fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+@@ -86,24 +84,12 @@ impl ChildKiller for WinChildKiller {
+
+ impl Child for WinChild {
+     fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+-        self.is_complete()
++        self.wait_for_exit(0)
+     }
+
+     fn wait(&mut self) -> IoResult<ExitStatus> {
+-        if let Ok(Some(status)) = self.try_wait() {
+-            return Ok(status);
+-        }
+-        let proc = self.proc.lock().unwrap().try_clone().unwrap();
+-        unsafe {
+-            WaitForSingleObject(proc.as_raw_handle() as _, INFINITE);
+-        }
+-        let mut status: DWORD = 0;
+-        let res = unsafe { GetExitCodeProcess(proc.as_raw_handle() as _, &mut status) };
+-        if res != 0 {
+-            Ok(ExitStatus::with_exit_code(status))
+-        } else {
+-            Err(IoError::last_os_error())
+-        }
++        self.wait_for_exit(INFINITE)?
++            .ok_or_else(|| IoError::new(std::io::ErrorKind::TimedOut, "process wait timed out"))
+     }
+
+     fn process_id(&self) -> Option<u32> {
+@@ -124,8 +110,8 @@ impl Child for WinChild {
+ impl std::future::Future for WinChild {
+     type Output = anyhow::Result<ExitStatus>;
+
+-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<anyhow::Result<ExitStatus>> {
+-        match self.is_complete() {
++    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<anyhow::Result<ExitStatus>> {
++        match self.wait_for_exit(0) {
+             Ok(Some(status)) => Poll::Ready(Ok(status)),
+             Err(err) => Poll::Ready(Err(err).context("Failed to retrieve process exit status")),
+             Ok(None) => {
