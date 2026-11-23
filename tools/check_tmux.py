@@ -994,8 +994,11 @@ os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
             self.assertLess(time.monotonic(), deadline)
             time.sleep(.01)
         args = dict(executionId="attempt-A", closeOperationId="close:A")
-        self.assertEqual(self.call("close", **args)["closeEffect"], "already_absent")
-        self.assertEqual(self.call("close", **args)["closeEffect"], "already_absent")
+        for _ in range(2):
+            closed = self.call("close", **args)
+            self.assertEqual(closed["closeEffect"], "already_absent")
+            self.assertNotIn("category", closed)
+            self.assertNotIn("cancellationEvidence", closed)
         self.assertEqual(self.call("create", executionId="attempt-B", **self.launch)["result"], "accepted")
         old = self.call("inspect", executionId="attempt-A")
         self.assertFalse(old["alive"])
@@ -1027,7 +1030,8 @@ os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
         launch = "ac" * 16
         pointer = state / "d-abc12345.json"
         pointer.write_text(json.dumps({"Registered": {"id": launch, "execution": "attempt-A"}}))
-        (launches / (launch + ".spec")).write_text(json.dumps(self.launch))
+        (launches / (launch + ".spec")).write_text(json.dumps({
+            **self.launch, "env": {"WFC_STATE": str(self.state), "WFC_DISPATCH": "d-abc12345"}}))
         (launches / (launch + ".json")).write_text('{"category":"unknown"}')
         args = dict(executionId="attempt-A", closeOperationId="close:A")
         self.assertEqual(self.call("inspect", executionId="attempt-A")["result"], "uncertain")
@@ -1037,6 +1041,121 @@ os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
         self.assertEqual(self.call("create", executionId="attempt-B", **self.launch)["result"], "accepted")
         self.assertEqual(self.call("close", **args)["closeEffect"], "already_absent")
         self.assertTrue(self.call("inspect", executionId="attempt-B")["owned"])
+
+    def test_registered_create_interrupted_before_tmux_start(self):
+        dispatch = "d-abc12345"
+        args = dict(executionId="attempt-A", closeOperationId="cancel-A")
+        # The real create has already reserved both IDs when it invokes new-session.
+        # Interrupt that caller before tmux consumes the spec, then exit the shim.
+        shim = self.work / "tmux"
+        shim.write_text(f"""#!{sys.executable}
+import os, signal, sys
+if "new-session" in sys.argv:
+    os.kill(os.getppid(), signal.SIGKILL)
+    sys.exit(0)
+os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
+""")
+        shim.chmod(0o700)
+        result = subprocess.run([WFC, "--tmux-backend"], capture_output=True, text=True, timeout=15,
+                                input=json.dumps(dict(op="create", dispatch=dispatch, executionId="attempt-A", **self.launch)),
+                                env={**self.env, "PATH": str(self.work), "WFC_STATE": str(self.state)})
+        self.assertEqual(result.returncode, -signal.SIGKILL, result.stderr)
+        spec, = (self.state / "launches").glob("*.spec")
+        offline = {"PATH": str(self.root / "unavailable")}
+        def unproven(**data):
+            response = self.call("close", environ=offline, **data)
+            self.assertNotEqual(response.get("category"), "not_started", response)
+            self.assertNotIn("cancellationEvidence", response)
+            return response
+        self.assertEqual(unproven(executionId="unregistered", closeOperationId="cancel-A")["result"], "uncertain")
+        self.assertEqual(unproven(dispatch="d-other", **args)["result"], "uncertain")
+        self.assertTrue(spec.is_file())
+        original = spec.read_bytes()
+        spec.unlink()  # A host could already have taken it.
+        self.assertEqual(unproven(**args)["result"], "uncertain")
+        spec.write_bytes(original)
+        server = spec.with_suffix(".server")
+        server.touch()
+        self.assertEqual(unproven(**args)["result"], "uncertain")
+        server.unlink()
+        spec.write_text(json.dumps({**json.loads(original), "launchId": "00" * 16}))
+        self.assertEqual(unproven(**args)["result"], "uncertain")
+        host_env = {**self.env, "WFC_STATE": str(self.state), "WFC_DISPATCH": dispatch}
+        def rejected_host():
+            host = subprocess.run([WFC, "--tmux-host", spec.stem], capture_output=True, env=host_env, timeout=5)
+            self.assertNotEqual(host.returncode, 0)
+            self.assertTrue(spec.exists())
+            self.assertFalse(server.exists())
+        rejected_host()
+        untagged = json.loads(original)
+        untagged.pop("launchId")
+        spec.write_text(json.dumps(untagged))
+        self.assertEqual(unproven(**args)["result"], "uncertain")
+        rejected_host()
+        moved = self.root / "displaced"
+        moved.write_bytes(original)
+        spec.unlink()
+        spec.symlink_to(moved)
+        self.assertEqual(unproven(**args)["result"], "uncertain")
+        rejected_host()
+        spec.unlink()
+        spec.write_bytes(original)
+
+        closed = self.call("close", environ=offline, **args)
+        record = dict(category="not_started", dispatch=dispatch, launchId=spec.stem, **args)
+        receipt = spec.with_suffix(".json")
+        self.assertEqual(closed, dict(result="completed", closeEffect="already_absent",
+                                      cancellationEvidence=str(receipt), **record))
+        self.assertFalse(spec.exists())
+        self.assertEqual(json.loads(receipt.read_bytes()), record)
+        self.assertEqual(self.call("close", environ=offline, **args), closed)
+        self.assertEqual(unproven(executionId="attempt-A", closeOperationId="different")["closeEffect"], "already_absent")
+        unproven(legacyExecutionId=spec.stem, closeOperationId="cancel-A")
+        self.assertEqual(self.call("create", executionId="attempt-B", **self.launch)["result"], "accepted")
+        self.assertEqual(self.call("close", **args), closed)
+        self.assertTrue(self.call("inspect", executionId="attempt-B")["owned"])
+        self.assertEqual(unproven(executionId="attempt-B", closeOperationId="cancel-A")["result"], "uncertain")
+        self.assertTrue(self.call("inspect", executionId="attempt-B")["workerBound"])
+        # A stale marker cannot outweigh evidence that the host consumed this launch.
+        marker = spec.with_suffix(".revoked")
+        marker.write_text(json.dumps(record))
+        receipt.write_text(json.dumps({"category": "process_exited", "launchId": spec.stem, "exitCode": 41}))
+        unproven(**args)
+
+    def test_recover_close_after_atomic_spec_take(self):
+        dispatch = "d-abc12345"
+        launch = "ab" * 16
+        args = dict(executionId="A", closeOperationId="close-A")
+        owner = dict(dispatch=dispatch, launchId=launch, **args)
+        registry = self.state / "tmux"
+        registry.mkdir(parents=True)
+        (registry / (dispatch + ".json")).write_text(json.dumps({"Registered": {"id": launch, "execution": "A"}}))
+        (registry / (dispatch + ".executions.json")).write_text(json.dumps({
+            "launches": {}, "closed": [], "close_operations": {launch: {"close-A": "Pending"}}}))
+        prefix = self.state / "launches" / launch
+        prefix.parent.mkdir()
+        receipt = prefix.with_suffix(".json")
+        receipt.write_text(json.dumps(dict(category="unknown", launchId=launch)))
+        # Durable cut immediately after the atomic rename and before publishing the proof.
+        held = prefix.with_suffix(".held")
+        held.write_text(json.dumps({**self.launch, "launchId": launch,
+                                    "env": {"WFC_STATE": str(self.state), "WFC_DISPATCH": dispatch}}))
+        intent = prefix.with_suffix(".intent")
+        intent.write_text(json.dumps(owner))
+        offline = {"PATH": str(self.work)}
+        self.assertEqual(self.call("close", executionId="A", closeOperationId="other",
+                                   environ=offline)["result"], "uncertain")
+        self.assertEqual(self.call("close", environ=offline)["result"], "uncertain")
+        self.assertEqual(self.call("create", **self.launch, executionId="A")["result"], "refused")
+        self.assertTrue(held.exists())
+        closed = self.call("close", environ=offline, **args)
+        proof = dict(category="not_started", **owner)
+        self.assertEqual(closed, dict(result="completed", closeEffect="already_absent",
+                                      cancellationEvidence=str(receipt), **proof))
+        self.assertEqual(json.loads(receipt.read_bytes()), proof)
+        self.assertFalse(held.exists())
+        self.assertFalse(intent.exists())
+        self.assertEqual(self.call("close", environ=offline, **args), closed)
 
     def test_native_inputs_require_the_live_original_worker(self):
         trigger, receipt = self.gated_exit()
