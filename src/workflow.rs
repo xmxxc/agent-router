@@ -583,12 +583,19 @@ fn status_with_history(
         );
         let alive = record["backendAlive"].as_bool();
         view::project(record, &messages, alive, id.is_some())?;
-        if active && record["state"] == "done" && alive == Some(true) {
-            reclaimable.push(json!({"dispatch":record["dispatch"],"label":record["label"],"tmux":record["tmux"]}));
-        }
     }
     if active {
-        dispatches.retain(|r| r["state"] != "done");
+        dispatches.retain(|row| {
+            if row["state"] != "done" || row["closePending"] == true {
+                return true;
+            }
+            if row["backendAlive"] == true {
+                reclaimable.push(
+                    json!({"dispatch":row["dispatch"],"label":row["label"],"tmux":row["tmux"]}),
+                );
+            }
+            false
+        });
     }
     undelivered.sort_by_key(|v| v["id"].as_u64());
     let mut response =

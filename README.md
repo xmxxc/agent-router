@@ -62,6 +62,8 @@ wfc close "$dispatch"
 
 实际请求关闭前，`wfc` 会在该派发的 `audit` 中持久保存关闭意图、目标 pane 和当时已知的写者。`status --dispatch ID` 中的 `closePending: true` 表示这次关闭仍待确认。此时输入与补绑会被拒绝；再次运行 `close ID` 只查询原单元，确认原 pane 消失且已记录写者全部退出后返回 completed。若连接在任何请求字节写入前失败，该次操作记为 definitely-not-sent，允许下一次关闭重新发送。
 
+关闭意图与新的 `done` 消息串行提交。关闭待确认或已经确认时，同一键和报告可重取原消息号，新完成记录会被拒绝。待确认的派发始终列在 `status --active` 的 `dispatches` 中。已确认的任务结果（包括原失败退出码）继续显示，`closePending` 单独表示资源关闭进度。
+
 这组入口支持独立 Rust 状态目录里、本程序创建且未登记 controller owner 的第一轮派发。状态目录中出现 Python `router.db` 时，须先集成旧库和 owner 身份。受控服务联验可用 `python3 tests/herdr_public.py /path/to/herdr target/debug/wfc -v`。通过 `--herdr-backend` 向同一 `wfc` 的标准输入提供 `{"op":"submit","dispatch":"…","round":1,"attempt":"…","text":"…"}`，可验证投递认领与回执丢失后的处理。正式的 `reply`、跨轮复用、owner 接替与旧库身份迁移分别由对应工单集成。
 
 回执包含 dispatch、round、attempt、host、backend、scope、role、label、tmux 和报告绝对路径。省略 scope 会分配新值，默认 role 来自报告目录名最后一个连字符后的部分。Codex 的 git/network 开关作用于宿主参数，OpenCode 和 Claude 的回执会说明这些开关的处理结果。tmux 服务地址在派发时绑定，后续查询和关闭沿用原服务。

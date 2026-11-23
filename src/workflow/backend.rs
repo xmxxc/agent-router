@@ -104,6 +104,50 @@ fn closed_path(state: &Path, row: &Value) -> Result<PathBuf> {
     )))
 }
 
+pub(super) fn last_herdr_close(row: &Value) -> Option<&Value> {
+    row["audit"]
+        .as_array()?
+        .iter()
+        .rfind(|event| event["operation"] == "close")
+}
+
+pub(super) fn close_is_pending(event: &Value) -> bool {
+    matches!(event["result"].as_str(), Some("pending" | "uncertain"))
+}
+
+pub(super) fn pending_herdr_close(row: &Value) -> Option<&Value> {
+    last_herdr_close(row).filter(|event| close_is_pending(event))
+}
+
+pub(super) fn verify_herdr_close_target(row: &Value, event: &Value) -> Result<()> {
+    let current = &row["backendHandle"];
+    let target = &event["target"];
+    ensure!(
+        [
+            "dispatch",
+            "round",
+            "attempt",
+            "endpoint",
+            "service",
+            "workspace",
+            "pane",
+            "terminal",
+            "nonce"
+        ]
+        .iter()
+        .all(|&k| target[k] == current[k])
+            && ["dispatch", "round", "attempt"]
+                .iter()
+                .all(|&k| event[k] == row[k])
+            && target["writerProcesses"]
+                .as_array()
+                .zip(current["writerProcesses"].as_array())
+                .is_some_and(|(old, known)| old.iter().all(|w| known.contains(w))),
+        "close intent target changed"
+    );
+    Ok(())
+}
+
 pub(super) fn closed(state: &Path, row: &Value) -> Result<Option<Value>> {
     match File::open(closed_path(state, row)?) {
         Ok(f) => {

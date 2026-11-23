@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import signal
+import sys
 import time
 
 
@@ -35,5 +36,8 @@ wait_file('background-job')
 os.tcsetpgrp(0, os.getpgrp())
 os.waitpid(pid, 0)
 Path('backgrounded').touch()
+if '--controlled-exit' in sys.argv:
+    wait_file('exit-main')
+    os._exit(17)
 while True:
     signal.pause()

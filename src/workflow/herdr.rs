@@ -318,21 +318,15 @@ pub(super) fn observe(state: &Path, row: &mut Value) -> Result<(Value, Value)> {
 }
 
 impl Assignment<'_> {
-    fn last_close(&self) -> Option<&Value> {
-        self.row["audit"]
-            .as_array()?
-            .iter()
-            .rfind(|event| event["operation"] == "close")
-    }
-
     fn pending_close(&self) -> bool {
-        self.last_close()
-            .is_some_and(|e| matches!(e["result"].as_str(), Some("uncertain" | "pending")))
+        backend::pending_herdr_close(&self.row).is_some()
     }
 
     fn closed_worker(&self) -> Result<Option<Value>> {
-        if let Some(event) = self.last_close().filter(|e| e["result"] == "completed") {
-            self.verify_close_target(event)?;
+        if let Some(event) =
+            backend::last_herdr_close(&self.row).filter(|e| e["result"] == "completed")
+        {
+            backend::verify_herdr_close_target(&self.row, event)?;
             ensure!(
                 matches!(
                     event["workerOnClose"]["state"].as_str(),
@@ -369,35 +363,6 @@ impl Assignment<'_> {
         self.save(next)?;
         Ok(self.close_receipt(outcome))
     }
-
-    fn verify_close_target(&self, event: &Value) -> Result<()> {
-        let current = &self.row["backendHandle"];
-        let target = &event["target"];
-        ensure!(
-            [
-                "dispatch",
-                "round",
-                "attempt",
-                "endpoint",
-                "service",
-                "workspace",
-                "pane",
-                "terminal",
-                "nonce"
-            ]
-            .iter()
-            .all(|&k| target[k] == current[k])
-                && ["dispatch", "round", "attempt"]
-                    .iter()
-                    .all(|&k| event[k] == self.row[k])
-                && target["writerProcesses"]
-                    .as_array()
-                    .zip(current["writerProcesses"].as_array())
-                    .is_some_and(|(old, known)| old.iter().all(|w| known.contains(w))),
-            "close intent target changed"
-        );
-        Ok(())
-    }
 }
 
 pub(super) fn close(state: &Path, row: &Value) -> Result<Value> {
@@ -415,8 +380,8 @@ pub(super) fn close(state: &Path, row: &Value) -> Result<Value> {
         return Ok(unit
             .close_receipt(json!({"result":"completed","diagnostic":"session was already gone"})));
     }
-    if unit.pending_close() {
-        unit.verify_close_target(unit.last_close().context("missing close intent")?)?;
+    if let Some(event) = backend::pending_herdr_close(&unit.row) {
+        backend::verify_herdr_close_target(&unit.row, event)?;
         let outcome = match handle.confirm_closed(|h| unit.checkpoint(h)) {
             Ok(true) => return unit.finish_close(json!({"result":"completed"})),
             Ok(false) => {
@@ -443,25 +408,30 @@ pub(super) fn close(state: &Path, row: &Value) -> Result<Value> {
             Err(e) => return Ok(unit.close_receipt(json!(e))),
         }
     };
-    let launch = backend::private_receipt(state, &unit.row["create"])?;
-    let worker = if launch["category"] == "process_exited" {
-        backend::worker(&launch, &Value::Null)
-    } else {
-        json!({"state":"cancelled","exit_code":null,"signal":null})
-    };
     let mut next = unit.row.clone();
     let receipt =
         unit.close_receipt(json!({"result": if prepared.is_some() {"pending"} else {"completed"}}));
     let mut event = receipt.clone();
     event["at"] = json!(chrono::Utc::now().to_rfc3339());
     event["target"] = unit.row["backendHandle"].clone();
-    event["workerOnClose"] = worker;
     let audit = next["audit"]
         .as_array_mut()
         .context("invalid lifecycle audit")?;
     event["id"] = json!(audit.len() + 1);
-    audit.push(event);
-    unit.save(next)?;
+    {
+        // done validates this assignment and publishes its receipt under the same lock.
+        // Keep backend RPCs outside this short commit section.
+        let _messages = super::messages::lock_for_publish(state)?;
+        let launch = backend::private_receipt(state, &unit.row["create"])?;
+        let worker = if launch["category"] == "process_exited" {
+            backend::worker(&launch, &Value::Null)
+        } else {
+            json!({"state":"cancelled","exit_code":null,"signal":null})
+        };
+        event["workerOnClose"] = worker;
+        audit.push(event);
+        unit.save(next)?;
+    }
     let Some(close) = prepared else {
         // Explicit stopped evidence already confirms this unit, even offline.
         return Ok(receipt);

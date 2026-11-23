@@ -142,6 +142,92 @@ for line in sys.stdin:
             self.assertEqual((self.root/'events').read_text().splitlines(), ['unique'])
             self.cli('close', self.dispatch_id)
 
+    def drop_close(self, calls):
+        def read(stream):
+            frame = stream.readline()
+            request = json.loads(frame)
+            if request['method'] == 'pane.close':
+                calls.append(request['id'])
+                return None
+            return frame
+        return self.enterContext(self.service.fault_proxy(lambda req, reply: reply, read_frame=read))
+
+    def callback(self, *flags):
+        env = self.env | {'WFC_DISPATCH':self.dispatch_id, 'WFC_ROUND':str(self.row['round']),
+                          'WFC_ATTEMPT':self.row['attempt']}
+        return subprocess.Popen([live.DRIVER, 'done', '--report', self.root/'report.md',
+                                 '--attempt', self.row['attempt'], *flags], env=env, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def assert_pending_views(self, status):
+        named = self.status()
+        active = self.cli('status', '--active')
+        self.assertEqual([r['dispatch'] for r in active['dispatches']], [self.dispatch_id])
+        listed, = active['dispatches']
+        self.assertEqual(active['reclaimable'], [])
+        self.assertTrue(named['closePending'])
+        self.assertEqual(named['status'], status)
+        for field in ('dispatch', 'round', 'attempt', 'rounds', 'status', 'state', 'closePending'):
+            self.assertEqual(listed[field], named[field])
+        return named
+
+    def test_close_during_first_done_git_sample(self):
+        calls = []
+        self.dispatch(endpoint=self.drop_close(calls))
+        (self.root/'report.md').write_text('finished')
+        git = self.root/'git'
+        git.write_text('#!/bin/sh\ntouch sampling\nwhile [ ! -f resume ]; do sleep .02; done\nexit 1\n')
+        git.chmod(0o700)
+        self.env['PATH'] = str(self.root) + ':' + self.env['PATH']
+        with self.callback() as callback:
+            try:
+                live.wait_for(lambda: (self.root/'sampling').exists())
+                self.unconfirmed_close('incomplete')
+            finally:
+                (self.root/'resume').touch()
+            _, diagnostic = callback.communicate(timeout=10)
+            self.assertEqual(callback.returncode, 1, diagnostic)
+            self.assertIn('closing or closed', diagnostic)
+        self.assertEqual(self.assert_pending_views('unknown')['messages'], [])
+        self.unconfirmed_close('pending close')
+        self.service.api('pane.close', pane_id=self.h['pane'])
+        live.wait_for(lambda: self.cli('close', self.dispatch_id)['result'] == 'completed')
+        with self.callback() as callback:
+            _, diagnostic = callback.communicate(timeout=10)
+            self.assertEqual(callback.returncode, 1, diagnostic)
+        self.assertEqual(self.status()['messages'], [])
+        self.assertEqual(len(calls), 1)
+
+    def test_done_receipt_and_active_list_through_close(self):
+        calls = []
+        self.dispatch(endpoint=self.drop_close(calls))
+        self.submit('finish')
+        message, = live.wait_for(lambda: self.status()['messages'])
+        self.assertEqual(self.cli('status', '--active')['reclaimable'][0]['dispatch'], self.dispatch_id)
+        self.unconfirmed_close('incomplete')
+        for confirmed in (False, True):
+            if confirmed:
+                self.service.api('pane.close', pane_id=self.h['pane'])
+                live.wait_for(lambda: self.status()['backendAlive'] is False)
+                self.assert_pending_views('completed')
+                self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+            else:
+                self.assert_pending_views('completed')
+                self.unconfirmed_close('pending close')
+            with self.callback() as callback:
+                out, error = callback.communicate(timeout=10)
+                self.assertEqual(callback.returncode, 0, error)
+                original = json.loads(out)
+                self.assertTrue(original['duplicate'])
+                self.assertEqual((original['message'], original['messageId']), (message['id'], message['messageId']))
+            with self.callback('--message-id', 'different') as callback:
+                _, error = callback.communicate(timeout=10)
+                self.assertEqual(callback.returncode, 1, error)
+            self.assertEqual(self.status()['messages'], [message])
+        active = self.cli('status', '--active')
+        self.assertEqual((active['dispatches'], active['reclaimable']), ([], []))
+        self.assertEqual(len(calls), 1)
+
     def test_close_request_not_forwarded(self):
         self.check_uncertain_close(forward=False)
 
@@ -328,6 +414,53 @@ Path('done-received').write_bytes(reply)
         self.assertIn(b'UTF-8', p.stderr)
         self.assertFalse(any(p.is_file() for p in state.rglob('*')))
 
+    def test_worker_fails_before_close_with_surviving_writer(self):
+        self.check_worker_exit_order(worker_first=True)
+
+    def test_writer_stops_before_worker_exits_during_close(self):
+        self.check_worker_exit_order(worker_first=False)
+
+    def check_worker_exit_order(self, worker_first):
+        calls = []
+        command = [sys.executable, str(Path(live.__file__).with_name('job_control.py')), '--controlled-exit']
+        self.dispatch(endpoint=self.drop_close(calls), command=command)
+        (self.root/'start-job').touch()
+        pid = int(live.wait_for(lambda: (self.root/'job-pid').exists() and (self.root/'job-pid').read_text()))
+        live.wait_for(lambda: any(w['pid'] == pid for w in self.status()['backendHandle']['writerProcesses']))
+        (self.root/'background-job').touch()
+        live.wait_for(lambda: (self.root/'backgrounded').exists())
+        if worker_first:
+            (self.root/'exit-main').touch()
+            live.wait_for(lambda: self.status()['status'] == 'failed')
+            os.kill(pid, 0)
+            live.wait_for(lambda: self.h['pane'] not in [p['pane_id'] for p in self.service.api('session.snapshot')['snapshot']['panes']])
+        self.unconfirmed_close('writer' if worker_first else 'incomplete')
+        pending_status = 'failed' if worker_first else 'unknown'
+        view = self.assert_pending_views(pending_status)
+        if worker_first:
+            self.assertEqual(view['rounds'][0]['result']['exit_code'], 17)
+            Path(self.h['receipt']).unlink()
+            self.assertEqual(self.assert_pending_views('failed')['worker']['exit_code'], 17)
+        (self.root/'stop-job').touch()
+        def writer_stopped():
+            try:
+                return Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].startswith('Z')
+            except FileNotFoundError:
+                return True
+        live.wait_for(writer_stopped)
+        if not worker_first:
+            self.assert_pending_views('unknown')
+            (self.root/'exit-main').touch()
+            live.wait_for(lambda: self.status()['launch'].get('exitCode') == 17)
+        self.assert_pending_views(pending_status)
+        live.wait_for(lambda: self.cli('close', self.dispatch_id)['result'] == 'completed')
+        final = self.status()
+        self.assertFalse(final['closePending'])
+        self.assertEqual(final['status'], 'failed' if worker_first else 'cancelled')
+        if worker_first:
+            self.assertEqual(final['worker']['exit_code'], 17)
+        self.assertEqual(len(calls), 0 if worker_first else 1)
+
     def test_writer_survives_pane_close(self):
         self.dispatch(script=Path(live.__file__).with_name('job_control.py'))
         other, pid = self.sibling()
@@ -427,12 +560,17 @@ while not Path('release').exists():
         (state/'router.db').unlink()
         path = state/'dispatches'/(self.dispatch_id+'.json')
         row = json.loads(path.read_bytes())
+        row['audit'] = [dict(operation='close', result='pending', dispatch=self.dispatch_id, round=1,
+                             attempt=row['attempt'], target=self.h, workerOnClose=dict(state='exited', exit_code=17))]
         row.update(round=2, attempt='a-abcdef123456')
         path.write_text(json.dumps(row))
         self.reconcile(error='R1')
         self.submit('stale', error='R1')
         self.assertIsNone(self.status()['backendAlive'])
-        self.assertEqual(self.status()['audit'], [])
+        view = self.status()
+        self.assertEqual(view['audit'], row['audit'])
+        self.assertEqual(view['status'], 'unknown')
+        self.assertEqual(view['worker']['state'], 'unknown')
         self.assertFalse((self.root/'events').exists())
 
     def test_reconcile_rechecks_current_assignment_at_commit(self):
