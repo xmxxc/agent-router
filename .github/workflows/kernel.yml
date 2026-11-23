@@ -11,6 +11,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 45
     env:
+      WFC_BUILD_ID: ${{ github.event.pull_request.head.sha || github.sha }}
       PYTHONUTF8: '1'
       CARGO_BUILD_JOBS: '2'
       TRIPLE: x86_64-pc-windows-msvc
@@ -29,11 +30,13 @@ jobs:
       - run: python tools/prepare.py
       - run: cargo build --release --locked --target $env:TRIPLE
       - run: cargo test --workspace --release --locked --target $env:TRIPLE
-      - name: Stage and exercise the WFC companion
+      - name: Exercise the CLI and its internal kernel
         run: |
           New-Item -ItemType Directory "target/standalone kernel" | Out-Null
-          Copy-Item "target/$env:TRIPLE/release/herdr-kernel-prototype.exe" "target/standalone kernel/wfc-kernel.exe"
-          python tools/smoke.py "target/standalone kernel/wfc-kernel.exe"
+          Copy-Item "target/$env:TRIPLE/release/wfc.exe" "target/standalone kernel/wfc.exe"
+          & "./target/standalone kernel/wfc.exe" --version
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tools/smoke.py "target/standalone kernel/wfc.exe" --kernel
       - run: python tools/collect_notices.py $env:TRIPLE "target/standalone kernel/bundled-notices"
       - name: Fetch the WFC lifecycle test suite after standalone validation
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -44,12 +47,14 @@ jobs:
           persist-credentials: false
       - name: Verify the six native WFC contracts including Job Object cleanup
         timeout-minutes: 8
-        run: python tools/check_wfc.py integration-workflow-core "target/standalone kernel/wfc-kernel.exe"
+        run: |
+          Copy-Item "target/standalone kernel/wfc.exe" "target/wfc-kernel.exe"
+          python tools/check_wfc.py integration-workflow-core "target/wfc-kernel.exe"
       - name: Record candidate and binary digest
         run: |
           git rev-parse HEAD | Set-Content -Encoding ascii "target/standalone kernel/COMMIT.txt"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          ((Get-FileHash "target/standalone kernel/wfc-kernel.exe").Hash.ToLowerInvariant() + '  wfc-kernel.exe') |
+          ((Get-FileHash "target/standalone kernel/wfc.exe").Hash.ToLowerInvariant() + '  wfc.exe') |
             Tee-Object -FilePath "target/standalone kernel/SHA256SUMS"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
