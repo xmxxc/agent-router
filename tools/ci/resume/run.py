@@ -132,6 +132,14 @@ def run(group_root, fixture, binary, evidence, selectors):
 
             def resume_status(case, dispatch):
                 row = original_status(case, dispatch)
+                if row.get("reclaimed") and row["attempt"] != getattr(case, "last_reclaimed_attempt", None):
+                    event = next(m for m in reversed(row["messages"])
+                                 if m["type"] == "reclaimed" and m["attempt"] == row["attempt"]
+                                 and m["round"] == row["round"])
+                    record("reclaimed-attempt", case, dispatch=dispatch, attempt=row["attempt"],
+                           round=row["round"], state=row["state"], backendAlive=row["backendAlive"],
+                           closeEffect=row.get("closeEffect"), message=event["id"])
+                    case.last_reclaimed_attempt = row["attempt"]
                 if row.get("audit"):
                     event = row["audit"][-1]
                     fields = ("id", "round", "fromAttempt", "toAttempt", "session",

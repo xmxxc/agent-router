@@ -4,6 +4,18 @@ set -euo pipefail
 
 group=${1:?test group required}
 case "$group" in
+    resume-reclaim)
+        fixture=tools/check_tmux.py
+        selectors=(
+            Backend.test_public_resume_preserves_conversation_rounds_and_callback_fences
+            Backend.test_public_resume_relative_codex_home_created_after_dispatch
+            Backend.test_public_resume_dot_codex_home_created_after_dispatch
+            Backend.test_public_resume_fences_pending_and_lost_launch_responses
+            Backend.test_public_resume_after_reclaim_preserves_history
+            Backend.test_public_reclaim_rechecks_selected_execution_under_scope_lock
+            Backend.test_read_only_unowned_close_replays_confirmed_archive
+        )
+        ;;
     codex-home-paths)
         fixture=tools/check_tmux.py
         selectors=(
