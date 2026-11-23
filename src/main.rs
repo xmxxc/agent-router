@@ -1,13 +1,13 @@
 mod kernel;
+mod workflow;
 
 use std::env;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::ExitCode;
 
-const WORKFLOW_COMMANDS: &[&str] = &[
-    "dispatch", "done", "ask", "reply", "continue", "nudge", "resume", "status", "reclaim", "wait",
-    "relay", "ack",
+const RESERVED_COMMANDS: &[&str] = &[
+    "done", "ask", "reply", "continue", "nudge", "resume", "reclaim", "wait", "relay", "ack",
 ];
 
 fn main() -> anyhow::Result<ExitCode> {
@@ -26,16 +26,18 @@ fn main() -> anyhow::Result<ExitCode> {
             "--help".into()
         }
     });
-    let extra = args.next().is_some();
+    let args: Vec<_> = args.collect();
     match command.to_str() {
-        Some("-h" | "--help") if !extra => {
+        Some("-h" | "--help") if args.is_empty() => {
             println!("Usage: wfc [--help | --version]");
+            println!("{}", workflow::DISPATCH_USAGE);
+            println!("{}", workflow::STATUS_USAGE);
             println!(
                 "Workflow commands reserved for later builds: {}",
-                WORKFLOW_COMMANDS.join(", ")
+                RESERVED_COMMANDS.join(", ")
             );
         }
-        Some("-V" | "--version") if !extra => {
+        Some("-V" | "--version") if args.is_empty() => {
             println!(
                 "wfc {} (Rust, {}, {}, build {})",
                 env!("CARGO_PKG_VERSION"),
@@ -46,8 +48,39 @@ fn main() -> anyhow::Result<ExitCode> {
                     .unwrap_or(env!("WFC_BUILT_AT"))
             );
         }
-        Some("--kernel") if !extra => kernel::run()?,
-        Some(name) if WORKFLOW_COMMANDS.contains(&name) => {
+        Some("--kernel") if args.is_empty() => kernel::run()?,
+        Some("dispatch" | "status") if args == ["--help"] => {
+            println!(
+                "{}",
+                if command == "dispatch" {
+                    workflow::DISPATCH_USAGE
+                } else {
+                    workflow::STATUS_USAGE
+                }
+            );
+        }
+        Some("dispatch") => {
+            let request = match workflow::Dispatch::parse(&args) {
+                Ok(request) => request,
+                Err(err) => {
+                    eprintln!("wfc: {err}. {}", workflow::DISPATCH_USAGE);
+                    return Ok(ExitCode::from(2));
+                }
+            };
+            println!("{}", request.run()?);
+        }
+        Some("status") => {
+            let id = match args.as_slice() {
+                [] => None,
+                [flag, id] if flag == "--dispatch" => Some(id.as_os_str()),
+                _ => {
+                    eprintln!("wfc: {}", workflow::STATUS_USAGE);
+                    return Ok(ExitCode::from(2));
+                }
+            };
+            println!("{}", workflow::status(id)?);
+        }
+        Some(name) if RESERVED_COMMANDS.contains(&name) => {
             eprintln!("wfc: '{name}' is unavailable in this Rust build");
             return Ok(ExitCode::from(2));
         }

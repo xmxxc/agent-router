@@ -36,9 +36,24 @@ prepare 校验并解出仓内的 Ghostty 源码包，校验 zlib 下载字节和
 
 ## 运行和接入 WFC
 
-直接运行 `wfc` 或 `wfc --help` 会列出熟悉的工作流命令名。当前版本提供帮助、版本和内核入口，预留命令返回退出码 2。`wfc --version` 显示 Rust 标识、包版本、目标平台、构建类型和编译时的 `WFC_BUILD_ID`（未设置、为空或仅含空白时，使用本地构建时间的 Unix 纳秒数）。
+直接运行 `wfc` 或 `wfc --help` 会列出熟悉的工作流命令名。当前版本支持前台派发和状态查询，预留命令返回退出码 2。`wfc --version` 显示 Rust 标识、包版本、目标平台、构建类型和编译时的 `WFC_BUILD_ID`（未设置、为空或仅含空白时，使用本地构建时间的 Unix 纳秒数）。
 
-Rust 的这三个入口都不读写调度状态。与 Python 版并排使用时，把两份 `wfc` 放在不同目录，分别使用显式路径，并为每次调用指定各自的 `WFC_STATE`。
+`dispatch` 接收调用方指定的角色、任务文件和工作目录。`--` 后依次放受控 worker 的程序和参数。下面的 Bash 示例让 worker 在工作目录中写出它实际读到的任务，再由另一个 CLI 查回编号。
+
+```sh
+export WFC_STATE="$(mktemp -d)"
+work="$(mktemp -d)"
+printf '检查发布说明\n' > "$work/task.md"
+wfc dispatch --role reviewer --task "$work/task.md" --cwd "$work" -- \
+  python3 -c 'import os, pathlib; pathlib.Path("received.md").write_bytes(pathlib.Path(os.environ["WFC_TASK"]).read_bytes())'
+wfc status
+# 将 ID 换成 dispatch 输出中的 d-… 值
+wfc status --dispatch ID
+```
+
+任务文件、工作目录和显式指定的程序路径都可以相对于调用方。程序也可使用 PATH 中的命令名。worker 以指定目录为当前目录，从 `WFC_TASK` 取得任务文件的绝对路径，并从 `WFC_ROLE`、`WFC_DISPATCH`、`WFC_ROUND`、`WFC_ATTEMPT` 和 `WFC_STATE` 取得本次派发上下文。派发在前台等待 worker 退出。worker 的标准输入和标准输出连接到空设备，诊断可写标准错误。worker 成功退出后，CLI 保存记录，标准输出返回一行 JSON，含 `dispatch`、`round`（首次为 1）、`attempt`、`role`、`task` 和 `cwd`。`status` 的 `dispatches` 数组列出已成功派发的记录，可用 `--dispatch` 按编号查询。启动失败、worker 返回非零或查询未知编号时，CLI 返回非零退出码并打印诊断。
+
+Rust 默认使用用户主目录下的 `.local/state/agent-router`，可用 `WFC_STATE` 指定独立状态目录。帮助、版本和内核入口都不会读写调度状态。与 Python 版并排使用时，把两份 `wfc` 放在不同目录，分别使用显式路径，并为每次调用指定各自的 `WFC_STATE`。
 
 启动 `wfc --kernel` 会收到一行 JSON 握手，其中含协议版本 1 和本次启动的 generation。保持标准输入打开，每行发送一个 JSON 请求。spawn 返回 nonce，后续 read、input、resize 和 close 使用同一个 unit、generation 和 nonce。关闭标准输入会结束内核。smoke 启动真实子进程，等待它就绪，调整窗口，输入随机文本并核对它回写的反转文本。
 
