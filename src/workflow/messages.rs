@@ -196,21 +196,43 @@ impl Completion {
             && self.computed_hash() == hash
     }
 
-    fn matches_ack_body(&self, body: &str) -> bool {
+    fn could_survive_legacy_write(&self) -> bool {
+        // The four-field publisher read the whole inbox, requiring a string
+        // request key on every row. Its rewrite dropped newer fields. Only
+        // publication-time values count: later claims can bind a digest or
+        // add null Git fields even on a genuine legacy row.
+        self.request_key.is_some()
+            && self.worker.scope.is_none()
+            && self.created_at.is_none()
+            && self
+                .additional_fields
+                .get("head")
+                .is_none_or(Value::is_null)
+            && self
+                .additional_fields
+                .get("dirty")
+                .is_none_or(Value::is_null)
+    }
+
+    fn matches_ack_body(&self, body: &str, earlier: &[Self]) -> bool {
         if self.matches_hash(&body_hash(body)) {
             return true;
         }
         // A pre-scope message could already have been received when a later
         // publisher rewrote the inbox, adding the two null Git fields. That
         // row is indistinguishable from one claimed after the rewrite. The
-        // original publisher always stored a request key and no timestamp.
+        // original publisher accepted only one completion per dispatch and
+        // attempt, and its write had to preserve the preceding publications.
         self.body_hash.is_none()
-            && self.worker.scope.is_none()
-            && self.request_key.is_some()
-            && self.created_at.is_none()
-            && self.additional_fields.get("head") == Some(&Value::Null)
-            && self.additional_fields.get("dirty") == Some(&Value::Null)
+            && self.could_survive_legacy_write()
+            && self.additional_fields.contains_key("head")
+            && self.additional_fields.contains_key("dirty")
             && body == canonical_body(self.original_body())
+            && earlier.iter().all(|m| {
+                m.could_survive_legacy_write()
+                    && (m.worker.dispatch != self.worker.dispatch
+                        || m.worker.attempt != self.worker.attempt)
+            })
     }
 
     fn receipt(&self, duplicate: bool) -> Value {
@@ -237,6 +259,9 @@ impl Completion {
 
     fn receive(&mut self) -> Result<Value> {
         self.delivery.advance(State::Received)?;
+        if self.body_hash.is_none() {
+            self.body_hash = Some(self.computed_hash());
+        }
         Ok(self.view())
     }
 }
