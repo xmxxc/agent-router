@@ -86,6 +86,7 @@ run_startup_opencode_suites() {
     run_suite startup-confirmation tests/startup_failure.py StartupFailure.test_tmux_exit_follows_the_create_confirmation 1
     run_suite startup-managed tests/startup_failure.py StartupFailure.test_managed_startup_recovery_rechecks_owner 1
     run_suite startup-generations tests/startup_failure.py StartupFailure.test_startup_recovery_ignores_conflicting_reservations_and_keeps_neighbors 1
+    run_suite startup-resume-polls tests/startup_failure.py StartupFailure.test_short_wait_restarts_resume_after_processed_prefix 1
     run_startup_units
     sha256sum --check --strict "$EVIDENCE/binary.sha256"
     run_suite receipt-legacy tests/receipts.py Receipts.test_mixed_legacy_inbox 1
@@ -95,7 +96,10 @@ run_startup_opencode_suites() {
     run_suite codex-deadline tests/relay.py Relay.test_deadline_bounds_locked_inbox_and_slow_queue 1
     run_suite codex-legacy-owner tests/relay.py Relay.test_conflicting_complete_generations_preserve_owner_and_identity 1
     run_suite opencode-order tests/opencode_relay.py OpenCodeRelay.test_204_detached_preserves_batch_order_scope_and_session 1
-    run_suite opencode-target tests/opencode_relay.py OpenCodeRelay.test_invalid_host_or_port_is_rejected_before_claiming 1
+    run_suite codex-scope-refresh tests/relay.py Relay.test_running_relay_refreshes_repaired_and_legacy_owner_records 1
+    run_suite reclaim-mixed tools/check_tmux.py Backend.test_public_reclaim_preview_mixed_results_and_history 1
+    run_suite reclaim-preflight tools/check_tmux.py Backend.test_public_reclaim_checks_history_before_closing 1
+    run_suite reclaim-owner tools/check_tmux.py Backend.test_public_reclaim_stops_on_scope_authority_loss 1
     run_suite opencode-refused tests/opencode_relay.py OpenCodeRelay.test_connection_refused_is_unsent_and_can_retry_original_id 1
     run_suite opencode-uncertain tests/opencode_relay.py OpenCodeRelay.test_errors_redirects_timeouts_and_eof_never_replay 1
     run_suite managed-opencode "$ci_dir/managed_owner.py" ManagedOpenCode.test_current_owner_delivers_and_old_owner_cannot_claim 1
@@ -106,7 +110,7 @@ run_startup_opencode_suites() {
 case "${1:-all}" in
   all)
     run_opencode_suites
-    run_suite codex tests/relay.py Relay 17
+    run_suite codex tests/relay.py Relay 18
     run_owner_suites
     ;;
   owner-only)

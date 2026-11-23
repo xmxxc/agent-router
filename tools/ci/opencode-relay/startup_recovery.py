@@ -42,6 +42,15 @@ class StartupOpenCode(OpenCodeRelay):
         self.assertEqual(self.posts, [])
         self.assertFalse(ledger.exists())
 
+        # This synthetic history row uses #36's explicit worker event shape
+        # for the same attempt whose durable startup decision is waiting.
+        reclaimed_id = "m-fixture-reclaimed"
+        ledger.write_text(json.dumps([{
+            "id": 1, "messageId": reclaimed_id, "dispatch": child["dispatch"],
+            "attempt": child["attempt"], "round": selected["round"], "scope": selected["scope"],
+            "role": selected["role"], "report": selected["report"], "tmux": "worker-history",
+            "type": "reclaimed", "state": "unsent", "statusVersion": 1,
+        }]))
         self.send("1.5")
         post, = self.posts
         notice, = self.batch(post)
@@ -54,7 +63,10 @@ class StartupOpenCode(OpenCodeRelay):
             (notice["fault"]["launchId"], notice["fault"]["exitCode"], notice["fault"]["pid"]),
             (launch, 17, child["pid"]),
         )
-        history, = self.data("status", "--dispatch", child["dispatch"])["dispatches"][0]["messages"]
+        event, history = self.data("status", "--dispatch", child["dispatch"])["dispatches"][0]["messages"]
+        self.assertEqual((event["messageId"], event["type"], event["to"]),
+                         (reclaimed_id, "reclaimed", "worker"))
+        self.cli("ack", reclaimed_id, code=1)
         identity = (notice["messageId"], notice["id"])
         self.assertEqual((history["messageId"], history["id"]), identity)
         self.assertEqual((history["state"], history["statusVersion"]), ("received", 3))
@@ -62,12 +74,13 @@ class StartupOpenCode(OpenCodeRelay):
         self.assertEqual((ack["messageId"], ack["message"]), identity)
         self.assertEqual((ack["state"], ack["statusVersion"]), ("processed", 4))
         self.assertTrue(self.data("ack", notice["messageId"])["duplicate"])
+        self.assertFalse(self.data("wait", "--timeout", "0", code=3)["messages"])
         self.send(".3")
         self.assertEqual(len(self.posts), 1)
-        self.assertEqual(len(json.loads(ledger.read_text())), 1)
+        self.assertEqual(len(json.loads(ledger.read_text())), 2)
         self.assertEqual(self.calls(), [])
         print(json.dumps({
             "dispatch": child["dispatch"], "attempt": child["attempt"], "launchId": launch,
             "messageId": ack["messageId"], "message": ack["message"], "posts": 1,
-            "wrongScopePosts": 0, "ackVerified": True,
+            "wrongScopePosts": 0, "workerHistory": reclaimed_id, "ackVerified": True,
         }), flush=True)
