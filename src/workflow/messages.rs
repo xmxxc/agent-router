@@ -247,24 +247,28 @@ impl Completion {
     }
 
     fn view(&self) -> Value {
+        self.view_at(self.delivery.state, self.delivery.status_version)
+    }
+
+    fn view_at(&self, state: State, version: u64) -> Value {
         let mut view = self.body();
         view.extend([
             ("id".into(), json!(self.id)),
             ("messageId".into(), json!(self.message_id)),
             ("dispatch".into(), json!(self.worker.dispatch)),
             ("type".into(), json!("done")),
-            ("state".into(), json!(self.delivery.state)),
-            ("statusVersion".into(), json!(self.delivery.status_version)),
+            ("state".into(), json!(state)),
+            ("statusVersion".into(), json!(version)),
         ]);
         Value::Object(view)
     }
 
-    fn claim(&mut self, state: State) -> Result<Value> {
+    fn claim(&mut self, state: State) -> Result<()> {
         self.delivery.advance(state)?;
         if self.body_hash.is_none() {
             self.body_hash = Some(self.computed_hash());
         }
-        Ok(self.view())
+        Ok(())
     }
 }
 
@@ -358,7 +362,10 @@ impl Inbox {
                     && dispatch.is_none_or(|id| id == m.worker.dispatch)
                     && scope.is_none_or(|scope| scope == m.worker.scope())
             })
-            .map(|m| m.claim(state))
+            .map(|m| {
+                m.claim(state)?;
+                Ok(m.view())
+            })
             .collect::<Result<_>>()?;
         if !batch.is_empty() {
             self.save().context("claim controller messages")?;

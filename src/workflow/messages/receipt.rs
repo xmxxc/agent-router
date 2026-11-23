@@ -67,11 +67,14 @@ impl Delivery {
         }
     }
 
-    pub fn advance(&mut self, state: State) -> Result<()> {
-        self.status_version = self
-            .status_version
+    pub fn next_version(&self) -> Result<u64> {
+        self.status_version
             .checked_add(1)
-            .context("receipt version exhausted")?;
+            .context("receipt version exhausted")
+    }
+
+    pub fn advance(&mut self, state: State) -> Result<()> {
+        self.status_version = self.next_version()?;
         self.state = state;
         Ok(())
     }

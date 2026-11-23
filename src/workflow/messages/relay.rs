@@ -11,9 +11,10 @@ use anyhow::{bail, ensure, Context, Result};
 use codex::Outcome;
 use serde_json::{json, Value};
 use std::{
+    collections::{HashMap, HashSet},
     env,
     ffi::{OsStr, OsString},
-    fs,
+    fs::{self, File, TryLockError},
     io::ErrorKind,
     os::unix::fs::OpenOptionsExt,
     path::Path,
@@ -87,7 +88,7 @@ impl<'a> Relay<'a> {
             "worker_callback_only: relay"
         );
         let state = state_dir()?;
-        scope_ready(&state, self.scope)?;
+        scope_assignments(&state, self.scope)?;
         let current = env::var("CODEX_THREAD_ID").ok();
         let thread = codex::controller(
             self.thread
@@ -129,18 +130,31 @@ impl<'a> Relay<'a> {
             self.lifetime
                 .map_or(Duration::MAX, |d| d.saturating_sub(start.elapsed()))
         };
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        ensure!(page_size > 0, "cannot determine queue argument limit");
+        // Linux MAX_ARG_STRLEN counts the terminating NUL.
+        let mut budget = page_size as usize * 32;
+        let mut diagnosed = HashSet::new();
         while !remaining().is_zero() {
-            let batch = if let Some(mut inbox) = Inbox::try_open(&state)? {
-                if scope_ready(&state, self.scope)? {
-                    inbox.claim(None, self.scope, State::Unknown)?
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
+            let order = transport_lock(&state, self.scope)?;
+            let batch = match &order {
+                Some(_) => match Inbox::try_open(&state)? {
+                    Some(mut inbox) => {
+                        let verified = scope_assignments(&state, self.scope)?;
+                        claim_batch(
+                            &mut inbox,
+                            self.scope,
+                            verified.as_ref(),
+                            budget,
+                            &mut diagnosed,
+                        )?
+                    }
+                    _ => None,
+                },
+                None => None,
             };
-            if !batch.is_empty() {
-                let outcome = codex::queue(&thread, &batch, remaining().min(timeout))?;
+            if let Some((batch, text)) = batch {
+                let outcome = codex::queue(&thread, &batch, &text, remaining().min(timeout))?;
                 if outcome != Outcome::Uncertain {
                     loop {
                         if let Some(mut inbox) = Inbox::try_open(&state)? {
@@ -158,62 +172,196 @@ impl<'a> Relay<'a> {
                     outcome != Outcome::Missing,
                     "no rollout found for thread {thread}; messages stay waiting"
                 );
+                if outcome == Outcome::TooLong {
+                    // exec rejected this exact argument before submission. Its byte
+                    // length excludes the NUL, so the next claim must be smaller.
+                    budget = text.len();
+                }
+                if matches!(outcome, Outcome::Delivered | Outcome::TooLong) {
+                    continue;
+                }
             }
+            drop(order);
             std::thread::sleep(remaining().min(Duration::from_millis(500)));
         }
         Ok(())
     }
 }
 
-// Until owner leases are integrated, refuse claimed scopes, even for a global
-// relay. An unrelated scope remains eligible. Dispatch publication uses rename.
-fn scope_ready(state: &Path, scope: Option<&str>) -> Result<bool> {
-    let entries = match fs::read_dir(state.join("dispatches")) {
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(true),
-        other => other?,
-    };
-    for entry in entries {
-        let path = entry?.path();
-        if !matches!(
-            path.extension().and_then(OsStr::to_str),
-            Some("json" | "pending")
-        ) || !path
-            .file_stem()
-            .and_then(OsStr::to_str)
-            .is_some_and(valid_id)
-        {
-            continue;
-        }
-        let pending = path.extension() == Some(OsStr::new("pending"));
-        let missing = |e: &anyhow::Error| {
-            e.downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == ErrorKind::NotFound)
-        };
-        let record = match read_record(&path) {
-            // The launcher is still writing its reservation. Defer this poll
-            // until that scope can be inspected, without terminating the relay.
-            Err(e)
-                if pending
-                    && e.downcast_ref::<serde_json::Error>()
-                        .is_some_and(|e| e.is_eof()) =>
-            {
-                return Ok(false)
-            }
-            Err(e) if pending && missing(&e) => match read_record(&path.with_extension("json")) {
-                Err(e) if missing(&e) => continue, // failed launch rolled back
-                other => other?,
-            },
-            other => other?,
-        };
-        if !record["controllerOwner"].is_null() {
-            let owned = record["scope"].as_str().or(record["dispatch"].as_str());
-            ensure!(
-                scope.is_some() && scope != owned,
-                "controller owner authorization required for relay"
-            );
+// Serialize queue submissions that can overlap, without holding the inbox lock
+// across an external call. Scoped senders still progress on independent scopes.
+fn transport_lock(state: &Path, scope: Option<&str>) -> Result<Option<Vec<File>>> {
+    let mut locks = Vec::new();
+    for (name, shared) in std::iter::once(("relay-transport.lock".into(), scope.is_some()))
+        .chain(scope.map(|s| (format!("relay-{}.lock", super::body_hash(s)), false)))
+    {
+        let lock = super::private_file()
+            .create(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(state.join(name))?;
+        match if shared {
+            lock.try_lock_shared()
+        } else {
+            lock.try_lock()
+        } {
+            Ok(()) => locks.push(lock),
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Error(e)) => return Err(e.into()),
         }
     }
-    Ok(true)
+    Ok(Some(locks))
+}
+
+fn claim_batch(
+    inbox: &mut Inbox,
+    scope: Option<&str>,
+    verified: Option<&Assignments>,
+    budget: usize,
+    diagnosed: &mut HashSet<u64>,
+) -> Result<Option<(Vec<Value>, String)>> {
+    let mut messages = Vec::new();
+    let mut text = String::from(codex::PREFIX);
+    for m in &mut inbox.messages {
+        if m.delivery.state != State::Unsent || scope.is_some_and(|s| s != m.worker.scope()) {
+            continue;
+        }
+        if verified.is_some_and(|assignments| {
+            !assignments
+                .get(&m.worker.dispatch)
+                .is_some_and(|(attempt, round)| {
+                    attempt == &m.worker.attempt && *round == m.worker.round
+                })
+        }) {
+            continue;
+        }
+        let view = m.view_at(State::Unknown, m.delivery.next_version()?);
+        let envelope = codex::envelope(&view);
+        let size = codex::PREFIX.len() + envelope.len() + codex::SUFFIX.len() + 1;
+        if size > budget {
+            if diagnosed.insert(m.id) {
+                println!("router relay: message {} ({}) needs {size} queue argument bytes, limit {budget}; available to wait", m.id, m.message_id);
+            }
+            continue;
+        }
+        if !messages.is_empty() {
+            if text.len() + 2 + envelope.len() + codex::SUFFIX.len() + 1 > budget {
+                break;
+            }
+            text.push_str(", ");
+        }
+        text.push_str(&envelope);
+        m.claim(State::Unknown)?;
+        messages.push(view);
+    }
+    if messages.is_empty() {
+        return Ok(None);
+    }
+    text.push_str(codex::SUFFIX);
+    inbox
+        .save()
+        .context("claim controller messages for relay")?;
+    Ok(Some((messages, text)))
+}
+
+type Assignments = HashMap<String, (String, u64)>;
+
+// A truncated legacy reservation has no trustworthy scope or owner. In that
+// case a scoped relay can claim only independently verified assignments.
+// A global relay has no such target and must defer.
+fn scope_assignments(state: &Path, scope: Option<&str>) -> Result<Option<Assignments>> {
+    let dir = state.join("dispatches");
+    let entries = match fs::read_dir(&dir) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        other => other?,
+    };
+    let mut ids = HashSet::new();
+    for entry in entries {
+        let path = entry?.path();
+        if matches!(
+            path.extension().and_then(OsStr::to_str),
+            Some("json" | "pending")
+        ) {
+            if let Some(id) = path
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .filter(|id| valid_id(id))
+            {
+                ids.insert(id.to_owned());
+            }
+        }
+    }
+    let mut restricted = false;
+    let mut verified = Assignments::new();
+    for id in ids {
+        let mut damaged = false;
+        // A concurrent rename can expose both generations. Check both for
+        // ownership. A conflict cannot establish a delivery identity.
+        let pending = generation(&dir.join(format!("{id}.pending")), &mut damaged)?;
+        let published = generation(&dir.join(format!("{id}.json")), &mut damaged)?;
+        for row in pending.iter().chain(&published) {
+            if !row["controllerOwner"].is_null() {
+                let owned = if row["scope"].is_null() {
+                    Some(id.as_str())
+                } else {
+                    row["scope"].as_str()
+                };
+                ensure!(
+                    scope.is_some() && owned.is_some() && scope != owned,
+                    "controller owner authorization required for relay"
+                );
+            }
+        }
+        if let (Some(a), Some(b)) = (&pending, &published) {
+            damaged |= ["attempt", "round", "scope", "controllerOwner"]
+                .iter()
+                .any(|&k| a[k] != b[k]);
+        }
+        if damaged {
+            restricted = true;
+            continue;
+        }
+        if let Some(row) = published.or(pending) {
+            let assigned = if row["scope"].is_null() {
+                Some(id.as_str())
+            } else {
+                row["scope"].as_str()
+            };
+            if scope.is_some() && scope == assigned && row["controllerOwner"].is_null() {
+                if let (Some(attempt), Some(round)) =
+                    (row["attempt"].as_str(), row["round"].as_u64())
+                {
+                    if crate::workflow::valid_identity(attempt, "a-") && round > 0 {
+                        verified.insert(id, (attempt.to_owned(), round));
+                    }
+                }
+            }
+        }
+    }
+    Ok(restricted.then_some(verified))
+}
+
+// Missing generations are normal during handoff. Malformed contents (including
+// a filename/record identity mismatch) supply no evidence for this dispatch.
+fn generation(path: &Path, damaged: &mut bool) -> Result<Option<Value>> {
+    match read_record(path) {
+        Ok(record) => Ok(Some(record)),
+        Err(e) => {
+            if let Some(io) = e.downcast_ref::<std::io::Error>() {
+                return if io.kind() == ErrorKind::NotFound {
+                    Ok(None)
+                } else {
+                    Err(e)
+                };
+            }
+            if e.downcast_ref::<serde_json::Error>()
+                .is_some_and(|err| err.is_io())
+            {
+                return Err(e);
+            }
+            *damaged = true;
+            Ok(None)
+        }
+    }
 }
 
 fn settle(inbox: &mut Inbox, batch: &[Value], received: bool) -> Result<()> {

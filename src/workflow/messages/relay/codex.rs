@@ -90,42 +90,38 @@ pub(super) fn controller(thread: &str) -> Result<String> {
 }
 
 // Match the Python queue text, including UTF-8, JSON separators and field order.
-fn queue_text(messages: &[Value]) -> String {
-    let mut envelopes = Vec::with_capacity(messages.len());
-    for m in messages {
-        let header = [
-            "id",
-            "messageId",
-            "dispatch",
-            "type",
-            "state",
-            "statusVersion",
-        ];
-        let mut fields = Vec::new();
-        let mut field = |k: &str, v: &Value| fields.push(format!("{}: {v}", json!(k)));
-        for k in header {
-            field(k, &m[k]);
-        }
-        for (k, v) in m.as_object().expect("controller message").iter() {
-            if !header.contains(&k.as_str()) {
-                field(k, v);
-            }
-        }
-        field("delivery", &json!("pending"));
-        field(
-            "deliveryAttempt",
-            &json!(format!(
-                "relay:{}:{}",
-                m["messageId"].as_str().unwrap(),
-                m["statusVersion"]
-            )),
-        );
-        envelopes.push(format!("{{{}}}", fields.join(", ")));
+pub(super) const PREFIX: &str = "[router] Messages for the controller: {\"messages\": [";
+pub(super) const SUFFIX: &str = "]}";
+
+pub(super) fn envelope(m: &Value) -> String {
+    let header = [
+        "id",
+        "messageId",
+        "dispatch",
+        "type",
+        "state",
+        "statusVersion",
+    ];
+    let mut fields = Vec::new();
+    let mut field = |k: &str, v: &Value| fields.push(format!("{}: {v}", json!(k)));
+    for k in header {
+        field(k, &m[k]);
     }
-    format!(
-        "[router] Messages for the controller: {{\"messages\": [{}]}}",
-        envelopes.join(", ")
-    )
+    for (k, v) in m.as_object().expect("controller message").iter() {
+        if !header.contains(&k.as_str()) {
+            field(k, v);
+        }
+    }
+    field("delivery", &json!("pending"));
+    field(
+        "deliveryAttempt",
+        &json!(format!(
+            "relay:{}:{}",
+            m["messageId"].as_str().unwrap(),
+            m["statusVersion"]
+        )),
+    );
+    format!("{{{}}}", fields.join(", "))
 }
 
 // Exit codes used only between wfc relay and its queue supervisor. An unexpected
@@ -137,6 +133,7 @@ pub(super) enum Outcome {
     Failed = 20,
     Missing = 21,
     Uncertain = 22,
+    TooLong = 23,
 }
 
 pub(super) fn missing_rollout(output: &mut fs::File, thread: &OsStr) -> io::Result<bool> {
@@ -144,16 +141,18 @@ pub(super) fn missing_rollout(output: &mut fs::File, thread: &OsStr) -> io::Resu
     let length = output.metadata()?.len();
     let mut lines = BufReader::new(output.take(length));
     let mut prefix = Vec::new();
+    let mut refused = false;
     loop {
         prefix.clear();
         let n = lines.by_ref().take(512).read_until(b'\n', &mut prefix)?;
         if n == 0 {
-            return Ok(false);
+            return Ok(refused);
+        }
+        if prefix.iter().all(u8::is_ascii_whitespace) {
+            continue;
         }
         if n == 512 && prefix.last() != Some(&b'\n') {
-            // A truncated prefix cannot establish a definitive rejection.
-            lines.skip_until(b'\n')?;
-            continue;
+            return Ok(false);
         }
         let line = String::from_utf8_lossy(&prefix);
         let mut diagnostic = line.trim();
@@ -165,7 +164,8 @@ pub(super) fn missing_rollout(output: &mut fs::File, thread: &OsStr) -> io::Resu
         }
         const MISSING: &str = "no rollout found for thread";
         if diagnostic == MISSING {
-            return Ok(true);
+            refused = true;
+            continue;
         }
         if let Some(id) = diagnostic
             .strip_prefix(MISSING)
@@ -173,13 +173,22 @@ pub(super) fn missing_rollout(output: &mut fs::File, thread: &OsStr) -> io::Resu
         {
             let id = id.strip_prefix("id ").unwrap_or(id);
             if id.eq_ignore_ascii_case(&thread.to_string_lossy()) {
-                return Ok(true);
+                refused = true;
+                continue;
             }
         }
+        // A historical refusal can occur before or after evidence of submission.
+        // Only a complete transcript consisting of explicit refusals is conclusive.
+        return Ok(false);
     }
 }
 
-pub(super) fn queue(thread: &str, messages: &[Value], limit: Duration) -> Result<Outcome> {
+pub(super) fn queue(
+    thread: &str,
+    messages: &[Value],
+    text: &str,
+    limit: Duration,
+) -> Result<Outcome> {
     let ids: Vec<_> = messages.iter().map(|m| m["id"].as_u64().unwrap()).collect();
     let mut supervisor = Command::new(env::current_exe()?);
     supervisor
@@ -187,11 +196,12 @@ pub(super) fn queue(thread: &str, messages: &[Value], limit: Duration) -> Result
         .arg(std::process::id().to_string())
         .arg(limit.as_secs_f64().to_string())
         .arg(thread)
-        .arg(queue_text(messages))
+        .arg(text)
         .stdin(Stdio::null());
     crate::workflow::worker_owner::new_session(&mut supervisor);
     let mut child = match supervisor.spawn() {
         Ok(child) => child,
+        Err(e) if e.raw_os_error() == Some(libc::E2BIG) => return Ok(Outcome::TooLong),
         Err(e) => {
             println!("router relay: queue supervisor could not start for messages {ids:?}: {e}");
             return Ok(Outcome::Failed);
@@ -200,6 +210,7 @@ pub(super) fn queue(thread: &str, messages: &[Value], limit: Duration) -> Result
     let outcome = match child.wait()?.code() {
         Some(0) => Outcome::Delivered,
         Some(code) if code == Outcome::Failed as i32 => Outcome::Failed,
+        Some(code) if code == Outcome::TooLong as i32 => Outcome::TooLong,
         Some(code) if code == Outcome::Missing as i32 => Outcome::Missing,
         _ => {
             println!("router relay: delivery of messages {ids:?} is uncertain");
