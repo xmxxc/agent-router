@@ -432,6 +432,35 @@ os.execv({TMUX!r}, [{TMUX!r}, *a])
         self.assertEqual(self.call("read")["screen"].count("literal once"), 1)
         self.assertEqual(self.call("close")["result"], "completed")
 
+    def test_session_identity_is_recorded_before_a_fast_worker_runs(self):
+        argv = [sys.executable, "-c", """import json, os, pathlib, sys
+launches = pathlib.Path(os.environ["WFC_STATE"]) / "launches"
+anchors = [json.loads(path.read_bytes()) for path in launches.glob("*.session")]
+sys.exit(23 if len(anchors) == 1 and anchors[0]["pane"] == os.environ["TMUX_PANE"] else 71)
+"""]
+        attempt = self.call("create", executionId="fast", **{**self.launch, "argv": argv})
+        self.assertEqual((attempt.get("category"), attempt.get("exitCode")), ("process_exited", 23), attempt)
+
+    def test_same_launch_worker_receipt_cannot_substitute_for_session_identity(self):
+        shim = self.work / "tmux"
+        shim.write_text(f"""#!{sys.executable}
+import json, os, sys
+from pathlib import Path
+args=sys.argv[1:]
+if "new-session" in args:
+    launch_id=args[args.index("--tmux-host")+1]
+    record=Path({str(self.state)!r})/"launches"/(launch_id+".session")
+    record.write_text(json.dumps(dict(category="unknown", launchId=launch_id)))
+    args=args[:args.index(";")]
+os.execv({TMUX!r},[{TMUX!r},*args])
+""")
+        shim.chmod(0o700)
+        ran = self.root / "worker-ran"
+        result = self.call("create", executionId="fast", environ={"PATH": str(self.work)},
+                           **{**self.launch, "argv": ["/usr/bin/touch", str(ran)]})
+        self.assertEqual(result.get("category"), "not_started", result)
+        self.assertFalse(ran.exists())
+
     def test_single_session_on_new_server(self):
         self.env["WFC_TMUX_SOCKET"] = str(self.root / "brand-new-server")
         self.addCleanup(subprocess.run, [TMUX, "-S", self.env["WFC_TMUX_SOCKET"], "kill-server"],

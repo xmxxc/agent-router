@@ -604,6 +604,24 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
     let dispatch = env::var("WFC_DISPATCH").context("missing dispatch")?;
     let spec = pending_spec(&spec_path, &initial, &state, &dispatch)
         .context("unverified launch specification")?;
+    let submission = dir.join(format!("{id}.submission"));
+    if !missing(&submission) {
+        // Let the tmux create queue identify its session before a fast worker
+        // can exit and remove the target of that queue.
+        let session = dir.join(format!("{id}.session"));
+        let host = super::binding::host_session()?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if super::binding::host_matches_created_session(&session, id, &host) {
+                break;
+            }
+            ensure!(
+                !missing(&spec_path) && Instant::now() < deadline,
+                "tmux session creation was not recorded"
+            );
+            sleep(Duration::from_millis(10));
+        }
+    }
     fs::remove_file(spec_path)?;
     super::binding::record_server(&dir, id)?;
     let mut cmd = Command::new(spec.argv.first().context("empty launch argv")?);

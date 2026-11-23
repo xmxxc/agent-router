@@ -429,7 +429,7 @@ pub(super) fn save(path: &Path, value: &impl Serialize) -> Result<()> {
     result
 }
 
-pub(super) fn record_server(dir: &Path, id: &str) -> Result<()> {
+pub(super) fn host_session() -> Result<ServerSession> {
     // TMUX ends in ",<server pid>,<numeric session id>". Socket names may contain commas.
     let tmux = env::var("TMUX")?;
     let mut parts = tmux.rsplitn(3, ',');
@@ -442,10 +442,24 @@ pub(super) fn record_server(dir: &Path, id: &str) -> Result<()> {
             .is_some_and(|s| s.parse::<u32>().is_ok()),
         "invalid tmux pane ID"
     );
-    let mut binding =
-        ServerSession::capture(pid, format!("${session}"), Some(pane), socket.into())?;
+    ServerSession::capture(pid, format!("${session}"), Some(pane), socket.into())
+}
+
+pub(super) fn record_server(dir: &Path, id: &str) -> Result<()> {
+    let mut binding = host_session()?;
     binding.launch_id = Some(id.to_owned());
     save(&dir.join(format!("{id}.server")), &binding)
+}
+
+pub(super) fn host_matches_created_session(path: &Path, id: &str, host: &ServerSession) -> bool {
+    super::launch::read_receipt(path)
+        .and_then(|value| serde_json::from_value::<ServerSession>(value).ok())
+        .is_some_and(|record| {
+            record.launch_id.as_deref() == Some(id)
+                && record.same_server(host)
+                && record.session == host.session
+                && record.pane == host.pane
+        })
 }
 
 // tmux calls this in its new-session command queue, independently of
