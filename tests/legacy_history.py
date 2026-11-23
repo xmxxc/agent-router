@@ -15,13 +15,14 @@ from legacy_public import snapshot
 
 FAULTED = "d-00000032"
 FAULT_ATTEMPT = "a-000000000032"
+FINAL_HEAD = "b" * 40
 
 
-def post(db, number, dispatch, recipient, kind, payload, *, state="unsent", version=1):
+def post(db, number, dispatch, recipient, kind, payload, *, state="unsent", version=1, created=14):
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     db.execute("""INSERT INTO message (id,dispatch,recipient,type,body,created,delivered,message_uid,
-               body_hash,state,status_version) VALUES (?,?,?,?,?,14,?,?,?,?,?)""",
-               (number, dispatch, recipient, kind, raw, int(state in ("received", "processed")),
+               body_hash,state,status_version) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+               (number, dispatch, recipient, kind, raw, created, int(state in ("received", "processed")),
                 identifier(number), digest(raw.encode()), state, version))
     return raw
 
@@ -44,6 +45,17 @@ def seed_full_history(source, work):
                      "result": "pending"}),
         }
         q_body = post(db, 39, DISPATCH, "controller", "question", question, state="processed", version=4)
+        final_done = {"report": str(work / "last.md"), "head": FINAL_HEAD, "dirty": True}
+        modern_done = {**final_done, "scope": SCOPE, "role": "worker", "round": 2, "attempt": CURRENT}
+        post(db, 47, DISPATCH, "controller", "done", {**modern_done, "head": "a" * 40, "dirty": False},
+             state="processed", version=4)
+        raw = json.dumps(modern_done, ensure_ascii=False, sort_keys=True)
+        db.execute("UPDATE message SET body=?, body_hash=?, created=15 WHERE id=49", (raw, digest(raw.encode())))
+        db.execute("UPDATE dispatch_round SET result=?, completed=16 WHERE dispatch=? AND round=2",
+                   (json.dumps(final_done), DISPATCH))
+        # An unqualified receipt does not supersede a fully attributed completion.
+        post(db, 51, DISPATCH, "controller", "done", {**final_done, "head": "c" * 40, "dirty": False},
+             state="processed", version=4, created=17)
         db.execute("""UPDATE message SET resolver_actor='fixture',resolution_source='operator',
                    resolution_reason='received',resolution_evidence='proof',resolved_at=15 WHERE id=39""")
         db.execute("""INSERT INTO message_resolution (id,message,actor,source,reason,evidence,body_hash,
@@ -95,6 +107,42 @@ def rejects_unverified(binary, root, source):
         assert not target.exists() and snapshot(rejected) == before
 
 
+def rejects_inconsistent_ledger(binary, root, source):
+    for scenario in ("head", "dirty", "duplicate-numeric-id"):
+        rejected = root / f"consistency-{scenario}"
+        target = root / f"unpublished-{scenario}"
+        rejected.mkdir()
+        database = Path(shutil.copyfile(source / "router.db", rejected / "router.db"))
+        with closing(sqlite3.connect(database)) as db, db:
+            if scenario == "duplicate-numeric-id":
+                # Keep the same columns and rows while removing the PK constraint
+                # in this synthetic copy. The archived fault collides with done.
+                db.executescript("""CREATE TABLE message_copy AS SELECT * FROM message;
+                                   DROP TABLE message;
+                                   ALTER TABLE message_copy RENAME TO message;
+                                   INSERT INTO sqlite_sequence(name,seq) VALUES ('message',125);
+                                   UPDATE message SET id=41 WHERE id=76;""")
+                assert db.execute("SELECT dispatch, message_uid FROM message WHERE id=41 ORDER BY dispatch").fetchall() == [
+                    (DISPATCH, identifier(41)), (FAULTED, identifier(76))]
+                diagnostic = "duplicate legacy numeric receipt ID 41"
+            else:
+                result, = db.execute("SELECT result FROM dispatch_round WHERE dispatch=? AND round=2",
+                                     (DISPATCH,)).fetchone()
+                damaged = {**json.loads(result), scenario: {"head": "d" * 40, "dirty": False}[scenario]}
+                db.execute("UPDATE dispatch_round SET result=? WHERE dispatch=? AND round=2",
+                           (json.dumps(damaged), DISPATCH))
+                diagnostic = f"legacy dispatch {DISPATCH} round 2 attempt {CURRENT} final done receipt 49"
+        before = snapshot(rejected)
+        proof = proof_for(root / f"consistency-{scenario}.json", database, target)
+        result = run(binary, root, target, *import_args(rejected, proof))
+        denied(result, diagnostic)
+        if scenario != "duplicate-numeric-id":
+            assert "conflicting stored result and final done receipt" in result.stderr, result
+        assert not target.exists() and snapshot(rejected) == before
+        print(json.dumps({"rejectedConsistencyCase": scenario, "sourceBeforeAfter": before["router.db"][1],
+                          "publishedTarget": False}), flush=True)
+
+
 def lookup(binary, root, target, dispatch):
     snapshot_now = snapshot(target)
     view = output(run(binary, root, target, "status", "--dispatch", dispatch))
@@ -106,8 +154,11 @@ def lookup(binary, root, target, dispatch):
 def verify_history(binary, root, target, archived, bodies, work):
     done, _ = lookup(binary, root, target, DISPATCH)
     by_id = {row["id"]: row for row in done["messages"]}
-    assert list(by_id) == [39, 40, 41, 43, 44, 45, 46, 49, 60, 61, 65]
+    assert list(by_id) == [39, 40, 41, 43, 44, 45, 46, 47, 49, 51, 60, 61, 65]
     assert done["status"] == "completed" and done["backendAlive"] is False
+    assert [(by_id[number]["head"], by_id[number]["dirty"]) for number in (47, 49, 51)] == [
+        ("a" * 40, False), (FINAL_HEAD, True), ("c" * 40, False)]
+    assert done["rounds"][1]["result"] == {"report": str(work / "last.md"), "head": FINAL_HEAD, "dirty": True}
     assert done["legacyAudit"][0]["ownerGeneration"] == 7
     assert done["legacyAudit"][0]["resolutionOwnerGeneration"] == 8
     assert done["legacyResolutions"][0]["messageId"] == identifier(39)
@@ -131,7 +182,7 @@ def verify_history(binary, root, target, archived, bodies, work):
         seen = by_id[number]
         assert (seen["messageId"], seen["body"], seen["bodyHash"], seen["legacyArchiveOnly"]) == (
             identifier(number), raw, digest(raw.encode()), True)
-    assert {row["id"] for row in json.loads((target / "messages.json").read_text())} == {39, 41, 49, 60, 61}
+    assert {row["id"] for row in json.loads((target / "messages.json").read_text())} == {39, 41, 47, 49, 51, 60, 61}
     for receipt in ("40", identifier(40), "76", identifier(82)):
         denied(run(binary, root, target, "ack", receipt, token=NEW), "no controller message")
     denied(run(binary, root, target, "resolve", "76", "--actor", "fixture", "--reason", "fixture",
@@ -165,10 +216,11 @@ def fixture(binary, schema, root, version, backend):
     archived = seed_full_history(source, work)
     original = snapshot(source)
     rejects_unverified(binary, root, source)
+    rejects_inconsistent_ledger(binary, root, source)
     target = root / "native"
     proof = proof_for(root / "history-proof.json", source / "router.db", target)
     result = output(run(binary, root, target, *import_args(source, proof)))
-    assert result["messages"] == 13 and result["messageHighWater"] == 125
+    assert result["messages"] == 15 and result["messageHighWater"] == 125
     backup = Path(result["backup"])
     assert digest(backup.read_bytes()) == original["router.db"][1]
     new_id = verify_history(binary, root, target, archived, bodies, work)

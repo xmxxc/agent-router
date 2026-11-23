@@ -6,8 +6,9 @@ mod preview;
 mod recovery;
 mod schema;
 
-pub use migrate::open_offline_copy;
+pub use completion::{check_final_done_result, keeps_earlier_done};
 pub use import::{import_scratch, stopped_ledger};
+pub use migrate::open_offline_copy;
 pub use preview::{can_preview_router_db, reclaim_preview, status, verify_router_db};
 
 use anyhow::{ensure, Context, Result};

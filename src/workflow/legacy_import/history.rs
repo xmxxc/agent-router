@@ -3,6 +3,7 @@ use super::{matching_round, messages, text, valid_identity};
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use wfc_legacy_state::{check_final_done_result, keeps_earlier_done};
 
 fn checked_body(record: &Value, row: &Value) -> Result<Value> {
     let raw = text(row, "body")?;
@@ -29,7 +30,6 @@ fn checked_body(record: &Value, row: &Value) -> Result<Value> {
     );
     ensure!(
         valid_identity(text(row, "messageId")?, "m-")
-            && row["id"].as_u64().is_some_and(|id| id > 0)
             && row["statusVersion"]
                 .as_u64()
                 .is_some_and(|version| version > 0),
@@ -198,9 +198,18 @@ pub(super) fn receipts(
 ) -> Result<Vec<Value>> {
     let mut native = Vec::new();
     let mut questions = BTreeMap::new();
+    let mut final_done = BTreeMap::new();
     let mut by_id = BTreeMap::new();
     let mut seen = BTreeSet::new();
     for row in rows {
+        let id = row["id"]
+            .as_u64()
+            .filter(|id| *id > 0)
+            .context("invalid legacy numeric receipt ID")?;
+        ensure!(
+            by_id.insert(id, row).is_none(),
+            "duplicate legacy numeric receipt ID {id}"
+        );
         let dispatch = text(row, "dispatch")?;
         let message_id = text(row, "messageId")?;
         ensure!(seen.insert(message_id), "duplicate legacy messageId");
@@ -209,17 +218,23 @@ pub(super) fn receipts(
             .with_context(|| format!("legacy receipt has no dispatch {dispatch}"))?;
         let context = || format!("legacy dispatch {dispatch} receipt {}", row["id"]);
         let body = checked_body(record, row).with_context(context)?;
-        let id = row["id"].as_u64().unwrap();
-        ensure!(
-            by_id.insert(id, row).is_none(),
-            "duplicate legacy numeric receipt ID"
-        );
         if row["recipient"] == "controller"
             && matches!(row["type"].as_str(), Some("done" | "question"))
         {
             let message = controller_receipt(record, row, &body).with_context(context)?;
             if row["type"] == "question" {
                 questions.insert(id, native.len());
+            } else {
+                // SQLite returns receipts in numeric ID order. Track the
+                // effective result independently of the preserved history.
+                let number = message["round"].as_i64().unwrap();
+                let attempt = text(&message, "attempt")?;
+                let key = (dispatch, number, attempt.to_owned());
+                if final_done.get(&key).is_none_or(|(_, previous)| {
+                    !keeps_earlier_done(previous, &body, number, attempt)
+                }) {
+                    final_done.insert(key, (native.len(), body));
+                }
             }
             native.push(message);
         } else {
@@ -227,6 +242,20 @@ pub(super) fn receipts(
                 archived_receipt(record, row, body, &questions, &native).with_context(context)?;
             record["messages"].as_array_mut().unwrap().push(message);
         }
+    }
+    for ((dispatch, number, attempt), (index, _)) in final_done {
+        let receipt = &native[index];
+        let round = matching_round(&records[dispatch], receipt, None)?;
+        check_final_done_result(
+            text(round, "legacyResultBody")?,
+            text(receipt, "legacy_body")?,
+        )
+        .with_context(|| {
+            format!(
+                "legacy dispatch {dispatch} round {number} attempt {attempt} final done receipt {}",
+                receipt["id"]
+            )
+        })?;
     }
     for mut resolution in resolutions {
         let row = resolution["message"]
