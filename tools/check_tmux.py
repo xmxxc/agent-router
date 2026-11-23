@@ -637,6 +637,10 @@ os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
         argv = [sys.executable, str(Path(__file__).resolve()), "--composer", "retry", str(log), "retry"]
         self.assertEqual(self.call("create", **{**self.launch, "argv": argv}, environ=endpoint)["result"], "accepted")
         self.assertEqual(self.call("create", **self.launch, environ=endpoint)["result"], "refused")
+        deadline = time.monotonic() + 5
+        while not log.exists() or log.stat().st_size == 0:
+            self.assertLess(time.monotonic(), deadline, "worker did not record its start")
+            time.sleep(0.02)
         self.assertEqual(len(log.read_text().splitlines()), 1)
         self.assertEqual(self.call("close", environ=endpoint)["result"], "completed")
 
