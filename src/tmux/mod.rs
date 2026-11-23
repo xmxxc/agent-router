@@ -915,8 +915,7 @@ pub(crate) fn execute_ordered_interrupt(state: &Path, request: Request) -> Resul
         Err(error) => return Ok(failure("definitely-not-sent", &format!("{error:#}"))),
     };
     let reply = execute_with_order(state, request, Some(&mut order))?;
-    order.finish(&reply)?;
-    Ok(reply)
+    order.finish(reply)
 }
 
 pub fn execute(state: &Path, request: Request) -> Result<Value> {

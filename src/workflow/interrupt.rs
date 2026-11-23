@@ -310,8 +310,8 @@ impl BackendOrder {
         messages::sync_directory(state)
     }
 
-    pub(crate) fn finish(self, reply: &Value) -> Result<()> {
-        if let Some(result) = terminal_result(reply).filter(|_| self.published) {
+    pub(crate) fn finish(self, mut reply: Value) -> Result<Value> {
+        if let Some(result) = terminal_result(&reply).filter(|_| self.published) {
             write_json(
                 &self.receipt,
                 &json!({"order":self.binding, "result":result}),
@@ -322,8 +322,15 @@ impl BackendOrder {
                     .parent()
                     .context("missing interrupt receipt directory")?,
             )?;
+        } else if !self.published
+            && reply["result"] == "uncertain"
+            && reply["inputResult"].is_null()
+        {
+            // Only this live backend knows it returned before the ordering
+            // record was published. Reaching the key command requires it.
+            reply["inputResult"] = json!("definitely-not-sent");
         }
-        Ok(())
+        Ok(reply)
     }
 }
 

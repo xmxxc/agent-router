@@ -2308,7 +2308,7 @@ with open(attempt + ".keys", "wb", buffering=0) as keys:
 
         shim = self.work / "tmux"
         shim.write_text(f"""#!{sys.executable}
-import json, os, subprocess, sys, time
+import json, os, signal, subprocess, sys, time
 from pathlib import Path
 
 args = sys.argv[1:]
@@ -2325,10 +2325,23 @@ def hold():
 
 if mode == "before-backend-start" and "list-panes" in args:
     hold()
-if mode == "fail-ordered-preflight" and "list-panes" in args:
-    parent = (Path("/proc") / str(os.getppid()) / "cmdline").read_bytes()
+if mode == "native-lock-error" and "list-panes" in args:
+    status = subprocess.run([real, *args], close_fds=False).returncode
+    lock = Path(os.environ["INTERRUPT_FIXTURE_LOCK"])
+    saved = lock.with_suffix(".original")
+    if status == 0 and not saved.exists():
+        # The public observation already holds the original native lock.
+        # Fail the next private backend's open, before any order is registered.
+        lock.rename(saved)
+        lock.mkdir()
+    sys.exit(status)
+if mode in ("fail-ordered-preflight", "lose-ordered-preflight") and "list-panes" in args:
+    backend_pid = os.getppid()
+    parent = (Path("/proc") / str(backend_pid) / "cmdline").read_bytes()
     if b"--lifecycle-lock-fds" in parent.split(bytes([0])):
         (work / "ordered-preflight-refused").touch()
+        if mode == "lose-ordered-preflight":
+            os.kill(backend_pid, signal.SIGKILL)
         sys.exit(7)
 if mode and "if-shell" in args and any("send-keys -t " in a and " C-c" in a for a in args):
     if mode == "hold":
@@ -2643,6 +2656,78 @@ os.execv(real, [real, *args])
                           "takeoverGeneration": current["generation"], "targetKeys": 0,
                           "neighborKeys": 0}), flush=True)
 
+    def test_public_interrupt_native_lock_error_allows_original_close(self):
+        cli, dispatch, env = self.public_interrupt_fixture()
+        scope = "interrupt-native-lock"
+        owner = cli("acquire", "--scope", scope, "--owner", "A")
+        credentials = {"WFC_OWNER_TOKEN": owner["token"]}
+        target, _, keys = dispatch(scope, **credentials)
+        neighbor, _, other_keys = dispatch("interrupt-native-lock-neighbor")
+        dispatch_id, attempt = target["dispatch"], target["attempt"]
+        lock = self.state / "tmux" / f"{dispatch_id}.lock"
+        saved = lock.with_suffix(".original")
+        self.assertTrue(lock.is_file())
+        try:
+            result = cli("interrupt", dispatch_id, **credentials,
+                         PATH=str(self.work) + ":" + env["PATH"],
+                         INTERRUPT_TEST_MODE="native-lock-error", INTERRUPT_FIXTURE_LOCK=str(lock))
+            self.assertTrue(saved.is_file())
+            self.assertTrue(lock.is_dir())
+        finally:
+            if saved.exists():
+                if lock.is_dir():
+                    lock.rmdir()
+                saved.rename(lock)
+
+        self.assertEqual((result["result"], result["attempt"], result["audit"]),
+                         ("definitely-not-sent", attempt, 1))
+        self.assertEqual(result["diagnostic"], "cannot confirm the original tmux session has ended")
+        self.assertFalse(list(self.state.glob("interrupt-order-*.json")))
+        audit, = cli("status", "--dispatch", dispatch_id)["dispatches"][0]["audit"]
+        self.assertEqual((audit["id"], audit["result"], audit["scopeFence"], audit["ownerGeneration"]),
+                         (1, "definitely-not-sent", True, owner["generation"]))
+        current = cli("takeover", "--scope", scope, "--owner", "B")
+        self.assertEqual(current["generation"], owner["generation"] + 1)
+        credentials = {"WFC_OWNER_TOKEN": current["token"]}
+        self.assertEqual((keys.read_bytes(), other_keys.read_bytes()), (b"", b""))
+        self.active_pane(dispatch_id)
+        self.active_pane(neighbor["dispatch"])
+        close = cli("close", dispatch_id, **credentials)
+        replay = cli("close", dispatch_id, **credentials)
+        self.assertEqual((close["result"], close["attempt"], close["closeEffect"]),
+                         ("completed", attempt, "session_closed"))
+        for field in ("dispatch", "round", "attempt", "result", "closeOperationId", "closeEffect"):
+            self.assertEqual(close[field], replay[field])
+        self.assertFalse(cli("status", "--dispatch", dispatch_id)["dispatches"][0]["backendAlive"])
+        self.active_pane(neighbor["dispatch"])
+        self.assertEqual((keys.read_bytes(), other_keys.read_bytes()), (b"", b""))
+        print(json.dumps({"nativeLockError": result, "verifiedCloseReplay": replay,
+                          "targetKeys": 0, "neighborKeys": 0, "ownerGeneration": current["generation"]}),
+              flush=True)
+
+    def test_public_interrupt_lost_preflight_reply_remains_unresolved(self):
+        cli, dispatch, env = self.public_interrupt_fixture()
+        target, _, keys = dispatch("interrupt-preflight-lost")
+        neighbor, _, other_keys = dispatch("interrupt-preflight-lost-neighbor")
+        dispatch_id, attempt = target["dispatch"], target["attempt"]
+        result = cli("interrupt", dispatch_id, PATH=str(self.work) + ":" + env["PATH"],
+                     INTERRUPT_TEST_MODE="lose-ordered-preflight")
+        self.assertTrue((self.work / "ordered-preflight-refused").exists())
+        self.assertEqual((result["result"], result["attempt"], result["audit"]), ("uncertain", attempt, 1))
+        self.assertFalse(list(self.state.glob("interrupt-order-*.json")))
+        audit, = cli("status", "--dispatch", dispatch_id)["dispatches"][0]["audit"]
+        self.assertEqual((audit["id"], audit["result"], audit["scopeFence"]), (1, "uncertain", True))
+        for operation in ("interrupt", "close"):
+            refused = json.loads(cli(operation, dispatch_id, code=1))
+            self.assertEqual((refused["error"], refused["audit"], refused["result"]),
+                             ("lifecycle_reconcile_required", 1, "uncertain"))
+        self.assertFalse((self.state / "dispatches" / f"{dispatch_id}.{attempt}.closed").exists())
+        self.active_pane(dispatch_id)
+        self.active_pane(neighbor["dispatch"])
+        self.assertEqual((keys.read_bytes(), other_keys.read_bytes()), (b"", b""))
+        print(json.dumps({"lostPreflightReply": result, "closeAndRetryBlocked": True,
+                          "targetKeys": 0, "neighborKeys": 0}), flush=True)
+
     def test_public_interrupt_blocks_owner_change_after_backend_dies_with_queued_key(self):
         cli, dispatch, env = self.public_interrupt_fixture()
         scope = "interrupt-queued"
@@ -2710,6 +2795,9 @@ os.execv(real, [real, *args])
         self.assertEqual(cli("takeover", "--scope", neighbor["scope"], "--owner", "C")["generation"], 1)
         repeated = json.loads(cli("interrupt", dispatch_id, code=1, **credentials))
         self.assertEqual((repeated["error"], repeated["audit"], repeated["result"]),
+                         ("lifecycle_reconcile_required", 1, "uncertain"))
+        close = json.loads(cli("close", dispatch_id, code=1, **credentials))
+        self.assertEqual((close["error"], close["audit"], close["result"]),
                          ("lifecycle_reconcile_required", 1, "uncertain"))
         self.active_pane(dispatch_id)
         self.active_pane(neighbor["dispatch"])
