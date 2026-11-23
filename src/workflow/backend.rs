@@ -1,4 +1,6 @@
-//! Public lifecycle client for the tmux create/inspect/close protocol (#31).
+//! Public lifecycle clients for hosted dispatches.
+#[cfg(target_os = "linux")]
+mod bundled;
 use super::{host::Launch, valid_identity, write_json};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
@@ -29,16 +31,22 @@ pub fn tmux_socket() -> Result<PathBuf> {
 }
 
 fn call(state: &Path, row: &Value, mut request: Value) -> Result<Value> {
-    ensure!(
-        row["backend"] == "tmux",
-        "{} backend adapter is unavailable in this build",
-        row["backend"]
-    );
-    request["dispatch"] = row["dispatch"].clone();
+    let backend = row["backend"].as_str().context("missing backend")?;
     let mut command = Command::new(env::current_exe()?);
-    command.arg("--tmux-backend").env("WFC_STATE", state);
-    if let Some(socket) = row["tmuxSocket"].as_str() {
-        command.env("WFC_TMUX_SOCKET", socket);
+    command.env("WFC_STATE", state);
+    match backend {
+        "tmux" => {
+            request["dispatch"] = row["dispatch"].clone();
+            command.arg("--tmux-backend");
+            if let Some(socket) = row["tmuxSocket"].as_str() {
+                command.env("WFC_TMUX_SOCKET", socket);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        "bundled" => {
+            command.arg("--bundled");
+        }
+        _ => bail!("{backend} backend adapter is unavailable in this build"),
     }
     let mut child = command
         .stdin(Stdio::piped())
@@ -51,19 +59,23 @@ fn call(state: &Path, row: &Value, mut request: Value) -> Result<Value> {
     );
     let out = child.wait_with_output()?;
     if out.status.code() == Some(2) {
-        bail!("tmux backend is unavailable in this build (requires #31)");
+        bail!("{backend} backend is unavailable in this build");
     }
     if sent.is_err() || !out.status.success() {
         return Ok(
-            json!({"result":"uncertain","diagnostic":"tmux backend did not confirm the request"}),
+            json!({"result":"uncertain","diagnostic":format!("{backend} backend did not confirm the request")}),
         );
     }
     Ok(serde_json::from_slice(&out.stdout).unwrap_or_else(
-        |_| json!({"result":"uncertain","diagnostic":"invalid tmux backend response"}),
+        |_| json!({"result":"uncertain","diagnostic":format!("invalid {backend} backend response")}),
     ))
 }
 
 pub fn create(state: &Path, row: &Value, launch: Launch) -> Result<Value> {
+    #[cfg(target_os = "linux")]
+    if row["backend"] == "bundled" {
+        return bundled::create(state, row, launch);
+    }
     call(
         state,
         row,
@@ -104,6 +116,10 @@ fn closed_path(state: &Path, row: &Value) -> Result<PathBuf> {
     )))
 }
 
+pub(super) fn bundled_close_path(state: &Path, row: &Value) -> Result<PathBuf> {
+    Ok(closed_path(state, row)?.with_extension("closing"))
+}
+
 fn closed(state: &Path, row: &Value) -> Result<Option<Value>> {
     match File::open(closed_path(state, row)?) {
         Ok(f) => {
@@ -122,8 +138,20 @@ fn closed(state: &Path, row: &Value) -> Result<Option<Value>> {
 }
 
 pub fn observe(state: &Path, row: &Value) -> Result<(Value, Value)> {
+    #[cfg(target_os = "linux")]
+    if row["backend"] == "bundled" {
+        return bundled::observe(state, row);
+    }
     if let Some(result) = closed(state, row)? {
         return Ok((result, json!({"result":"completed","alive":false})));
+    }
+    // This tmux adapter predates #42's attempt-bound launch lookup. A bare
+    // reservation alone cannot authorize acting on a live pane.
+    if row["createPending"] == true && row["create"]["receipt"].is_null() {
+        return Ok((
+            json!({"state":"unknown"}),
+            json!({"result":"uncertain","diagnostic":"missing verified tmux launch receipt"}),
+        ));
     }
     let evidence = private_receipt(state, &row["create"])?;
     let mut inspection = call(state, row, json!({"op":"inspect"}))
@@ -147,10 +175,16 @@ pub fn observe(state: &Path, row: &Value) -> Result<(Value, Value)> {
 
 pub fn close(state: &Path, row: &Value) -> Result<Value> {
     let id = row["dispatch"].as_str().context("missing dispatch")?;
-    // This immutable assignment file serializes competing closes, including
-    // across a restart. Completed archives need only read access.
-    let lock = File::open(state.join("dispatches").join(format!("{id}.json")))?;
-    lock.lock()?;
+    #[cfg(target_os = "linux")]
+    if row["backend"] == "bundled" {
+        return bundled::close(state, row);
+    }
+    // Completed archives can replay on read-only state.
+    let _lock = if closed(state, row)?.is_none() {
+        Some(super::assignment::close_lock(state, row)?)
+    } else {
+        None
+    };
     let mut receipt = json!({"dispatch":id,"operation":"close","result":"completed","round":row["round"],"attempt":row["attempt"]});
     if closed(state, row)?.is_some() {
         receipt["diagnostic"] = json!("session was already gone");

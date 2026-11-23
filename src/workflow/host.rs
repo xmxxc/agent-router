@@ -67,6 +67,16 @@ pub fn default_label(cwd: &Path, report_dir: &str) -> String {
     )
 }
 
+pub(crate) fn router_credential(key: &str) -> bool {
+    [
+        "WFC_CONTROLLER_TOKEN",
+        "WFC_OWNER_TOKEN",
+        "WFC_WORKER_CALLBACK",
+    ]
+    .iter()
+    .any(|name| key.eq_ignore_ascii_case(name))
+}
+
 fn append_env(to: &mut Map<String, Value>, from: Option<&Value>) -> Result<()> {
     if let Some(value) = from {
         for (k, v) in value.as_object().context("invalid env")? {
@@ -76,14 +86,7 @@ fn append_env(to: &mut Map<String, Value>, from: Option<&Value>) -> Result<()> {
                     && v.as_str().is_some_and(|s| !s.contains('\0')),
                 "invalid env"
             );
-            if ![
-                "WFC_CONTROLLER_TOKEN",
-                "WFC_OWNER_TOKEN",
-                "WFC_WORKER_CALLBACK",
-            ]
-            .iter()
-            .any(|name| k.eq_ignore_ascii_case(name))
-            {
+            if !router_credential(k) {
                 to.insert(k.clone(), v.clone());
             }
         }

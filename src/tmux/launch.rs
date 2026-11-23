@@ -30,15 +30,7 @@ struct Spec {
     env: BTreeMap<String, String>,
 }
 
-pub(super) fn router_credential(key: &str) -> bool {
-    [
-        "WFC_CONTROLLER_TOKEN",
-        "WFC_OWNER_TOKEN",
-        "WFC_WORKER_CALLBACK",
-    ]
-    .iter()
-    .any(|name| key.eq_ignore_ascii_case(name))
-}
+pub(super) use crate::workflow::host::router_credential;
 
 fn private_file(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut f = OpenOptions::new()

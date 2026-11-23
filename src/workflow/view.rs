@@ -2,6 +2,72 @@
 use anyhow::{ensure, Result};
 use serde_json::{json, Value};
 
+// Archive order fixes the first completion for each round. Delivery state
+// can advance in the live ledger; its numeric IDs belong to that ledger.
+pub fn merged_history(row: &Value, ledger: Vec<Value>) -> Result<Vec<Value>> {
+    let mut history = Vec::<Value>::new();
+    let mut positions = std::collections::HashMap::<String, usize>::new();
+    for message in row["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .cloned()
+        .chain(ledger)
+    {
+        ensure!(
+            message.is_object() && message["dispatch"] == row["dispatch"],
+            "message assignment mismatch"
+        );
+        if let Some(key) = message["messageId"].as_str() {
+            if let Some(&pos) = positions.get(key) {
+                let original = &mut history[pos];
+                for field in ["round", "attempt", "report", "type"] {
+                    ensure!(
+                        original[field].is_null()
+                            || message[field].is_null()
+                            || original[field] == message[field],
+                        "conflicting {field} for message {key}"
+                    );
+                }
+                let delivery_fields = ["state", "statusVersion", "delivered", "resolution"];
+                if message["statusVersion"].as_u64().unwrap_or(0)
+                    >= original["statusVersion"].as_u64().unwrap_or(0)
+                {
+                    for key in delivery_fields {
+                        if let Some(value) = message.get(key) {
+                            original[key] = value.clone();
+                        } else {
+                            original.as_object_mut().unwrap().remove(key);
+                        }
+                    }
+                }
+                // Older archived views can omit this derived flag. Derive it
+                // from the chosen version, never from another delivery snapshot.
+                match original["state"].as_str() {
+                    Some("received" | "processed") => original["delivered"] = json!(true),
+                    Some("unsent" | "unknown") => original["delivered"] = json!(false),
+                    _ => {}
+                }
+                for (k, v) in message.as_object().unwrap() {
+                    if !delivery_fields.contains(&k.as_str())
+                        && (original.get(k).is_none()
+                            || (original[k].is_null()
+                                && matches!(k.as_str(), "round" | "attempt" | "type" | "report"))
+                            || k == "id")
+                    {
+                        original[k] = v.clone();
+                    }
+                }
+                continue;
+            }
+            positions.insert(key.to_owned(), history.len());
+        }
+        history.push(message);
+    }
+    history.sort_by_key(|m| m["round"].as_u64().unwrap_or(0));
+    Ok(history)
+}
+
 pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: bool) -> Result<()> {
     let mut rounds = row
         .get("rounds")
@@ -87,7 +153,7 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
         status
     });
     row["backendAlive"] = json!(alive);
-    if row["backend"] == "tmux" {
+    if matches!(row["backend"].as_str(), Some("tmux" | "bundled")) {
         row["tmuxAlive"] = json!(alive);
     }
     row["rounds"] = json!(rounds);
@@ -96,4 +162,44 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
         row["messages"] = json!(history);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delivery_fields_follow_one_version_in_either_snapshot_order() -> Result<()> {
+        let initial = json!({"messageId":"m","dispatch":"d","state":"unsent","statusVersion":1,
+            "delivered":false,"resolution":"old","head":"original"});
+        let processed = json!({"messageId":"m","dispatch":"d","state":"processed","statusVersion":3,"head":"later"});
+        for (first, second) in [(&initial, &processed), (&processed, &initial)] {
+            let row = json!({"dispatch":"d","messages":[first]});
+            let merged = &merged_history(&row, vec![second.clone()])?[0];
+            assert_eq!(merged["statusVersion"], 3);
+            assert_eq!(merged["state"], "processed");
+            assert_eq!(merged["delivered"], true);
+            assert!(merged.get("resolution").is_none());
+            assert_eq!(merged["head"], first["head"]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn archive_and_live_receipts_share_stable_ids_across_delivery_transitions() -> Result<()> {
+        let old = json!({"id":1,"messageId":"archived","dispatch":"d-12345678","round":1,"attempt":"old","report":"original"});
+        let shared = json!({"id":2,"messageId":"shared","dispatch":"d-12345678","round":2,"attempt":null,"report":null,"state":"unsent","head":null});
+        let row = json!({"dispatch":"d-12345678","messages":[old, shared]});
+        let claimed = json!({"id":1,"messageId":"shared","dispatch":"d-12345678","round":2,"attempt":"current","report":"second","state":"processed","statusVersion":3,"head":"later"});
+        let messages = merged_history(&row, vec![claimed])?;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0], old);
+        assert!(messages[1]["head"].is_null());
+        assert_eq!(messages[1]["attempt"], "current");
+        assert_eq!(messages[1]["report"], "second");
+        assert_eq!(messages[1]["state"], "processed");
+        assert_eq!(messages[1]["id"], 1);
+        assert_eq!(row["messages"][1], shared);
+        Ok(())
+    }
 }

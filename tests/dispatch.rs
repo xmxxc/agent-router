@@ -357,6 +357,38 @@ fn missing_legacy_host_binding_cannot_confirm_close() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn public_bundled_rejects_an_ordinary_directory_before_launch() {
+    let f = Fixture::new();
+    fs::write(f.0.join("task"), "work").unwrap();
+    let out = f
+        .wfc()
+        .env("WFC_BUNDLED_CGROUP_ROOT", &f.0)
+        .args([
+            "dispatch",
+            "--backend",
+            "bundled",
+            "--host",
+            "codex",
+            "--task",
+            "task",
+            "--cwd",
+            ".",
+            "--report",
+            "report",
+        ])
+        .output()
+        .unwrap();
+    let diagnostic = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        diagnostic.contains("expected cgroup v2 filesystem"),
+        "{diagnostic}"
+    );
+    assert_eq!(run(f.wfc().arg("status"))["dispatches"], json!([]));
+}
+
 #[test]
 fn invalid_public_options_and_launch_config_leave_no_active_dispatch() {
     let f = Fixture::new();
@@ -378,7 +410,7 @@ fn invalid_public_options_and_launch_config_leave_no_active_dispatch() {
         "codex",
     ];
     for (extra, code, diagnostic) in [
-        (vec!["--backend", "bundled"], 1, "unavailable"),
+        (vec!["--backend", "herdr"], 1, "unavailable"),
         (
             vec!["--herdr-endpoint", "socket"],
             2,
@@ -847,4 +879,36 @@ fn r1_bare_retry_preserves_receipt_across_upgrade() {
             assert_eq!(batch, json!({"messages":[],"timedOut":true}));
         }
     }
+}
+
+#[test]
+fn unresolved_reservations_stay_visible_without_claiming_other_assignments() {
+    let f = Fixture::new();
+    let dir = f.0.join("state/dispatches");
+    fs::create_dir_all(&dir).unwrap();
+    let id = "d-ffeeddcc";
+    fs::write(dir.join(format!("{id}.pending")), b"{").unwrap();
+    fs::write(dir.join("d-12345678.reserving"), b"{").unwrap();
+    let all = run(f.wfc().args(["status", "--active"]));
+    let rows = all["dispatches"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["dispatch"], id);
+    assert_eq!(rows[0]["worker"]["state"], "unknown");
+    assert_eq!(rows[0]["rounds"], json!([]));
+    let named = run(f.wfc().args(["status", "--dispatch", id]));
+    assert_eq!(named["dispatches"][0]["createPending"], true);
+    #[cfg(target_os = "linux")]
+    assert!(!f
+        .wfc()
+        .args(["close", id])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let published = json!({"dispatch":id,"round":1,"attempt":"a-aaaabbbbcccc"});
+    fs::write(dir.join(format!("{id}.json")), published.to_string()).unwrap();
+    let all = run(f.wfc().arg("status"));
+    assert_eq!(all["dispatches"].as_array().unwrap().len(), 1);
+    assert!(all["dispatches"][0].get("createPending").is_none());
+    assert_eq!(all["dispatches"][0]["attempt"], published["attempt"]);
 }
