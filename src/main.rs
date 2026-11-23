@@ -10,6 +10,8 @@ const RESERVED_COMMANDS: &[&str] = &[
     "done", "ask", "reply", "continue", "nudge", "resume", "reclaim", "wait", "relay", "ack",
 ];
 
+const UNEXPECTED_ARGUMENTS: &str = "wfc: unexpected arguments. See wfc --help";
+
 fn main() -> anyhow::Result<ExitCode> {
     let mut args = env::args_os();
     let program = args.next().unwrap_or_default();
@@ -32,6 +34,8 @@ fn main() -> anyhow::Result<ExitCode> {
             println!("Usage: wfc [--help | --version]");
             println!("{}", workflow::DISPATCH_USAGE);
             println!("{}", workflow::STATUS_USAGE);
+            #[cfg(target_os = "linux")]
+            println!("{}", workflow::worker_owner::CLOSE_USAGE);
             println!(
                 "Workflow commands reserved for later builds: {}",
                 RESERVED_COMMANDS.join(", ")
@@ -49,7 +53,7 @@ fn main() -> anyhow::Result<ExitCode> {
             );
         }
         Some("--kernel") if args.is_empty() => kernel::run()?,
-        Some("dispatch" | "status") if args == ["--help"] => {
+        Some("dispatch" | "status") if args == ["--help"] || args == ["-h"] => {
             println!(
                 "{}",
                 if command == "dispatch" {
@@ -59,6 +63,21 @@ fn main() -> anyhow::Result<ExitCode> {
                 }
             );
         }
+        #[cfg(target_os = "linux")]
+        Some("--worker-owner") => workflow::worker_owner::run(&args)?,
+        #[cfg(target_os = "linux")]
+        Some("close") => match args.as_slice() {
+            [help] if help == "--help" || help == "-h" => {
+                println!("{}", workflow::worker_owner::CLOSE_USAGE)
+            }
+            [id] if !id.as_encoded_bytes().starts_with(b"-") => {
+                println!("{}", workflow::worker_owner::close(id)?)
+            }
+            _ => {
+                eprintln!("wfc: {}", workflow::worker_owner::CLOSE_USAGE);
+                return Ok(ExitCode::from(2));
+            }
+        },
         Some("dispatch") => {
             let request = match workflow::Dispatch::parse(&args) {
                 Ok(request) => request,
@@ -70,22 +89,23 @@ fn main() -> anyhow::Result<ExitCode> {
             println!("{}", request.run()?);
         }
         Some("status") => {
-            let id = match args.as_slice() {
-                [] => None,
-                [flag, id] if flag == "--dispatch" => Some(id.as_os_str()),
+            let (id, active) = match args.as_slice() {
+                [] => (None, false),
+                [flag] if flag == "--active" => (None, true),
+                [flag, id] if flag == "--dispatch" => (Some(id.as_os_str()), false),
                 _ => {
                     eprintln!("wfc: {}", workflow::STATUS_USAGE);
                     return Ok(ExitCode::from(2));
                 }
             };
-            println!("{}", workflow::status(id)?);
+            println!("{}", workflow::status(id, active)?);
         }
         Some(name) if RESERVED_COMMANDS.contains(&name) => {
             eprintln!("wfc: '{name}' is unavailable in this Rust build");
             return Ok(ExitCode::from(2));
         }
         _ => {
-            eprintln!("wfc: unexpected arguments. See wfc --help");
+            eprintln!("{UNEXPECTED_ARGUMENTS}");
             return Ok(ExitCode::from(2));
         }
     }
