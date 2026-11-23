@@ -159,14 +159,29 @@ fn read_record(path: &Path) -> Result<Value> {
 }
 
 pub fn status(id: Option<&OsStr>) -> Result<Value> {
-    let dir = state_dir()?.join("dispatches");
+    let state = state_dir()?;
+    let dir = state.join("dispatches");
     let mut dispatches = Vec::new();
     if let Some(id) = id {
         let id = id
             .to_str()
             .filter(|s| valid_id(s))
             .context("invalid dispatch ID")?;
-        dispatches.push(read_record(&dir.join(format!("{id}.json")))?);
+        let history = messages::history(&state, id)?;
+        let mut record = match (read_record(&dir.join(format!("{id}.json"))), history.last()) {
+            (Ok(record), _) => record,
+            // A worker can publish a receipt before its foreground handoff
+            // finishes, even if it subsequently exits with an error.
+            (Err(e), Some(last))
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == ErrorKind::NotFound) =>
+            {
+                json!({"dispatch": id, "round": last["round"], "role": last["role"], "attempt": last["attempt"]})
+            }
+            (Err(e), _) => return Err(e),
+        };
+        record["messages"] = Value::Array(history);
+        dispatches.push(record);
     } else {
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
