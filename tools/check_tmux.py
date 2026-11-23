@@ -313,6 +313,17 @@ while time.monotonic() < deadline and not Path(attempt + '.quit').exists():
                       self.resume_cli("resume", dispatch, code=1, **owner))
         self.rollout(session, first["argv"][-1])
 
+        # The final directory existing is not proof if an earlier component
+        # of the saved spelling disappeared before a "..".
+        hop.rmdir()
+        existing_home = {**self.resume_settings["env"], "CODEX_HOME": str(self.codex_home)}
+        self.resume_config.write_text(json.dumps({**self.resume_settings, "env": existing_home}))
+        refused = json.loads(self.resume_cli("resume", dispatch, code=1, **owner))
+        self.assertEqual(refused["error"], "lifecycle_reconcile_required")
+        self.assertIn("configured Codex home differs", refused["diagnostic"])
+        self.resume_config.write_text(json.dumps(self.resume_settings))
+        hop.mkdir()
+
         # A symlink in a component followed by ".." can change its meaning.
         redirect = self.root / "redirect"
         (redirect / hop.name).mkdir(parents=True)
@@ -337,6 +348,49 @@ while time.monotonic() < deadline and not Path(attempt + '.quit').exists():
         self.assertEqual(second["argv"][-2], session)
         self.assertEqual(second["CODEX_HOME"], str(self.codex_home))
         self.assertEqual(second["WFC_REPORT"], first["WFC_REPORT"])
+        self.end_resume_host(dispatch, resumed["attempt"])
+
+    def test_public_resume_dot_codex_home_created_after_dispatch(self):
+        relative = "./codex-data"
+        original, first = self.resume_fixture(relative)
+        dispatch, attempt = original["dispatch"], original["attempt"]
+        session = "11111111-2222-4333-8444-555555555555"
+        owner = {"WFC_OWNER_TOKEN": "owner-one"}
+        self.assertFalse(first["codexHomeExisted"])
+        self.assertEqual(first["CODEX_HOME"], relative)
+        self.assertEqual(original["codexHome"], f"{self.work}/{relative}")
+        self.end_resume_host(dispatch, attempt)
+        rollout = self.rollout(session, first["argv"][-1])
+
+        # An identical rollout in a different, existing home does not prove
+        # that the home belongs to the original dispatch.
+        other = self.root / "other Codex home"
+        copied = other / rollout.relative_to(self.codex_home)
+        copied.parent.mkdir(parents=True)
+        shutil.copyfile(rollout, copied)
+        different_home = {**self.resume_settings["env"], "CODEX_HOME": str(other)}
+        self.resume_config.write_text(json.dumps({**self.resume_settings, "env": different_home}))
+        refused = json.loads(self.resume_cli("resume", dispatch, code=1, **owner))
+        self.assertEqual(refused["error"], "lifecycle_reconcile_required")
+        self.assertIn("configured Codex home differs", refused["diagnostic"])
+        row = self.resume_status(dispatch)
+        self.assertEqual(row["attempt"], attempt)
+        self.assertFalse(row.get("audit"))
+
+        self.resume_config.write_text(json.dumps(self.resume_settings))
+        resumed = self.resume_cli("resume", dispatch, **owner)
+        self.assertEqual((resumed["session"], resumed["round"], resumed["launchResult"]),
+                         (session, 1, "accepted"))
+        self.assertNotEqual(resumed["attempt"], attempt)
+        second = self.resumed_host(resumed["attempt"])
+        self.assertEqual((second["argv"][0], second["argv"][-2]), ("resume", session))
+        self.assertEqual(second["CODEX_HOME"], str(self.codex_home))
+        self.assertEqual(second["WFC_REPORT"], first["WFC_REPORT"])
+        self.assertIn("attempt is no longer accepted",
+                      self.resume_callback(first, "ask", "stale", code=1))
+        wrong_callback = {**second, "WFC_WORKER_CALLBACK": first["WFC_WORKER_CALLBACK"]}
+        self.assertIn("invalid_worker_callback",
+                      self.resume_callback(wrong_callback, "ask", "wrong worker", code=1))
         self.end_resume_host(dispatch, resumed["attempt"])
 
     def test_public_resume_records_definite_spawn_failure(self):

@@ -451,9 +451,9 @@ fn codex_home(cwd: &Path, settings: &Map<String, Value>) -> Result<PathBuf> {
 pub(super) fn matches_unresolved_codex_home(saved: &Path, current: &Path) -> bool {
     use std::path::Component;
 
-    // A canonical saved home must keep its identity even if the path becomes
-    // a symlink. Only the missing-directory fallback can contain "..".
-    if !saved.is_absolute() || !saved.components().any(|part| part == Component::ParentDir) {
+    // A home saved before creation can contain "." as well as "..".
+    // Accept alternate spellings only after checking the actual directories.
+    if !saved.is_absolute() {
         return false;
     }
     let mut checked = PathBuf::new();
