@@ -2,6 +2,7 @@
 use super::{Assignment, Identity, Inbox};
 use crate::workflow::{assignment, backend, decode_record, startup, valid_id};
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
