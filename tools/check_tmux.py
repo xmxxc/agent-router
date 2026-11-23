@@ -666,6 +666,102 @@ os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
         self.assertEqual(self.call("inspect")["result"], "uncertain")
         self.assertEqual(self.call("create", **self.launch)["result"], "uncertain")
 
+    def test_native_socket_alias_preserves_server_identity(self):
+        alias = self.root / "socket-alias"
+        alias.symlink_to(self.socket)
+        environ = {"WFC_TMUX_SOCKET": str(alias)}
+        args = {"executionId": "A"}
+        started = self.call("create", environ=environ, **args, **self.launch)
+        self.assertEqual(started["result"], "accepted", started)
+        receipt = Path(started["receipt"])
+        self.assertEqual(json.loads(receipt.with_suffix(".session").read_text())["socket"], self.socket)
+        self.assertTrue(self.call("inspect", environ=environ, **args)["workerBound"])
+        self.assertTrue(self.call("inspect", **args)["workerBound"])
+        foreign = self.root / "foreign-socket"
+        foreign_tmux = [TMUX, "-S", str(foreign)]
+        subprocess.run(foreign_tmux + ["new-session", "-d", "-s", "foreign", "/bin/cat"], check=True)
+        self.addCleanup(subprocess.run, foreign_tmux + ["kill-server"], capture_output=True)
+        alias.unlink()
+        alias.symlink_to(foreign)
+        key = dict(**args, closeOperationId="end")
+        self.assertEqual(self.call("close", environ=environ, **key)["result"], "uncertain")
+        self.assertTrue(self.call("inspect", **args)["workerBound"])
+        alias.unlink()
+        alias.symlink_to(self.socket)
+        self.assertEqual(self.call("close", environ=environ, **key)["closeEffect"], "session_closed")
+        subprocess.run(foreign_tmux + ["has-session", "-t", "=foreign"], check=True)
+        subprocess.run(self.tmux + ["has-session", "-t", "=sibling"], check=True)
+
+    def test_legacy_socket_alias_can_identify_original_pane(self):
+        self.state.mkdir()
+        subprocess.run(self.tmux + ["new-session", "-d", "-s", "wfc-d-abc12345", "-e",
+                                    f"WFC_STATE={self.state}", "/bin/cat"], env=self.env, check=True)
+        time.sleep(2 / os.sysconf("SC_CLK_TCK"))
+        alias = self.root / "alias"
+        alias.symlink_to(self.socket)
+        selector = {"legacyExecutionId": "old", "legacyWorkerPane": self.active_pane()}
+        reply = self.call("inspect", environ={"WFC_TMUX_SOCKET": str(alias)}, **selector)
+        self.assertTrue(reply["workerBound"], reply)
+        self.assertEqual(self.call("close", legacyExecutionId="old")["closeEffect"], "session_closed")
+
+    def test_legacy_cancelled_reservation_requires_empty_original_endpoint(self):
+        launch = "af" * 16
+        launches = self.state / "launches"
+        claims = self.state / "tmux"
+        launches.mkdir(parents=True)
+        claims.mkdir()
+        pointer = claims / "d-abc12345.json"
+        pointer.write_text(json.dumps({"Launch": launch}))
+        receipt = launches / (launch + ".json")
+        receipt.write_text('{"category":"not_started"}')
+        recovery = {
+            "bootId": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+            "pidNamespace": Path("/proc/self/ns/pid").stat().st_ino,
+            "networkNamespace": Path("/proc/self/ns/net").stat().st_ino,
+            "userNamespace": Path("/proc/self/ns/user").stat().st_ino,
+            "effectiveUid": os.geteuid(),
+        }
+        self.assertEqual(self.call("inspect", legacyRecovery=recovery)["result"], "uncertain")
+        parked = self.root / "moved-original"
+        os.rename(self.socket, parked)
+        try:
+            self.assertEqual(self.call("inspect", legacyRecovery=recovery)["result"], "uncertain")
+            self.assertEqual(self.call("create", **self.launch)["result"], "uncertain")
+        finally:
+            os.rename(parked, self.socket)
+        self.stop_server()
+        self.assertEqual(self.call("inspect")["result"], "uncertain")
+        for field in ("pidNamespace", "networkNamespace", "userNamespace", "effectiveUid"):
+            wrong_scope = {**recovery, field: recovery[field] + 1}
+            self.assertEqual(self.call("inspect", legacyRecovery=wrong_scope)["result"], "uncertain")
+        self.assertFalse(self.call("inspect", legacyRecovery=recovery)["alive"])
+
+        other_id = "bf" * 16
+        pointer.write_text(json.dumps({"Registered": {"id": other_id, "execution": "A"}}))
+        registered = launches / (other_id + ".json")
+        registered.write_bytes(receipt.read_bytes())
+        absent = self.call("inspect", executionId="A", legacyRecovery=recovery)
+        self.assertEqual(absent, dict(result="accepted", alive=False, owned=False))
+        self.assertEqual(self.call("inspect", executionId="A"), absent)
+        self.assertEqual(json.loads(registered.read_text()), {"category": "not_started"})
+        self.assertEqual(self.call("create", executionId="A", **self.launch)["result"], "accepted")
+
+    def test_keyed_close_can_confirm_prepared_launch_without_claiming_revocation(self):
+        endpoint = self.root / "absent-parent" / "socket"
+        environ = {"WFC_TMUX_SOCKET": str(endpoint)}
+        args = dict(executionId="A", closeOperationId="close:A")
+        failed = self.call("create", environ=environ, executionId="A", **self.launch)
+        self.assertEqual(failed.get("category"), "not_started", failed)
+        receipt = Path(failed["receipt"])
+        self.assertIsNone(json.loads(receipt.read_text())["closeOperationId"])
+        endpoint.parent.mkdir()
+        expected = dict(result="completed", closeEffect="already_absent", closeOperationId="close:A")
+        self.assertEqual(self.call("revoke", environ=environ, **args)["result"], "uncertain")
+        self.assertEqual(self.call("close", environ=environ, **args), expected)
+        self.assertEqual(self.call("close", environ=environ, **args), expected)
+        self.assertEqual(self.call("revoke", environ=environ, **args)["result"], "uncertain")
+        self.assertIsNone(json.loads(receipt.read_text())["closeOperationId"])
+
     def test_retry_same_dispatch_after_launcher_could_not_start(self):
         parent = self.root / "new-directory"
         endpoint = {"WFC_TMUX_SOCKET": str(parent / "socket")}

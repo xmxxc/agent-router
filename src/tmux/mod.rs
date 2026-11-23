@@ -27,6 +27,8 @@ pub struct Request {
     legacy_worker_pane: Option<String>,
     #[serde(rename = "legacyLaunchId")]
     legacy_launch_id: Option<String>,
+    #[serde(rename = "legacyRecovery")]
+    legacy_recovery: Option<binding::LegacyRecovery>,
     #[serde(default, rename = "freshDispatch")]
     fresh_dispatch: bool,
     backend: Option<String>,
@@ -68,6 +70,7 @@ struct Tmux<'a> {
     legacy_execution_id: Option<&'a str>,
     legacy_worker_pane: Option<&'a str>,
     legacy_launch_id: Option<&'a str>,
+    legacy_recovery: Option<&'a binding::LegacyRecovery>,
     input_request: bool,
     new_execution_id: Option<&'a str>,
     close_operation_id: Option<&'a str>,
@@ -656,19 +659,27 @@ impl Tmux<'_> {
             };
             if let Some((id, execution)) = launch {
                 let execution = execution.as_deref();
-                if let Some((fact, path)) = self.cancellation(&id, execution)? {
+                let fact = if self.legacy_worker_cancelled(&id) {
+                    None
+                } else {
+                    self.cancellation(&id, execution)?
+                };
+                if let Some((fact, path)) = fact {
                     let keyed_fact = self.close_execution == execution
                         && execution.is_some()
                         && fact["closeOperationId"].as_str() == self.close_operation_id
                         && self.close_operation_id.is_some();
-                    let reply = if self.close_execution.is_some() && !keyed_fact {
-                        Err(binding::unknown())
-                    } else if self
+                    let prepared = self
                         .submission(&id, execution)
-                        .is_ok_and(|s| s.phase == launch::SubmissionPhase::Prepared)
+                        .is_ok_and(|s| s.phase == launch::SubmissionPhase::Prepared);
+                    let create_rolled_back = fact["closeOperationId"].is_null();
+                    let reply = if prepared
+                        && (keyed_fact || create_rolled_back || self.close_execution.is_none())
                     {
                         self.confirm_cancelled_absence(&id, execution, false)
                             .and_then(|()| self.finish_cancelled_close(CloseEffect::AlreadyAbsent))
+                    } else if self.close_execution.is_some() && !keyed_fact {
+                        Err(binding::unknown())
                     } else {
                         match self.target() {
                             Ok(None) if !launch::missing(&self.launch_path(&id, "cleanup")) => Err(
@@ -806,6 +817,7 @@ pub(crate) fn attach(state: &Path, dispatch: &str, socket: &Path, token: &str) -
         legacy_execution_id: None,
         legacy_worker_pane: None,
         legacy_launch_id: None,
+        legacy_recovery: None,
         input_request: false,
         new_execution_id: None,
         close_operation_id: None,
@@ -911,6 +923,11 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
             || (request.execution_id.is_some() && request.close_operation_id.is_some()),
         "revoke requires the native execution and close operation IDs"
     );
+    ensure!(
+        request.legacy_recovery.is_none()
+            || (matches!(request.op, Operation::Inspect) && !request.fresh_dispatch),
+        "legacyRecovery requires ordinary inspect"
+    );
     let native_id;
     let mut backend = Tmux {
         state: &state,
@@ -919,6 +936,7 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
         legacy_execution_id: request.legacy_execution_id.as_deref(),
         legacy_worker_pane: request.legacy_worker_pane.as_deref(),
         legacy_launch_id: request.legacy_launch_id.as_deref(),
+        legacy_recovery: request.legacy_recovery.as_ref(),
         new_execution_id: request.execution_id.as_deref().filter(|_| launching),
         close_operation_id: request.close_operation_id.as_deref(),
         close_execution: request
@@ -957,6 +975,15 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
             let id = backend
                 .legacy_execution_id
                 .expect("resolved execution selector");
+            if accepted
+                && result["alive"] == false
+                && backend.legacy_worker_cancelled(id)
+                && backend
+                    .submission(id, Some(execution))
+                    .is_ok_and(|row| row.phase == launch::SubmissionPhase::LegacyAbsent)
+            {
+                return Ok(result);
+            }
             match backend.confirm_launch(id) {
                 Ok(worker) if accepted || worker == binding::Worker::Exited => {
                     result["executionId"] = json!(execution);
