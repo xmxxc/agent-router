@@ -81,6 +81,7 @@ pub(super) enum SubmissionPhase {
     Prepared,
     InFlight,
     Returned,
+    LegacyAbsent,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -153,11 +154,66 @@ impl Tmux<'_> {
         if submission.launch_id != id
             || submission.dispatch != self.dispatch
             || submission.execution_id.as_deref() != execution
-            || submission.socket != self.socket
+            || !super::binding::same_selection(submission.socket.as_deref(), self.socket.as_deref())
         {
             return Err(unknown());
         }
         Ok(submission)
+    }
+
+    pub(super) fn legacy_worker_cancelled(&self, id: &str) -> bool {
+        if !super::binding::valid_launch_id(id)
+            || ["spec", "held", "intent", "server", "session", "cleanup"]
+                .iter()
+                .any(|ext| !missing(&self.launch_path(id, ext)))
+        {
+            return false;
+        }
+        let receipt_path = self.launch_path(id, "json");
+        let marker = self.launch_path(id, "revoked");
+        match read_private_json(&receipt_path) {
+            Some(record) if record == json!({"category":"not_started"}) => missing(&marker),
+            Some(record) if record == json!({"category":"unknown"}) => {
+                read_receipt(&marker) == Some(Value::Null)
+            }
+            None if missing(&receipt_path)
+                || fs::symlink_metadata(&receipt_path).is_ok_and(|m| m.is_dir()) =>
+            {
+                read_receipt(&marker) == Some(Value::Null)
+            }
+            _ => false,
+        }
+    }
+
+    pub(super) fn confirm_legacy_absence(
+        &self,
+        id: &str,
+        execution: Option<&str>,
+        reachable: bool,
+    ) -> Reply<()> {
+        let unknown = super::binding::unknown;
+        let path = self.launch_path(id, "submission");
+        if !missing(&path) {
+            return if self.submission(id, execution)?.phase == SubmissionPhase::LegacyAbsent {
+                Ok(())
+            } else {
+                Err(unknown())
+            };
+        }
+        if reachable || !self.legacy_endpoint_is_empty(id)? {
+            return Err(unknown());
+        }
+        // Store the independently checked absence as history. The legacy
+        // worker receipt is left intact and supplies no close-operation fact.
+        let submission = Submission {
+            launch_id: id.to_owned(),
+            dispatch: self.dispatch.to_owned(),
+            execution_id: execution.map(str::to_owned),
+            socket: self.socket.clone(),
+            origin: None,
+            phase: SubmissionPhase::LegacyAbsent,
+        };
+        super::binding::save(&path, &submission).map_err(|_| unknown())
     }
 
     fn cancellation_record(
@@ -252,6 +308,9 @@ impl Tmux<'_> {
         else {
             return Ok(None);
         };
+        if self.legacy_worker_cancelled(id) {
+            return Ok(None);
+        }
         Ok(self
             .cancellation(id, Some(execution))?
             .filter(|(record, _)| record["closeOperationId"] == operation))
@@ -473,12 +532,17 @@ impl Tmux<'_> {
                     "tmux socket directory does not exist",
                 ));
             }
+            // Confirm the socket before marking submission in flight. A
+            // failed preflight cannot have issued new-session.
+            let pinned_socket = submission
+                .origin
+                .as_ref()
+                .map(|origin| self.pin_submission(origin))
+                .transpose()?;
             submission.phase = SubmissionPhase::InFlight;
             super::binding::save(&path, &submission).map_err(|_| io_error())?;
-            let out = if let Some(origin) = &submission.origin {
-                // A launch sent to a pinned server cannot be redirected to a replacement.
-                let socket = self.pin_submission(origin)?;
-                let pinned_path = super::binding::fd_path(&socket);
+            let out = if let Some(socket) = &pinned_socket {
+                let pinned_path = super::binding::fd_path(socket);
                 let mut pinned = vec!["-N", "-S", &pinned_path];
                 pinned.extend_from_slice(&args);
                 self.run_with_tail(&pinned, &tail)

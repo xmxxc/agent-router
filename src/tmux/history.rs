@@ -194,7 +194,8 @@ impl Tmux<'_> {
         {
             if active == execution {
                 // Retry only a proven unstarted reservation before any keyed close.
-                if self.cancellation(&id, Some(execution))?.is_some()
+                if (self.legacy_worker_cancelled(&id)
+                    || self.cancellation(&id, Some(execution))?.is_some())
                     && !self.was_released(&id)?
                     && !self.registry()?.close_operations.contains_key(&id)
                 {

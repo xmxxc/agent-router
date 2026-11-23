@@ -8,7 +8,7 @@ use std::env;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::ErrorKind;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -77,27 +77,43 @@ fn listener_inode(line: &[u8], socket: &Path) -> Option<u64> {
     fields.next().is_none().then_some(inode)
 }
 
+// Trusted original scope, supplied only for migrations without a saved
+// server record. Verify the recovering process can see that same scope.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct LegacyRecovery {
+    boot_id: String,
+    pid_namespace: u64,
+    network_namespace: u64,
+    user_namespace: u64,
+    effective_uid: u32,
+}
+
+impl LegacyRecovery {
+    fn matches_current(&self, uid: u32) -> bool {
+        self.effective_uid == uid
+            && boot_id().is_ok_and(|id| id.trim_end() == self.boot_id)
+            && [
+                ("pid", self.pid_namespace),
+                ("net", self.network_namespace),
+                ("user", self.user_namespace),
+            ]
+            .iter()
+            .all(|(name, inode)| {
+                fs::metadata(format!("/proc/self/ns/{name}")).is_ok_and(|ns| ns.ino() == *inode)
+            })
+    }
+}
+
 impl PaneEvidence {
     fn hint(t: &Tmux<'_>) -> Option<Self> {
         // The kernel retains a listening socket's bound name across rename.
         // Require one stream listener for the historical address, even if its
         // filesystem entry is temporarily inaccessible.
-        let socket = match &t.socket {
-            Some(path) => path.clone(),
-            None => {
-                let out = t
-                    .run(&[
-                        "-N",
-                        "display-message",
-                        "-p",
-                        "-t",
-                        &format!("={}:", t.session),
-                        "#{socket_path}",
-                    ])
-                    .ok()?;
-                PathBuf::from(std::str::from_utf8(&out.stdout).ok()?.strip_suffix('\n')?)
-            }
-        };
+        let socket = t
+            .launch_server()
+            .map(|server| server.socket)
+            .or_else(|| t.socket.clone())?;
         let sockets = fs::read("/proc/net/unix").ok()?;
         let mut listeners = sockets
             .split(|b| *b == b'\n')
@@ -356,7 +372,7 @@ impl ServerSession {
     }
 
     fn same_server(&self, other: &Self) -> bool {
-        self.socket == other.socket
+        same_socket(&self.socket, &other.socket)
             && self.boot == other.boot
             && self.namespace == other.namespace
             && self.pid == other.pid
@@ -372,6 +388,29 @@ impl ServerSession {
             "different PID namespace"
         );
         Ok(process_start(self.pid)? == Some(self.start_ticks))
+    }
+}
+
+// Alternate absolute names are equivalent only while the kernel resolves
+// both to the same socket. Each live caller still checks its peer PID.
+pub(super) fn same_socket(a: &Path, b: &Path) -> bool {
+    a == b
+        || fs::metadata(a)
+            .ok()
+            .zip(fs::metadata(b).ok())
+            .is_some_and(|(a, b)| {
+                a.file_type().is_socket()
+                    && b.file_type().is_socket()
+                    && a.dev() == b.dev()
+                    && a.ino() == b.ino()
+            })
+}
+
+pub(super) fn same_selection(a: Option<&Path>, b: Option<&Path>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => same_socket(a, b),
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -490,7 +529,7 @@ pub(crate) fn record_created_session(args: &[std::ffi::OsString]) -> Result<()> 
             && submission
                 .socket
                 .as_ref()
-                .is_none_or(|expected| *expected == socket),
+                .is_none_or(|expected| same_socket(expected, &socket)),
         "unverified tmux creation"
     );
     pin_socket(&socket, pid)?;
@@ -547,7 +586,7 @@ impl Tmux<'_> {
     }
 
     pub(super) fn clear_anonymous_preflight(&self) -> Reply<()> {
-        if matches!(self.claim()?, Some(Claim::LegacyPending {execution:None, socket, hints}) if socket == self.socket && hints == LegacyHints::default())
+        if matches!(self.claim()?, Some(Claim::LegacyPending {execution:None, socket, hints}) if same_selection(socket.as_deref(), self.socket.as_deref()) && hints == LegacyHints::default())
         {
             fs::remove_file(self.claim_path()).map_err(|_| unknown())?;
         }
@@ -620,7 +659,9 @@ impl Tmux<'_> {
                 execution,
                 hints,
             }) => {
-                if socket != self.socket || execution.as_deref().is_some_and(|old| old != id) {
+                if !same_selection(socket.as_deref(), self.socket.as_deref())
+                    || execution.as_deref().is_some_and(|old| old != id)
+                {
                     return Err(unknown());
                 }
                 pending = hints;
@@ -636,7 +677,7 @@ impl Tmux<'_> {
                     if self
                         .socket
                         .as_ref()
-                        .is_some_and(|socket| *socket != server.socket)
+                        .is_some_and(|socket| !same_socket(socket, &server.socket))
                     {
                         return Err(unknown());
                     }
@@ -792,7 +833,7 @@ impl Tmux<'_> {
                     && self
                         .socket
                         .as_ref()
-                        .is_none_or(|socket| *socket == server.socket)
+                        .is_none_or(|socket| same_socket(socket, &server.socket))
                     && server.pid != 0
                     && server.start_ticks != 0
                     && !server.boot.trim().is_empty()
@@ -811,8 +852,16 @@ impl Tmux<'_> {
             .strip_suffix('\n')?
             .split_once('\n')?;
         let pid = pid.parse().ok()?;
-        let socket = self.socket.clone().unwrap_or_else(|| PathBuf::from(socket));
-        pin_socket(&socket, pid).ok()?;
+        let socket = PathBuf::from(socket);
+        if !socket.is_absolute()
+            || self
+                .socket
+                .as_ref()
+                .is_some_and(|selected| !same_socket(selected, &socket))
+        {
+            return None;
+        }
+        pin_socket(self.socket.as_deref().unwrap_or(&socket), pid).ok()?;
         ServerSession::capture(pid, String::new(), None, socket).ok()
     }
 
@@ -820,7 +869,11 @@ impl Tmux<'_> {
         if !origin.server_alive().map_err(|_| unknown())? {
             return Err(unknown());
         }
-        pin_socket(&origin.socket, origin.pid).map_err(|_| unknown())
+        let socket = self.socket.as_deref().unwrap_or(&origin.socket);
+        if !same_socket(socket, &origin.socket) {
+            return Err(unknown());
+        }
+        pin_socket(socket, origin.pid).map_err(|_| unknown())
     }
 
     fn created_session(&self, id: &str) -> Reply<Option<ServerSession>> {
@@ -847,7 +900,7 @@ impl Tmux<'_> {
         }
         if let Some(origin) = submission.origin {
             if origin.pid.to_string() != t.server_pid
-                || origin.socket != Path::new(&t.socket)
+                || !same_socket(&origin.socket, Path::new(&t.socket))
                 || !origin.server_alive().map_err(|_| unknown())?
             {
                 return Err(unknown());
@@ -855,7 +908,9 @@ impl Tmux<'_> {
         }
         let binding = self.created_session(id)?.ok_or_else(unknown)?;
         binding.verify(t)?;
-        if binding.pane.as_deref() != Some(&t.pane) || binding.socket != Path::new(&t.socket) {
+        if binding.pane.as_deref() != Some(&t.pane)
+            || !same_socket(&binding.socket, Path::new(&t.socket))
+        {
             return Err(unknown());
         }
         // Check the session-local launch flag and the original startup command.
@@ -930,7 +985,7 @@ impl Tmux<'_> {
                     || self
                         .socket
                         .as_ref()
-                        .is_some_and(|socket| *socket != server.socket)
+                        .is_some_and(|socket| !same_socket(socket, &server.socket))
                 {
                     return Err(unknown());
                 }
@@ -982,6 +1037,73 @@ impl Tmux<'_> {
         }
     }
 
+    pub(super) fn legacy_endpoint_is_empty(&self, id: &str) -> Reply<bool> {
+        let uid = unsafe { libc::geteuid() };
+        if !self
+            .legacy_recovery
+            .is_some_and(|scope| scope.matches_current(uid))
+        {
+            return Ok(false);
+        }
+        let socket = self.socket.as_deref().ok_or_else(unknown)?;
+        let parent = socket.parent().ok_or_else(unknown)?;
+        // Require the configured original address, with no ambiguity from
+        // a symlinked parent or an orphaned pathname that still has a listener.
+        if !super::launch::missing(socket)
+            || !parent
+                .canonicalize()
+                .is_ok_and(|resolved| resolved == parent)
+        {
+            return Ok(false);
+        }
+        let launch_env = format!("WFC_TMUX_LAUNCH={id}");
+        for entry in fs::read_dir("/proc").map_err(|_| unknown())? {
+            let entry = entry.map_err(|_| unknown())?;
+            if !entry
+                .file_name()
+                .as_encoded_bytes()
+                .iter()
+                .all(u8::is_ascii_digit)
+            {
+                continue;
+            }
+            let path = entry.path();
+            match entry.metadata() {
+                Ok(meta) if meta.uid() == uid => (),
+                Err(err) if err.kind() != ErrorKind::NotFound => return Err(unknown()),
+                _ => continue,
+            }
+            let args = match fs::read(path.join("cmdline")) {
+                Ok(args) if args.is_empty() => continue, // Dead processes have no command line.
+                Ok(args) => args,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(_) => return Err(unknown()),
+            };
+            if args.starts_with(b"tmux: server")
+                || args
+                    .split(|byte| *byte == 0)
+                    .any(|arg| arg == id.as_bytes() || arg == launch_env.as_bytes())
+            {
+                return Ok(false);
+            }
+            // R7 did not store the bound address. A disappeared alias can
+            // otherwise hide a live server whose listener has another name.
+            match fs::read(path.join("comm")) {
+                Ok(name) if name.starts_with(b"tmux: server") => return Ok(false),
+                Ok(_) => (),
+                Err(err) if err.kind() == ErrorKind::NotFound => (),
+                Err(_) => return Err(unknown()),
+            }
+        }
+        // Check after looking for pending launch clients. A moved socket
+        // retains the path it originally bound for as long as it listens.
+        let table = fs::read("/proc/net/unix").map_err(|_| unknown())?;
+        Ok(super::launch::missing(socket)
+            && !table
+                .split(|byte| *byte == b'\n')
+                .any(|line| listener_inode(line, socket).is_some()))
+    }
+
     pub(super) fn confirm_absence(&self, claim: Option<Claim>, reachable: bool) -> Reply<()> {
         let claim = match claim {
             None if self.protect_offline && !reachable => {
@@ -1003,6 +1125,9 @@ impl Tmux<'_> {
                     Some(Claim::Registered { execution, .. }) => Some(execution.as_str()),
                     _ => None,
                 };
+                if self.legacy_worker_cancelled(id) {
+                    return self.confirm_legacy_absence(id, execution, reachable);
+                }
                 if self.cancellation(id, execution)?.is_some() {
                     return self.confirm_cancelled_absence(id, execution, reachable);
                 }
@@ -1151,14 +1276,16 @@ impl Tmux<'_> {
                     || self
                         .socket
                         .as_ref()
-                        .is_some_and(|socket| *socket != server.socket)
+                        .is_some_and(|socket| !same_socket(socket, &server.socket))
                 {
                     return Err(unknown());
                 }
                 server.verify(t)?;
                 (execution, hints, receipt, server, false)
             }
-            Some(Claim::LegacyPending { socket, .. }) if socket != self.socket || !t.owned => {
+            Some(Claim::LegacyPending { socket, .. })
+                if !same_selection(socket.as_deref(), self.socket.as_deref()) || !t.owned =>
+            {
                 return Err(unknown())
             }
             Some(Claim::Released(Some(closed)))
