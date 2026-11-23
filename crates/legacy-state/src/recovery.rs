@@ -16,12 +16,16 @@ struct Evidence {
     started: Option<f64>,
     snapshot_row: Option<i64>,
     stored_state: Option<String>,
-    stored_result: Option<String>,
+    continued: bool,
 }
 
 type Key = (i64, String);
 
-fn agree<T: PartialEq>(known: &mut Option<T>, other: Option<T>, field: &str) -> Result<()> {
+pub(super) fn agree<T: PartialEq>(
+    known: &mut Option<T>,
+    other: Option<T>,
+    field: &str,
+) -> Result<()> {
     if let Some(value) = other {
         ensure!(
             known.as_ref().is_none_or(|old| old == &value),
@@ -32,7 +36,7 @@ fn agree<T: PartialEq>(known: &mut Option<T>, other: Option<T>, field: &str) -> 
     Ok(())
 }
 
-fn text(body: &Value, key: &str) -> Result<Option<String>> {
+pub(super) fn text(body: &Value, key: &str) -> Result<Option<String>> {
     match body.get(key) {
         Some(Value::String(s)) if !s.is_empty() => Ok(Some(s.clone())),
         Some(Value::Null) | None => Ok(None),
@@ -112,6 +116,7 @@ fn read_receipts(
             report: text(&body, "report")?,
             task: text(&body, "task")?,
             done: done.then_some((raw, when)),
+            continued: kind.as_deref() == Some("continue"),
             started: if kind.as_deref() == Some("continue") {
                 when
             } else {
@@ -220,10 +225,19 @@ fn bind_evidence(parent: &Evidence, mut facts: Vec<Evidence>) -> Result<BTreeMap
         let mut candidates = history.iter_mut().filter(|(key, known)| {
             matches(key, &f)
                 && (known.report.is_none() || f.report.is_none() || known.report == f.report)
+                && (known.task.is_none() || f.task.is_none() || known.task == f.task)
         });
-        let (_, known) = candidates
-            .next()
-            .context("receipt or audit has no matching attempt")?;
+        let first = candidates.next();
+        if first.is_none()
+            && f.done.is_some()
+            && f.round.is_none()
+            && f.attempt.is_none()
+            && f.report.is_some()
+        {
+            // A pre-attempt dispatch can retain earlier reports solely as messages.
+            continue;
+        }
+        let (_, known) = first.context("receipt or audit has no matching attempt")?;
         ensure!(
             candidates.next().is_none(),
             "ambiguous receipt or audit attempt"
@@ -242,7 +256,7 @@ fn bind_evidence(parent: &Evidence, mut facts: Vec<Evidence>) -> Result<BTreeMap
             "snapshot rows for one identity",
         )?;
         agree(&mut known.stored_state, f.stored_state, "snapshot state")?;
-        agree(&mut known.stored_result, f.stored_result, "snapshot result")?;
+        known.continued |= f.continued;
         agree(&mut known.started, f.started, "attempt start")?;
         if let Some(done) = f.done {
             ensure!(
@@ -264,7 +278,8 @@ fn recover(db: &Connection, id: &str) -> Result<()> {
                  r.get::<_,Option<String>>(4)?,r.get::<_,Option<String>>(5)?, r.get::<_,Option<f64>>(6)?)))?;
 
     let mut facts: Vec<Evidence> = db
-        .prepare("SELECT round,attempt,report,task,state,rowid,result FROM dispatch_round WHERE dispatch=?")?
+        .prepare("SELECT round,attempt,coalesce(nullif(report,''),CASE WHEN json_valid(result) THEN result->>'$.report' END),
+            task,state,rowid FROM dispatch_round WHERE dispatch=?")?
         .query_map([id], |r| {
             Ok(Evidence {
                 round: r.get(0)?,
@@ -273,7 +288,6 @@ fn recover(db: &Connection, id: &str) -> Result<()> {
                 task: r.get(3)?,
                 stored_state: r.get(4)?,
                 snapshot_row: r.get(5)?,
-                stored_result: r.get(6)?,
                 ..Default::default()
             })
         })?
@@ -286,17 +300,22 @@ fn recover(db: &Connection, id: &str) -> Result<()> {
     if !modern {
         // An old completion with a single known report still identifies it when
         // the dispatch predates the report column.
-        let mut report = parent.report;
-        let mut result = None;
+        let mut by_report = BTreeMap::new();
         for f in facts {
-            ensure!(f.report.is_some(), "legacy done has no report");
-            agree(&mut report, f.report, "legacy completion report")?;
+            let report = f.report.context("legacy done has no report")?;
             agree(
-                &mut result,
-                f.done.map(|(body, _)| body),
+                by_report.entry(report).or_default(),
+                f.done.map(|(raw, _)| raw),
                 "legacy done results",
             )?;
         }
+        let report = match parent.report {
+            Some(path) => Some(path),
+            None => {
+                ensure!(by_report.len() <= 1, "ambiguous current legacy report");
+                by_report.into_keys().next()
+            }
+        };
         db.execute(
             "UPDATE dispatch SET report=? WHERE id=? AND coalesce(report,'')='' AND ?1 IS NOT NULL",
             params![report, id],
@@ -306,21 +325,52 @@ fn recover(db: &Connection, id: &str) -> Result<()> {
 
     let mut history = bind_evidence(&parent, facts)?;
     let (&(last, _), _) = history.last_key_value().context("no historical attempts")?;
+    // A complete pointer to a real older snapshot can lag a committed continue.
+    // Move it only if both ends have independent snapshot evidence. An invented
+    // first attempt or a half-recorded transition cannot authorize a new writer.
+    let old_key = parent.round.zip(parent.attempt.clone());
+    let stale = old_key.as_ref().is_some_and(|key| {
+        (key.0 < last || superseded.contains(&key.1))
+            && history.get(key).is_some_and(|f| {
+                f.snapshot_row.is_some()
+                    && parent
+                        .task
+                        .as_ref()
+                        .is_none_or(|t| f.task.as_ref() == Some(t))
+                    && parent
+                        .report
+                        .as_ref()
+                        .is_none_or(|r| f.report.as_ref() == Some(r))
+            })
+    });
     let mut candidates = history.iter().filter(|(key, f)| {
         key.0 == last
             && !superseded.contains(&key.1)
-            && matches(key, &parent)
-            && (parent.report.is_none() || f.report.is_none() || f.report == parent.report)
-            && (parent.task.is_none() || f.task.is_none() || f.task == parent.task)
+            && if stale {
+                f.snapshot_row.is_some()
+            } else {
+                matches(key, &parent)
+                    && (parent.report.is_none() || f.report.is_none() || f.report == parent.report)
+                    && (parent.task.is_none() || f.task.is_none() || f.task == parent.task)
+            }
     });
     let (current, _) = candidates
         .next()
         .context("current dispatch conflicts with historical attempts or report")?;
     ensure!(candidates.next().is_none(), "ambiguous current attempt");
     let current = current.clone();
+    ensure!(
+        !history.iter().any(|(key, f)| f.continued
+            && key.0 == last
+            && *key != current
+            && !superseded.contains(&key.1)),
+        "continue conflicts with current attempt"
+    );
     let selected = history.get_mut(&current).unwrap();
-    agree(&mut selected.report, parent.report, "current report")?;
-    agree(&mut selected.task, parent.task, "current task")?;
+    if !stale {
+        agree(&mut selected.report, parent.report, "current report")?;
+        agree(&mut selected.task, parent.task, "current task")?;
+    }
     ensure!(
         selected.report.is_some(),
         "insufficient evidence for current report"
@@ -355,43 +405,18 @@ fn save_snapshots(
                 !state.is_empty() || f.done.is_some(),
                 "missing snapshot state for round {round}, attempt {attempt}"
             );
-            if let (Some(result), Some((body, _))) = (&f.stored_result, &f.done) {
-                // Python stores report and Git fields in the snapshot and adds
-                // scope/role/identity to the receipt. Common result fields must agree.
-                let saved: Value =
-                    serde_json::from_str(result).context("invalid recorded done result")?;
-                let receipt: Value = serde_json::from_str(body)?;
-                let fields = saved.as_object().context("invalid recorded done result")?;
-                ensure!(
-                    fields
-                        .iter()
-                        .all(|(k, v)| receipt.get(k).is_none_or(|r| r == v)),
-                    "conflicting snapshot result for round {round}, attempt {attempt}"
-                );
-            }
-            ensure!(
-                f.done.is_none() || matches!(state, "" | "completed" | "running"),
-                "done conflicts with snapshot state for round {round}, attempt {attempt}"
-            );
-            // Preserve original Python results/timestamps where present; fill missing
-            // fields only with the evidence already bound to this exact attempt.
+            // Keep the original row and its callback fields when completing its identity.
             db.execute(
-                "UPDATE dispatch_round SET task=coalesce(task,?1),report=coalesce(report,?2),
+                "UPDATE dispatch_round SET task=coalesce(task,?1),report=coalesce(nullif(report,''),?2),
                     round=?3, attempt=?4 WHERE rowid=?5",
                 params![f.task, f.report, round, attempt, row_id],
             )?;
-            if let Some((body, when)) = f.done {
-                db.execute(
-                    "UPDATE dispatch_round SET state='completed',result=coalesce(result,?1),
-                    completed=coalesce(completed,?2) WHERE dispatch=?3 AND round=?4 AND attempt=?5",
-                    params![body, when, id, round, attempt],
-                )?;
-            }
             continue;
         }
-        let (body, completed) = f.done.with_context(|| {
-            format!("insufficient outcome evidence for round {round}, attempt {attempt}")
-        })?;
+        ensure!(
+            f.done.is_some(),
+            "insufficient outcome evidence for round {round}, attempt {attempt}"
+        );
         ensure!(
             f.report.is_some(),
             "missing report for round {round}, attempt {attempt}"
@@ -401,8 +426,11 @@ fn save_snapshots(
         } else {
             None
         });
-        db.execute("INSERT INTO dispatch_round(dispatch,round,attempt,task,report,state,result,created,completed)
-            VALUES(?,?,?,?,?,'completed',?,?,?)",params![id,round,attempt,f.task,f.report,body,started,completed])?;
+        db.execute(
+            "INSERT INTO dispatch_round(dispatch,round,attempt,task,report,state,created)
+            VALUES(?,?,?,?,?,'completed',?)",
+            params![id, round, attempt, f.task, f.report, started],
+        )?;
     }
     Ok(())
 }
@@ -411,7 +439,20 @@ fn save_snapshots(
 // first attempt despite a receipt naming a different, now missing snapshot.
 pub fn candidates(db: &Connection) -> Result<Vec<String>> {
     let mut query = db.prepare("WITH receipts AS MATERIALIZED (
-            SELECT dispatch,body FROM message WHERE json_valid(body)),
+            SELECT id,dispatch,type,body FROM message WHERE json_valid(body)),
+        continues AS (
+            SELECT id,dispatch,body->>'$.round' n,body->>'$.attempt' a,
+                body->>'$.task' task,body->>'$.report' report FROM receipts WHERE type='continue'),
+        possible AS (
+            SELECT m.*,r.round,r.attempt,r.task recorded_task,r.report recorded_report,
+                ((m.task IS NULL OR r.task IS NULL OR m.task=r.task)
+                  AND (m.report IS NULL OR r.report IS NULL OR m.report=r.report)) compatible
+            FROM continues m JOIN dispatch_round r ON r.dispatch=m.dispatch
+              AND (m.n IS NULL OR m.n=r.round) AND (m.a IS NULL OR m.a=r.attempt)
+            WHERE m.n IS NOT NULL OR m.a IS NOT NULL),
+        bindings AS (
+            SELECT *, count(*) OVER(PARTITION BY id) choices,
+                sum(compatible) OVER(PARTITION BY id) compatible_count FROM possible),
         attested(id,n,a) AS (
             SELECT dispatch,body->>'$.round',body->>'$.attempt' FROM receipts
             UNION ALL SELECT dispatch,body->>'$.round',body->>'$.toAttempt' FROM receipts
@@ -425,8 +466,27 @@ pub fn candidates(db: &Connection) -> Result<Vec<String>> {
         SELECT id FROM dispatch d WHERE nullif(current_attempt,'') IS NULL OR coalesce(current_round,0)=0
           OR coalesce(scope,'')='' OR coalesce(role,'')=''
           OR NOT EXISTS(SELECT 1 FROM dispatch_round r WHERE r.dispatch=d.id)
+          OR EXISTS(SELECT 1 FROM dispatch_round r WHERE r.dispatch=d.id AND r.round=d.current_round
+              AND r.attempt=d.current_attempt AND ((r.report IS NOT NULL AND nullif(d.report,'') IS NULL)
+              OR (r.task IS NOT NULL AND nullif(d.task,'') IS NULL)))
           OR EXISTS(SELECT 1 FROM dispatch_round r WHERE r.dispatch=d.id
-              AND (r.round IS NULL OR r.attempt IS NULL OR coalesce(r.state,'')=''))
+              AND (r.round IS NULL OR r.attempt IS NULL OR coalesce(r.state,'')='' OR r.round>d.current_round))
+        UNION SELECT d.id FROM dispatch d JOIN lifecycle_event l ON l.dispatch=d.id
+          WHERE l.operation IN ('resume','handoff') AND l.result='accepted' AND l.from_attempt=d.current_attempt
+            AND l.to_attempt IS NOT NULL AND l.to_attempt<>l.from_attempt
+        UNION SELECT d.id FROM bindings b JOIN dispatch d ON d.id=b.dispatch
+          WHERE (b.choices>1 AND b.compatible_count<>1)
+            OR ((b.choices=1 OR b.compatible) AND (
+               (b.task IS NOT NULL AND b.recorded_task IS NOT b.task)
+               OR (b.report IS NOT NULL AND b.recorded_report IS NOT b.report)
+               OR (b.round=d.current_round AND b.attempt=d.current_attempt AND (
+                   (b.task IS NOT NULL AND d.task IS NOT b.task)
+                   OR (b.report IS NOT NULL AND d.report IS NOT b.report)))
+               OR (b.round=d.current_round AND b.attempt<>d.current_attempt AND NOT EXISTS(
+                   SELECT 1 FROM lifecycle_event l WHERE l.dispatch=d.id AND l.from_attempt=b.attempt
+                   AND l.operation IN ('resume','handoff') AND l.result='accepted' AND l.to_attempt<>l.from_attempt))))
+        UNION SELECT d.id FROM message m JOIN dispatch d ON d.id=m.dispatch
+            WHERE m.type='continue' AND NOT json_valid(m.body)
         UNION SELECT e.id FROM attested e JOIN dispatch d ON d.id=e.id
           WHERE (e.n IS NOT NULL OR e.a IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM dispatch_round r
               WHERE r.dispatch=e.id AND (e.n IS NULL OR r.round=e.n) AND (e.a IS NULL OR r.attempt=e.a))")?;

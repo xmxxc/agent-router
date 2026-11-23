@@ -323,9 +323,9 @@ fn evidence_without_dispatch_rows_is_visible_before_and_after_migration() {
         INSERT INTO fault_event VALUES('fault-only','create','writer unconfirmed');
         CREATE TABLE message(id INTEGER PRIMARY KEY,dispatch TEXT,recipient TEXT,type TEXT,body TEXT,delivered INTEGER);
         INSERT INTO message VALUES(41,'receipt-only','controller','done','{"report":"/old/r"}',1);
-        CREATE TABLE dispatch_round(dispatch TEXT,round INTEGER,attempt TEXT,state TEXT,report TEXT,
+        CREATE TABLE dispatch_round(dispatch TEXT,round INTEGER,attempt TEXT,state TEXT,report TEXT,result TEXT,completed REAL,
             PRIMARY KEY(dispatch,round,attempt));
-        INSERT INTO dispatch_round VALUES('attempt-only',2,'a-old','completed','/old/round-two');
+        INSERT INTO dispatch_round VALUES('attempt-only',2,'a-old','completed','/old/round-two','{"report":"/old/round-two"}',20);
         CREATE TABLE watchdog_fault(dispatch TEXT,round INTEGER,attempt TEXT,kind TEXT,fingerprint TEXT,
             PRIMARY KEY(dispatch, round, attempt, kind, fingerprint));
         INSERT INTO watchdog_fault VALUES('watchdog-only',2,'a-old','timeout','deadline');
@@ -554,7 +554,7 @@ fn conflicting_done_results_do_not_choose_the_first_message() {
 
 #[test]
 fn partial_snapshot_needs_an_outcome_and_retains_its_existing_row() {
-    for done in [false, true] {
+    for (done, when) in [(false, None), (true, None), (true, Some(34.0))] {
         let dir = tempfile::tempdir().unwrap();
         let (db, _) = wfc_legacy_state::open_offline_copy(dir.path()).unwrap();
         db.execute_batch(
@@ -565,9 +565,10 @@ fn partial_snapshot_needs_an_outcome_and_retains_its_existing_row() {
         )
         .unwrap();
         if done {
-            db.execute_batch(
-                r#"INSERT INTO message(dispatch,type,body)
-                VALUES('old','done','{"round":2,"attempt":"a-real","report":"/r"}');"#,
+            db.execute(
+                r#"INSERT INTO message(dispatch,type,body,created)
+                VALUES('old','done','{"round":2,"attempt":"a-real","report":"/r"}',?)"#,
+                [when],
             )
             .unwrap();
         }
@@ -575,7 +576,7 @@ fn partial_snapshot_needs_an_outcome_and_retains_its_existing_row() {
         let path = dir.path().join("router.db");
         let before = fs::read(&path).unwrap();
         let result = wfc_legacy_state::open_offline_copy(dir.path());
-        if done {
+        if done && when.is_some() {
             let db = result.unwrap().0;
             let row: (i64, String, String, String) = db
                 .query_row(
@@ -596,9 +597,67 @@ fn partial_snapshot_needs_an_outcome_and_retains_its_existing_row() {
         } else {
             let message = format!("{:#}", result.unwrap_err());
             assert!(
-                message.contains("dispatch old") && message.contains("missing snapshot state"),
+                message.contains("dispatch old")
+                    && message.contains(if done {
+                        "missing completion time"
+                    } else {
+                        "missing snapshot state"
+                    }),
                 "{message}"
             );
+            assert_eq!(fs::read(path).unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn orphan_completion_requires_evidence_and_keeps_the_parent_absent() {
+    for receipt in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("router.db");
+        let (db, _) = wfc_legacy_state::open_offline_copy(dir.path()).unwrap();
+        db.execute_batch(
+            "INSERT INTO dispatch_round(dispatch,round,attempt,state)
+            VALUES('orphan',1,'real','completed')",
+        )
+        .unwrap();
+        if receipt {
+            db.execute_batch(
+                r#"INSERT INTO message(dispatch,type,body,created) VALUES
+                ('orphan','done','{"round":1,"attempt":"real","report":"/done"}',17.5)"#,
+            )
+            .unwrap();
+        }
+        drop(db);
+        let before = fs::read(&path).unwrap();
+        let result = wfc_legacy_state::open_offline_copy(dir.path());
+        if receipt {
+            let (db, backup) = result.unwrap();
+            assert!(backup.is_some());
+            let got: (String, String, f64, i64) = db
+                .query_row(
+                    "SELECT report,result,completed,
+                (SELECT count(*) FROM dispatch) FROM dispatch_round",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                got,
+                (
+                    "/done".into(),
+                    r#"{"round":1,"attempt":"real","report":"/done"}"#.into(),
+                    17.5,
+                    0
+                )
+            );
+            drop(db);
+            assert!(wfc_legacy_state::open_offline_copy(dir.path())
+                .unwrap()
+                .1
+                .is_none());
+        } else {
+            assert!(format!("{:#}", result.unwrap_err()).contains("dispatch orphan"));
             assert_eq!(fs::read(path).unwrap(), before);
         }
     }

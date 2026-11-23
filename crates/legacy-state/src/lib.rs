@@ -1,4 +1,5 @@
 //! Offline access to workflow-core's Python router.db. See the crate README for cutover.
+mod completion;
 mod migrate;
 mod preview;
 mod recovery;

@@ -56,10 +56,20 @@ def run(source, binary):
         original_hash = digest(source_db)
         with closing(sqlite3.connect(source_db)) as db:
             receipts = db.execute("SELECT id,message_uid,body,created FROM message WHERE type='done' ORDER BY id").fetchall()
+            original_rounds = db.execute("SELECT task,report,result,completed FROM dispatch_round ORDER BY round").fetchall()
+            messages = db.execute("SELECT * FROM message ORDER BY id").fetchall()
         assert len(receipts) == 2
+        for snap, receipt in zip(original_rounds, receipts):
+            assert snap[2] != receipt[2] and snap[3] != receipt[3]
+        rejected = {"conflict", "insufficient", "prior-migration", "in-flight", "wrong-report", "wrong-result",
+                    "missing-time", "missing-done", "wrong-continue", "partial-continue", "same-round-conflict", "cancelled", "cancelled-no-role"}
+        missing_columns = {"missing-columns", "wrong-report", "missing-time", "missing-done"}
+        for snap, receipt in zip(original_rounds, receipts):
+            print("completion clocks", json.loads(receipt[2])["round"], "snapshot", snap[3], "receipt", receipt[3])
 
         with tempfile.TemporaryDirectory() as tmp:
-            for mode in ["complete", "recover", "conflict", "insufficient", "prior-migration", "in-flight"]:
+            for mode in ["complete", "recover", "running", "running-no-role", "stale-current", "missing-time-only",
+                         "report-from-result", *sorted(missing_columns | rejected)]:
                 work = Path(tmp) / mode
                 work.mkdir()
                 db_path = work / "router.db"
@@ -74,11 +84,46 @@ def run(source, binary):
                             # The only evidence of the missing second round is a genuine continue.
                             db.execute("DELETE FROM message WHERE type!='continue'")
                             db.execute("DELETE FROM lifecycle_event")
-                    elif mode != "complete":
+                    elif mode in ("conflict", "insufficient", "recover"):
                         db.executescript("""DROP TABLE dispatch_round;
                             CREATE TABLE old(id TEXT PRIMARY KEY, task TEXT,report TEXT,created REAL);
                             INSERT INTO old SELECT id,task,report,created FROM dispatch;
                             DROP TABLE dispatch; ALTER TABLE old RENAME TO dispatch;""")
+                    if mode in ("running", "running-no-role", "wrong-result"):
+                        db.execute("UPDATE dispatch_round SET state='running' WHERE round=2")
+                    if mode == "running-no-role":
+                        db.execute("UPDATE dispatch SET role=NULL")
+                    if mode == "wrong-result":
+                        db.execute("UPDATE dispatch_round SET result=json_set(result,'$.report','/wrong') WHERE round=2")
+                    if mode in missing_columns:
+                        for field in ("report", "result", "completed"):
+                            db.execute(f"ALTER TABLE dispatch_round DROP COLUMN {field}")
+                    if mode == "wrong-report":
+                        db.execute("UPDATE message SET body=json_set(body,'$.report','/wrong') WHERE type='done' AND id=3")
+                    if mode == "missing-time":
+                        db.execute("UPDATE message SET created=NULL WHERE type='done' AND id=3")
+                    if mode == "missing-done":
+                        db.execute("DELETE FROM message WHERE type='done' AND id=3")
+                    if mode == "missing-time-only":
+                        db.execute("UPDATE dispatch_round SET completed=NULL")
+                    if mode == "report-from-result":
+                        db.execute("UPDATE dispatch_round SET report=NULL WHERE round=1")
+                        db.execute("DELETE FROM message WHERE type='done' AND id=1")
+                    if mode == "stale-current":
+                        db.execute("UPDATE dispatch SET current_round=1,current_attempt=?,task=?,report=?",
+                                   (attempts[0], *original_rounds[0][:2]))
+                    if mode == "wrong-continue":
+                        db.execute("UPDATE message SET body=json_set(body,'$.task','/wrong') WHERE type='continue'")
+                    if mode == "partial-continue":
+                        db.execute("UPDATE message SET body=json_set(json_remove(body,'$.attempt'),'$.report','/wrong') WHERE type='continue'")
+                    if mode in ("cancelled", "cancelled-no-role"):
+                        db.execute("UPDATE dispatch_round SET state='cancelled' WHERE round=2")
+                        if mode == "cancelled-no-role":
+                            db.execute("UPDATE dispatch SET role=NULL")
+                    if mode == "same-round-conflict":
+                        db.execute("INSERT INTO dispatch_round(dispatch,round,attempt,task,report,state) VALUES(?,2,'other',?,?,'running')",
+                                   (dispatch, *original_rounds[1][:2]))
+                        db.execute("UPDATE dispatch SET current_attempt='other'")
                     if mode == "conflict":
                         db.execute("INSERT INTO lifecycle_event(dispatch,round,attempt,operation,result) VALUES(?,1,?,'create','accepted')",
                                    (dispatch, attempts[1]))
@@ -94,20 +139,20 @@ def run(source, binary):
                 def migrate():
                     return subprocess.run(args, env=settings, capture_output=True, text=True, timeout=30)
 
-                if mode in ("conflict", "insufficient", "prior-migration", "in-flight"):
+                if mode in rejected:
                     for _ in range(2):
                         failed = migrate()
                         assert failed.returncode == 1 and dispatch in failed.stderr and not failed.stdout, failed
                         assert digest(db_path) == before and dump(db_path) == prior_sql
                     copies = list(work.glob("router.before-*.db"))
-                    assert copies and all(dump(p) == prior_sql for p in copies)
+                    assert len(copies) == 2 and all(dump(p) == prior_sql and p.stat().st_mode & 0o777 == 0o600 for p in copies)
                     print(mode, failed.stderr.strip(), "unchanged SHA", before, "backups", len(copies))
                     continue
 
                 result = migrate()
                 assert result.returncode == 0, result.stderr
                 original = json.loads(result.stdout)["backup"]
-                if mode == "recover":
+                if mode != "complete":
                     assert original and dump(Path(original)) == prior_sql
                     assert Path(original).stat().st_mode & 0o777 == 0o600
                 else:
@@ -119,13 +164,19 @@ def run(source, binary):
                 assert len(d["rounds"]) == 2
                 for n, (snap, (num, uid, body, when)) in enumerate(zip(d["rounds"], receipts), start=1):
                     payload = json.loads(body)
-                    msg = next(m for m in d["messages"] if m["id"] == num)
                     assert (snap["round"], snap["attempt"], snap["state"], snap["report"]) == (
                         n, attempts[n-1], "completed", payload["report"])
-                    assert msg["messageId"] == uid and msg["body"] == body
+                    if mode == "recover" or mode == "missing-columns":
+                        assert (snap["result"], snap["completed"]) == (body, when)
+                    else:
+                        original_time = when if mode == "missing-time-only" else original_rounds[n-1][3]
+                        assert (snap["result"], snap["completed"]) == (original_rounds[n-1][2], original_time)
                     if mode == "recover":
                         assert snap["result"] == body and snap["completed"] == when
                         assert snap["task"] == (str(task) if n == 2 else None)
+                expected_messages = [m for m in messages if mode != "report-from-result" or m[0] != 1]
+                with closing(sqlite3.connect(db_path)) as checked:
+                    assert checked.execute("SELECT * FROM message ORDER BY id").fetchall() == expected_messages
                 after = digest(db_path)
                 assert json.loads(migrate().stdout)["backup"] is None and digest(db_path) == after
                 print(mode, attempts, "before", before, "after", after, "backup", digest(Path(original)) if original else None)

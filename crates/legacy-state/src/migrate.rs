@@ -18,22 +18,11 @@ const IDENTITY: &str = "coalesce(backend,'')='' OR coalesce(scope,'')='' OR coal
     OR coalesce(current_round,0)=0 OR coalesce(current_attempt,'')=''";
 const NO_SNAPSHOT: &str = "NOT EXISTS (SELECT 1 FROM dispatch_round r WHERE r.dispatch=d.id)";
 
-// Pre-attempt receipts can identify a snapshot by report only when that match is unique.
-const DONE_MATCH: &str = "FROM dispatch_round r JOIN message m ON m.dispatch=r.dispatch
-    WHERE r.state='running' AND m.type='done' AND json_valid(m.body)
-    AND json_extract(m.body,'$.report')=r.report
-    AND (json_extract(m.body,'$.round') IS NULL OR json_extract(m.body,'$.round')=r.round)
-    AND (json_extract(m.body,'$.attempt')=r.attempt OR
-        (json_extract(m.body,'$.attempt') IS NULL AND
-         (SELECT count(*) FROM dispatch_round other WHERE other.dispatch=r.dispatch
-            AND other.report=r.report)=1))";
-
 fn has_repairs(db: &Connection) -> Result<bool> {
     Ok(db.query_row(
         &format!(
             "SELECT EXISTS(SELECT 1 FROM message WHERE {INCOMPLETE_RECEIPT} OR {DELIVERY_CONFLICT})
-        OR EXISTS(SELECT 1 FROM dispatch WHERE coalesce(backend,'')='')
-        OR EXISTS(SELECT 1 {DONE_MATCH})"
+        OR EXISTS(SELECT 1 FROM dispatch WHERE coalesce(backend,'')='')"
         ),
         [],
         |r| r.get(0),
@@ -111,16 +100,6 @@ fn repair(db: &Connection, ids: Vec<String>) -> Result<()> {
     db.execute(&format!("INSERT INTO dispatch_round (dispatch,round,attempt,task,report,state,created)
         SELECT id,current_round,current_attempt,task,report,'running',coalesce(created,unixepoch('subsec'))
         FROM dispatch d WHERE {NO_SNAPSHOT}"), [])?;
-    let conflicting: Option<String> = db.query_row(
-        &format!("SELECT r.dispatch {DONE_MATCH} GROUP BY r.rowid HAVING count(DISTINCT m.body)>1 LIMIT 1"),
-        [], |row| row.get(0)).optional()?;
-    if let Some(id) = conflicting {
-        bail!("dispatch {id} has conflicting done results");
-    }
-    db.execute(&format!("WITH matches AS MATERIALIZED (
-        SELECT r.rowid AS snapshot,min(m.id) AS receipt {DONE_MATCH} GROUP BY r.rowid)
-        UPDATE dispatch_round SET state='completed',result=m.body,completed=m.created
-        FROM matches JOIN message m ON m.id=matches.receipt WHERE dispatch_round.rowid=matches.snapshot"), [])?;
     Ok(())
 }
 
@@ -184,8 +163,16 @@ pub fn open_offline_copy(state: &Path) -> Result<(Connection, Option<PathBuf>)> 
         )
         .optional()?;
     if let Some((id, round, attempt)) = mismatch {
+        if original.is_none() && has_ledger {
+            backup(&state).context("preserve pre-migration router.db")?;
+        }
         bail!("dispatch {id}, round {round}, attempt {attempt} has no matching current snapshot");
     }
+    let completions = crate::completion::plan(&tx);
+    if original.is_none() && has_ledger && !completions.as_ref().is_ok_and(|p| p.is_empty()) {
+        original = Some(backup(&state).context("preserve pre-migration router.db")?);
+    }
+    completions?.apply(&tx)?;
     tx.commit()?;
     Ok((db, original))
 }
