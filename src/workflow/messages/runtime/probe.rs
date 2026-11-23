@@ -250,21 +250,22 @@ pub(crate) fn run_runtime_probe(args: &[OsString]) -> Result<()> {
     };
     let sample = if backend::runtime_exit(&state, &row)?.is_some() {
         Sample::Unavailable // the publisher takes the same bound local terminal evidence
-    } else if let Some(screen) = backend::runtime_screen(&state, &mut row, &mut progress)? {
-        let start = screen.ceil_char_boundary(screen.len().saturating_sub(4096));
-        let tail = screen[start..].trim();
-        Sample::Screen {
-            fingerprint: super::body_hash(&format!("{salt}{tail}")),
-            fault: classify(row["host"].as_str().unwrap_or_default(), tail),
-            nonblank: !tail.is_empty(),
-            salt: salt.to_owned(),
-        }
-    } else if sent {
-        Sample::Unavailable
     } else {
-        // Tmux clients and preflight RPCs do not establish that the bound
-        // screen request reached its peer. Local contention is also silent.
-        return Ok(());
+        match backend::runtime_screen(&state, &mut row, &mut progress)? {
+            backend::RuntimeScreen::Screen(screen) => {
+                let start = screen.ceil_char_boundary(screen.len().saturating_sub(4096));
+                let tail = screen[start..].trim();
+                Sample::Screen {
+                    fingerprint: super::body_hash(&format!("{salt}{tail}")),
+                    fault: classify(row["host"].as_str().unwrap_or_default(), tail),
+                    nonblank: !tail.is_empty(),
+                    salt: salt.to_owned(),
+                }
+            }
+            backend::RuntimeScreen::Unavailable => Sample::Unavailable,
+            backend::RuntimeScreen::Unobserved if sent => Sample::Unavailable,
+            backend::RuntimeScreen::Unobserved => return Ok(()),
+        }
     };
     serde_json::to_writer(
         io::stdout().lock(),

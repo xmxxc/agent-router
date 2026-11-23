@@ -516,16 +516,38 @@ fn classify(host: &str, screen: &str) -> Option<Notice> {
             .unwrap_or(line)
             .trim_start()
             .to_ascii_lowercase();
-        let assistant_output = assistant_marker
-            && line.chars().next().is_some_and(char::is_alphabetic)
-            && ![
+        let explicit_activity = ["working", "processing", "resumed activity"]
+            .iter()
+            .any(|p| {
+                line == *p
+                    || line
+                        .strip_prefix(*p)
+                        .is_some_and(|rest| rest.starts_with([' ', ':', '.', '!', '(', '\t']))
+            });
+        let timer = ["working (", "processing ("].iter().any(|p| {
+            line.strip_prefix(*p)
+                .and_then(|text| text.split_once(')'))
+                .is_some_and(|(inner, tail)| {
+                    tail.trim().is_empty()
+                        && inner.chars().next().is_some_and(|c| c.is_ascii_digit())
+                        && inner
+                            .chars()
+                            .all(|c| c.is_ascii_digit() || matches!(c, '.' | ' ' | 'h' | 'm' | 's'))
+                })
+        });
+        let decoration = timer
+            || line.contains("esc to interrupt")
+            || [
                 "elapsed:",
                 "time elapsed:",
                 "this conversation is read-only or unavailable;",
             ]
             .iter()
-            .any(|&prefix| line.starts_with(prefix))
-            && !line.contains("esc to interrupt");
+            .any(|&p| line.starts_with(p));
+        let assistant_output = assistant_marker
+            && line
+                .split_whitespace()
+                .any(|word| word.chars().next().is_some_and(char::is_alphabetic));
         let prefix = |choices: &[&str]| {
             choices.iter().any(|choice| {
                 line.strip_prefix(choice).is_some_and(|rest| {
@@ -563,7 +585,7 @@ fn classify(host: &str, screen: &str) -> Option<Notice> {
             Notice::Policy
         } else if prefix(&["request timed out", "operation timed out", "host timeout"]) {
             Notice::HostTimeout
-        } else if assistant_output || prefix(&["working", "processing", "resumed activity"]) {
+        } else if !decoration && (assistant_output || explicit_activity) {
             return None;
         } else {
             continue;

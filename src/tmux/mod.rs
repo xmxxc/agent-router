@@ -530,10 +530,16 @@ impl Tmux<'_> {
                 let t = self.owned()?;
                 Ok(json!({"result":"accepted","screen":self.capture(&t,&t.pane)?}))
             }
-            Operation::ObserveScreen => {
-                let t = self.owned()?;
-                Ok(json!({"result":"accepted","screen":self.worker_screen(&t)?}))
-            }
+            Operation::ObserveScreen => match self.target()? {
+                None => Ok(json!({"result":"accepted","observation":"target_absent"})),
+                Some(t) if t.owned => {
+                    Ok(json!({"result":"accepted","screen":self.worker_screen(&t)?}))
+                }
+                Some(_) => Err(failure(
+                    "refused",
+                    "session ownership does not match WFC_STATE",
+                )),
+            },
             Operation::Interrupt => {
                 let target = self.input_target()?;
                 self.worker_command(
@@ -965,6 +971,7 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
         Err(result) => return Ok(result),
     };
     let inspect = matches!(request.op, Operation::Inspect);
+    let observe_screen = matches!(request.op, Operation::ObserveScreen);
     if let Some(execution) = request.execution_id.as_deref().filter(|_| !launching) {
         native_id = match backend.registered_launch(execution) {
             Ok(id) => id,
@@ -980,6 +987,18 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
             }
             error
         });
+    if observe_screen && result["result"] == "accepted" {
+        let execution = request.execution_id.as_deref().expect("native observation");
+        let id = backend.legacy_execution_id.expect("resolved execution");
+        match backend.confirm_launch(id) {
+            Ok(binding::Worker::Started(_)) => (),
+            Ok(_) => return Ok(failure("refused", "original worker is no longer running")),
+            Err(reply) => return Ok(reply),
+        }
+        result["executionId"] = json!(execution);
+        result["launchId"] = json!(id);
+        result["receipt"] = json!(state.join("launches").join(format!("{id}.json")));
+    }
     if inspect {
         let accepted = result["result"] == "accepted";
         let launch = if let Some(execution) = &request.execution_id {

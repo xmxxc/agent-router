@@ -169,28 +169,42 @@ fn existing(state: &Path, row: &Value, op: &str) -> Result<Value> {
 }
 
 #[cfg(target_os = "linux")]
+pub(super) enum RuntimeScreen {
+    Screen(String),
+    Unavailable,
+    Unobserved,
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn runtime_screen(
     state: &Path,
     row: &mut Value,
     progress: &mut dyn FnMut(bool),
-) -> Result<Option<String>> {
+) -> Result<RuntimeScreen> {
     if row["backend"] == "herdr" {
-        return super::herdr::runtime_screen(state, row, progress);
+        return Ok(super::herdr::runtime_screen(state, row, progress)?
+            .map_or(RuntimeScreen::Unobserved, RuntimeScreen::Screen));
     }
     if runtime_closing(state, row)? {
-        return Ok(None);
-    }
-    // An uncertain old archive is not process evidence. Inspect the registered
-    // execution directly rather than projecting the archive's worker shape.
-    let (worker, _) = inspect_worker(state, row, &Value::Null)?;
-    if worker["state"] != "running" {
-        return Ok(None);
+        return Ok(RuntimeScreen::Unobserved);
     }
     let mut reply = existing(state, row, "observe-screen")?;
-    Ok(match reply["screen"].take() {
-        Value::String(screen) if reply["result"] == "accepted" => Some(screen),
-        _ => None,
-    })
+    if reply["result"] != "accepted" {
+        return Ok(RuntimeScreen::Unobserved);
+    }
+    let Some(registered) = receipt_id(row)? else {
+        return Ok(RuntimeScreen::Unobserved);
+    };
+    if inspect_launch(state, row, &reply).ok().flatten() != Some(registered) {
+        return Ok(RuntimeScreen::Unobserved);
+    }
+    if let Value::String(screen) = reply["screen"].take() {
+        Ok(RuntimeScreen::Screen(screen))
+    } else if reply["observation"] == "target_absent" {
+        Ok(RuntimeScreen::Unavailable)
+    } else {
+        Ok(RuntimeScreen::Unobserved)
+    }
 }
 
 #[cfg(target_os = "linux")]

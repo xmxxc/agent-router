@@ -731,6 +731,10 @@ class StartupFailure(unittest.TestCase):
         quiet()
         append("• 4s")
         quiet()
+        append("• Working (4s • esc to interrupt)")
+        quiet()
+        append("Processing (5s)")
+        quiet()
         append("普通尾注只是界面文本")
         quiet()
         append("• 已拿到结果。")
@@ -742,11 +746,15 @@ class StartupFailure(unittest.TestCase):
         append("• 已生成下一批结果")
         without_punctuation = observe("recovered", "changed_activity")
         quiet()
-        self.assertNotEqual(with_punctuation, without_punctuation)
+        append("Quota exceeded")
+        third = observe("quota", "screen_notice")
+        append("• 2 files changed.")
+        numeric = observe("recovered", "changed_activity")
+        self.assertEqual(len({with_punctuation, without_punctuation, numeric}), 3)
         self.assertEqual(self.cli("close", job["dispatch"])["result"], "completed")
         print(json.dumps({"case": "codex-unicode-appended-activity", "scope": job["scope"],
-                          "attempt": job["attempt"], "quotaReceipts": [first, second],
-                          "recoveryReceipts": [with_punctuation, without_punctuation],
+                          "attempt": job["attempt"], "quotaReceipts": [first, second, third],
+                          "recoveryReceipts": [with_punctuation, without_punctuation, numeric],
                           "ordinaryFootersSilent": True}), flush=True)
 
 

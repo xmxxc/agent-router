@@ -273,6 +273,92 @@ sys.exit(child.wait())
                           "slowClientStart": shim.started, "descendant": descendant.pid,
                           "descendantStart": descendant.started, **cleanup}), flush=True)
 
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_tmux_bound_absence_is_reported_and_recovers(self):
+        self.start_private_tmux()
+        cfg = self.root / "launch.json"
+        code = "import time; print('Ready.', flush=True); time.sleep(60)"
+        cfg.write_text(json.dumps({"hosts": {"codex": {"command": [sys.executable, "-c", code]}}}))
+        job = self.data("dispatch", "--task", "task", "--role", "worker", "--scope", "ours",
+                        "--report", "task", "--cwd", ".", "--host", "codex", "--launch-config", str(cfg))
+        dispatch = job["dispatch"]
+        session = f"wfc-{dispatch}"
+        tmux = [shutil.which("tmux"), "-S", self.env["WFC_TMUX_SOCKET"]]
+        run_tmux = lambda *args: subprocess.check_output([*tmux, *args], text=True).strip()
+        pane = run_tmux("display-message", "-p", "-t", session, "#{session_id} #{pane_id}")
+        wait = ("wait", "--scope", "ours", "--dispatch", dispatch, "--stall-after", "0")
+
+        def quiet(timeout="1.25"):
+            self.assertFalse(self.data(*wait, "--timeout", timeout, code=3)["messages"])
+
+        def notice(evidence, read_state):
+            [message] = self.data(*wait, "--timeout", "3")["messages"]
+            self.assertEqual((message["kind"], message["fault"]["evidence"]), ("host_runtime", evidence))
+            for key in ("scope", "round", "attempt", "dispatch"):
+                self.assertEqual(message[key], job[key])
+            row, = self.data("status", "--dispatch", dispatch)["dispatches"]
+            self.assertEqual(row["hostActivity"]["readState"], read_state)
+            self.assertEqual(self.data("ack", message["messageId"])["state"], "processed")
+            self.assertTrue(self.data("ack", message["messageId"])["duplicate"])
+            return message["messageId"]
+
+        quiet()
+        watch = self.root / "state" / "dispatches" / f"{dispatch}.host-watch"
+        execution = json.loads(watch.read_text())["execution"]
+        run_tmux("rename-session", "-t", session, "renamed-original")
+        quiet()  # Same session/pane still appears in the pinned server's roster.
+        run_tmux("rename-session", "-t", "renamed-original", session)
+        launch = run_tmux("show-environment", "-t", session, "WFC_TMUX_LAUNCH").split("=", 1)[1]
+        run_tmux("set-environment", "-t", session, "WFC_TMUX_LAUNCH", "0" * 32)
+        quiet()  # A returned foreign binding does not establish absence.
+        run_tmux("set-environment", "-t", session, "WFC_TMUX_LAUNCH", launch)
+
+        # Isolate a reversible negative roster on the real, pinned private
+        # server. Everything other than these two reported results passes through.
+        gate = self.root / "reported-absence"
+        shim = self.root / "tmux"
+        shim.write_text(f"#!{sys.executable}\n" + f"""
+import os, subprocess, sys
+from pathlib import Path
+args = sys.argv[1:]
+real = {tmux[0]!r}
+if Path({str(gate)!r}).exists() and "list-panes" in args:
+    if {f'={session}:'!r} in args:
+        print({"can't find session: " + session!r}, file=sys.stderr)
+        sys.exit(1)
+    if "-a" in args and "#{{session_id}} #{{pane_id}}" in args:
+        result = subprocess.run([real, *args], capture_output=True, text=True, close_fds=False)
+        if result.returncode:
+            sys.stderr.write(result.stderr)
+            sys.exit(result.returncode)
+        for line in result.stdout.splitlines():
+            if line != {pane!r}:
+                print(line)
+        sys.exit(0)
+os.execv(real, [real, *args])
+""")
+        shim.chmod(0o700)
+
+        gate.touch()
+        wrong, = self.data("status", "--dispatch", dispatch)["dispatches"]
+        self.assertFalse(wrong["backendAlive"])
+        first = notice("backend_unavailable", "unavailable")
+        quiet()
+        gate.unlink()
+        recovered = notice("read_restored", "readable")
+        self.assertEqual(json.loads(watch.read_text())["execution"], execution)
+        gate.touch()
+        again = notice("backend_unavailable", "unavailable")
+        self.assertEqual(len({first, recovered, again}), 3)
+        quiet()
+        gate.unlink()
+        self.assertEqual(self.data("close", dispatch)["result"], "completed")
+        gate.touch()
+        quiet()
+        print(json.dumps({"case": "tmux-bound-absence", "scope": job["scope"], "attempt": job["attempt"],
+                          "returnedAbsence": [first, again], "readRestored": recovered,
+                          "renameAndForeignBindingSilent": True, "confirmedCloseSilent": True}), flush=True)
+
     def test_detached_scope(self):
         other = self.publish("other")
         args = ["relay", "--scope", "ours", "--codex", "--detach", "--for", "1.5"]
