@@ -1,4 +1,6 @@
 #[cfg(target_os = "linux")]
+mod bundled;
+#[cfg(target_os = "linux")]
 mod host_launch;
 mod kernel;
 #[cfg(target_os = "linux")]
@@ -126,6 +128,12 @@ fn run() -> anyhow::Result<ExitCode> {
         Some("--herdr-host") if args.len() == 2 => {
             let spec = host_launch::spec_path(Path::new(&args[0]), Path::new(&args[1]))?;
             return host_launch::supervise(&spec);
+        }
+        #[cfg(target_os = "linux")]
+        Some(stage @ ("--bundled" | "--bundled-guardian" | "--bundled-runtime"))
+            if args.is_empty() =>
+        {
+            return Ok(ExitCode::from(bundled::run(stage)?));
         }
         #[cfg(target_os = "linux")]
         Some("--tmux-backend") if args.is_empty() => {

@@ -1,4 +1,6 @@
-//! Public lifecycle clients for tmux and Herdr.
+//! Workflow adapters for tmux, Herdr and bundled execution.
+#[cfg(target_os = "linux")]
+pub(super) mod bundled;
 use super::{host::Launch, valid_identity, write_json};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
