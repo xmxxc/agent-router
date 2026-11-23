@@ -1,7 +1,7 @@
 name: Linux continue and nudge
 on:
   push:
-    branches: [rust-router/34-continue-nudge]
+    branches: [rust-router/34-continue-nudge-r3]
 
 permissions:
   contents: read
@@ -131,6 +131,10 @@ jobs:
           python -B "$reaper" python -Bu tools/check_tmux.py "target/$TRIPLE/release/wfc" -v \
             Backend.test_public_continue_and_nudge_share_live_worker \
             Backend.test_public_continue_preserves_uncertain_round \
+            Backend.test_public_continue_rejects_overlap_before_fast_r2_done \
+            Backend.test_public_nudge_rechecks_completion_and_lease_before_text \
+            Backend.test_public_continue_checks_draft_and_does_not_infer_from_empty \
+            Backend.test_public_continue_rolls_back_confirmed_refusal \
             2>&1 | tee -a "$EVIDENCE/tmux-public.log"
       - name: Checksum the evidence logs
         if: ${{ always() }}

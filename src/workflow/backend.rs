@@ -185,20 +185,31 @@ fn legacy_launch_hint(row: &Value) -> Result<Option<&str>> {
 }
 
 fn existing(state: &Path, row: &Value, op: &str) -> Result<Value> {
-    existing_request(state, row, json!({"op":op}))
+    call(state, row, existing_request(row, json!({"op":op}))?)
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn submit(state: &Path, row: &Value, text: &str) -> Result<Value> {
+pub(super) fn submit_checked(
+    state: &Path,
+    row: &Value,
+    text: &str,
+    check: &mut dyn FnMut(crate::tmux::InputBoundary) -> std::result::Result<(), Value>,
+) -> Result<Value> {
+    ensure!(row["backend"] == "tmux", "input requires a tmux worker");
     let row = execution_row(row)?;
-    existing_request(
-        state,
-        &row,
+    let request = existing_request(
+        row.as_ref(),
         json!({"op":"submit","text":text,"host":row["host"],"confirm_reply":true}),
+    )?;
+    crate::tmux::execute_checked(
+        state,
+        serde_json::from_value(request)?,
+        row["tmuxSocket"].as_str(),
+        check,
     )
 }
 
-fn existing_request(state: &Path, row: &Value, mut request: Value) -> Result<Value> {
+fn existing_request(row: &Value, mut request: Value) -> Result<Value> {
     let attempt = row["attempt"]
         .as_str()
         .filter(|v| valid_identity(v, "a-"))
@@ -221,7 +232,8 @@ fn existing_request(state: &Path, row: &Value, mut request: Value) -> Result<Val
     if matches!(request["op"].as_str(), Some("close" | "revoke")) {
         request["closeOperationId"] = json!(close_operation(row)?);
     }
-    call(state, row, request)
+    request["dispatch"] = row["dispatch"].clone();
+    Ok(request)
 }
 
 fn receipt_id(row: &Value) -> Result<Option<&str>> {

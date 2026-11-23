@@ -1,4 +1,4 @@
-use super::{failure, Reply, Target, Tmux};
+use super::{failure, InputBoundary, Reply, Target, Tmux};
 use serde_json::{json, Value};
 use std::env;
 use std::thread::sleep;
@@ -95,10 +95,72 @@ fn codex_draft(screen: &str) -> Option<Draft> {
     Some(Draft { text, scrolled })
 }
 
+fn strict_composer(screen: &str) -> Option<(usize, &str)> {
+    let lines: Vec<_> = screen.trim_end().lines().map(str::trim_end).collect();
+    let prompt = lines
+        .iter()
+        .rposition(|s| *s == "›" || s.starts_with("› "))?;
+    let [line, "", footer @ ..] = &lines[prompt..] else {
+        return None;
+    };
+    if !(1..=2).contains(&footer.len())
+        || !footer
+            .iter()
+            .all(|s| s.starts_with("  ") && s.contains(" · "))
+    {
+        return None;
+    }
+    // A plain redraw cannot distinguish an adjacent draft attachment from history.
+    if lines[..prompt].iter().rev().take(2).any(|line| {
+        line.trim_start()
+            .strip_prefix("[Image #")
+            .and_then(|label| label.strip_suffix(']'))
+            .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+    }) {
+        return None;
+    }
+    if *line == "›" {
+        return Some((prompt, ""));
+    }
+    let shown = line.strip_prefix("› ")?;
+    (!shown.ends_with(['↑', '↓'])).then_some((prompt, shown))
+}
+
 fn empty_codex_composer(screen: &str) -> bool {
-    // The plain screen cannot tell a placeholder from an identical draft.
-    // Require a bare prompt in the recognized composer layout.
-    codex_draft(screen).is_some_and(|draft| !draft.scrolled && draft.text.is_empty())
+    // A plain redraw cannot distinguish the placeholder from an identical draft.
+    strict_composer(screen).is_some_and(|(_, text)| text.is_empty())
+}
+
+fn exact_draft(screen: &str, text: &str) -> bool {
+    strict_composer(screen)
+        .is_some_and(|(_, shown)| wfc_herdr::matches_single_line_draft(shown, text))
+}
+
+fn transcript_count(screen: &str, text: &str) -> Option<usize> {
+    let (start, _) = strict_composer(screen)?;
+    Some(
+        screen
+            .lines()
+            .take(start)
+            .filter(|line| {
+                line.trim_end()
+                    .strip_prefix("› ")
+                    .is_some_and(|entry| entry == text)
+            })
+            .count(),
+    )
+}
+
+fn new_refusal(screen: &str, text: &str, before: &Notices, prior: usize) -> Reply<()> {
+    if notices(screen).refusals > before.refusals {
+        if empty_codex_composer(screen) && transcript_count(screen, text) == Some(prior) {
+            let mut result = refused(REFUSAL);
+            result["inputEvidence"] = json!("new-host-refusal");
+            return Err(result);
+        }
+        return Err(uncertain("input refusal could not be confirmed"));
+    }
+    Ok(())
 }
 
 fn matches_input(draft: &Draft, text: &str) -> bool {
@@ -182,11 +244,17 @@ impl Tmux<'_> {
         text: &str,
         host: Option<&str>,
         confirm_reply: bool,
+        check_input: &mut dyn FnMut(InputBoundary) -> Reply<()>,
     ) -> Reply<Value> {
         if text.contains('\0') {
             return Err(failure("definitely-not-sent", "tmux input contains NUL"));
         }
-        let screen = self.worker_screen(t).map_err(|e| {
+        let screen = (if confirm_reply {
+            self.joined_worker_screen(t)
+        } else {
+            self.worker_screen(t)
+        })
+        .map_err(|e| {
             if e["result"] == "refused" {
                 e
             } else {
@@ -200,41 +268,34 @@ impl Tmux<'_> {
         if let Some(message) = before.state {
             return Err(refused(&message));
         }
-        if confirm_reply && (host != Some("codex") || !empty_codex_composer(&screen)) {
-            return Err(failure(
-                "definitely-not-sent",
-                "could not verify an empty Codex composer",
-            ));
-        }
+        let prior = if confirm_reply {
+            let prior = transcript_count(&screen, text)
+                .filter(|_| host == Some("codex") && empty_codex_composer(&screen))
+                .ok_or_else(|| {
+                    failure(
+                        "definitely-not-sent",
+                        "could not verify an empty Codex composer",
+                    )
+                })?;
+            Some(prior)
+        } else {
+            None
+        };
         // Single-quote for the tmux command parser inside if-shell. No shell is invoked.
         let literal = text.replace('\'', "'\\''");
-        self.worker_command(
-            t,
-            &format!("send-keys -t {} -l -- '{literal}'", t.worker_pane()?),
-        )
-        .map_err(|mut err| {
-            if err["result"] == "uncertain" {
-                err["category"] = json!("input_uncertain");
-            }
-            err
-        })?;
+        let pane = t.worker_pane()?;
+        check_input(InputBoundary::Text)?;
+        self.worker_command(t, &format!("send-keys -t {pane} -l -- '{literal}'"))
+            .map_err(|mut err| {
+                if err["result"] == "uncertain" {
+                    err["category"] = json!("input_uncertain");
+                }
+                err
+            })?;
         sleep(Duration::from_millis(500));
         let window = setting("WFC_TYPED_CHECK_SECONDS", 1.5);
-        if confirm_reply {
-            let after_text =
-                |_| uncertain("input was attempted but submission could not be confirmed");
-            self.worker_command(t, &format!("send-keys -t {} Enter", t.worker_pane()?))
-                .map_err(after_text)?;
-            self.observe(t, before.refusals, window)
-                .map_err(after_text)?;
-            let after = self.worker_screen(t).map_err(after_text)?;
-            check_notice(&after, before.refusals).map_err(after_text)?;
-            if !empty_codex_composer(&after) {
-                return Err(uncertain(
-                    "Codex composer did not return to a verified empty state",
-                ));
-            }
-            return Ok(json!({"result":"accepted"}));
+        if let Some(prior) = prior {
+            return self.confirm_input(t, pane, text, &before, prior, window, check_input);
         }
         let mut earlier_refusals = before.refusals;
         for retry in 0..=2 {
@@ -271,6 +332,63 @@ impl Tmux<'_> {
         Ok(json!({"result":"accepted"}))
     }
 
+    fn joined_worker_screen(&self, t: &Target) -> Reply<String> {
+        // tmux can join terminal soft wraps without folding genuine newlines.
+        self.worker_command(t, &format!("capture-pane -p -J -t {}", t.worker_pane()?))
+    }
+
+    fn confirm_input(
+        &self,
+        t: &Target,
+        pane: &str,
+        text: &str,
+        before: &Notices,
+        prior: usize,
+        window: Duration,
+        check_input: &mut dyn FnMut(InputBoundary) -> Reply<()>,
+    ) -> Reply<Value> {
+        let after_text = |_| uncertain("input was attempted but submission could not be confirmed");
+        for delay in [Duration::ZERO, Duration::from_millis(300)] {
+            sleep(delay);
+            let screen = self.joined_worker_screen(t).map_err(after_text)?;
+            new_refusal(&screen, text, before, prior)?;
+            if notices(&screen).state.is_some() || !exact_draft(&screen, text) {
+                return Err(uncertain(
+                    "Codex draft does not match the complete input; Enter was not sent",
+                ));
+            }
+        }
+        check_input(InputBoundary::Enter)?;
+        self.worker_command(t, &format!("send-keys -t {pane} Enter"))
+            .map_err(after_text)?;
+        let start = Instant::now();
+        loop {
+            sleep(
+                window
+                    .saturating_sub(start.elapsed())
+                    .min(Duration::from_millis(250)),
+            );
+            let screen = self.joined_worker_screen(t).map_err(after_text)?;
+            new_refusal(&screen, text, before, prior)?;
+            if notices(&screen).state.is_some() {
+                return Err(uncertain(
+                    "Codex changed state before submission was confirmed",
+                ));
+            }
+            if empty_codex_composer(&screen)
+                && transcript_count(&screen, text).and_then(|count| count.checked_sub(prior))
+                    == Some(1)
+            {
+                return Ok(json!({"result":"accepted","inputEvidence":"new-transcript-entry"}));
+            }
+            if start.elapsed() >= window {
+                return Err(uncertain(
+                    "Codex did not show the submitted input in the transcript",
+                ));
+            }
+        }
+    }
+
     pub(super) fn resume_input(
         &self,
         t: &Target,
@@ -288,7 +406,13 @@ impl Tmux<'_> {
                     )
                 })?;
                 if !screen.trim().is_empty() && screen == last {
-                    return self.submit(t, text.unwrap_or_default(), Some("opencode"), false);
+                    return self.submit(
+                        t,
+                        text.unwrap_or_default(),
+                        Some("opencode"),
+                        false,
+                        &mut |_| Ok(()),
+                    );
                 }
                 last = screen;
                 sleep(Duration::from_secs(1));

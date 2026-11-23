@@ -274,6 +274,8 @@ struct Message {
     report: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     question_payload: Option<Question>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_input: Option<WorkerInput>,
     request_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     body_hash: Option<String>,
@@ -286,6 +288,22 @@ struct Message {
     // Keep additive fields when rewriting a receipt from a newer publisher.
     #[serde(flatten)]
     additional_fields: Map<String, Value>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum WorkerInput {
+    Continue { task: String, report: String },
+    Nudge { text: String },
+}
+
+impl WorkerInput {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Continue { .. } => "continue",
+            Self::Nudge { .. } => "nudge",
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -375,6 +393,7 @@ impl Message {
             worker,
             report: None,
             question_payload: None,
+            worker_input: None,
             request_key,
             body_hash: None,
             delivery: Delivery::unsent(),
@@ -397,6 +416,19 @@ impl Message {
             return question.body(&self.worker);
         }
         let mut body = self.original_body();
+        if let Some(input) = &self.worker_input {
+            body.insert("scope".into(), json!(self.worker.scope()));
+            match input {
+                WorkerInput::Continue { task, report } => {
+                    body.insert("task".into(), json!(task));
+                    body.insert("report".into(), json!(report));
+                }
+                WorkerInput::Nudge { text } => {
+                    body.insert("text".into(), json!(text));
+                }
+            }
+            return body;
+        }
         for key in ["head", "dirty"] {
             if let Some(value) = self.additional_fields.get(key) {
                 body.insert(key.into(), value.clone());
@@ -482,7 +514,9 @@ impl Message {
             ("dispatch".into(), json!(self.worker.dispatch)),
             (
                 "type".into(),
-                json!(if self.question_payload.is_some() {
+                json!(if let Some(input) = &self.worker_input {
+                    input.kind()
+                } else if self.question_payload.is_some() {
                     "question"
                 } else {
                     "done"
@@ -492,6 +526,10 @@ impl Message {
             ("statusVersion".into(), json!(version)),
         ]);
         Value::Object(view)
+    }
+
+    fn is_controller_message(&self) -> bool {
+        self.worker_input.is_none()
     }
 
     fn claim(&mut self, state: State) -> Result<()> {
@@ -511,7 +549,7 @@ pub(super) fn private_file() -> OpenOptions {
     options
 }
 
-struct Inbox {
+pub(super) struct Inbox {
     dir: PathBuf,
     messages: Vec<Message>,
     // The lock lives on a stable file because save replaces the data file.
@@ -550,8 +588,15 @@ impl Inbox {
                 // body (including the earlier four-field form) byte for byte.
                 for m in &mut messages {
                     ensure!(
-                        m.report.is_some() != m.question_payload.is_some(),
-                        "invalid controller message payload"
+                        if m.is_controller_message() {
+                            m.report.is_some() != m.question_payload.is_some()
+                        } else {
+                            m.report.is_none()
+                                && m.question_payload.is_none()
+                                && m.request_key.is_none()
+                                && m.delivery.state == State::Received
+                        },
+                        "invalid message payload"
                     );
                     if m.report.is_some()
                         && m.delivery.legacy_unclaimed
@@ -571,7 +616,7 @@ impl Inbox {
         }
     }
 
-    fn open(dir: &Path) -> Result<Self> {
+    pub(super) fn open(dir: &Path) -> Result<Self> {
         Self::read_locked(dir, lock_for_publish(dir)?)
     }
 
@@ -605,6 +650,7 @@ impl Inbox {
             .iter_mut()
             .filter(|m| {
                 m.delivery.state == State::Unsent
+                    && m.is_controller_message()
                     && dispatch.is_none_or(|id| id == m.worker.dispatch)
                     && scope.is_none_or(|scope| scope == m.worker.scope())
             })
@@ -745,6 +791,39 @@ impl Inbox {
         Ok(receipt)
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn publish_worker_input(&mut self, row: &Value, event: &Value) -> Result<u64> {
+        let worker = Identity::deserialize(row).context("read worker input identity")?;
+        let mut payload = event.clone();
+        payload["type"] = event["operation"].clone();
+        let input = WorkerInput::deserialize(payload)?;
+        let key = event["id"]
+            .as_str()
+            .and_then(|id| id.strip_prefix("i-"))
+            .context("invalid input audit ID")?;
+        let mut message = Message::new(self.messages.len() as u64 + 1, worker, None);
+        message.message_id = format!("m-{key}");
+        message.worker_input = Some(input);
+        message.claim(State::Received)?;
+        if let Some(previous) = self
+            .messages
+            .iter()
+            .find(|row| row.message_id == message.message_id)
+        {
+            ensure!(
+                previous.worker == message.worker
+                    && previous.body() == message.body()
+                    && previous.worker_input.as_ref().map(WorkerInput::kind)
+                        == message.worker_input.as_ref().map(WorkerInput::kind),
+                "worker input history conflict"
+            );
+            return Ok(previous.id);
+        }
+        let id = message.id;
+        self.publish(message)?;
+        Ok(id)
+    }
+
     fn save(&self) -> Result<()> {
         let tmp = self.dir.join("messages.pending");
         // A crash before rename can only leave a scratch file. The next writer
@@ -777,7 +856,11 @@ pub(super) fn history(state: &Path, dispatch: &str) -> Result<Vec<Value>> {
         .filter(|m| m.worker.dispatch == dispatch)
         .map(|m| {
             let mut view = m.view();
-            view["to"] = json!("controller");
+            view["to"] = json!(if m.is_controller_message() {
+                "controller"
+            } else {
+                "worker"
+            });
             view["delivered"] = json!(m.delivery.delivered());
             view["at"] = json!(m.created_at);
             if let Some(resolution) = &m.resolution {
@@ -862,16 +945,24 @@ impl<'a> Done<'a> {
                     assignment.worker.attempt
                 );
             }
-            Ok::<_, anyhow::Error>((assignment, inbox, receipt, key))
+            Ok::<_, anyhow::Error>((assignment, row, inbox, receipt, key))
         };
-        let (initial, inbox, duplicate, _) = check()?;
+        let (initial, initial_row, inbox, duplicate, _) = check()?;
         if let Some(receipt) = duplicate {
             return Ok(receipt);
         }
         // Git can block. Let unrelated callbacks and waits proceed while sampling.
         drop(inbox);
         let snapshot = Snapshot::read(&initial.cwd);
-        let (current, mut inbox, duplicate, key) = check()?;
+        // Publish after the same execution lock used for controller input.
+        // The first check and Git probe hold neither lock while waiting.
+        #[cfg(target_os = "linux")]
+        let _execution = (initial_row["backend"] == "tmux" && initial_row["host"].is_string())
+            .then(|| super::assignment::close_lock(&state, &initial_row))
+            .transpose()?;
+        #[cfg(not(target_os = "linux"))]
+        let _ = initial_row;
+        let (current, _, mut inbox, duplicate, key) = check()?;
         ensure!(
             initial.worker.round == current.worker.round
                 && initial.worker.attempt == current.worker.attempt

@@ -91,35 +91,50 @@ impl<'a> Request<'a> {
         );
         let scope = record_scope(&original).context("invalid dispatch scope")?;
         let token = controller::token(self.token);
+        controller::Owners::read(&state)?.require(scope, token.as_deref(), operation)?;
+        ensure!(
+            !assignment::input_unresolved(&original),
+            "input is pending or uncertain; verify the prior input before retrying"
+        );
         let (_scope, _execution) =
             lock_input(&state, &original, scope, token.as_deref(), operation)?;
         let current = super::read_record(&path)?;
         ensure!(
-            record_scope(&current) == Some(scope)
-                && [
-                    "round",
-                    "attempt",
-                    "host",
-                    "backend",
-                    "executionId",
-                    "tmuxSocket",
-                    "create"
-                ]
-                .iter()
-                .all(|key| current[*key] == original[*key]),
-            "assignment changed while waiting for input"
+            record_scope(&current) == Some(scope),
+            "scope changed while waiting for input"
         );
         controller::Owners::read(&state)?.require(scope, token.as_deref(), operation)?;
+        ensure!(
+            !assignment::input_unresolved(&current),
+            "input is pending or uncertain; verify the prior input before retrying"
+        );
+        if let Action::Continue { task, report } = &self.action {
+            if let Some(event) = accepted_continue(&current, task, report)? {
+                return Ok(input_response(self.dispatch, event, true));
+            }
+        }
+        ensure!(
+            [
+                "round",
+                "attempt",
+                "host",
+                "backend",
+                "executionId",
+                "tmuxSocket",
+                "create"
+            ]
+            .iter()
+            .all(|key| current[*key] == original[*key]),
+            "assignment changed while waiting for input"
+        );
         ensure!(
             current["controllerOwner"].is_null()
                 && assignment::identified(&current)
                 && current["executionId"].is_string()
-                && current["create"]["result"] == "accepted",
-            "input requires a confirmed native launch"
-        );
-        ensure!(
-            !assignment::input_unresolved(&current),
-            "input is pending or uncertain; verify the prior input before retrying"
+                && current["tmuxSocket"].as_str().is_some_and(|socket| Path::new(socket).is_absolute())
+                && current["create"]["result"] == "accepted"
+                && current["create"]["receipt"].is_string(),
+            "input requires a confirmed native launch; verify the original execution before retrying"
         );
         ensure!(
             backend::archive(&state, &current)?.is_none(),
@@ -138,20 +153,23 @@ impl<'a> Request<'a> {
         ensure!(
             observed["owned"] == true
                 && observed["workerBound"] == true
+                && observed["executionId"] == current["executionId"]
+                && observed["receipt"] == current["create"]["receipt"]
                 && worker["state"] == "running",
             "execution is not a verified writable worker"
         );
 
-        let (mut next, index, text) = {
+        let (mut next, index, text, generation) = {
             let _inbox = messages::lock_for_publish(&state)?;
-            controller::Owners::read(&state)?.require(scope, token.as_deref(), operation)?;
+            let generation = authorized_generation(&state, scope, token.as_deref(), operation)?;
             let history =
                 view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
             let mut projected = current.clone();
             view::project(&mut projected, &history, Some(true), false)?;
             let mut next = current.clone();
             let mut event = json!({"id":format!("i-{}", Uuid::new_v4().simple()),
-                "operation":operation, "result":"pending"});
+                "operation":operation, "result":"pending", "ownerGeneration":generation,
+                "fromRound":current["round"], "fromAttempt":current["attempt"]});
             let text = match self.action {
                 Action::Continue { task, report } => {
                     ensure!(
@@ -163,7 +181,7 @@ impl<'a> Request<'a> {
                         current[controller::CALLBACK_HASH]
                             .as_str()
                             .is_some_and(|hash| !hash.is_empty()),
-                        "original worker has no independent callback credential"
+                        "original worker has no independent callback credential; verify its launch before continuing"
                     );
                     let round = current["round"]
                         .as_u64()
@@ -185,7 +203,6 @@ impl<'a> Request<'a> {
                     next[controller::CALLBACK_REF_HASH] = json!(messages::body_hash(&reference));
                     event["task"] = json!(task);
                     event["report"] = json!(report);
-                    event["fromAttempt"] = current["attempt"].clone();
                     continued_brief(self.dispatch, &task, &report, &attempt, &reference)
                 }
                 Action::Nudge(text) => {
@@ -224,12 +241,53 @@ impl<'a> Request<'a> {
             let index = audit.len();
             audit.push(event);
             save(&path, &dir, &next)?;
-            (next, index, text)
+            (next, index, text, generation)
         };
 
-        let answer = backend::submit(&state, &current, &text).unwrap_or_else(
-            |error| json!({"result":"uncertain","diagnostic":format!("{error:#}")}),
-        );
+        let mut first_write_error = None;
+        let answer = backend::submit_checked(&state, &current, &text, &mut |boundary| {
+            let check = || -> Result<()> {
+                let _inbox = messages::lock_for_publish(&state)?;
+                let current_generation =
+                    authorized_generation(&state, scope, token.as_deref(), operation)?;
+                ensure!(
+                    current_generation == generation,
+                    "scope owner changed before input"
+                );
+                ensure!(
+                    super::read_record(&path)? == next,
+                    "assignment changed before input"
+                );
+                let history =
+                    view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
+                let mut projected = current.clone();
+                view::project(&mut projected, &history, Some(true), false)?;
+                if operation == "nudge" {
+                    ensure!(
+                        matches!(projected["state"].as_str(), Some("working" | "asking")),
+                        "current round is no longer writable; use continue after completion"
+                    );
+                } else {
+                    ensure!(
+                        projected["state"] == "done",
+                        "continue lost its completed base round"
+                    );
+                }
+                Ok(())
+            };
+            check().map_err(|error| {
+                let diagnostic = format!("{error:#}");
+                let result = match boundary {
+                    crate::tmux::InputBoundary::Text => {
+                        first_write_error = Some(error);
+                        "definitely-not-sent"
+                    }
+                    crate::tmux::InputBoundary::Enter => "uncertain",
+                };
+                json!({"result":result, "diagnostic":diagnostic})
+            })
+        })
+        .unwrap_or_else(|error| json!({"result":"uncertain","diagnostic":format!("{error:#}")}));
         let diagnostic = answer["diagnostic"]
             .as_str()
             .unwrap_or("backend did not confirm input");
@@ -241,7 +299,7 @@ impl<'a> Request<'a> {
             }
             _ => "uncertain",
         };
-        let _inbox = messages::lock_for_publish(&state)?;
+        let mut inbox = messages::Inbox::open(&state)?;
         let saved = super::read_record(&path)?;
         ensure!(
             saved["attempt"] == next["attempt"]
@@ -268,6 +326,12 @@ impl<'a> Request<'a> {
         if outcome != "accepted" && event["diagnostic"].is_null() {
             event["diagnostic"] = json!(diagnostic);
         }
+        if let Some(evidence) = answer.get("inputEvidence") {
+            event["inputEvidence"] = evidence.clone();
+        }
+        if outcome == "accepted" {
+            event["message"] = json!(inbox.publish_worker_input(&next, &event)?);
+        }
         if next["audit"].is_null() {
             next["audit"] = json!([]);
         }
@@ -280,19 +344,60 @@ impl<'a> Request<'a> {
             audit[index] = event.clone();
         }
         save(&path, &dir, &next)?;
+        if let Some(error) = first_write_error {
+            return Err(error);
+        }
         if outcome != "accepted" {
             bail!("{operation} {outcome}: {}", event["diagnostic"]);
         }
-        let mut result = json!({"dispatch":self.dispatch, "operation":operation, "result":outcome,
-            "round":next["round"], "attempt":next["attempt"], "audit":event["id"]});
-        let action = if operation == "continue" {
-            "continued"
-        } else {
-            "nudged"
-        };
-        result[action] = json!(self.dispatch);
-        Ok(result)
+        Ok(input_response(self.dispatch, &event, false))
     }
+}
+
+fn input_response(dispatch: &str, event: &Value, duplicate: bool) -> Value {
+    let mut result = json!({"dispatch":dispatch,"operation":event["operation"],"result":"accepted",
+        "round":event["round"],"attempt":event["attempt"],"audit":event["id"],"message":event["message"]});
+    let action = if event["operation"] == "continue" {
+        "continued"
+    } else {
+        "nudged"
+    };
+    result[action] = json!(dispatch);
+    if duplicate {
+        result["duplicate"] = json!(true);
+    }
+    result
+}
+
+fn accepted_continue<'a>(row: &'a Value, task: &Path, report: &Path) -> Result<Option<&'a Value>> {
+    let event = row["audit"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .rev()
+        .find(|event| {
+            event["operation"] == "continue"
+                && event["result"] == "accepted"
+                && event["round"] == row["round"]
+                && event["attempt"] == row["attempt"]
+                && event["message"].is_u64()
+        });
+    let Some(event) = event else {
+        return Ok(None);
+    };
+    let (task, report) = input_paths(row, task, report)?;
+    Ok((event["task"] == task && event["report"] == report).then_some(event))
+}
+
+fn authorized_generation(
+    state: &Path,
+    scope: &str,
+    token: Option<&str>,
+    operation: &str,
+) -> Result<Value> {
+    let owners = controller::Owners::read(state)?;
+    owners.require(scope, token, operation)?;
+    Ok(owners.public(scope)?.unwrap_or(Value::Null)["generation"].clone())
 }
 
 fn lock_input(
@@ -329,6 +434,26 @@ fn next_paths(
     task: &Path,
     report: &Path,
 ) -> Result<(String, String)> {
+    let (task, report) = input_paths(current, task, report)?;
+    ensure!(
+        current["report"] != report
+            && !projected["rounds"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|r| r["report"] == report)
+            && !history.iter().any(|m| m["report"] == report),
+        "report was already used by an earlier round"
+    );
+    match fs::symlink_metadata(&report) {
+        Ok(_) => bail!("next report already exists"),
+        Err(error) if error.kind() == ErrorKind::NotFound => (),
+        Err(error) => return Err(error).context("check next report path"),
+    }
+    Ok((task, report))
+}
+
+fn input_paths(current: &Value, task: &Path, report: &Path) -> Result<(String, String)> {
     let task = task.canonicalize().context("resolve task file")?;
     ensure!(task.is_file(), "--task must name a file");
     let original = Path::new(
@@ -347,23 +472,7 @@ fn next_paths(
         "next report must be in the original report directory"
     );
     let report = parent.join(absolute.file_name().context("missing report filename")?);
-    let report = path_text(report)?;
-    ensure!(
-        current["report"] != report
-            && !projected["rounds"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|r| r["report"] == report)
-            && !history.iter().any(|m| m["report"] == report),
-        "report was already used by an earlier round"
-    );
-    match fs::symlink_metadata(&report) {
-        Ok(_) => bail!("next report already exists"),
-        Err(error) if error.kind() == ErrorKind::NotFound => (),
-        Err(error) => return Err(error).context("check next report path"),
-    }
-    Ok((path_text(task)?, report))
+    Ok((path_text(task)?, path_text(report)?))
 }
 
 fn path_text(path: PathBuf) -> Result<String> {

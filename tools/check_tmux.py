@@ -1,6 +1,7 @@
 """Exercise the public CLI and private backend with a fresh tmux server and state roots."""
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -2248,7 +2249,7 @@ time.sleep(45)
                 owner = self.call("inspect", dispatch=other["dispatch"], executionId=other["attempt"])
                 self.assertTrue(owner["alive"] and owner["owned"] and owner["workerBound"], owner)
 
-    def public_input_worker(self):
+    def public_input_worker(self, scope="rounds"):
         worker = self.work / "round-worker.py"
         worker.write_text(r"""import json, os, select, shlex, subprocess, time, tty
 from pathlib import Path
@@ -2262,6 +2263,8 @@ report = os.environ["WFC_REPORT"]
 draft = b""
 local_draft = False
 assignment = None
+transcript = ""
+notice = ""
 
 def write_json(name, value):
     tmp = Path(name + ".tmp")
@@ -2270,7 +2273,16 @@ def write_json(name, value):
 
 def draw():
     shown = "Ask Codex to do anything" if local_draft else draft.decode(errors="replace")
-    print(f"\x1b[2J\x1b[H› {shown}\r\n\r\n  model · cwd", end="", flush=True)
+    if draft and Path("change-draft").exists():
+        shown = shown[:8]
+    if draft and Path("hard-wrap-draft").exists():
+        shown += "\r\n  model · not a footer"
+    if Path("swallow-draft").exists():
+        shown = ""
+    if draft and Path("unknown-draft").exists():
+        print("\x1b[2J\x1b[Hunknown shell mode", end="", flush=True)
+        return
+    print(f"\x1b[2J\x1b[H{notice}{transcript}› {shown}\r\n\r\n  model · cwd", end="", flush=True)
     Path("screen").write_text("draft" if local_draft else "ready")
 
 def callback(*args):
@@ -2286,6 +2298,11 @@ while time.monotonic() < deadline:
     if Path("draft").exists() != local_draft:
         local_draft = not local_draft
         draw()
+    if Path("finish-first-externally").exists():
+        Path("finish-first-externally").unlink()
+        Path(report).write_text("first report")
+        result = done(report, original)
+        write_json("first-done", json.loads(result.stdout))
     if assignment and Path("finish-next").exists():
         Path("finish-next").unlink()
         target, attempt, reference = assignment
@@ -2317,6 +2334,15 @@ while time.monotonic() < deadline:
             draw()
             continue
         draft = b""
+        if Path("refuse-input").exists():
+            notice = "This conversation is read-only or unavailable; no operation was sent.\r\n"
+            draw()
+            continue
+        notice = ""
+        with open("formal-input", "a") as log:
+            print(json.dumps(line), file=log)
+        if not Path("omit-transcript").exists():
+            transcript = f"› {line}\r\n\r\n"
         draw()
         if line == "[router] Message from the controller: finish first":
             Path(report).write_text("first report")
@@ -2327,6 +2353,14 @@ while time.monotonic() < deadline:
             assignment = tuple(args[args.index(flag) + 1].rstrip(".")
                                for flag in ("--report", "--attempt", "--callback-ref"))
             write_json("accepted-round", assignment)
+            if Path("fast-r2-complete").exists():
+                target, attempt, reference = assignment
+                Path(target).write_text("second report")
+                Path("r2-done-started").touch()
+                result = done(target, attempt, "--callback-ref", reference)
+                write_json("r2-done", json.loads(result.stdout))
+    if draft:
+        draw()
 """)
         config = self.work / "launch.json"
         config.write_text(json.dumps({"hosts": {"codex": {"command": [sys.executable, str(worker)]}}}))
@@ -2342,11 +2376,42 @@ while time.monotonic() < deadline:
             self.assertEqual(proc.returncode, expected, (args, proc.stdout, proc.stderr))
             return json.loads(proc.stdout) if expected == 0 else proc.stderr
 
-        owner = cli("acquire", "--scope", "rounds", "--owner", "A")["token"]
-        first = cli("dispatch", "--host", "codex", "--scope", "rounds", "--task", "task",
+        owner = cli("acquire", "--scope", scope, "--owner", "A")["token"]
+        first = cli("dispatch", "--host", "codex", "--scope", scope, "--task", "task",
                     "--cwd", ".", "--report", "report1", "--launch-config", str(config), token=owner)
         self.await_input_value(lambda: (self.work / "worker-pid").exists())
         return cli, first, owner, env
+
+    def public_input_gate(self, env, mode):
+        shim = self.work / "tmux"
+        shim.write_text(f"""#!{sys.executable}
+import os, subprocess, sys, time
+from pathlib import Path
+
+args = sys.argv[1:]
+real = {TMUX!r}
+root = Path({str(self.work)!r})
+mode = os.environ["INPUT_TEST_GATE"]
+read = any("capture-pane -p -J -t " in arg for arg in args)
+enter = any("send-keys -t " in arg and " Enter" in arg for arg in args)
+if mode == "lose-enter-response" and enter:
+    result = subprocess.run([real, *args], close_fds=False, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    if result.returncode == 0:
+        (root / "enter-sent").touch()
+    sys.exit(1)
+if read and (mode == "first-read" or
+             (mode == "after-enter" and (root / "accepted-round").exists())):
+    (root / "input-boundary").touch()
+    deadline = time.monotonic() + 12
+    while not (root / "release-input-boundary").exists():
+        if time.monotonic() >= deadline:
+            sys.exit(2)
+        time.sleep(.02)
+os.execv(real, [real, *args])
+""")
+        shim.chmod(0o700)
+        return {"PATH": str(self.work) + ":" + env["PATH"], "INPUT_TEST_GATE": mode}
 
     def await_input_value(self, predicate):
         deadline = time.monotonic() + 8
@@ -2389,6 +2454,13 @@ while time.monotonic() < deadline:
         finished = status()
         self.assertEqual(finished["state"], "done")
         self.assertEqual(finished["audit"][-1]["text"], "finish first")
+        sent = [message for message in finished["messages"] if message["to"] == "worker"]
+        self.assertEqual([(m["id"], m["type"], m["text"]) for m in sent],
+                         [(nudged["message"], "nudge", "finish first")])
+        self.assertIsInstance(nudged["message"], int)
+        self.assertIn("no controller message", cli("ack", str(nudged["message"]), token=token, expected=1))
+        received = cli("wait", "--scope", "rounds", "--timeout", "0", token=token)
+        self.assertEqual([message["type"] for message in received["messages"]], ["done"])
         self.assertIn("with continue", cli("nudge", dispatch, "--text", "late", token=token, expected=1))
         self.assertIn("already used", cli(*advance("report1"), token=token, expected=1))
         (self.root / "other-report").mkdir()
@@ -2451,21 +2523,143 @@ while time.monotonic() < deadline:
         self.assertIn("resume", cli(*advance("report4"), token=token, expected=1))
 
     def test_public_continue_preserves_uncertain_round(self):
-        cli, first, token, _ = self.public_input_worker()
+        cli, first, token, env = self.public_input_worker()
         dispatch = first["dispatch"]
         cli("nudge", dispatch, "--text", "finish first", token=token)
         self.await_input_value(lambda: (self.work / "first-done").exists())
-        (self.work / "hold-input").touch()
         args = ("continue", dispatch, "--task", "next-task", "--report", "report2")
-        self.assertIn("continue uncertain", cli(*args, token=token, expected=1))
+        gate = self.public_input_gate(env, "lose-enter-response")
+        self.assertIn("continue uncertain", cli(*args, token=token, expected=1, **gate))
+        self.assertTrue((self.work / "enter-sent").exists())
+        formal = self.work / "formal-input"
+        self.await_input_value(lambda: len(formal.read_text().splitlines()) == 2)
         row = cli("status", "--dispatch", dispatch)["dispatches"][0]
         self.assertEqual((row["state"], row["round"], row["audit"][-1]["result"]), ("unknown", 2, "uncertain"))
         self.assertNotEqual(row["attempt"], first["attempt"])
         self.assertEqual(row["executionId"], first["executionId"])
         self.assertIn("pending or uncertain", cli(*args, token=token, expected=1))
         self.assertIn("pending or uncertain", cli("nudge", dispatch, "--text", "retry", token=token, expected=1))
-        self.assertEqual(len((self.work / "typed").read_text().splitlines()), 2)
+        self.assertEqual(len(formal.read_text().splitlines()), 2)
         self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
+
+    def test_public_continue_rejects_overlap_before_fast_r2_done(self):
+        cli, first, token, env = self.public_input_worker()
+        dispatch = first["dispatch"]
+        cli("nudge", dispatch, "--text", "finish first", token=token)
+        self.await_input_value(lambda: (self.work / "first-done").exists())
+        (self.work / "fast-r2-complete").touch()
+        args = ("continue", dispatch, "--task", "next-task", "--report")
+        gate = self.public_input_gate(env, "after-enter")
+        with subprocess.Popen([WFC, *args, "report2", "--owner-token", token],
+                              cwd=self.work, env={**env, **gate},
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as first_send:
+            try:
+                self.await_input_value(lambda: (self.work / "input-boundary").exists()
+                                       and (self.work / "r2-done-started").exists())
+                error = cli(*args, "report3", token=token, expected=1)
+                self.assertIn("pending or uncertain", error)
+                self.assertFalse((self.work / "r2-done").exists())
+            finally:
+                (self.work / "release-input-boundary").touch()
+                out, error = first_send.communicate(timeout=15)
+        self.assertEqual(first_send.returncode, 0, (out, error))
+        accepted = json.loads(out)
+        self.await_input_value(lambda: (self.work / "r2-done").exists())
+        self.assertEqual(cli(*args, "report2", token=token), {**accepted, "duplicate": True})
+        row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual([round_["state"] for round_ in row["rounds"]], ["completed", "completed"])
+        self.assertEqual((row["round"], row["attempt"]), (2, accepted["attempt"]))
+        sent = [m for m in row["messages"] if m["type"] == "continue" and m["to"] == "worker"]
+        self.assertEqual([m["id"] for m in sent], [accepted["message"]])
+        self.assertEqual(len((self.work / "formal-input").read_text().splitlines()), 2)
+
+    def test_public_nudge_rechecks_completion_and_lease_before_text(self):
+        cli, first, token, env = self.public_input_worker()
+        dispatch = first["dispatch"]
+        args = ("nudge", dispatch, "--text", "must not be sent")
+        gate = self.public_input_gate(env, "first-read")
+        cli("renew", "--scope", "rounds", "--lease", "4", token=token)
+        with subprocess.Popen([WFC, *args, "--owner-token", token],
+                              cwd=self.work, env={**env, **gate},
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as waiting:
+            try:
+                self.await_input_value(lambda: (self.work / "input-boundary").exists())
+                self.assertIsNone(waiting.poll())
+                time.sleep(4.1)
+            finally:
+                (self.work / "release-input-boundary").touch()
+                out, error = waiting.communicate(timeout=15)
+        self.assertEqual((waiting.returncode, out), (1, ""))
+        self.assertEqual(json.loads(error)["error"], "stale_controller_owner")
+        self.assertFalse((self.work / "input-bytes").exists())
+
+        token = cli("takeover", "--scope", "rounds", "--owner", "B")["token"]
+        lock = self.state / f"relay-{hashlib.sha256(b'rounds').hexdigest()}.lock"
+        with lock.open("a+") as scope:
+            fcntl.flock(scope, fcntl.LOCK_EX)
+            with subprocess.Popen(
+                [WFC, *args, "--owner-token", token], cwd=self.work, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            ) as waiting:
+                (self.work / "finish-first-externally").touch()
+                try:
+                    self.await_input_value(lambda: (self.work / "first-done").exists())
+                    self.assertIsNone(waiting.poll())
+                finally:
+                    fcntl.flock(scope, fcntl.LOCK_UN)
+                out, error = waiting.communicate(timeout=15)
+        self.assertEqual((waiting.returncode, out), (1, ""))
+        self.assertIn("finished its task", error)
+        self.assertFalse((self.work / "input-bytes").exists())
+        status = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((status["state"], status["round"]), ("done", 1))
+
+    def test_public_continue_checks_draft_and_does_not_infer_from_empty(self):
+        original = self.work
+        for mode in ("change-draft", "hard-wrap-draft", "unknown-draft", "swallow-draft",
+                     "omit-transcript"):
+            with self.subTest(mode=mode):
+                self.work = original / mode
+                self.work.mkdir()
+                cli, first, token, _ = self.public_input_worker(scope=mode)
+                dispatch = first["dispatch"]
+                cli("nudge", dispatch, "--text", "finish first", token=token)
+                self.await_input_value(lambda: (self.work / "first-done").exists())
+                (self.work / mode).touch()
+                result = cli("continue", dispatch, "--task", "next-task", "--report", "report2",
+                             token=token, expected=1)
+                self.assertIn("continue uncertain", result)
+                row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+                self.assertEqual((row["round"], row["audit"][-1]["result"]), (2, "uncertain"))
+                if mode == "omit-transcript":
+                    self.assertIn("did not show the submitted input", result)
+                else:
+                    self.assertIn("Enter was not sent", result)
+                expected = 2 if mode == "omit-transcript" else 1
+                self.assertEqual(len((self.work / "formal-input").read_text().splitlines()), expected)
+                self.assertEqual(len((self.work / "typed").read_text().splitlines()), expected)
+                self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
+        self.work = original
+
+    def test_public_continue_rolls_back_confirmed_refusal(self):
+        cli, first, token, _ = self.public_input_worker()
+        dispatch = first["dispatch"]
+        cli("nudge", dispatch, "--text", "finish first", token=token)
+        self.await_input_value(lambda: (self.work / "first-done").exists())
+        refusal = self.work / "refuse-input"
+        refusal.touch()
+        args = ("continue", dispatch, "--task", "next-task", "--report", "report2")
+        self.assertIn("continue refused", cli(*args, token=token, expected=1))
+        row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((row["round"], row["attempt"], row["audit"][-1]["result"]),
+                         (1, first["attempt"], "refused"))
+        self.assertEqual(row["audit"][-1]["inputEvidence"], "new-host-refusal")
+        formal = self.work / "formal-input"
+        self.assertEqual(len(formal.read_text().splitlines()), 1)
+        refusal.unlink()
+        resumed = cli(*args, token=token)
+        self.assertEqual(resumed["round"], 2)
+        self.assertEqual(len(formal.read_text().splitlines()), 2)
 
     def test_lifecycle(self):
         # Keep the worker alive across Ctrl-C so close tests the active-session path.

@@ -16,6 +16,11 @@ use uuid::Uuid;
 
 pub type Result<T> = std::result::Result<T, Failure>;
 
+/// PTY redraws do not distinguish layout wrapping from a draft newline.
+pub fn matches_single_line_draft(shown: &str, sent: &str) -> bool {
+    !shown.is_empty() && shown == sent && !shown.chars().any(char::is_control)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FailureKind {
