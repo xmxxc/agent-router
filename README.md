@@ -38,6 +38,19 @@ prepare 校验并解出仓内的 Ghostty 源码包，校验 zlib 下载字节和
 
 直接运行 `wfc` 或 `wfc --help` 会列出熟悉的工作流命令名。当前版本支持派发和状态查询，Linux 还支持后台运行与按编号关闭，预留命令返回退出码 2。`wfc --version` 显示 Rust 标识、包版本、目标平台、构建类型和编译时的 `WFC_BUILD_ID`（未设置、为空或仅含空白时，使用本地构建时间的 Unix 纳秒数）。
 
+Linux 公开入口按宿主和后端派发，例如：
+
+```sh
+wfc dispatch --host codex --task task.md --cwd . --report reports/04-review/r1.md
+wfc status --active
+```
+
+默认使用 tmux。此入口调用同一可执行文件中的 tmux 后端（#31）；仅构建本分支时会以非零退出码报告缺少后端。宿主可选 codex、opencode 或 claude，`--launch-config` 或 `WFC_LAUNCH_CONFIG` 指向带有 env、hosts 的 JSON 配置。每个宿主可指定 command、runtime 参数数组及 env。完整参数见 `wfc dispatch --help`。独立的 herdr、bundled 后端和控制器授权由对应工单接入。
+
+回执包含 dispatch、round、attempt、host、backend、scope、role、label、tmux 和报告绝对路径。省略 scope 会分配新值，默认 role 来自报告目录名最后一个连字符后的部分。Codex 的 git/network 开关作用于宿主参数，OpenCode 和 Claude 的回执会说明这些开关的处理结果。tmux 服务地址在派发时绑定，后续查询和关闭沿用原服务。
+
+点名查询 `wfc status --dispatch ID` 返回当前 worker 进程状态、各轮任务结果及消息。接入 #6/#7 后，首条完成回报固定该轮的报告和 Git 快照，后续领取或进程退出仍能查回。已完成且会话仍存活的任务在 `status --active` 的 reclaimable 数组中。长编号和旧版短编号均可查询、关闭。
+
 `dispatch` 接收调用方指定的角色、任务文件和工作目录。`--` 后依次放受控 worker 的程序和参数。下面的 Bash 示例让 worker 在工作目录中写出它实际读到的任务，再由另一个 CLI 查回编号。
 
 ```sh
@@ -51,9 +64,9 @@ wfc status
 wfc status --dispatch ID
 ```
 
-任务文件、工作目录和显式指定的程序路径都可以相对于调用方。程序也可使用 PATH 中的命令名。worker 以指定目录为当前目录，从 `WFC_TASK` 取得任务文件的绝对路径，并从 `WFC_ROLE`、`WFC_DISPATCH`、`WFC_ROUND`、`WFC_ATTEMPT` 和 `WFC_STATE` 取得本次派发上下文。任务文件和工作目录的绝对路径需能用 UTF-8 表示。CLI 在标准输出返回一行 JSON，含 `dispatch`、`round`（首次为 1）、`attempt`、`role`、`task` 和 `cwd`。`status` 的 `dispatches` 数组列出已交付记录，可用 `--dispatch` 按编号查询。启动失败或查询未知编号时，CLI 返回非零退出码并打印诊断。
+任务文件、工作目录和显式指定的程序路径都可以相对于调用方。程序也可使用 PATH 中的命令名。worker 以指定目录为当前目录，从 `WFC_TASK` 取得任务文件的绝对路径，并从 `WFC_REPORT`、`WFC_SCOPE`、`WFC_ROLE`、`WFC_DISPATCH`、`WFC_ROUND`、`WFC_ATTEMPT` 和 `WFC_STATE` 取得本次派发上下文。任务文件和工作目录的绝对路径需能用 UTF-8 表示。CLI 在标准输出返回一行 JSON，含 `dispatch`、`round`（首次为 1）、`attempt`、`role`、`task` 和 `cwd`。`status` 的 `dispatches` 数组列出已交付记录，可用 `--dispatch` 按编号查询。启动失败或查询未知编号时，CLI 返回非零退出码并打印诊断。
 
-在 Linux 上，`dispatch` 用同一个 `wfc` 启动独立会话。worker 成功启动且记录可查后，派发命令即返回，终端可以关闭。worker 的三个标准流连接到空设备，需要保留的输出应写入文件。使用 `wfc status --dispatch ID` 查询本次进程的结果。回执中的 `worker.state` 初始为 `running`，任务进程树退出后变为 `exited`，附带根进程的 `exit_code` 或 `signal`。例如 worker 退出 7 时，派发回执仍有效，稍后可查到 `exit_code: 7`。
+在 Linux 上，受控入口用同一个 `wfc` 启动独立会话。worker 成功启动且记录可查后，派发命令即返回，终端可以关闭。worker 的三个标准流连接到空设备，需要保留的输出应写入文件。使用 `wfc status --dispatch ID` 查询本次进程的结果。回执中的 `worker.state` 初始为 `running`，任务进程树退出后变为 `exited`，附带根进程的 `exit_code` 或 `signal`。例如 worker 退出 7 时，派发回执仍有效，稍后可查到 `exit_code: 7`。
 
 `wfc close ID` 通知该任务的后台进程回收其 worker 和后代。后台进程只向自己尚未回收的子进程发送信号。成功回执含 `operation`、`result`、`dispatch`、`round` 和 `attempt`。重复调用安全，已结束的任务保留原退出结果。根进程被本次关闭终止时，`worker.state` 为 `cancelled`。回收超过 5 秒会返回非零，可再次用同一编号查询或关闭。若后台进程意外退出且未留下结果，状态为 `unknown`，close 会报告无法确认。本版 Linux 实现使用本机状态目录上的文件锁和可读的 procfs 子进程列表。
 

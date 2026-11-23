@@ -51,7 +51,7 @@ fn main() -> anyhow::Result<ExitCode> {
             );
         }
         Some("--kernel") if args.is_empty() => kernel::run()?,
-        Some("dispatch" | "status") if args == ["--help"] => {
+        Some("dispatch" | "status") if args == ["--help"] || args == ["-h"] => {
             println!(
                 "{}",
                 if command == "dispatch" {
@@ -65,7 +65,9 @@ fn main() -> anyhow::Result<ExitCode> {
         Some("--worker-owner") => workflow::worker_owner::run(&args)?,
         #[cfg(target_os = "linux")]
         Some("close") => match args.as_slice() {
-            [help] if help == "--help" => println!("{}", workflow::worker_owner::CLOSE_USAGE),
+            [help] if help == "--help" || help == "-h" => {
+                println!("{}", workflow::worker_owner::CLOSE_USAGE)
+            }
             [id] if !id.as_encoded_bytes().starts_with(b"-") => {
                 println!("{}", workflow::worker_owner::close(id)?)
             }
@@ -85,15 +87,16 @@ fn main() -> anyhow::Result<ExitCode> {
             println!("{}", request.run()?);
         }
         Some("status") => {
-            let id = match args.as_slice() {
-                [] => None,
-                [flag, id] if flag == "--dispatch" => Some(id.as_os_str()),
+            let (id, active) = match args.as_slice() {
+                [] => (None, false),
+                [flag] if flag == "--active" => (None, true),
+                [flag, id] if flag == "--dispatch" => (Some(id.as_os_str()), false),
                 _ => {
                     eprintln!("wfc: {}", workflow::STATUS_USAGE);
                     return Ok(ExitCode::from(2));
                 }
             };
-            println!("{}", workflow::status(id)?);
+            println!("{}", workflow::status(id, active)?);
         }
         Some(name) if RESERVED_COMMANDS.contains(&name) => {
             eprintln!("wfc: '{name}' is unavailable in this Rust build");

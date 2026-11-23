@@ -95,10 +95,10 @@ fn open_owner(dir: &Path, record: &Value, writable: bool) -> Result<(File, bool)
         .open(owner_path(dir, record)?)
         .context("open worker owner record")?;
     ensure!(file.metadata()?.is_file(), "invalid worker owner file");
-    let finished = shared_lock(&file)?;
+    let unlocked = shared_lock(&file)?;
     // Completed results can be read from an archive. A live control file
     // belongs only to its original state directory, even if hard-linked.
-    let identity = if finished {
+    let identity = if unlocked {
         owner_identity(record)
     } else {
         owner_header(dir, record)?[1..].to_owned()
@@ -109,7 +109,7 @@ fn open_owner(dir: &Path, record: &Value, writable: bool) -> Result<(File, bool)
         actual == identity.as_bytes(),
         "worker owner identity mismatch"
     );
-    Ok((file, finished))
+    Ok((file, unlocked))
 }
 
 fn outcome(file: &File) -> Result<Value> {
@@ -122,8 +122,8 @@ fn outcome(file: &File) -> Result<Value> {
 }
 
 pub fn status(dir: &Path, record: &Value) -> Result<Value> {
-    let (file, finished) = open_owner(dir, record, false)?;
-    if finished {
+    let (file, unlocked) = open_owner(dir, record, false)?;
+    if unlocked {
         return Ok(outcome(&file).unwrap_or_else(|_| json!({"state":"unknown"})));
     }
     Ok(json!({"state":"running"}))
@@ -136,11 +136,23 @@ pub fn close(id: &OsStr) -> Result<Value> {
         .context("invalid dispatch ID")?;
     let dir = state_dir()?.join("dispatches");
     let record = read_record(&dir.join(format!("{id}.json")))?;
+    ensure!(
+        record.get("controllerOwner").is_none_or(Value::is_null),
+        "controller owner authorization required"
+    );
+    if record["host"].is_string() {
+        return super::backend::close(dir.parent().context("missing state directory")?, &record);
+    }
     // Older foreground records were only published after successful exit.
     let mut already_gone = true;
     if record.get("worker").is_some() {
-        let (owner, finished) = open_owner(&dir, &record, true)?;
-        already_gone = finished;
+        let (reader, unlocked) = open_owner(&dir, &record, false)?;
+        let (owner, unlocked) = if unlocked {
+            (reader, true)
+        } else {
+            open_owner(&dir, &record, true)?
+        };
+        already_gone = unlocked;
         if !already_gone {
             owner
                 .write_all_at(b"1", 0)
