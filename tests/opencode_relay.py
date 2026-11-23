@@ -11,6 +11,7 @@ import relay
 
 
 class OpenCodeRelay(unittest.TestCase):
+    meta = relay.Relay.meta
     cli = relay.Relay.cli
     data = relay.Relay.data
     publish = relay.Relay.publish
