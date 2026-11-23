@@ -1,0 +1,156 @@
+name: Linux reply, reclaim and controller receipts
+on:
+  push:
+    branches: [rust-router/11-reply-r11-tmux-composer]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  worker-replies:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      WFC_BUILD_ID: ${{ github.sha }}
+      NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+      HERDR_SOURCE_SHA: 2ecf19a92fc3a7fff75b6ce3655ef04f4625ec01
+      CODEX_SOURCE_SHA: 086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a
+      CARGO_BUILD_JOBS: '2'
+      PYTHONUTF8: '1'
+      EVIDENCE: ${{ github.workspace }}/linux-reply-evidence
+    steps:
+      - name: Record run identity
+        run: |
+          mkdir -p "$EVIDENCE"
+          printf 'Workflow %s\nRun %s attempt %s\nExpected product %s\n' \
+            "$GITHUB_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$WFC_BUILD_ID" | tee "$EVIDENCE/run.log"
+          printf 'Codex screen fixture source %s\n' "$CODEX_SOURCE_SHA" | tee -a "$EVIDENCE/run.log"
+          uname -a | tee -a "$EVIDENCE/run.log"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.WFC_BUILD_ID }}
+          path: product
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.NATIVE_INPUT_SHA }}
+          path: native-input
+          sparse-checkout: vendor/zlib-1.3.1.tar.gz
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        with:
+          version: '0.16.0'
+      - name: Verify sources and prepare the native build
+        working-directory: product
+        run: |
+          git log -1 --format='Rust HEAD %H tree %T' | tee "$EVIDENCE/sources.log"
+          test "$(git rev-parse HEAD)" = "$WFC_BUILD_ID"
+          test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
+          sha256sum vendor/INPUTS.sha256 tests/herdr_public.py tools/check_tmux.py crates/herdr/tests/live.py crates/herdr/tests/composer.py tests/relay.py tests/opencode_relay.py | tee "$EVIDENCE/inputs.log"
+          sha256sum -c vendor/INPUTS.sha256 2>&1 | tee -a "$EVIDENCE/inputs.log"
+          rustup toolchain install 1.96.1 --profile minimal 2>&1 | tee "$EVIDENCE/toolchain.log"
+          { rustc -vV; cargo --version; zig version; python --version; pkg-config --modversion openssl zlib; } | tee -a "$EVIDENCE/toolchain.log"
+          python tools/prepare.py --zlib-archive ../native-input/vendor/zlib-1.3.1.tar.gz 2>&1 | tee -a "$EVIDENCE/inputs.log"
+      - name: Build the Linux CLI
+        id: build
+        working-directory: product
+        run: |
+          cargo build --release --locked --bin wfc 2>&1 | tee "$EVIDENCE/build.log"
+          sha256sum target/release/wfc | tee "$EVIDENCE/binary.log"
+          version=$(target/release/wfc --version)
+          printf '%s\n' "$version" | tee -a "$EVIDENCE/binary.log"
+          [[ "$version" == *"(Rust, x86_64-unknown-linux-gnu, release, build $WFC_BUILD_ID)" ]]
+      - name: Verify the Herdr screen parser
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: |
+          cargo test --release --locked -p wfc-herdr --lib screen::tests 2>&1 | tee "$EVIDENCE/herdr-screen.log"
+      - name: Ensure strace for the zero-write boundary fixture
+        run: |
+          if ! command -v strace >/dev/null; then
+            sudo apt-get update 2>&1 | tee "$EVIDENCE/strace-install.log"
+            sudo apt-get install -y --no-install-recommends strace 2>&1 | tee -a "$EVIDENCE/strace-install.log"
+          fi
+          strace --version | tee "$EVIDENCE/strace.log"
+      - name: Verify the Herdr composer and first-write boundaries
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: |
+          herdr="$RUNNER_TEMP/herdr-0.9.5"
+          {
+            printf 'Herdr v0.9.5 release source %s\n' "$HERDR_SOURCE_SHA"
+            curl --fail --silent --show-error --location --retry 3 --max-time 120 \
+              https://github.com/herdrdev/herdr/releases/download/v0.9.5/herdr-linux-x86_64 -o "$herdr"
+            printf '%s  %s\n' 14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d "$herdr" \
+              | sha256sum --check --strict
+            chmod 700 "$herdr"
+            version=$("$herdr" --version)
+            printf '%s\n' "$version"
+            test "$version" = 'herdr 0.9.5'
+          } 2>&1 | tee "$EVIDENCE/herdr-input.log"
+          python -Bu tests/herdr_public.py "$herdr" target/release/wfc -v \
+            PublicLifecycle.test_public_reply_accepts_styled_compact_herdr_empty_composer \
+            PublicLifecycle.test_public_reply_protects_compact_herdr_drafts_without_footer_proof \
+            PublicLifecycle.test_public_reply_retries_after_herdr_presend_checkpoint_failure \
+            PublicLifecycle.test_public_reply_releases_claim_after_herdr_preflight_read_fails \
+            PublicLifecycle.test_public_reply_distinguishes_zero_write_deadline_and_lost_receipt \
+            PublicLifecycle.test_public_reply_distinguishes_authored_herdr_text_from_dim_placeholder \
+            PublicLifecycle.test_public_reply_requires_a_writable_herdr_chat_prompt \
+            PublicLifecycle.test_public_reply_retains_claim_when_herdr_empty_composer_cannot_be_confirmed \
+            PublicLifecycle.test_public_reply_uses_upstream_codex_footer_and_protects_attachments \
+            PublicLifecycle.test_public_reply_only_retries_enter_for_the_exact_visible_codex_line \
+            PublicLifecycle.test_public_reply_uses_native_opencode_and_claude_composer_shapes \
+            PublicLifecycle.test_managed_herdr_reply_rechecks_owner_while_waiting \
+            PublicLifecycle.test_question_replays_after_herdr_close_intent \
+            PublicLifecycle.test_reclaim_uses_verified_herdr_close_and_keeps_sibling \
+            2>&1 | tee "$EVIDENCE/herdr-public.log"
+      - name: Verify tmux reply text and controller takeover
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: |
+          if ! command -v tmux >/dev/null; then
+            sudo apt-get update 2>&1 | tee "$EVIDENCE/tmux-install.log"
+            sudo apt-get install -y --no-install-recommends tmux 2>&1 | tee -a "$EVIDENCE/tmux-install.log"
+          fi
+          tmux -V | tee "$EVIDENCE/tmux.log"
+          python -Bu tools/check_tmux.py target/release/wfc -v \
+            Backend.test_public_reply_once_and_original_done \
+            Backend.test_public_reply_preserves_tmux_draft_with_changed_whitespace \
+            Backend.test_public_reply_requires_confirmed_tmux_chat_composer \
+            Backend.test_managed_tmux_reply_rechecks_owner_while_waiting \
+            Backend.test_public_reply_and_reclaim_preserve_controller_receipts \
+            Backend.test_public_reclaim_preview_mixed_results_and_history \
+            Backend.test_public_reclaim_stops_on_scope_authority_loss \
+            2>&1 | tee -a "$EVIDENCE/tmux.log"
+      - name: Verify controller delivery receipts for both routes
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: |
+          python -Bu tests/relay.py target/release/wfc -v \
+            Relay.test_question_envelope_matches_python_json_separators \
+            2>&1 | tee "$EVIDENCE/codex-relay.log"
+          python -Bu tests/opencode_relay.py target/release/wfc -v \
+            OpenCodeRelay.test_204_detached_preserves_batch_order_scope_and_session \
+            2>&1 | tee "$EVIDENCE/opencode-relay.log"
+      - name: Checksum evidence
+        if: always()
+        run: |
+          cd "$EVIDENCE"
+          sha256sum -- *.log > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: linux-reply-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 14

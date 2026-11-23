@@ -1,40 +1,153 @@
 """Raw PTY fixture with scrollback, a wrapped draft and two adjacent footer lines."""
 import os
+import select
+import subprocess
 import sys
 from pathlib import Path
 import time
 import tty
 
 
-while not Path('show-history').exists():
-    time.sleep(.02)
+reply_worker = '--reply-worker' in sys.argv[2:]
+reply_mode = sys.argv[sys.argv.index('--reply-worker') + 1] if reply_worker else None
+if not reply_worker:
+    while not Path('show-history').exists():
+        time.sleep(.02)
 tty.setraw(0)
-os.write(1, b'old history\r\n' * 260)
-draft = b''
+if reply_worker:
+    wfc, attempt = os.environ['WFC_BIN'], os.environ['WFC_ATTEMPT']
+    receipt = subprocess.check_output([wfc, 'ask', 'One controlled question?',
+                                       '--attempt', attempt, '--message-id', 'reply-question'])
+    Path('question.tmp').write_bytes(receipt)
+    Path('question.tmp').rename('question.json')
+else:
+    os.write(1, b'old history\r\n' * 260)
+draft = {
+    'existing-scroll': 'original draft ↑'.encode(),
+    'ambiguous-footer': b'original draft',
+    'compact-placeholder': b'AskCodextodoanything',
+    'plain-placeholder-draft': b'Ask Codex to do anything',
+    'folded-placeholder-draft': b'Ask Codex to do\n  anything',
+    'ultra-draft': b'original Ultra draft',
+    'shell': b'echo untouched',
+    'styled-compact-draft': '\n  model · dir'.encode(),
+    'unstyled-compact-draft': '\n  model · dir'.encode(),
+    'opencode-draft': b'keep OpenCode draft',
+    'opencode-shell': b'echo untouched',
+    'claude-draft': b'keep Claude draft',
+}.get(reply_mode, b'')
+protect_draft = reply_mode in ('ambiguous-footer', 'ambiguous-continuation')
+compact = reply_mode in (
+    'styled-compact-empty', 'styled-compact-draft', 'unstyled-compact-empty', 'unstyled-compact-draft',
+)
+prompt = {'shell': '!', 'unknown': '❯', 'ultra-empty': '»', 'ultra-draft': '»'}.get(reply_mode, '›')
+disabled = reply_mode in ('disabled', 'claude-disabled')
+image = reply_mode in ('codex-image', 'codex-image-unstyled')
+accepted = False
 submit_first = '--submit-first' in sys.argv[2:]
 
 
 def draw():
-    body = draft.replace(b' tail ', b'\r\n  tail ')
-    footer = '\r\n  model · dir\r\n'
+    clear = b'\x1b[2J\x1b[H'
+    reset = b'\x1b[0m'
+    if reply_mode and reply_mode.startswith('opencode-'):
+        body = draft.replace(b'\n', '\r\n  ┃  '.encode())
+        shell = reply_mode == 'opencode-shell'
+        metadata = 'Shell' if shell else 'Build · Iceman Free OpenCode'
+        footer = 'esc exit shell mode' if shell else 'shift+tab agents  ctrl+p commands'
+        bar = ('  ╹' + '▀' * 40).encode()
+        os.write(1, clear + '  ┃\r\n  ┃  '.encode() + body + '\r\n  ┃\r\n  ┃  '.encode() +
+                 metadata.encode() + b'\r\n\x1b[38;5;24m' + bar + reset +
+                 b'\r\n   ' + footer.encode() + b'\r\n')
+        return
+    if reply_mode and reply_mode.startswith('claude-'):
+        rail = ('─' * 56).encode()
+        style = b'\x1b[2m' if disabled else b'\x1b[38;5;15m'
+        os.write(1, clear + rail + b'\r\n' + style + '❯'.encode() + reset + b' ' + draft +
+                 b'\r\n' + rail + '\r\n  ⏵⏵ auto mode\r\n'.encode())
+        return
+    if compact:
+        background = b'\x1b[48;2;20;30;40m' if reply_mode.startswith('styled-') else b''
+        glyph = b'\x1b[1m' + '› '.encode() if background else '› '.encode()
+        reset = b'\x1b[0m' if background else b''
+        footer = '  keys · help'
+        if reply_mode.endswith('-empty'):
+            footer = '  model · dir\r\n' + footer
+        os.write(1, b'\x1b[2J\x1b[H' + background + glyph + draft.replace(b'\n', b'\r\n') +
+                 reset + b'\r\n' + footer.encode() + b'\r\n')
+        return
+    body = draft.replace(b' tail ', b'\n  tail ').replace(b'\n', b'\r\n')
+    if protect_draft:
+        body += '\r\n  tail · value'.encode()
+    elif reply_worker and not body:
+        folded = reply_mode in ('compact-placeholder', 'folded-placeholder-draft')
+        placeholder = b'Ask Codex to do\r\n  anything' if folded else b'Ask Codex to do anything'
+        body = b'\x1b[2m' + placeholder + b'\x1b[0m'
+    upstream = reply_mode in ('codex-footer', 'codex-image', 'codex-image-unstyled')
+    if upstream:
+        footer = '\r\n  ' + ('? for shortcuts' + ' ' * 43 if not draft else ' ' * 58) + '100% context left\r\n'
+    else:
+        footer = '\r\n  model · dir\r\n'
     if sys.argv[1] == 'two':
         footer += '  keys · help\r\n'
-    if not draft and not submit_first:
+    if (reply_worker and not protect_draft and not (reply_mode == 'compact-placeholder' and draft)
+            or not reply_worker and not draft and not submit_first):
         footer = '\r\n' + footer
-    os.write(1, '\x1b[2J\x1b[H› '.encode() + body + footer.encode())
+    prompt_style = b'\x1b[2m' if disabled else b'\x1b[1m'
+    background = b'\x1b[48;2;20;30;40m' if reply_mode in ('codex-footer', 'codex-image') else b''
+    history = b''
+    if upstream:
+        history = b'older transcript\r\n'
+        if reply_mode != 'codex-footer':
+            image_style = background if image else b''
+            history += image_style + b'  [Image #1]' + reset + b'\r\n\r\n'
+            if not image and not background:
+                history += b'assistant response\r\n\r\n'
+    os.write(1, clear + history + background + prompt_style + prompt.encode() + reset +
+             b' ' + body + footer.encode())
 
 
 draw()
-drop_next_enter = not submit_first
+drop_next_enter = not submit_first or reply_mode == 'exact-reply'
 while True:
+    if reply_worker:
+        if Path('clear-draft').exists():
+            Path('clear-draft').unlink()
+            draft = b''
+            protect_draft = False
+            compact = False
+            disabled = False
+            image = False
+            if prompt not in ('›', '»'):
+                prompt = '›'
+            draw()
+        if accepted and Path('finish').exists():
+            Path('finish').unlink()
+            report = Path(os.environ['WFC_REPORT'])
+            report.write_text('original worker received the answer\n')
+            subprocess.run([wfc, 'done', '--report', report, '--attempt', attempt,
+                            '--message-id', 'reply-done'], check=True, stdout=subprocess.DEVNULL)
+        if not select.select([0], [], [], .02)[0]:
+            continue
     key = os.read(0, 1)
+    if not key:
+        break
     if key in (b'\r', b'\n'):
-        if drop_next_enter:
+        if reply_mode == 'always-drop':
+            pass
+        elif reply_mode == 'changed-reply':
+            draft = draft.replace(b': a b', b': ab')
+        elif reply_mode == 'folded-reply':
+            draft = draft.replace(b': a b', b': a\n  b')
+        elif reply_mode == 'exact-reply' and not accepted and drop_next_enter:
+            drop_next_enter = False
+        elif drop_next_enter:
             drop_next_enter = False
         else:
-            with Path('events').open('ab') as log:
+            with Path('accepted' if reply_worker else 'events').open('ab') as log:
                 log.write(draft + b'\n')
-            draft = b''
+            accepted = True
+            draft = b'Ask Codex to do anything' if reply_mode == 'plain-after-send' else b''
     else:
         draft += key
     draw()

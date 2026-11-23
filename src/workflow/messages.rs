@@ -3,8 +3,12 @@
 mod receipt;
 #[cfg(target_os = "linux")]
 pub mod relay;
+#[cfg(target_os = "linux")]
+mod reply;
 pub use receipt::{Confirm, ACK_USAGE, RESOLVE_USAGE};
 use receipt::{Delivery, Resolution, State};
+#[cfg(target_os = "linux")]
+pub use reply::{Reply, REPLY_USAGE};
 
 use super::{controller, git_snapshot::Snapshot, resolve_report_path, state_dir, valid_id};
 use anyhow::{ensure, Context, Result};
@@ -190,11 +194,7 @@ struct Assignment {
 }
 
 impl Assignment {
-    fn current(
-        state: &Path,
-        dispatch: &str,
-        expected_attempt: Option<&str>,
-    ) -> Result<(Self, Value)> {
+    fn read(state: &Path, dispatch: &str) -> Result<(Self, Value)> {
         let dir = state.join("dispatches");
         let (file, path) = super::assignment::open_assignment(&dir, dispatch)
             .with_context(|| format!("open dispatch {dispatch}"))?;
@@ -203,11 +203,20 @@ impl Assignment {
             row["createPending"] = json!(true);
         }
         let assignment = Self::deserialize(&row).context("read worker assignment identity")?;
-        let worker = &assignment.worker;
         ensure!(
             assignment.controller_owner.is_none(),
             "controller owner authorization required for {dispatch}"
         );
+        Ok((assignment, row))
+    }
+
+    fn current(
+        state: &Path,
+        dispatch: &str,
+        expected_attempt: Option<&str>,
+    ) -> Result<(Self, Value)> {
+        let (assignment, row) = Self::read(state, dispatch)?;
+        let worker = &assignment.worker;
         if let Some(round) = env::var_os("WFC_ROUND") {
             ensure!(
                 round.to_str().and_then(|s| s.parse::<u64>().ok()) == Some(worker.round),
@@ -248,6 +257,8 @@ struct Message {
     report: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     question_payload: Option<Question>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reply_payload: Option<ReplyRecord>,
     request_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     body_hash: Option<String>,
@@ -267,6 +278,7 @@ struct Message {
 enum MessageKind {
     Done,
     Question,
+    Reply,
     Reclaimed,
 }
 
@@ -274,6 +286,37 @@ enum MessageKind {
 struct Question {
     text: String,
     options: Vec<String>,
+}
+
+// Reply attempts live in the same ledger as the question. They are addressed
+// to the worker and never appear in controller delivery or confirmation.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplyRecord {
+    to: u64,
+    question_message_id: String,
+    answer: String,
+    input_result: InputResult,
+    diagnostic: Option<String>,
+    category: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum InputResult {
+    Pending,
+    NotSubmitted,
+    DefinitelyNotSent,
+    Refused,
+    Uncertain,
+    Accepted,
+}
+
+#[cfg(target_os = "linux")]
+impl InputResult {
+    fn claims_question(self) -> bool {
+        matches!(self, Self::Pending | Self::Uncertain | Self::Accepted)
+    }
 }
 
 pub(super) fn body_hash(body: &str) -> String {
@@ -357,6 +400,7 @@ impl Message {
             worker,
             report: None,
             question_payload: None,
+            reply_payload: None,
             request_key,
             body_hash: None,
             delivery: Delivery::unsent(),
@@ -375,6 +419,8 @@ impl Message {
             .is_some_and(|tag| tag == "reclaimed")
         {
             MessageKind::Reclaimed
+        } else if self.reply_payload.is_some() {
+            MessageKind::Reply
         } else if self.question_payload.is_some() {
             MessageKind::Question
         } else {
@@ -387,14 +433,19 @@ impl Message {
     }
 
     fn is_controller_message(&self) -> bool {
-        self.kind() != MessageKind::Reclaimed
+        matches!(self.kind(), MessageKind::Done | MessageKind::Question)
     }
 
     fn valid_payload(&self) -> bool {
         match self.kind() {
             MessageKind::Done => self.report.is_some(),
             MessageKind::Question => self.report.is_none(),
-            MessageKind::Reclaimed => self.question_payload.is_none() && self.request_key.is_none(),
+            MessageKind::Reply => self.report.is_none() && self.question_payload.is_none(),
+            MessageKind::Reclaimed => {
+                self.question_payload.is_none()
+                    && self.reply_payload.is_none()
+                    && self.request_key.is_none()
+            }
         }
     }
 
@@ -407,6 +458,12 @@ impl Message {
     }
 
     fn body(&self) -> Map<String, Value> {
+        if let Some(reply) = &self.reply_payload {
+            let mut body = self.worker.fields();
+            body.insert("scope".into(), json!(self.worker.scope()));
+            body.extend(json!(reply).as_object().unwrap().clone());
+            return body;
+        }
         if let Some(question) = &self.question_payload {
             return question.body(&self.worker);
         }
@@ -939,12 +996,18 @@ pub(super) fn history(state: &Path, dispatch: &str) -> Result<Vec<Value>> {
         .filter(|m| m.worker.dispatch == dispatch)
         .map(|m| {
             let mut view = m.view();
-            view["to"] = json!(if m.is_controller_message() {
-                "controller"
-            } else {
-                "worker"
-            });
-            view["delivered"] = json!(m.delivery.delivered());
+            match m.kind() {
+                MessageKind::Done | MessageKind::Question => {
+                    view["to"] = json!("controller");
+                    view["delivered"] = json!(m.delivery.delivered());
+                }
+                MessageKind::Reclaimed => {
+                    view["to"] = json!("worker");
+                    view["delivered"] = json!(m.delivery.delivered());
+                }
+                // The reply body already carries the original question number.
+                MessageKind::Reply => {}
+            }
             view["at"] = json!(m.created_at);
             if let Some(resolution) = &m.resolution {
                 view["resolution"] = json!(resolution);
@@ -1016,6 +1079,7 @@ impl Reclaimed {
             worker: self.worker.clone(),
             report: Some(self.report.clone()),
             question_payload: None,
+            reply_payload: None,
             request_key: None,
             body_hash: None,
             delivery: Delivery::unsent(),
@@ -1028,6 +1092,23 @@ impl Reclaimed {
         });
         id
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn reply_was_not_sent(state: &Path, row: &Value, message_id: &str) -> Result<bool> {
+    // Read a complete ledger generation while the Herdr assignment is
+    // locked. A pre-effect or uncertain snapshot only delays recovery.
+    let worker = Identity::deserialize(row).context("read Herdr reply assignment identity")?;
+    Ok(Inbox::snapshot(state)?.iter().any(|message| {
+        message.message_id == message_id
+            && message.worker == worker
+            && message.reply_payload.as_ref().is_some_and(|reply| {
+                matches!(
+                    reply.input_result,
+                    InputResult::DefinitelyNotSent | InputResult::Refused
+                )
+            })
+    }))
 }
 
 pub struct Done<'a> {

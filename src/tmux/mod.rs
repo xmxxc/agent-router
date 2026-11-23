@@ -47,6 +47,8 @@ enum Operation {
     Submit {
         text: String,
         host: Option<String>,
+        #[serde(default)]
+        confirm_reply: bool,
     },
     Interrupt,
     Resume {
@@ -380,12 +382,17 @@ impl Tmux<'_> {
     }
 
     fn worker_command(&self, t: &Target, action: &str) -> Reply<String> {
+        self.worker_command_if(t, action, "1")
+    }
+
+    fn worker_command_if(&self, t: &Target, action: &str, condition: &str) -> Reply<String> {
         if let Some((id, pid)) = &t.supervisor {
             if binding::host_launch_id(*pid, self.state, self.dispatch, t).as_ref() != Some(id) {
                 return Err(failure("refused", "original worker is no longer running"));
             }
         }
-        let live = format!("#{{&&:{EXCLUSIVE_WINDOW},#{{==:#{{pane_dead}},0}}}}");
+        let live =
+            format!("#{{&&:{EXCLUSIVE_WINDOW},#{{&&:#{{==:#{{pane_dead}},0}},{condition}}}}}");
         self.guarded(t, t.worker_pane()?, action, &t.guard_worker_process(&live))
     }
 
@@ -439,6 +446,23 @@ impl Tmux<'_> {
 
     fn operate(&self, op: Operation, fresh: bool) -> Reply<Value> {
         if let Some(id) = self.legacy_execution_id {
+            if matches!(
+                &op,
+                Operation::Submit {
+                    confirm_reply: true,
+                    ..
+                }
+            ) && self.close_blocks_input(id).map_err(|_| {
+                failure(
+                    "definitely-not-sent",
+                    "could not verify the execution close state",
+                )
+            })? {
+                return Err(failure(
+                    "definitely-not-sent",
+                    "original execution is closing or closed",
+                ));
+            }
             if let Some(reply) = self.replay_unverified_revocation(id)? {
                 return Ok(reply);
             }
@@ -553,9 +577,13 @@ impl Tmux<'_> {
             Operation::Create(launch) => self
                 .create(launch)
                 .map(|(_, receipt)| json!({"result":"accepted","receipt":receipt})),
-            Operation::Submit { text, host } => self
+            Operation::Submit {
+                text,
+                host,
+                confirm_reply,
+            } => self
                 .input_target()
-                .and_then(|target| self.submit(&target, &text, host.as_deref())),
+                .and_then(|target| self.submit(&target, &text, host.as_deref(), confirm_reply)),
             Operation::Resume {
                 launch,
                 host,

@@ -8,6 +8,7 @@ mod rpc;
 mod screen;
 pub use process::Process;
 use rpc::Session;
+pub use screen::{classify_reply_capture, ReplyBox};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -15,6 +16,11 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub type Result<T> = std::result::Result<T, Failure>;
+
+/// PTY redraws do not distinguish layout wrapping from a draft newline.
+pub fn matches_single_line_draft(shown: &str, sent: &str) -> bool {
+    !shown.is_empty() && shown == sent && !shown.chars().any(char::is_control)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -116,6 +122,7 @@ pub struct Binding {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Screen {
     pub text: String,
+    /// Herdr 0.9.5 reports zero for pane.read, independently of content changes.
     pub revision: u64,
     pub truncated: bool,
 }
@@ -400,15 +407,36 @@ impl Handle {
     }
 
     pub fn read(&self) -> Result<Screen> {
+        self.read_screen("text")
+    }
+
+    fn read_ansi(&self) -> Result<Screen> {
+        self.read_screen("ansi")
+    }
+
+    fn read_screen(&self, format: &str) -> Result<Screen> {
         let rpc = self.session()?;
         self.guarded(&rpc, false)?;
-        let data = rpc.call("pane.read",json!({"pane_id":self.pane,"source":"recent","format":"text","strip_ansi":true,"lines":200}))?;
+        let data = rpc.call("pane.read",json!({"pane_id":self.pane,"source":"recent","format":format,"strip_ansi":format != "ansi","lines":200}))?;
         if data["read"]["pane_id"].as_str() != self.pane.as_deref()
             || data["read"]["workspace_id"].as_str() != self.workspace.as_deref()
+            || (format == "ansi"
+                && (data["read"]["format"] != "ansi" || data["read"]["source"] != "recent"))
         {
             return Err(INVALID);
         }
         serde_json::from_value(data["read"].clone()).map_err(|_| INVALID)
+    }
+
+    fn prepare_send(
+        &mut self,
+        input: bool,
+        save: &mut impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<Session> {
+        let rpc = self.session()?;
+        self.checkpoint_writers(&rpc, save)?;
+        self.guarded(&rpc, input)?;
+        Ok(rpc)
     }
 
     fn send(
@@ -418,10 +446,7 @@ impl Handle {
         input: bool,
         save: &mut impl FnMut(&Self) -> std::io::Result<()>,
     ) -> Result<()> {
-        let rpc = self.session()?;
-        self.checkpoint_writers(&rpc, save)?;
-        self.guarded(&rpc, input)?;
-        rpc.call(method, params)?;
+        self.prepare_send(input, save)?.call(method, params)?;
         Ok(())
     }
 
@@ -455,6 +480,27 @@ impl Handle {
             screen::confirm_codex(self, text, &before, &mut save).map_err(Failure::after_effect)?;
         }
         Ok(())
+    }
+
+    pub fn submit_reply(
+        &mut self,
+        text: &str,
+        host: &str,
+        mut save: impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<()> {
+        let before = self.read().map_err(Failure::before_effect)?;
+        if screen::read_only(&before.text) {
+            return Err(Failure::refused("worker input is paused"));
+        }
+        screen::require_empty_reply_box(self, &before, host).map_err(Failure::before_effect)?;
+        // Preparation performs only observation and local checkpoints. An
+        // incomplete response to the subsequent input call may be post-effect.
+        let rpc = self
+            .prepare_send(true, &mut save)
+            .map_err(Failure::before_effect)?;
+        let params = json!({"pane_id":self.pane,"text":text,"keys":["Enter"]});
+        rpc.send_reply(params)?;
+        screen::confirm_reply(self, text, &before, host, &mut save).map_err(Failure::after_effect)
     }
 
     /// Close only the bound pane. Persist all observed writers before closing,

@@ -85,6 +85,20 @@ subprocess.run([sys.argv[1], 'ask', '选甲,乙？', '--options', '甲,乙',
         record = self.data("dispatch", "--task", "task", "--role", "复核", "--scope", "ours",
                            "--cwd", ".", "--", sys.executable, "-c", worker, WFC)
         self.until(lambda: self.data("status")["undelivered"])
+        ledger = Path(self.env["WFC_STATE"]) / "messages.json"
+        question, = json.loads(ledger.read_bytes())
+        worker_fields = {key: question[key] for key in ("dispatch", "round", "attempt", "role", "scope")}
+        worker_history = [
+            dict(worker_fields, id=question["id"] + 1, messageId=f"m-{uuid.uuid4().hex}",
+                 state="unsent", statusVersion=3, reply_payload={
+                     "to": question["id"], "questionMessageId": question["messageId"],
+                     "answer": "unsent reply", "inputResult": "definitely-not-sent",
+                     "diagnostic": "fixture", "category": None,
+                 }),
+            dict(worker_fields, id=question["id"] + 2, messageId=f"m-{uuid.uuid4().hex}",
+                 state="unsent", statusVersion=1, type="reclaimed", report=str(self.root / "task")),
+        ]
+        ledger.write_text(json.dumps([question, *worker_history]))
         self.cli("relay", "--scope", "ours", "--codex", "--for", "1")
         command, = self.calls()
         envelope = command[4]
@@ -95,9 +109,11 @@ subprocess.run([sys.argv[1], 'ask', '选甲,乙？', '--options', '甲,乙',
         message, = batch["messages"]
         self.assertEqual((message["type"], message["question"], message["options"]),
                          ("question", "选甲,乙？", ["甲", "乙"]))
+        self.assertEqual((message["id"], message["messageId"]), (question["id"], question["messageId"]))
         self.assertEqual((message["dispatch"], message["attempt"]), (record["dispatch"], record["attempt"]))
         confirmed = self.data("ack", message["messageId"])
         self.assertEqual((confirmed["state"], confirmed["statusVersion"]), ("processed", 4))
+        self.assertEqual(json.loads(ledger.read_bytes())[1:], [dict(row, request_key=None) for row in worker_history])
 
     def test_detached_scope(self):
         other = self.publish("other")

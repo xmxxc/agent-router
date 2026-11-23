@@ -135,6 +135,29 @@ pub(super) fn ids(dir: &Path) -> Result<BTreeSet<String>> {
 // The pending and published files can have different inodes. Close and new
 // questions must still serialize on the same attempt across that transition.
 pub(super) fn close_lock(state: &Path, row: &Value) -> Result<File> {
+    let file = attempt_lock_file(state, row)?;
+    file.lock()?;
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn try_reply_lock(state: &Path, row: &Value) -> Result<Option<File>> {
+    let file = attempt_lock_file(state, row)?;
+    Ok(try_input_lock(&file)?.then_some(file))
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn try_input_lock(file: &File) -> Result<bool> {
+    use std::fs::TryLockError;
+
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(TryLockError::WouldBlock) => Ok(false),
+        Err(TryLockError::Error(error)) => Err(error).context("lock worker input"),
+    }
+}
+
+fn attempt_lock_file(state: &Path, row: &Value) -> Result<File> {
     let dir = state.join("close-locks");
     let id = row["dispatch"]
         .as_str()
@@ -149,7 +172,5 @@ pub(super) fn close_lock(state: &Path, row: &Value) -> Result<File> {
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let file = options.open(dir.join(format!("{id}.{attempt}")))?;
-    file.lock()?;
-    Ok(file)
+    Ok(options.open(dir.join(format!("{id}.{attempt}")))?)
 }
