@@ -32,7 +32,7 @@ fn has_repairs(db: &Connection) -> Result<bool> {
     Ok(db.query_row(
         &format!(
             "SELECT EXISTS(SELECT 1 FROM message WHERE {INCOMPLETE_RECEIPT} OR {DELIVERY_CONFLICT})
-        OR EXISTS(SELECT 1 FROM dispatch d WHERE {IDENTITY} OR {NO_SNAPSHOT})
+        OR EXISTS(SELECT 1 FROM dispatch WHERE coalesce(backend,'')='')
         OR EXISTS(SELECT 1 {DONE_MATCH})"
         ),
         [],
@@ -86,7 +86,7 @@ fn register_functions(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn repair(db: &Connection) -> Result<()> {
+fn repair(db: &Connection, ids: Vec<String>) -> Result<()> {
     register_functions(db)?;
     db.execute(
         &format!(
@@ -102,19 +102,7 @@ fn repair(db: &Connection) -> Result<()> {
         [],
     )?;
 
-    // Python's oldest dispatches have no history at all. Never invent a new current
-    // writer for a partially populated ledger whose prior attempts already exist.
-    let ambiguous: Option<String> = db.query_row(
-        &format!(
-            "SELECT min(id) FROM dispatch d WHERE
-        (coalesce(current_attempt,'')='' OR coalesce(current_round,0)=0) AND NOT ({NO_SNAPSHOT})"
-        ),
-        [],
-        |r| r.get(0),
-    )?;
-    if let Some(id) = ambiguous {
-        bail!("dispatch {id} has attempt history but incomplete current identity; inspect the original ledger");
-    }
+    crate::recovery::recover_missing(db, ids)?;
     db.execute(&format!("UPDATE dispatch SET
         backend=coalesce(nullif(backend,''),'tmux'), scope=coalesce(nullif(scope,''),'s-'||substr(new_uuid(),1,8)),
         role=coalesce(nullif(role,''),legacy_role(report_dir)), current_round=coalesce(nullif(current_round,0),1),
@@ -123,6 +111,12 @@ fn repair(db: &Connection) -> Result<()> {
     db.execute(&format!("INSERT INTO dispatch_round (dispatch,round,attempt,task,report,state,created)
         SELECT id,current_round,current_attempt,task,report,'running',coalesce(created,unixepoch('subsec'))
         FROM dispatch d WHERE {NO_SNAPSHOT}"), [])?;
+    let conflicting: Option<String> = db.query_row(
+        &format!("SELECT r.dispatch {DONE_MATCH} GROUP BY r.rowid HAVING count(DISTINCT m.body)>1 LIMIT 1"),
+        [], |row| row.get(0)).optional()?;
+    if let Some(id) = conflicting {
+        bail!("dispatch {id} has conflicting done results");
+    }
     db.execute(&format!("WITH matches AS MATERIALIZED (
         SELECT r.rowid AS snapshot,min(m.id) AS receipt {DONE_MATCH} GROUP BY r.rowid)
         UPDATE dispatch_round SET state='completed',result=m.body,completed=m.created
@@ -154,7 +148,12 @@ pub fn open_offline_copy(state: &Path) -> Result<(Connection, Option<PathBuf>)> 
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (gaps, has_ledger) = schema::inspect(&tx)?;
     let mut original = None;
-    if !gaps.is_empty() || has_repairs(&tx)? {
+    let candidates = if gaps.is_empty() {
+        Some(crate::recovery::candidates(&tx)?)
+    } else {
+        None
+    };
+    if candidates.as_ref().is_none_or(|ids| !ids.is_empty()) || has_repairs(&tx)? {
         if has_ledger {
             original = Some(backup(&state).context("preserve pre-migration router.db")?);
         }
@@ -162,7 +161,11 @@ pub fn open_offline_copy(state: &Path) -> Result<(Connection, Option<PathBuf>)> 
         for gap in gaps {
             gap.upgrade(&tx)?;
         }
-        repair(&tx).with_context(|| format!("repair offline copy in {}", state.display()))?;
+        let ids = match candidates {
+            Some(ids) => ids,
+            None => crate::recovery::candidates(&tx)?,
+        };
+        repair(&tx, ids).with_context(|| format!("repair offline copy in {}", state.display()))?;
     }
     // A current identity authorizes writes only when that exact snapshot exists.
     let mismatch = tx

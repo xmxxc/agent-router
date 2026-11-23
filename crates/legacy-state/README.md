@@ -50,14 +50,18 @@
 `reclaim_preview(state, dispatch)` 和 `open_offline_copy(state)`。
 最后一个入口返回已提交升级的 rusqlite 连接与可选的备份路径，供调度层在完成停写切换后接续。
 状态输出是持久账本的离线视图；后端在线状态、待投递权限、owner 授权、回调真实性和回收执行由各自的调用方实现。
+快照缺失时，迁移会核对回执正文、生命周期审计和已有尝试记录。能确定归属的 done 按原轮次、attempt、报告及原始正文恢复。
+缺少结果证据、存在多个当前候选或证据冲突时，迁移点名任务并回滚。早于 attempt 机制的记录仍可分配首轮身份。
+仅剩屏幕观察记录的任务可按 ID 查看观察时间 `screenObservedSince`，当前身份和在线状态显示为未知。
 已有尝试历史时，取得写连接需要当前轮次和 attempt 同时匹配快照。身份冲突时返回任务诊断；即使库无需升级也执行此检查。多次尝试复用同一报告时，只把能确定归属的 done 计入轮次。
 
 ```sh
 cargo test --locked -p wfc-legacy-state
 python3 crates/legacy-state/tests/python_ledger.py /path/to/workflow-core-checkout target/debug/wfc-legacy-state
+python3 crates/legacy-state/tests/python_recovery.py /path/to/workflow-core-checkout target/debug/wfc-legacy-state
 ```
 
-第二条用 #39 或 #40 固定版自带的隔离宿主夹具生成两轮记录。它在副本上核对已有 scope、
+跨版本检查用 #39 或 #40 固定版自带的隔离宿主夹具生成两轮记录。它在副本上核对已有 scope、
 已收未 ack 与 unknown 回执、各表逐条数据，以及迁移后原 Python 对 owner 的校验和 ack。
 
 共享根命令接入后，需用最终 Linux 下载件复验状态目录发现、历史回执公开字段、owner/worker 鉴权、实际后端身份、回收与回退。

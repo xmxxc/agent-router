@@ -115,8 +115,16 @@ def run(source, binary):
             assert bad.returncode == 1 and "stale_controller_owner" in bad.stderr
             ack = env.json("ack", msg["messageId"], *auth, env=copy_env)
             assert ack["state"] == "processed" and ack["statusVersion"] == msg["statusVersion"] + 1
+            decision = env.json("resolve", unknown["messageId"], "--actor", "reviewer", "--reason", "confirmed",
+                                "--evidence", "fixture", "--body-hash", unknown["bodyHash"], *auth, env=copy_env)
+            resolved = next(m for m in rust("status", "--dispatch", dispatch)["dispatches"][0]["messages"]
+                            if m["id"] == ask["message"])
+            expected = next(m for m in env.json("status", "--dispatch", dispatch, env=copy_env)["dispatches"][0]["messages"]
+                            if m["id"] == ask["message"])
+            assert isinstance(resolved["resolution"]["at"], str)
+            assert resolved["resolution"] == expected["resolution"] == decision["resolution"]
             assert hashlib.sha256(source_db.read_bytes()).digest() == original
-        print(f"{revision[:8]}: paths, two rounds, claimed scope, received/unknown, reply target, resolution generation, backup, full SQL comparison, Python ack OK")
+        print(f"{revision[:8]}: paths, two rounds, claimed scope, received/unknown, reply target, resolution generation, backup, full SQL comparison, Python ack and resolution.at OK")
     finally:
         env.close()
 

@@ -332,7 +332,9 @@ fn evidence_without_dispatch_rows_is_visible_before_and_after_migration() {
         CREATE TABLE host_error(dispatch TEXT PRIMARY KEY,turn TEXT);
         INSERT INTO host_error VALUES('host-error-only','old-turn');
         CREATE TABLE lifecycle_event(id INTEGER PRIMARY KEY,dispatch TEXT,operation TEXT,attempt TEXT);
-        INSERT INTO lifecycle_event VALUES(19,'audit-only','create','a-pending');"#).unwrap();
+        INSERT INTO lifecycle_event VALUES(19,'audit-only','create','a-pending');
+        CREATE TABLE screen_watch(dispatch TEXT PRIMARY KEY,screen TEXT,since REAL,reported_screen TEXT);
+        INSERT INTO screen_watch VALUES('screen-only','private-screen-bytes',29.99,'private-previous-screen');"#).unwrap();
     drop(db);
     let original_hash = Sha256::digest(fs::read(&db_file).unwrap());
     fs::copy(&db_file, copy.path().join("router.db")).unwrap();
@@ -351,7 +353,9 @@ fn evidence_without_dispatch_rows_is_visible_before_and_after_migration() {
         }
         let overview = json(command(dir).arg("status"));
         let rows = overview["dispatches"].as_array().unwrap();
-        assert_eq!(rows.len(), 6);
+        assert_eq!(rows.len(), 7);
+        assert!(!overview.to_string().contains("private-screen"));
+        assert!(!overview.to_string().contains("private-previous"));
         for entry in rows {
             for key in [
                 "attempt",
@@ -389,6 +393,7 @@ fn evidence_without_dispatch_rows_is_visible_before_and_after_migration() {
                     assert_eq!(entry["watchdogFaults"][0]["attempt"], "a-old");
                 }
                 "host-error-only" => assert_eq!(entry["hostError"]["turn"], "old-turn"),
+                "screen-only" => assert_eq!(entry["screenObservedSince"], 29.99),
                 "audit-only" => assert_eq!(entry["audit"][0]["attempt"], "a-pending"),
                 _ => panic!("unexpected dispatch {id}"),
             }
@@ -457,4 +462,144 @@ fn resolves_dangling_state_links_and_rejects_unknown_named_home() {
         .unwrap();
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("home directory"));
+}
+
+#[test]
+fn an_audit_can_bind_a_partial_receipt_but_cannot_claim_an_unrelated_legacy_done() {
+    for body in [
+        r#"{"round":2,"report":"/r","scope":"s"}"#,
+        r#"{"report":"/r"}"#,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("router.db");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE dispatch(id TEXT PRIMARY KEY,report TEXT);
+            INSERT INTO dispatch VALUES('old','/r');
+            CREATE TABLE lifecycle_event(id INTEGER PRIMARY KEY,dispatch TEXT,round INTEGER,attempt TEXT,to_attempt TEXT);
+            INSERT INTO lifecycle_event VALUES(1,'old',2,'a-real','a-real');
+            CREATE TABLE message(id INTEGER PRIMARY KEY,dispatch TEXT,type TEXT,body TEXT,created REAL);").unwrap();
+        db.execute("INSERT INTO message VALUES(9,'old','done',?,42)", [body])
+            .unwrap();
+        drop(db);
+        let before = fs::read(&path).unwrap();
+        let result = wfc_legacy_state::open_offline_copy(tmp.path());
+        if body.contains("round") {
+            let (_, backup) = result.unwrap();
+            assert!(backup.unwrap().is_file());
+            let d = &details(tmp.path())["dispatches"][0];
+            assert_eq!(d["round"], 2);
+            assert_eq!(d["attempt"], "a-real");
+            assert_eq!(d["rounds"][0]["result"], body);
+        } else {
+            assert!(format!("{:#}", result.unwrap_err()).contains("dispatch old"));
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn pre_attempt_completion_recovers_its_only_report_and_stays_stable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Connection::open(tmp.path().join("router.db")).unwrap();
+    db.execute_batch(r#"CREATE TABLE dispatch(id TEXT PRIMARY KEY,task TEXT);
+        INSERT INTO dispatch VALUES('old','/t');
+        CREATE TABLE message(id INTEGER PRIMARY KEY, dispatch TEXT,type TEXT,body TEXT,created REAL);
+        INSERT INTO message VALUES(21,'old','done','{"report":"/early/report"}',14);"#).unwrap();
+    drop(db);
+    let (_, backup) = wfc_legacy_state::open_offline_copy(tmp.path()).unwrap();
+    assert!(backup.unwrap().is_file());
+    let view = details(tmp.path());
+    let d = &view["dispatches"][0];
+    assert_eq!(d["round"], 1);
+    assert!(d["attempt"].as_str().unwrap().starts_with("a-"));
+    assert_eq!(d["report"], "/early/report");
+    assert_eq!(d["rounds"][0]["result"], d["messages"][0]["body"]);
+    assert_eq!(d["status"], "completed");
+    assert!(wfc_legacy_state::open_offline_copy(tmp.path())
+        .unwrap()
+        .1
+        .is_none());
+    assert_eq!(details(tmp.path()), view);
+}
+
+#[test]
+fn conflicting_done_results_do_not_choose_the_first_message() {
+    for existing_snapshot in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _) = wfc_legacy_state::open_offline_copy(dir.path()).unwrap();
+        db.execute("INSERT INTO dispatch(id,report) VALUES('old','/r')", [])
+            .unwrap();
+        if existing_snapshot {
+            db.execute_batch("UPDATE dispatch SET scope='s', role='w', current_attempt='a';
+                INSERT INTO dispatch_round(dispatch,round,attempt,report) VALUES('old',1,'a','/r');").unwrap();
+        }
+        db.execute_batch(
+            r#"INSERT INTO message(dispatch,type,body) VALUES
+            ('old','done','{"report":"/r","head":"abc"}'),
+            ('old','done','{"report":"/r","head":"def"}');"#,
+        )
+        .unwrap();
+        drop(db);
+        let path = dir.path().join("router.db");
+        let original = fs::read(&path).unwrap();
+        let err = wfc_legacy_state::open_offline_copy(dir.path()).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("old") && message.contains("conflicting"),
+            "{message}"
+        );
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+}
+
+#[test]
+fn partial_snapshot_needs_an_outcome_and_retains_its_existing_row() {
+    for done in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _) = wfc_legacy_state::open_offline_copy(dir.path()).unwrap();
+        db.execute_batch(
+            "INSERT INTO dispatch(id,report,current_round) VALUES('old','/r',NULL);
+            INSERT INTO lifecycle_event(dispatch,round,attempt) VALUES('old',2,'a-real');
+            INSERT INTO dispatch_round(dispatch,round,attempt,report,state,callback_channel)
+                VALUES('old',2,NULL,'/r',NULL,'preserve');",
+        )
+        .unwrap();
+        if done {
+            db.execute_batch(
+                r#"INSERT INTO message(dispatch,type,body)
+                VALUES('old','done','{"round":2,"attempt":"a-real","report":"/r"}');"#,
+            )
+            .unwrap();
+        }
+        drop(db);
+        let path = dir.path().join("router.db");
+        let before = fs::read(&path).unwrap();
+        let result = wfc_legacy_state::open_offline_copy(dir.path());
+        if done {
+            let db = result.unwrap().0;
+            let row: (i64, String, String, String) = db
+                .query_row(
+                    "SELECT count(*),attempt,state,callback_channel FROM dispatch_round",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                row,
+                (
+                    1,
+                    "a-real".to_string(),
+                    "completed".to_string(),
+                    "preserve".to_string()
+                )
+            );
+        } else {
+            let message = format!("{:#}", result.unwrap_err());
+            assert!(
+                message.contains("dispatch old") && message.contains("missing snapshot state"),
+                "{message}"
+            );
+            assert_eq!(fs::read(path).unwrap(), before);
+        }
+    }
 }

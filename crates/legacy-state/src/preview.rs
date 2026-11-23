@@ -13,7 +13,7 @@ const MESSAGE: &str = "SELECT id,coalesce(nullif(message_uid,''),cast(id AS text
     dispatch,type,recipient AS 'to',datetime(epoch_second(created),'unixepoch','localtime') AS 'at',
     coalesce(nullif(state,''),CASE WHEN delivered THEN 'received' ELSE 'unsent' END) AS state,
     coalesce(nullif(status_version,0),1) AS statusVersion,body_hash AS bodyHash,body,delivered,
-    resolver_actor,resolution_source,resolution_reason,resolution_evidence,resolved_at FROM message";
+    resolver_actor,resolution_source,resolution_reason,resolution_evidence,datetime(epoch_second(resolved_at),'unixepoch','localtime') AS resolved_at FROM message";
 
 fn rows(db: &Connection, sql: &str, params: impl Params) -> Result<Vec<Value>> {
     let mut stmt = db.prepare(sql)?;
@@ -64,7 +64,7 @@ fn messages(db: &Connection, filter: &str, id: Option<&str>) -> Result<Vec<Value
         let resolution = json!({"actor":actor,"source":map.remove("resolution_source"),
             "reason":map.remove("resolution_reason"),"evidence":map.remove("resolution_evidence"),
             "at":map.remove("resolved_at")});
-        if !actor.is_null() {
+        if actor.as_str().is_some_and(|s| !s.is_empty()) {
             map.insert("resolution".into(), resolution);
         }
     }
@@ -136,7 +136,7 @@ fn reader(state: &Path) -> Result<Option<(Connection, bool)>> {
         WITH ids(id) AS (SELECT id FROM dispatch UNION SELECT dispatch FROM message
             UNION SELECT dispatch FROM dispatch_round UNION SELECT dispatch FROM fault_event
             UNION SELECT dispatch FROM lifecycle_event UNION SELECT dispatch FROM watchdog_fault
-            UNION SELECT dispatch FROM host_error)
+            UNION SELECT dispatch FROM host_error UNION SELECT dispatch FROM screen_watch)
         SELECT ids.id AS history_id, d.*,
             CASE WHEN d.id IS NOT NULL THEN coalesce(nullif(d.backend,''),'tmux') END AS known_backend,
             coalesce(r.state,'unknown') AS current_state,
@@ -177,7 +177,8 @@ pub fn status(state: &Path, dispatch: Option<&str>, active: bool) -> Result<Valu
     let mut dispatches = rows(&db, "SELECT history_id AS dispatch, id IS NOT NULL AS dispatchRecorded, scope,role,label,host,model,cwd,task,report,
         host_session AS hostSession,started,current_round AS round,current_attempt AS attempt,
         known_backend AS backend,backend_handle AS backendHandle,current_state AS status,diagnostic,
-        launch_receipt AS launchReceipt FROM offline_dispatch WHERE ?1 IS NULL OR history_id=?1 ORDER BY created,history_id", [dispatch])?;
+        launch_receipt AS launchReceipt,(SELECT since FROM screen_watch WHERE dispatch=history_id) AS screenObservedSince
+        FROM offline_dispatch WHERE ?1 IS NULL OR history_id=?1 ORDER BY created,history_id", [dispatch])?;
     ensure!(
         dispatch.is_none() || !dispatches.is_empty(),
         "unknown dispatch {}",
