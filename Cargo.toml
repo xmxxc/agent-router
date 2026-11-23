@@ -1,6 +1,6 @@
 [package]
-name = "herdr-kernel-prototype"
-version = "0.0.0"
+name = "wfc"
+version = "0.1.0"
 edition = "2021"
 publish = false
 

@@ -8,8 +8,8 @@ import time
 import uuid
 
 
-def run(binary):
-    with subprocess.Popen([str(binary)], cwd=binary.parent, stdin=subprocess.PIPE,
+def run(binary, *args):
+    with subprocess.Popen([str(binary), *args], cwd=binary.parent, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, encoding="utf-8") as kernel:
         # Bound a stalled hello or RPC as well as the polling loop.
         deadline = Timer(45, kernel.kill)
@@ -76,4 +76,4 @@ def run(binary):
 
 
 if __name__ == "__main__":
-    run(Path(sys.argv[1]).resolve())
+    run(Path(sys.argv[1]).resolve(), *sys.argv[2:])
