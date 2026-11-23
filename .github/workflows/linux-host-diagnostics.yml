@@ -9,14 +9,14 @@ permissions:
 jobs:
   linux-host-diagnostics:
     name: '#14 with #16, #36 and #38'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 40
     defaults:
       run:
         shell: bash
     env:
-      PRODUCT_SHA: 5b347c4582ff99a515a08f0c0344b4f93bf66683
-      PRODUCT_TREE: 8a8ca29b9b5b8a4b10f010ca5622dbb2c696bfa1
+      PRODUCT_SHA: 3bbb7d209bf4e1c0775d5f9b18e611b4f8dc3d4a
+      PRODUCT_TREE: f7a31b7c7b2f7f0a2d9d9d92dbe81c1548634e7d
       PRODUCT_PARENTS: 'f8d5e713d3e5e41cf4eff94b7583c875034092c0 197f3d14a24d1fbd545453c7ac08a5c06c125585'
       REFERENCE_RUNS: '45246627284/2 45250815210/1'
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
@@ -70,7 +70,7 @@ jobs:
             git -C ../native-input show -s --format='native-input=%H tree=%T'
             printf '%s  %s\n' 17e88863f3600672ab49182f217281b6fc4d3c762bde361935e436a95214d05c \
               ../native-input/vendor/zlib-1.3.1.tar.gz | sha256sum --check --strict
-            printf '%s  %s\n' 58d287fe1006ad58e4a74d75718a2ece32064bda4577f2d8bd6b2ee73440490b vendor/INPUTS.sha256 | sha256sum --check --strict
+            printf '%s  %s\n' 509bbb2757bdf1145f4bffd8023f1244403611303d00ba1e2de5e4fa45078640 vendor/INPUTS.sha256 | sha256sum --check --strict
             sha256sum vendor/INPUTS.sha256
             sha256sum --check --strict vendor/INPUTS.sha256
           } 2>&1 | tee "$EVIDENCE/sources.log"
