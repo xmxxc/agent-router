@@ -114,7 +114,7 @@ impl Session {
             service,
             deadline,
         };
-        let pong = rpc.exchange(socket, "ping", json!({}), None)?;
+        let pong = rpc.exchange(socket, "ping", json!({}), None, None)?;
         if pong["version"] != "0.9.5" || pong["protocol"] != 22 {
             return Err(Failure::refused(
                 "Herdr requires version 0.9.5 / protocol 22",
@@ -133,7 +133,7 @@ impl Session {
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
         let unsent = (method == "pane.close").then_some("Herdr close was not sent");
-        self.call_with_write_boundary(method, params, unsent)
+        self.call_with_write_boundary(method, params, unsent, None)
     }
 
     pub(super) fn send_reply(&self, params: Value) -> Result<Value> {
@@ -141,7 +141,16 @@ impl Session {
             "pane.send_input",
             params,
             Some("Herdr reply input was not sent"),
+            None,
         )
+    }
+
+    pub(super) fn read_pane(
+        &self,
+        params: Value,
+        progress: Option<&mut dyn FnMut(bool)>,
+    ) -> Result<Value> {
+        self.call_with_write_boundary("pane.read", params, None, progress)
     }
 
     fn call_with_write_boundary(
@@ -149,6 +158,7 @@ impl Session {
         method: &str,
         params: Value,
         unsent: Option<&'static str>,
+        progress: Option<&mut dyn FnMut(bool)>,
     ) -> Result<Value> {
         let before_send = |e: Failure| {
             if unsent.is_some() {
@@ -163,7 +173,7 @@ impl Session {
                 "Herdr service identity changed",
             )));
         }
-        self.exchange(socket, method, params, unsent)
+        self.exchange(socket, method, params, unsent, progress)
     }
 
     fn exchange(
@@ -172,6 +182,7 @@ impl Session {
         method: &str,
         params: Value,
         unsent: Option<&'static str>,
+        progress: Option<&mut dyn FnMut(bool)>,
     ) -> Result<Value> {
         let id = Uuid::new_v4().simple().to_string();
         let mut frame =
@@ -203,6 +214,18 @@ impl Session {
             }
             bytes = &bytes[n..];
         }
+        // A fully written, peer-checked frame is distinct from waiting on a
+        // local lock, opening a socket, or checking the pane binding.
+        struct InFlight<'a>(&'a mut dyn FnMut(bool));
+        impl Drop for InFlight<'_> {
+            fn drop(&mut self) {
+                (self.0)(false);
+            }
+        }
+        let _pending = progress.map(|progress| {
+            progress(true);
+            InFlight(progress)
+        });
         frame.clear();
         let mut chunk = [0; 8192];
         loop {

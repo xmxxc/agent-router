@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const RECORDS_PER_SLICE: usize = 16;
+pub(super) const RECORDS_PER_SLICE: usize = 16;
 pub(super) const SLICE: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -144,7 +144,7 @@ impl Generations {
         }
     }
 
-    fn published(&self) -> Option<&Value> {
+    pub(super) fn published(&self) -> Option<&Value> {
         self.published
             .as_ref()
             .filter(|_| !self.damaged)
@@ -262,7 +262,7 @@ impl Scan {
     }
 }
 
-fn dispatch_filename(name: &[u8]) -> Option<&str> {
+pub(super) fn dispatch_filename(name: &[u8]) -> Option<&str> {
     std::str::from_utf8(name)
         .ok()?
         .strip_suffix(".json")
@@ -290,7 +290,7 @@ impl Inbox {
         for message in self
             .messages
             .iter()
-            .filter(|message| message.is_controller_message())
+            .filter(|message| message.blocks_startup_notice())
         {
             missing.remove(&generation(&message.worker));
             if missing.is_empty() {

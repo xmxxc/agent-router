@@ -3,7 +3,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import socket
+import sys
 import threading
 import unittest
 
@@ -143,6 +145,37 @@ class OpenCodeRelay(unittest.TestCase):
         second, = self.batch(self.posts[1], "ses_neighbor")
         self.assertEqual(second["messageId"], neighbor["messageId"])
         self.assertEqual(len(self.posts), 2)
+
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_runtime_notice_preserves_the_explicit_opencode_target(self):
+        relay.Relay.start_private_tmux(self)
+        self.rollout.unlink()
+        fixture = "import time; print('Quota exceeded', flush=True); time.sleep(20)"
+        config = self.root / "launch.json"
+        config.write_text(json.dumps({"hosts": {
+            "codex": {"command": [sys.executable, "-c", fixture]},
+        }}))
+        job = self.data("dispatch", "--task", "task", "--role", "worker", "--scope", "ours",
+                        "--report", "task", "--cwd", ".", "--host", "codex", "--launch-config", str(config))
+        neighbor = self.publish("neighbor")
+        self.send("2")
+        [post] = self.posts
+        [notice] = self.batch(post)
+        self.assertEqual((notice["kind"], notice["type"], notice["fault"]["category"]),
+                         ("host_runtime", "blocked", "quota"))
+        for key in ("dispatch", "round", "attempt", "scope"):
+            self.assertEqual(notice[key], job[key])
+        ack = self.data("ack", notice["messageId"])
+        self.assertEqual((ack["messageId"], ack["state"]), (notice["messageId"], "processed"))
+        self.assertTrue(self.data("ack", notice["messageId"])["duplicate"])
+        self.send(".65")
+        self.assertEqual(len(self.posts), 1)
+        self.assertEqual(self.row(neighbor)["state"], "unsent")
+        self.assertFalse(self.calls())
+        self.assertEqual(self.data("close", job["dispatch"])["result"], "completed")
+        print(json.dumps({"case": "runtime-opencode", "session": self.session,
+                          "receipt": notice["messageId"], "neighbor": neighbor["messageId"]}),
+              flush=True)
 
     def test_connection_refused_is_unsent_and_can_retry_original_id(self):
         receipt = self.publish("ours")

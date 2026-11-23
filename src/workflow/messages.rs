@@ -4,6 +4,10 @@ mod receipt;
 #[cfg(target_os = "linux")]
 mod recovery;
 #[cfg(target_os = "linux")]
+pub(super) mod runtime;
+#[cfg(target_os = "linux")]
+pub(crate) use runtime::{run_runtime_owner, run_runtime_probe};
+#[cfg(target_os = "linux")]
 pub mod relay;
 #[cfg(target_os = "linux")]
 mod reply;
@@ -29,6 +33,9 @@ pub const DONE_USAGE: &str =
     "wfc done --report FILE [--attempt ID] [--message-id KEY] [--owner-token TOKEN]";
 pub const ASK_USAGE: &str =
     "wfc ask QUESTION [--options CSV] [--attempt ID] [--callback-ref REF] [--message-id KEY] [--owner-token TOKEN]";
+#[cfg(target_os = "linux")]
+pub const WAIT_USAGE: &str = "wfc wait [--timeout SECONDS] [--dispatch ID] [--scope NAME] [--owner-token TOKEN] [--stall-after SECONDS]";
+#[cfg(not(target_os = "linux"))]
 pub const WAIT_USAGE: &str =
     "wfc wait [--timeout SECONDS] [--scope NAME] [--dispatch ID] [--owner-token TOKEN]";
 
@@ -283,6 +290,7 @@ enum MessageKind {
     Question,
     Reply,
     Reclaimed,
+    HostRuntime,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -428,6 +436,12 @@ impl Message {
             MessageKind::StartupFailure
         } else if self.reply_payload.is_some() {
             MessageKind::Reply
+        } else if self
+            .additional_fields
+            .get("kind")
+            .is_some_and(|kind| kind == "host_runtime")
+        {
+            MessageKind::HostRuntime
         } else if self.question_payload.is_some() {
             MessageKind::Question
         } else {
@@ -442,7 +456,10 @@ impl Message {
     fn is_controller_message(&self) -> bool {
         matches!(
             self.kind(),
-            MessageKind::Done | MessageKind::Question | MessageKind::StartupFailure
+            MessageKind::Done
+                | MessageKind::Question
+                | MessageKind::StartupFailure
+                | MessageKind::HostRuntime
         )
     }
 
@@ -464,6 +481,19 @@ impl Message {
                     && self.reply_payload.is_none()
                     && self.request_key.is_none()
             }
+            MessageKind::HostRuntime => {
+                self.question_payload.is_none()
+                    && self.reply_payload.is_none()
+                    && self.request_key.is_none()
+                    && matches!(
+                        self.additional_fields.get("type").and_then(Value::as_str),
+                        Some("blocked" | "unknown" | "stalled" | "exited" | "recovered")
+                    )
+                    && self
+                        .additional_fields
+                        .get("fault")
+                        .is_some_and(Value::is_object)
+            }
         }
     }
 
@@ -475,13 +505,18 @@ impl Message {
         body
     }
 
-    fn is_startup_failure(&self) -> bool {
-        self.kind() == MessageKind::StartupFailure
+    #[cfg(target_os = "linux")]
+    fn blocks_startup_notice(&self) -> bool {
+        // An independent runtime observation is not startup deduplication evidence.
+        matches!(
+            self.kind(),
+            MessageKind::Done | MessageKind::Question | MessageKind::StartupFailure
+        )
     }
 
     fn message_type(&self) -> &str {
         match self.kind() {
-            MessageKind::StartupFailure => self
+            MessageKind::StartupFailure | MessageKind::HostRuntime => self
                 .additional_fields
                 .get("type")
                 .and_then(Value::as_str)
@@ -504,7 +539,10 @@ impl Message {
             return question.body(&self.worker);
         }
         let mut body = self.original_body();
-        if self.is_startup_failure() {
+        if matches!(
+            self.kind(),
+            MessageKind::StartupFailure | MessageKind::HostRuntime
+        ) {
             body.insert("scope".into(), json!(self.worker.scope()));
             for key in ["kind", "host", "message", "fault"] {
                 if let Some(value) = self.additional_fields.get(key) {
@@ -856,7 +894,7 @@ impl Inbox {
     ) -> bool {
         let worker = &assignment.worker;
         if self.messages.iter().any(|m| {
-            m.is_controller_message()
+            m.blocks_startup_notice()
                 && m.worker.dispatch == worker.dispatch
                 && m.worker.attempt == worker.attempt
                 && m.worker.round == worker.round
@@ -1213,7 +1251,10 @@ pub(super) fn history(state: &Path, dispatch: &str) -> Result<Vec<Value>> {
         .map(|m| {
             let mut view = m.view();
             match m.kind() {
-                MessageKind::Done | MessageKind::Question | MessageKind::StartupFailure => {
+                MessageKind::Done
+                | MessageKind::Question
+                | MessageKind::StartupFailure
+                | MessageKind::HostRuntime => {
                     view["to"] = json!("controller");
                     view["delivered"] = json!(m.delivery.delivered());
                 }
@@ -1574,10 +1615,25 @@ pub struct Wait<'a> {
     dispatch: Option<&'a str>,
     scope: Option<&'a str>,
     owner_token: Option<&'a str>,
+    #[cfg(target_os = "linux")]
+    stall_after: Duration,
 }
 
 impl<'a> Wait<'a> {
     pub fn parse(args: &'a [OsString]) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        let [timeout, dispatch, scope, owner_token, stall_after] = options(
+            args,
+            [
+                "--timeout",
+                "--dispatch",
+                "--scope",
+                "--owner-token",
+                "--stall-after",
+            ],
+            None,
+        )?;
+        #[cfg(not(target_os = "linux"))]
         let [timeout, dispatch, scope, owner_token] = options(
             args,
             ["--timeout", "--dispatch", "--scope", "--owner-token"],
@@ -1595,6 +1651,8 @@ impl<'a> Wait<'a> {
             dispatch,
             scope,
             owner_token,
+            #[cfg(target_os = "linux")]
+            stall_after: runtime::seconds(stall_after.unwrap_or("300"))?,
         })
     }
 
@@ -1604,6 +1662,8 @@ impl<'a> Wait<'a> {
         let start = Instant::now();
         #[cfg(target_os = "linux")]
         let (mut scan, mut pending, mut first) = (recovery::Scan::default(), None, true);
+        #[cfg(target_os = "linux")]
+        let mut runtime = runtime::Monitor::new(self.stall_after);
         loop {
             let preflight = || {
                 controller::Owners::read(&state)?.preflight(self.scope, token.as_deref(), "wait")
@@ -1647,10 +1707,23 @@ impl<'a> Wait<'a> {
                 return Ok(batch);
             }
             #[cfg(target_os = "linux")]
+            if runtime.poll(
+                &state,
+                self.dispatch,
+                self.scope,
+                token.as_deref(),
+                remaining,
+            )? {
+                continue;
+            }
+            #[cfg(target_os = "linux")]
             if more {
                 continue;
             }
-            std::thread::sleep(remaining.min(Duration::from_millis(100)));
+            let delay = Duration::from_millis(100);
+            #[cfg(target_os = "linux")]
+            let delay = runtime.delay(delay);
+            std::thread::sleep(self.timeout.saturating_sub(start.elapsed()).min(delay));
         }
     }
 }

@@ -73,10 +73,12 @@ class StartupFailure(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline, description)
             time.sleep(.002)
 
-    def check_ack(self, message):
+    def check_ack(self, message, *, earlier=()):
         public = self.cli("status", "--dispatch", message["dispatch"])["dispatches"][0]
-        notice, = public["messages"]
-        self.assertEqual(notice["messageId"], message["messageId"])
+        self.assertEqual([m["messageId"] for m in public["messages"]], [*earlier, message["messageId"]])
+        notice = public["messages"][-1]
+        self.assertEqual((notice["id"], notice["to"], notice["delivered"]),
+                         (message["id"], "controller", True))
         self.assertEqual(public["startupFailure"], message["fault"])
         self.assertNotIn(SECRET, json.dumps(notice))
         body = {key: message[key] for key in
@@ -511,6 +513,31 @@ class StartupFailure(unittest.TestCase):
         self.assertFalse(ledger.exists())
         self.assertFalse(self.cli("wait", "--dispatch", child["dispatch"], "--scope", "wrong-scope", "--timeout", "0", code=3)["messages"])
         self.assertFalse(ledger.exists())
+
+        pending = self.state / "dispatches" / f"{child['dispatch']}.pending"
+        previous = pending.read_bytes() if pending.is_file() else None
+        pending.unlink(missing_ok=True)
+        os.mkfifo(pending, 0o600)
+        try:
+            # A positive timeout reaches runtime observation as well as startup recovery.
+            self.assertFalse(self.cli("wait", "--dispatch", child["dispatch"], "--scope", scope,
+                                      "--timeout", ".2", code=3)["messages"])
+            queue, env = self.codex_capture()
+            self.cli("relay", "--scope", scope, "--codex", "--for", ".3", extra=env)
+            self.assertFalse(queue.exists())
+            self.assertFalse(ledger.exists())
+        finally:
+            pending.unlink()
+            if previous is not None:
+                pending.write_bytes(previous)
+
+        # An already delivered runtime notice for this exact generation must
+        # not substitute for the missing verified startup outcome.
+        runtime = {key: row[key] for key in ("dispatch", "round", "attempt", "role", "scope", "host", "report")}
+        runtime.update(id=1, messageId="m-runtime-fixture", request_key=None, kind="host_runtime",
+                       type="blocked", message="Host reported a quota limit", state="received", statusVersion=2,
+                       fault={"category": "quota", "evidence": "screen_notice"})
+        ledger.write_text(json.dumps([runtime]))
         args = [BINARY, "wait", "--scope", scope, "--timeout", "1.5"]
         with ThreadPoolExecutor(max_workers=2) as waiters:
             results = list(waiters.map(lambda _: subprocess.run(args, cwd=self.cwd, env=self.env,
@@ -522,10 +549,22 @@ class StartupFailure(unittest.TestCase):
                          (child["dispatch"], scope, child["attempt"], 1))
         self.assertEqual((message["fault"]["exitCode"], message["fault"]["pid"], message["fault"]["launchId"]),
                          (17, child["pid"], Path(row["create"]["receipt"]).stem))
-        self.check_ack(message)
-        self.assertEqual(len(json.loads(ledger.read_text())), 1)
+        self.assertEqual((message["id"], message["kind"], message["type"]), (2, "startup_failure", "exited"))
+        public = self.check_ack(message, earlier=(runtime["messageId"],))
+        retained = public["messages"][0]
+        for key in ("id", "messageId", "kind", "type", "dispatch", "round", "attempt", "scope", "fault"):
+            self.assertEqual(retained[key], runtime[key])
+        self.assertEqual((retained["to"], retained["delivered"]), ("controller", True))
+        ack = self.cli("ack", runtime["messageId"])
+        self.assertEqual((ack["message"], ack["messageId"], ack["state"]),
+                         (runtime["id"], runtime["messageId"], "processed"))
+        stored = json.loads(ledger.read_text())
+        self.assertEqual([(m["id"], m["messageId"], m["kind"]) for m in stored],
+                         [(runtime["id"], runtime["messageId"], "host_runtime"),
+                          (message["id"], message["messageId"], "startup_failure")])
         print(json.dumps({"case": scope, "dispatch": child["dispatch"], "attempt": child["attempt"],
-                          "messageId": message["messageId"], "waitExitCodes": [0, 3], "ackVerified": True}), flush=True)
+                          "messageId": message["messageId"], "runtimeMessageId": runtime["messageId"],
+                          "waitExitCodes": [0, 3], "ackVerified": True}), flush=True)
 
         done_scope = "interrupted-with-done"
         completed, _ = self.stop_after_startup_decision(done_scope, done=True)

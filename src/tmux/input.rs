@@ -45,6 +45,10 @@ fn notices(screen: &str) -> Notices {
     found
 }
 
+pub(crate) fn codex_read_only(screen: &str) -> bool {
+    notices(screen).state.is_some()
+}
+
 // Only the last prompt immediately above the model footer is a composer.
 // Submitted transcript lines use the same leading glyph.
 #[derive(PartialEq)]
