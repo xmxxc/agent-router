@@ -635,7 +635,8 @@ pub fn observe(state: &Path, row: &mut Value) -> Result<(Value, Value)> {
     if row["backend"] == "herdr" {
         return super::herdr::observe(state, row);
     }
-    observe_tmux(state, &execution_row(row)?)
+    let physical = execution_row(row)?;
+    observe_tmux(state, physical.as_ref())
 }
 
 fn observe_tmux(state: &Path, row: &Value) -> Result<(Value, Value)> {
@@ -751,7 +752,8 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
     if row["backend"] == "herdr" {
         return super::herdr::close(state, row);
     }
-    let result = close_tmux(state, &execution_row(row)?)?;
+    let physical = execution_row(row)?;
+    let result = close_tmux(state, physical.as_ref())?;
     Ok(public_close(result, row))
 }
 
