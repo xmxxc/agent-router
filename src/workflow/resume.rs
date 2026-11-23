@@ -7,7 +7,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Read},
     os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
+    path::Path,
 };
 use uuid::Uuid;
 

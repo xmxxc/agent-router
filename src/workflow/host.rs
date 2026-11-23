@@ -240,7 +240,7 @@ impl Options<'_> {
         record: &mut Value,
         resume: Option<&str>,
     ) -> Result<Launch> {
-        let cwd = Path::new(record["cwd"].as_str().context("missing cwd")?);
+        let cwd = PathBuf::from(record["cwd"].as_str().context("missing cwd")?);
         let report = Path::new(record["report"].as_str().context("missing report")?);
         let mut writable = vec![
             state.to_owned(),
@@ -275,7 +275,7 @@ impl Options<'_> {
                 };
                 let path = path.canonicalize().context("invalid launch config path")?;
                 selected_config = Some(path.clone());
-                configured(&path, self.name, cwd).map_err(|_| {
+                configured(&path, self.name, &cwd).map_err(|_| {
                     anyhow::anyhow!("invalid launch config or missing configured script")
                 })?
             }
@@ -307,7 +307,7 @@ impl Options<'_> {
                 }
                 if self.git {
                     for flag in ["--git-dir", "--git-common-dir"] {
-                        let path = git_dir(cwd, flag).context("--git requires a Git worktree")?;
+                        let path = git_dir(&cwd, flag).context("--git requires a Git worktree")?;
                         if !writable.contains(&path) {
                             writable.push(path);
                         }
@@ -352,7 +352,7 @@ impl Options<'_> {
                     a.push(p.to_str().context("writable path must be UTF-8")?.into());
                 }
                 #[cfg(unix)]
-                match claude_trust(cwd) {
+                match claude_trust(&cwd) {
                     Ok(Some(ancestor)) => record["trustedBy"] = json!(ancestor),
                     Ok(None) => {}
                     Err(_) => eprintln!("wfc: could not confirm Claude worktree trust"),
@@ -386,7 +386,7 @@ impl Options<'_> {
         }
         #[cfg(target_os = "linux")]
         if self.name == "codex" && self.backend == "tmux" {
-            match codex_home(cwd, &launch.env) {
+            match codex_home(&cwd, &launch.env) {
                 Ok(home) => {
                     record["codexHome"] = json!(home);
                     if resume.is_some() {
