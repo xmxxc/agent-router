@@ -331,34 +331,49 @@ impl Tmux<'_> {
 
     fn close(&self) -> Reply<Value> {
         self.revoke_pending_launch()?;
-        if let Some(t) = self.target()? {
+        let effect = if let Some(t) = self.target()? {
             if !t.owned {
                 return Err(failure(
                     "refused",
                     "session ownership does not match WFC_STATE",
                 ));
             }
-            // Killing a session leaves linked windows in their other sessions.
-            // Check all windows, even when the active window is exclusive.
             let exclusive = "#{m/r:^1+$,#{W:#{?#{==:#{window_linked_sessions},1},1,0}}}";
-            let has_worker = format!("#{{m:*|{}|*,#{{W:#{{P:|#{{pane_id}}|}}}}}}", t.worker_pane);
-            // On this pinned server a pane ID cannot be reused. Once its worker
-            // has a terminal receipt and that ID is absent everywhere, it cannot
-            // move back between this observation and the guarded close.
-            let condition = if self.exited_pane_absent(&t)? {
-                exclusive.to_owned()
+            let kill = format!("kill-session -t '{}'", t.session);
+            let worker = self.close_worker(&t)?;
+            if worker == binding::Worker::Exited {
+                // Once absent from the pinned server, a pane ID cannot move back.
+                let pane = if self.worker_pane_absent(&t)? {
+                    &t.pane
+                } else {
+                    &t.worker_pane
+                };
+                self.guarded(&t, pane, &kill, exclusive)?;
+                "worker_exited"
             } else {
-                format!("#{{&&:{exclusive},{has_worker}}}")
-            };
-            self.guarded(
-                &t,
-                &t.pane,
-                &format!("kill-session -t '{}'", t.session),
-                &condition,
-            )?;
-        }
+                worker.check_before_kill()?;
+                // Leave a retained dead pane intact for reconciliation.
+                let action = format!(
+                    "if-shell -F -t {} '#{{pane_dead}}' {{ display-message -p dead }} {{ {kill} }}",
+                    t.worker_pane
+                );
+                let outcome = self.guarded(&t, &t.worker_pane, &action, exclusive)?;
+                if !outcome.is_empty() {
+                    return Err(failure("uncertain", "worker pane is no longer active"));
+                }
+                if self.close_worker(&t)? != worker {
+                    return Err(failure(
+                        "uncertain",
+                        "session closed but worker exit order is unconfirmed",
+                    ));
+                }
+                "session_closed"
+            }
+        } else {
+            "already_absent"
+        };
         self.release()?;
-        Ok(json!({"result":"completed"}))
+        Ok(json!({"result":"completed", "closeEffect":effect}))
     }
 }
 

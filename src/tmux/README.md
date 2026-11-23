@@ -10,7 +10,15 @@
 | submit | 必填 `text`，可选 `host`。在登记的 worker pane 上检查画面并按字面发送一次文字。每次按键都复核目标 pane 的会话归属和窗口独占性。Codex 有稳定匹配草稿时，最多补两次 Enter。 |
 | interrupt | 向登记且仍归该会话独占的 worker pane 发送 C-c。 |
 | resume | 接收与 create 相同的启动数据。调用方提供恢复原宿主会话的 argv。OpenCode 另取 `text`，在画面稳定后提交。Codex 可传 `probe_read_only: true` 检查恢复后的只读提示。 |
-| close | 关闭前核对会话归属和全部窗口独占性。原 worker pane 应在其中，或同次启动已有进程退出回执且原 pane 已从整个服务消失。原会话消失后，已登记的 pane 仍在相邻会话中时保留未决。已确认关闭时返回 completed。 |
+| close | 关闭前核对会话归属和全部窗口独占性。原 worker pane 应在其中，或同次启动已有进程退出回执且原 pane 已从整个服务消失。原会话消失后，已登记的 pane 仍在相邻会话中时保留未决。已确认关闭时返回 `result=completed`，可选字段 `closeEffect` 说明本次调用做了什么。 |
+
+| closeEffect | 本次 close 的证据 |
+| --- | --- |
+| `already_absent` | 核实原会话已不存在，本次没有关闭会话。重复 close 也可得到此值。worker 的退出状态须另查同次启动的回执。 |
+| `session_closed` | 在原服务端复核会话归属、窗口独占、原 pane 仍活动，随后确认 kill-session 成功。该值说明本次主动关闭了活动会话。 |
+| `worker_exited` | 在关闭前已取得同次启动的 `process_exited` 及有效退出码，随后确认关闭其剩余会话。调用方从原启动回执读取退出码。 |
+
+#42 在归档前应同时核对 dispatch、attempt 和轮次。`already_absent` 和 `worker_exited` 应保留同次执行的退出记录；缺少退出证据时保留未决。`session_closed` 记录本次主动关闭会话的动作。worker 自然退出与关闭动作可能重叠，单凭此值无法断定进程的死因。归档时应保留同次执行已确认的退出结果，并让随后取得的可靠退出证据可以对账。旧后端可能只返回 `result=completed`。遇到缺失或未知的 `closeEffect`，以及 `result=uncertain` 时，应保留已有执行证据，将未查明的退出原因留待对账。单凭 completed 或关闭前的 running 状态推断取消，会丢失恰在此时产生的真实退出码。
 
 例如，已创建会话后可以在另一个进程读屏。
 
