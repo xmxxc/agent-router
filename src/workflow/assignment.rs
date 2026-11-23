@@ -57,14 +57,29 @@ pub(super) fn identified(row: &Value) -> bool {
         && row["round"].as_u64().is_some_and(|n| n > 0)
 }
 
+fn interrupt_events(row: &Value) -> impl Iterator<Item = &Value> {
+    row["audit"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .rev()
+        .filter(|event| {
+            event["operation"] == "interrupt"
+                && event["dispatch"] == row["dispatch"]
+                && event["round"] == row["round"]
+                && event["attempt"] == row["attempt"]
+                && event["scopeFence"] == true
+        })
+}
+
 pub(super) fn interrupt_fence(row: &Value) -> Option<&Value> {
-    row["audit"].as_array()?.iter().rev().find(|event| {
-        event["operation"] == "interrupt"
-            && event["dispatch"] == row["dispatch"]
-            && event["round"] == row["round"]
-            && event["attempt"] == row["attempt"]
-            && event["scopeFence"] == true
-    })
+    interrupt_events(row).next()
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn unresolved_interrupt(row: &Value) -> Option<&Value> {
+    interrupt_events(row)
+        .find(|event| matches!(event["result"].as_str(), Some("pending" | "uncertain")))
 }
 
 #[cfg(target_os = "linux")]

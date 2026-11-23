@@ -326,6 +326,8 @@ impl<'a> Owner<'a> {
             } else {
                 1
             };
+            #[cfg(target_os = "linux")]
+            super::interrupt::require_backend_settled(&state, &self.scope)?;
             owners.0.insert(
                 self.scope.clone(),
                 Lease {

@@ -142,6 +142,10 @@ wfc wait --scope team-a --timeout 30
 
 用 `wfc owner acquire --scope team-a --owner controller-a` 为该组认领默认 60 秒的租约。将返回的 `token` 保存在总控环境的 `WFC_CONTROLLER_TOKEN` 中，或在单次操作时用 `--owner-token` 指定。用 `wfc owner renew --scope team-a` 续租。另一位总控可用 `wfc owner takeover --scope team-a` 接管并领取新凭据。接管完成后，旧凭据的 `wait`、`ack` 和下一批 `relay` 会报 `stale_controller_owner`。
 
+Linux 的 `wfc interrupt DISPATCH` 对已核验的原生 tmux 执行发送一次中断键，并为旧执行保留写权围栏。已有问答和完成回执仍可按原号读取。重复中断不会再次发键。原执行的中断仍未决时，`close` 可以重放同一次的已确认旧回执，新的关停则须先完成对账。
+
+私有后端在进入 tmux 命令队列前登记本次中断，并在同一 scope 锁下保存可验证的后端回执。已登记而缺少匹配回执时，`owner acquire` 和 `owner takeover` 取得锁后会返回 `lifecycle_reconcile_required` 和原审计号，原代次不变。等待时间或进程退出本身不会解除围栏。此时同一有效持有人仍可续租。需要用原服务器及执行的确切证据对账，证明原队列已处理该请求或已无法再执行，再开放新的 owner 代次。
+
 状态目录一旦有租约记录，`wait` 和 `relay` 都需要指定 `--scope`。尚未认领的组仍可用原命令。普通总控可用 `status --dispatch ID` 查看组的 owner、代数和租约状态。
 
 外部投递结果为 `unknown` 时，先核实对方确已收到，再用下面的命令记录证据。

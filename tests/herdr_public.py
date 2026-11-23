@@ -279,10 +279,13 @@ for line in sys.stdin:
         self.check_uncertain_close(forward=True)
 
     def check_uncertain_close(self, forward):
-        requested, executed = [], []
+        requested, executed, confirmations = [], [], []
+        confirming = False
         def read(stream):
             frame = stream.readline()
             req = json.loads(frame)
+            if confirming and req['method'] == 'session.snapshot':
+                confirmations.append(req['id'])
             if req['method'] == 'pane.close':
                 # See the durable intent while the client is still inside the RPC.
                 assignment = Path(self.env['WFC_STATE'])/'dispatches'/(self.dispatch_id+'.json')
@@ -306,12 +309,16 @@ for line in sys.stdin:
         with self.service.fault_proxy(reply, read_frame=read) as proxy:
             self.dispatch(endpoint=proxy)
             other, sibling_pid = self.sibling()
+            receipt_path = Path(self.h['receipt'])
+            owners = Path(self.env['WFC_STATE'])/'controller-owners.json'
+            self.assertFalse(owners.exists())
             first = self.cli('close', self.dispatch_id)
             self.assertEqual(first['result'], 'uncertain')
             view = self.status()
             self.assertTrue(view['closePending'])
             self.assertEqual(view['status'], 'unknown')
             self.assertEqual(view['audit'][0]['result'], 'uncertain')
+            original_intent, = view['audit']
             self.submit('must not arrive', error='close still pending')
             self.reconcile(error='close still pending')
             if not forward:
@@ -325,18 +332,33 @@ for line in sys.stdin:
                 self.assertFalse((self.root/'events').exists())
                 # An independent operator removes this pane on the real service.
                 self.service.api('pane.close', pane_id=self.h['pane'])
+            confirming = True
             live.wait_for(lambda: self.cli('close', self.dispatch_id)['result'] == 'completed')
+            confirming = False
             self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
             end = self.status()
             self.assertFalse(end['closePending'])
             self.assertEqual(end['worker']['state'], 'cancelled')
             event, = end['audit']
             self.assertEqual(event['result'], 'completed')
+            for key in ('id', 'dispatch', 'round', 'attempt', 'target', 'workerOnClose'):
+                self.assertEqual(event[key], original_intent[key])
+            self.assertEqual(end['create']['receipt'], str(receipt_path))
+            self.assertTrue(confirmations)
+            self.assertIsNone(end.get('controllerOwner'))
+            self.assertFalse(owners.exists())
+            if forward:
+                # The supervisor may legitimately replace "started" with exit
+                # evidence. The receipt path and close intent must stay bound.
+                self.assertIn(json.loads(receipt_path.read_bytes())['category'],
+                              ('started', 'process_exited'))
             self.assertEqual(len(requested), 1)
             self.assertEqual(executed, requested if forward else [])
             self.assertEqual(self.service.api('pane.process_info', pane_id=other)['process_info']['shell_pid'], sibling_pid)
             print(json.dumps(dict(dispatch=self.dispatch_id, forward=forward, requests=requested,
-                                  executed=executed, first=first['result'], confirmed=event['result'])))
+                                  executed=executed, first=first['result'], confirmed=event['result'],
+                                  confirmations=confirmations, audit=event['id'], unowned=True,
+                                  originalLaunchReceipt=end['create']['receipt'])))
 
     def test_killed_close_client_leaves_queryable_intent(self):
         from threading import Event

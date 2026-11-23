@@ -1,11 +1,16 @@
 //! Fence the current writer durably before asking its native backend to interrupt.
-use super::{assignment, backend, controller, messages, record_scope, state_dir, view, write_json};
+use super::{
+    assignment, backend, controller, messages, record_scope, state_dir, valid_id, valid_identity,
+    view, write_json,
+};
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
-    ffi::OsString,
+    env,
+    ffi::{OsStr, OsString},
     fs::File,
-    path::Path,
+    io::ErrorKind,
+    path::{Path, PathBuf},
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -67,6 +72,7 @@ impl<'a> Interrupt<'a> {
         {
             return Err(assignment::lifecycle_reconcile_required(&row, event));
         }
+        require_backend_settled(&state, scope)?;
         ensure!(
             row == initial,
             "assignment changed while preparing interrupt"
@@ -136,14 +142,7 @@ impl<'a> Interrupt<'a> {
         // The backend rechecks the live pane and process in its guarded
         // command. From the first send, missing confirmation is ambiguous.
         let outcome = backend::interrupt(&state, &row, launch, [&scope_lock, &execution_lock]);
-        let result = match (outcome["result"].as_str(), outcome["inputResult"].as_str()) {
-            (Some("accepted"), _) => "accepted",
-            (Some("refused"), _) => "refused",
-            (Some("definitely-not-sent"), _) | (_, Some("definitely-not-sent")) => {
-                "definitely-not-sent"
-            }
-            _ => "uncertain",
-        };
+        let result = terminal_result(&outcome).unwrap_or("uncertain");
         let mut response = json!({
             "dispatch":row["dispatch"],"operation":"interrupt","round":row["round"],
             "attempt":row["attempt"],"audit":index + 1,"result":result
@@ -167,6 +166,164 @@ impl<'a> Interrupt<'a> {
         write_json(&path, &next, None)?;
         messages::sync_directory(&dir)?;
         Ok(response)
+    }
+}
+
+fn order_path(state: &Path, scope: &str) -> PathBuf {
+    state.join(format!(
+        "interrupt-order-{}.json",
+        messages::body_hash(scope)
+    ))
+}
+
+fn receipt_path(state: &Path, order: &Value) -> Result<PathBuf> {
+    let dispatch = order["dispatch"]
+        .as_str()
+        .filter(|id| valid_id(id))
+        .context("invalid interrupt order dispatch")?;
+    let attempt = order["attempt"]
+        .as_str()
+        .filter(|id| valid_identity(id, "a-"))
+        .context("invalid interrupt order attempt")?;
+    let audit = order["audit"]
+        .as_u64()
+        .filter(|&id| id > 0)
+        .context("invalid interrupt order audit")?;
+    Ok(state
+        .join("dispatches")
+        .join(format!("{dispatch}.{attempt}.{audit}.interrupt-order")))
+}
+
+fn read_order(path: &Path) -> Result<Option<Value>> {
+    match File::open(path) {
+        Ok(file) => Ok(Some(
+            serde_json::from_reader(file).context("read interrupt order evidence")?,
+        )),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("open interrupt order evidence"),
+    }
+}
+
+fn terminal_result(reply: &Value) -> Option<&str> {
+    match (reply["result"].as_str(), reply["inputResult"].as_str()) {
+        (result @ Some("accepted" | "refused" | "definitely-not-sent"), _) => result,
+        (_, Some("definitely-not-sent")) => Some("definitely-not-sent"),
+        _ => None,
+    }
+}
+
+// The caller holds the scope lock. A finished client or a lost pipe is not
+// proof that tmux can no longer act on an already connected request.
+pub(super) fn require_backend_settled(state: &Path, scope: &str) -> Result<()> {
+    let Some(order) = read_order(&order_path(state, scope))? else {
+        return Ok(());
+    };
+    ensure!(order["scope"] == scope, "interrupt order scope mismatch");
+    if read_order(&receipt_path(state, &order)?)?.is_some_and(|receipt| {
+        receipt["order"] == order
+            && matches!(
+                receipt["result"].as_str(),
+                Some("accepted" | "refused" | "definitely-not-sent")
+            )
+    }) {
+        return Ok(());
+    }
+    Err(controller::ControllerError::from_detail(json!({
+        "error":"lifecycle_reconcile_required", "operation":"interrupt", "scope":scope,
+        "dispatch":order["dispatch"], "round":order["round"], "attempt":order["attempt"],
+        "audit":order["audit"], "result":"pending", "requiresDecision":true,
+        "diagnostic":"original tmux interrupt has no verified ordering receipt"
+    }))
+    .into())
+}
+
+pub(crate) struct BackendOrder {
+    path: PathBuf,
+    receipt: PathBuf,
+    binding: Value,
+    published: bool,
+}
+
+impl BackendOrder {
+    // Prepare under the two inherited locks. Failed preflight checks do not
+    // need a settlement receipt because no key can have reached tmux.
+    pub(crate) fn begin(
+        state: &Path,
+        dispatch: &str,
+        execution: &str,
+        launch: &str,
+    ) -> Result<Self> {
+        ensure!(valid_id(dispatch), "invalid interrupt order dispatch");
+        let row = assignment::public_record(&state.join("dispatches"), dispatch)?
+            .context("missing interrupt order assignment")?;
+        let scope = record_scope(&row).context("invalid interrupt order scope")?;
+        let event = assignment::unresolved_interrupt(&row)
+            .filter(|event| event["result"] == "pending")
+            .context("missing pending interrupt order")?;
+        let target = &event["target"];
+        ensure!(
+            verified_assignment(&row)
+                && row["executionId"] == execution
+                && target["executionId"] == execution
+                && target["backend"] == row["backend"]
+                && target["launchId"] == launch
+                && target["receipt"] == row["create"]["receipt"]
+                && target["tmuxSocket"] == row["tmuxSocket"]
+                && row["tmuxSocket"].as_str().is_some_and(|socket| {
+                    env::var_os("WFC_TMUX_SOCKET").as_deref() == Some(OsStr::new(socket))
+                }),
+            "interrupt order does not match its physical execution"
+        );
+        require_backend_settled(state, scope)?;
+        let binding = json!({
+            "scope":scope, "dispatch":dispatch, "round":row["round"], "attempt":row["attempt"],
+            "audit":event["id"], "ownerGeneration":event["ownerGeneration"], "target":target
+        });
+        let receipt = receipt_path(state, &binding)?;
+        ensure!(
+            !receipt.try_exists()?,
+            "interrupt order receipt already exists"
+        );
+        Ok(Self {
+            path: order_path(state, scope),
+            receipt,
+            binding,
+            published: false,
+        })
+    }
+
+    pub(crate) fn publish(&mut self, state: &Path, server: Value) -> Result<()> {
+        let scope = self.binding["scope"]
+            .as_str()
+            .context("missing interrupt order scope")?;
+        let owner = controller::Owners::read(state)?
+            .public(scope)?
+            .unwrap_or(Value::Null);
+        ensure!(
+            owner["generation"] == self.binding["ownerGeneration"]
+                && (owner.is_null() || owner["active"] == true),
+            "interrupt order no longer has the original owner"
+        );
+        self.binding["server"] = server;
+        write_json(&self.path, &self.binding, None)?;
+        self.published = true;
+        messages::sync_directory(state)
+    }
+
+    pub(crate) fn finish(self, reply: &Value) -> Result<()> {
+        if let Some(result) = terminal_result(reply).filter(|_| self.published) {
+            write_json(
+                &self.receipt,
+                &json!({"order":self.binding, "result":result}),
+                None,
+            )?;
+            messages::sync_directory(
+                self.receipt
+                    .parent()
+                    .context("missing interrupt receipt directory")?,
+            )?;
+        }
+        Ok(())
     }
 }
 

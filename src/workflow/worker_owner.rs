@@ -207,7 +207,7 @@ pub fn close(id: &str, explicit_token: Option<&str>) -> Result<Value> {
         "assignment changed while waiting to close; inspect status and retry"
     );
     validate_close(&record)?;
-    if let Some(event) = assignment::unresolved_lifecycle(&record) {
+    if let Some(event) = assignment::unresolved_interrupt(&record) {
         // Older builds could confirm the close while this audit was
         // unresolved. Replay that receipt without asking the backend to close.
         if let Ok(Some(receipt)) = replay(&record) {

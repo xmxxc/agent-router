@@ -5,6 +5,7 @@ mod history;
 mod input;
 pub(crate) mod launch;
 
+use crate::workflow::interrupt::BackendOrder;
 use anyhow::{ensure, Context, Result};
 use history::{CloseEffect, CloseOperation};
 use serde::Deserialize;
@@ -376,14 +377,19 @@ impl Tmux<'_> {
         Err(failure("uncertain", "tmux did not confirm the operation"))
     }
 
-    fn worker_command(&self, t: &Target, action: &str) -> Reply<String> {
+    fn worker_guard<'a>(&self, t: &'a Target) -> Reply<(&'a str, String)> {
         if let Some((id, pid)) = &t.supervisor {
             if binding::host_launch_id(*pid, self.state, self.dispatch, t).as_ref() != Some(id) {
                 return Err(failure("refused", "original worker is no longer running"));
             }
         }
         let live = format!("#{{&&:{EXCLUSIVE_WINDOW},#{{==:#{{pane_dead}},0}}}}");
-        self.guarded(t, t.worker_pane()?, action, &t.guard_worker_process(&live))
+        Ok((t.worker_pane()?, t.guard_worker_process(&live)))
+    }
+
+    fn worker_command(&self, t: &Target, action: &str) -> Reply<String> {
+        let (pane, guard) = self.worker_guard(t)?;
+        self.guarded(t, pane, action, &guard)
     }
 
     fn worker_screen(&self, t: &Target) -> Reply<String> {
@@ -434,7 +440,12 @@ impl Tmux<'_> {
         }))
     }
 
-    fn operate(&self, op: Operation, fresh: bool) -> Reply<Value> {
+    fn operate(
+        &self,
+        op: Operation,
+        fresh: bool,
+        order: Option<&mut BackendOrder>,
+    ) -> Reply<Value> {
         if let Some(id) = self.legacy_execution_id {
             if let Some(reply) = self.replay_unverified_revocation(id)? {
                 return Ok(reply);
@@ -528,10 +539,19 @@ impl Tmux<'_> {
             }
             Operation::Interrupt { .. } => {
                 let target = self.input_target()?;
-                self.worker_command(
-                    &target,
-                    &format!("send-keys -t {} C-c", target.worker_pane()?),
-                )?;
+                let (pane, guard) = self.worker_guard(&target)?;
+                if let Some(order) = order {
+                    order
+                        .publish(
+                            self.state,
+                            json!({
+                                "pid":target.server_pid, "startTime":target.server_start,
+                                "session":target.session, "pane":pane
+                            }),
+                        )
+                        .map_err(|e| failure("definitely-not-sent", &format!("{e:#}")))?;
+                }
+                self.guarded(&target, pane, &format!("send-keys -t {pane} C-c"), &guard)?;
                 Ok(json!({"result":"accepted"}))
             }
             Operation::Close => self.close(),
@@ -879,7 +899,35 @@ pub(crate) fn retain_lifecycle_locks(fds: [&std::ffi::OsStr; 2]) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn execute_ordered_interrupt(state: &Path, request: Request) -> Result<Value> {
+    let Operation::Interrupt {
+        launch_id: Some(launch),
+    } = &request.op
+    else {
+        anyhow::bail!("inherited lifecycle locks require a native interrupt");
+    };
+    let execution = request
+        .execution_id
+        .as_deref()
+        .context("missing interrupt execution")?;
+    let mut order = match BackendOrder::begin(state, &request.dispatch, execution, launch) {
+        Ok(order) => order,
+        Err(error) => return Ok(failure("definitely-not-sent", &format!("{error:#}"))),
+    };
+    let reply = execute_with_order(state, request, Some(&mut order))?;
+    order.finish(&reply)?;
+    Ok(reply)
+}
+
 pub fn execute(state: &Path, request: Request) -> Result<Value> {
+    execute_with_order(state, request, None)
+}
+
+fn execute_with_order(
+    state: &Path,
+    request: Request,
+    order: Option<&mut BackendOrder>,
+) -> Result<Value> {
     ensure!(
         matches!(request.backend.as_deref(), None | Some("" | "tmux")),
         "request selects another execution backend"
@@ -1000,7 +1048,7 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
         backend.legacy_execution_id = Some(&native_id);
     }
     let mut result = backend
-        .operate(request.op, request.fresh_dispatch)
+        .operate(request.op, request.fresh_dispatch, order)
         .unwrap_or_else(|mut error| {
             if backend.input_request && error["result"] == "definitely-not-sent" {
                 error["category"] = json!("input_not_delivered");

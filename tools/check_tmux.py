@@ -2325,6 +2325,11 @@ def hold():
 
 if mode == "before-backend-start" and "list-panes" in args:
     hold()
+if mode == "fail-ordered-preflight" and "list-panes" in args:
+    parent = (Path("/proc") / str(os.getppid()) / "cmdline").read_bytes()
+    if b"--lifecycle-lock-fds" in parent.split(bytes([0])):
+        (work / "ordered-preflight-refused").touch()
+        sys.exit(7)
 if mode and "if-shell" in args and any("send-keys -t " in a and " C-c" in a for a in args):
     if mode == "hold":
         links = []
@@ -2341,6 +2346,16 @@ if mode and "if-shell" in args and any("send-keys -t " in a and " C-c" in a for 
         if result.returncode == 0:
             (work / "real-key-command-succeeded").touch()
         sys.exit(1)
+    elif mode == "pause-server-queue":
+        # This wait occurs inside the real server's guarded command queue.
+        # Leave the real client connected when the private backend is killed.
+        assert " ; send-keys -t " in args[-2]
+        args[-2] = args[-2].replace(
+            " ; send-keys -t ",
+            " ; set-option -g @wfc-r20-queued 1 ; wait-for wfc-r20-release ; send-keys -t ",
+            1,
+        )
+        (work / "interrupt-backend-pid").write_text(str(os.getppid()))
 os.execv(real, [real, *args])
 """)
         shim.chmod(0o700)
@@ -2519,6 +2534,12 @@ os.execv(real, [real, *args])
                 pending.communicate(timeout=5)
         self.wait_interrupt_fixture(lambda: keys.read_bytes() == b"\x03")
         self.assertEqual((current["generation"], path.read_bytes()), (2, saved))
+        proof_path = self.state / "dispatches" / f"{dispatch_id}.{attempt}.1.interrupt-order"
+        proof = json.loads(proof_path.read_text())
+        self.assertEqual((proof["result"], proof["order"]["ownerGeneration"],
+                          proof["order"]["audit"], proof["order"]["target"]),
+                         ("accepted", owner["generation"], 1, audit["target"]))
+        self.assertEqual(proof["order"]["server"]["pane"], self.active_pane(dispatch_id))
         for operation in ("close", "interrupt"):
             blocked = json.loads(cli(operation, dispatch_id, code=1, WFC_OWNER_TOKEN=current["token"]))
             self.assertEqual((blocked["error"], blocked["audit"], blocked["result"]),
@@ -2528,7 +2549,8 @@ os.execv(real, [real, *args])
         self.active_pane(neighbor["dispatch"])
         self.assertEqual((keys.read_bytes(), other_keys.read_bytes()), (b"\x03", b""))
         print(json.dumps({"controllerExited": True, "bothLocksHeld": True, "tmuxInheritedLocks": False,
-                          "takeoverGeneration": current["generation"], "audit": audit}), flush=True)
+                          "takeoverGeneration": current["generation"], "audit": audit,
+                          "orderingReceipt": proof}), flush=True)
 
     def test_public_interrupt_leaves_pending_when_owner_expires(self):
         cli, dispatch, env = self.public_interrupt_fixture()
@@ -2597,6 +2619,104 @@ os.execv(real, [real, *args])
         self.assertEqual(cli("close", dispatch_id)["closeEffect"], "session_closed")
         self.active_pane(neighbor["dispatch"])
         print(json.dumps({"definiteFailure": result, "targetKeys": 0, "neighborKeys": 0}), flush=True)
+
+    def test_public_interrupt_preflight_zero_send_allows_takeover(self):
+        cli, dispatch, env = self.public_interrupt_fixture()
+        scope = "interrupt-preflight"
+        owner = cli("acquire", "--scope", scope, "--owner", "A")
+        credentials = {"WFC_OWNER_TOKEN": owner["token"]}
+        target, _, keys = dispatch(scope, **credentials)
+        neighbor, _, other_keys = dispatch("interrupt-preflight-neighbor")
+        result = cli("interrupt", target["dispatch"], **credentials,
+                     PATH=str(self.work) + ":" + env["PATH"],
+                     INTERRUPT_TEST_MODE="fail-ordered-preflight")
+        self.assertTrue((self.work / "ordered-preflight-refused").exists())
+        self.assertEqual((result["result"], result["audit"]), ("definitely-not-sent", 1))
+        self.assertIn("tmux could not inspect", result["diagnostic"])
+        self.assertFalse(list(self.state.glob("interrupt-order-*.json")))
+        current = cli("takeover", "--scope", scope, "--owner", "B")
+        self.assertEqual(current["generation"], 2)
+        self.active_pane(target["dispatch"])
+        self.active_pane(neighbor["dispatch"])
+        self.assertEqual((keys.read_bytes(), other_keys.read_bytes()), (b"", b""))
+        print(json.dumps({"backendPreflightFailed": True, "result": result,
+                          "takeoverGeneration": current["generation"], "targetKeys": 0,
+                          "neighborKeys": 0}), flush=True)
+
+    def test_public_interrupt_blocks_owner_change_after_backend_dies_with_queued_key(self):
+        cli, dispatch, env = self.public_interrupt_fixture()
+        scope = "interrupt-queued"
+        owner = cli("acquire", "--scope", scope, "--owner", "A")
+        credentials = {"WFC_OWNER_TOKEN": owner["token"]}
+        target, _, keys = dispatch(scope, **credentials)
+        neighbor, _, other_keys = dispatch("interrupt-queued-neighbor")
+        dispatch_id, attempt = target["dispatch"], target["attempt"]
+        draft = self.state / "dispatches" / f"{dispatch_id}.json"
+        pane = self.active_pane(dispatch_id)
+        order_path = self.state / ("interrupt-order-" + hashlib.sha256(scope.encode()).hexdigest() + ".json")
+        receipt = self.state / "dispatches" / f"{dispatch_id}.{attempt}.1.interrupt-order"
+        owners = self.state / "controller-owners.json"
+        original = owners.read_bytes()
+        launch = {**env, **credentials, "PATH": str(self.work) + ":" + env["PATH"],
+                  "INTERRUPT_TEST_MODE": "pause-server-queue"}
+        blocked = []
+
+        def assert_owner_blocked(action):
+            refused = json.loads(cli(action, "--scope", scope, "--owner", "B", code=1))
+            self.assertEqual((refused["error"], refused["operation"], refused["scope"],
+                              refused["dispatch"], refused["attempt"], refused["audit"],
+                              refused["requiresDecision"]),
+                             ("lifecycle_reconcile_required", "interrupt", scope,
+                              dispatch_id, attempt, 1, True))
+            self.assertFalse(receipt.exists())
+            self.assertEqual(owners.read_bytes(), original)
+            blocked.append(refused)
+
+        with subprocess.Popen([WFC, "interrupt", dispatch_id], cwd=self.work, env=launch,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            try:
+                def server_has_queued_key():
+                    result = subprocess.run(self.tmux + ["show-options", "-gqv", "@wfc-r20-queued"],
+                                            env=self.env, check=True, text=True, capture_output=True, timeout=5)
+                    return result.stdout.strip() == "1"
+
+                self.wait_interrupt_fixture(server_has_queued_key)
+                self.assertEqual(keys.read_bytes(), b"")
+                event = json.loads(draft.read_text())["audit"][-1]
+                self.assertEqual(event["result"], "pending")
+                order = json.loads(order_path.read_text())
+                self.assertEqual((order["audit"], order["ownerGeneration"], order["target"], order["server"]["pane"]),
+                                 (event["id"], owner["generation"], event["target"], pane))
+                backend_pid = int((self.work / "interrupt-backend-pid").read_text())
+                os.kill(backend_pid, signal.SIGKILL)
+                out, err = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, (out, err))
+                response = json.loads(out)
+                self.assertEqual((response["attempt"], response["audit"], response["result"]),
+                                 (attempt, 1, "uncertain"))
+                assert_owner_blocked("takeover")
+                self.assertEqual(keys.read_bytes(), b"")
+            finally:
+                subprocess.run(self.tmux + ["wait-for", "-S", "wfc-r20-release"],
+                               env=self.env, check=True, timeout=5)
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+
+        self.wait_interrupt_fixture(lambda: keys.read_bytes() == b"\x03")
+        assert_owner_blocked("takeover")
+        same = cli("renew", "--scope", scope, **credentials)
+        self.assertEqual(same["generation"], owner["generation"])
+        self.assertEqual(cli("takeover", "--scope", neighbor["scope"], "--owner", "C")["generation"], 1)
+        repeated = json.loads(cli("interrupt", dispatch_id, code=1, **credentials))
+        self.assertEqual((repeated["error"], repeated["audit"], repeated["result"]),
+                         ("lifecycle_reconcile_required", 1, "uncertain"))
+        self.active_pane(dispatch_id)
+        self.active_pane(neighbor["dispatch"])
+        self.assertEqual((keys.read_bytes(), other_keys.read_bytes()), (b"\x03", b""))
+        print(json.dumps({"realServerQueue": True, "backendKilled": True, "ownerBlocked": blocked,
+                          "confirmationReceipts": 0, "targetKeys": 1, "neighborKeys": 0,
+                          "retainedGeneration": same["generation"]}), flush=True)
 
     def test_lifecycle(self):
         # Keep the worker alive across Ctrl-C so close tests the active-session path.
