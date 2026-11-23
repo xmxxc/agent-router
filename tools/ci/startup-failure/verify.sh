@@ -1,6 +1,11 @@
 #!/bin/bash
 # From the frozen Linux product checkout, with the candidate already built.
 set -euo pipefail
+selection=${1:-all}
+case "$selection" in
+    all|hosted-tmux) ;;
+    *) printf 'Unsupported test group: %s\n' "$selection" >&2; exit 2 ;;
+esac
 fixtures=$(cd "$(dirname "$0")" && pwd)
 binary=$(realpath "target/$TARGET/release/wfc")
 reap="$fixtures/reap.py"
@@ -13,6 +18,9 @@ failed=0
 run_group() {
     local group=$1 status=0
     shift
+    if [[ "$selection" != all && "$selection" != "$group" ]]; then
+        return 0
+    fi
     python3 "$reap" "$@" 2>&1 | tee "$EVIDENCE/$group.log" || status=$?
     printf '%s exit=%s\n' "$group" "$status" | tee -a "$EVIDENCE/results.log"
     if (( status != 0 )); then
