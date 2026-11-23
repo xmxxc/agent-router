@@ -42,7 +42,10 @@ fn options<'a, const N: usize>(
                 positional_only = true;
                 continue;
             }
-            if positional_only || !flag.starts_with('-') || (question && short_question(flag)) {
+            if positional_only
+                || !flag.starts_with('-')
+                || (question && literal_question_argument(flag, &names))
+            {
                 ensure!(
                     (!flag.is_empty() || question) && slot.replace(flag).is_none(),
                     "expected one {name}"
@@ -71,8 +74,11 @@ fn options<'a, const N: usize>(
                 || (question && matches!(flag, "--attempt" | "--message-id" | "--callback-ref")),
             "empty option value"
         );
-        let looks_like_option = value.starts_with("--")
-            || (question && value.starts_with('-') && !short_question(value));
+        let looks_like_option = if question {
+            !literal_question_argument(value, &names)
+        } else {
+            value.starts_with("--")
+        };
         ensure!(
             inline.is_some() || positional.is_none() || !looks_like_option,
             "option requires a value"
@@ -83,6 +89,15 @@ fn options<'a, const N: usize>(
         );
     }
     Ok(values)
+}
+
+fn literal_question_argument(text: &str, names: &[&str]) -> bool {
+    // Argparse recognizes a named option with "=" before applying its
+    // literal-space rule to other hyphen-prefixed arguments.
+    let option = text.split_once('=').map_or(text, |(name, _)| name);
+    !text.starts_with('-')
+        || short_question(text)
+        || (text.contains(' ') && !matches!(option, "-h" | "--help") && !names.contains(&option))
 }
 
 // Argparse accepts "-" and negative integer or decimal text as positionals.
@@ -899,19 +914,24 @@ impl<'a> Ask<'a> {
         let _close_lock = (row["backend"] == "tmux" || controlled)
             .then(|| super::assignment::close_lock(&state, &row))
             .transpose()?;
-        let observation = if hosted {
+        let blocked = if hosted {
             let mut inspected = row.clone();
-            super::backend::observe(&state, &mut inspected).map(|(worker, _)| worker)
+            super::backend::observe(&state, &mut inspected).map(|(worker, _)| {
+                matches!(
+                    worker["state"].as_str(),
+                    Some("exited" | "cancelled" | "not_started")
+                )
+            })
         } else {
             #[cfg(target_os = "linux")]
-            let outcome = if controlled {
-                super::worker_owner::status(&state.join("dispatches"), &row)
+            let blocked = if controlled {
+                super::worker_owner::question_blocked(&state.join("dispatches"), &row)
             } else {
-                Ok(Value::Null)
+                Ok(false)
             };
             #[cfg(not(target_os = "linux"))]
-            let outcome = Ok(Value::Null);
-            outcome
+            let blocked = Ok(false);
+            blocked
         };
         let (mut inbox, assignment, current, replay) = check()?;
         if let Some(replay) = replay {
@@ -925,10 +945,7 @@ impl<'a> Ask<'a> {
             "assignment changed while inspecting {dispatch}"
         );
         ensure!(
-            !matches!(
-                observation?["state"].as_str(),
-                Some("exited" | "cancelled" | "not_started")
-            ),
+            !blocked?,
             "attempt is no longer accepted for {dispatch}; its round is not running"
         );
         let mut message = Message::new(inbox.messages.len() as u64 + 1, assignment.worker, key);

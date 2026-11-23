@@ -125,12 +125,31 @@ fn outcome(file: &File) -> Result<Value> {
     serde_json::from_str(&result).context("invalid worker outcome")
 }
 
+fn close_requested(file: &File) -> Result<bool> {
+    let mut flag = [0];
+    file.read_exact_at(&mut flag, 0)?;
+    Ok(&flag == b"1")
+}
+
 pub fn status(dir: &Path, record: &Value) -> Result<Value> {
     let (file, unlocked) = open_owner(dir, record, false)?;
     if unlocked {
         return Ok(outcome(&file).unwrap_or_else(|_| json!({"state":"unknown"})));
     }
     Ok(json!({"state":"running"}))
+}
+
+// The publisher holds the attempt lock shared with close while reading this flag.
+pub(super) fn question_blocked(dir: &Path, record: &Value) -> Result<bool> {
+    let (file, unlocked) = open_owner(dir, record, false)?;
+    Ok(close_requested(&file)?
+        || (unlocked
+            && outcome(&file).is_ok_and(|worker| {
+                matches!(
+                    worker["state"].as_str(),
+                    Some("exited" | "cancelled" | "not_started")
+                )
+            })))
 }
 
 pub fn close(id: &OsStr) -> Result<Value> {
@@ -156,15 +175,23 @@ pub fn close(id: &OsStr) -> Result<Value> {
     // Older foreground records were only published after successful exit.
     let mut already_gone = true;
     if record.get("worker").is_some() {
-        let _lock = super::assignment::close_lock(
-            dir.parent().context("missing state directory")?,
-            &record,
-        )?;
         let (reader, unlocked) = open_owner(&dir, &record, false)?;
+        let _lock;
         let (owner, unlocked) = if unlocked {
             (reader, true)
         } else {
-            open_owner(&dir, &record, true)?
+            // A verified finished archive can be replayed read-only. Only
+            // a live attempt needs the write lock and a fresh owner check.
+            _lock = super::assignment::close_lock(
+                dir.parent().context("missing state directory")?,
+                &record,
+            )?;
+            let (reader, unlocked) = open_owner(&dir, &record, false)?;
+            if unlocked {
+                (reader, true)
+            } else {
+                open_owner(&dir, &record, true)?
+            }
         };
         already_gone = unlocked;
         if !already_gone {
@@ -299,9 +326,7 @@ fn watch_tree(file: &File, root: i32, mut closing: bool) -> Result<Value> {
             return Err(err.into());
         }
         if !closing {
-            let mut flag = [0];
-            file.read_exact_at(&mut flag, 0)?;
-            closing = &flag == b"1";
+            closing = close_requested(file)?;
         }
         if closing || root_exit.is_some() {
             // Children remain pinned until our next waitpid. An independent
