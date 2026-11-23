@@ -260,19 +260,10 @@ while True:
 
         with self.service.fault_proxy(observe_reply, read_frame=read_request) as endpoint:
             self.dispatch(endpoint=endpoint)
-            hide_pane.set()
-            self.assertFalse(run_wait("1.4", quiet=True))
-            self.assertTrue(hidden)
-            self.assertFalse(requests, "a missing pane has no valid pane.read request")
-            hide_pane.clear()
-            self.assertFalse(run_wait("1.4", quiet=True))
-            self.assertTrue(requests, "the original bound pane was read successfully")
             state = Path(self.env["WFC_STATE"])
             watch = state / "dispatches" / f"{self.dispatch_id}.host-watch"
-            execution = json.loads(watch.read_text())["execution"]
-            self.assertTrue(execution)
 
-            def absence():
+            def absence(execution=None):
                 previous_requests, previous_hidden = len(requests), len(hidden)
                 hide_pane.set()
                 notices = run_wait("3")
@@ -281,15 +272,21 @@ while True:
                 self.assertFalse(run_wait("1.4", quiet=True))
                 self.assertEqual(len(requests), previous_requests)
                 self.assertGreater(len(hidden), previous_hidden)
+                if execution is None:
+                    self.assertFalse(watch.exists(), "first absence needs no earlier capture")
                 hide_pane.clear()
                 restored = run_wait("3")
                 verify(restored, ["read_restored"])
+                self.assertGreater(len(requests), previous_requests)
                 self.assertEqual(self.status()["hostActivity"]["readState"], "readable")
-                self.assertEqual(json.loads(watch.read_text())["execution"], execution)
+                self.assertTrue(json.loads(watch.read_text())["execution"])
+                if execution is not None:
+                    self.assertEqual(json.loads(watch.read_text())["execution"], execution)
                 return notices[0]["messageId"], restored[0]["messageId"]
 
+            self.assertFalse(watch.exists())
             absent, restored = absence()
-            absent_again, restored_again = absence()
+            absent_again, restored_again = absence(json.loads(watch.read_text())["execution"])
             self.assertEqual(len({absent, restored, absent_again, restored_again}), 4)
 
             # A reply from a different peer at the exact path cannot prove absence.
@@ -344,6 +341,14 @@ while True:
             self.assertEqual(len({req_id for req_id, _ in requests}), len(requests))
             self.assertEqual(self.status()["hostActivity"]["readState"], "unavailable")
 
+            show(f"Approval required: {secret}")
+            permission_restored = run_wait("3")
+            verify(permission_restored, ["screen_notice", "read_restored"])
+            activity = self.status()["hostActivity"]
+            self.assertEqual((activity["state"], activity["readState"]),
+                             ("awaiting_permission", "readable"))
+            self.assertNotIn("awaitingAnswer", activity)
+
             ledger = state / "messages.json"
             messages = json.loads(ledger.read_text())
             question = {key: self.row[key] for key in ("dispatch", "scope", "round", "attempt", "role")}
@@ -353,9 +358,7 @@ while True:
             pending = ledger.with_suffix(".tmp")
             pending.write_text(json.dumps(messages))
             pending.replace(ledger)
-            show(f"Approval required: {secret}")
-            permission_restored = run_wait("3")
-            verify(permission_restored, ["screen_notice", "read_restored"])
+            self.assertFalse(run_wait("1.4", quiet=True))
             activity = self.status()["hostActivity"]
             self.assertEqual((activity["state"], activity["fault"]["category"], activity["readState"],
                               activity["awaitingAnswer"]),
@@ -375,7 +378,9 @@ while True:
                               "slowReadReceipts": [first[0]["messageId"], again[0]["messageId"]],
                               "quotaRestored": quota_restored[-1]["messageId"],
                               "permissionRestored": permission_restored[-1]["messageId"],
-                              "pendingAnswerPreserved": True, "close": "completed"}), flush=True)
+                              "firstAbsenceWithoutEarlierCapture": True,
+                              "permissionBeforeQuestionKeptBothStates": True, "close": "completed"}),
+                  flush=True)
 
     def test_reclaim_uses_verified_herdr_close_and_keeps_sibling(self):
         self.dispatch()

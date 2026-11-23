@@ -1,7 +1,7 @@
 //! Keep slow backend I/O out of the controller's receipt polling loop.
 use super::{
-    binding, candidate, classify, current_generation, execution_binding, row_scope, screen_content,
-    Sample, Watch,
+    binding, candidate, current_generation, execution_binding, row_scope, screen_content,
+    screen_evidence, InputVersion, Sample, Watch,
 };
 use crate::workflow::messages::relay::queue_owner::{
     become_subreaper, completed, guard_group, stop_group,
@@ -39,6 +39,7 @@ pub(super) struct Probe {
     pub id: String,
     pub previous: Option<Watch>,
     pub generation: Option<u64>,
+    pub(super) input: InputVersion,
     output: File,
     child: Option<Child>,
     execution: String,
@@ -53,6 +54,7 @@ impl Probe {
         salt: &str,
         remaining: Duration,
         generation: Option<u64>,
+        input: InputVersion,
     ) -> Result<Self> {
         let deadline = monotonic_ns()? + remaining.min(MAX_PROBE).as_nanos() as u64;
         // The helper writes only classified evidence and hashes. An anonymous
@@ -88,6 +90,7 @@ impl Probe {
             id: id.to_owned(),
             previous,
             generation,
+            input,
             output,
             child: Some(supervisor.spawn()?),
             execution: execution_binding(row),
@@ -104,7 +107,7 @@ impl Probe {
         if status.code() == Some(i32::from(READ_TIMEOUT)) && self.full_budget {
             return Ok(Poll::Ready(Some(Observation {
                 binding: self.execution.clone(),
-                sample: Sample::Unavailable,
+                sample: Sample::ReadFailed,
                 timed_out: true,
             })));
         }
@@ -267,20 +270,22 @@ pub(crate) fn run_runtime_probe(args: &[OsString]) -> Result<()> {
         let _ = io::stderr().lock().write_all(&[byte]);
     };
     let sample = if backend::runtime_exit(&state, &row)?.is_some() {
-        Sample::Unavailable // the publisher takes the same bound local terminal evidence
+        Sample::Terminal // the publisher takes the same bound local terminal evidence
     } else {
         match backend::runtime_screen(&state, &row, &mut progress)? {
             backend::RuntimeScreen::Screen(screen) => {
                 let content = screen_content(&screen);
+                let (fault, activity) =
+                    screen_evidence(row["host"].as_str().unwrap_or_default(), &content, salt);
                 Sample::Screen {
                     fingerprint: super::body_hash(&format!("{salt}{content}")),
-                    fault: classify(row["host"].as_str().unwrap_or_default(), &content),
-                    nonblank: !content.is_empty(),
+                    fault,
+                    activity,
                     salt: salt.to_owned(),
                 }
             }
-            backend::RuntimeScreen::Unavailable => Sample::Unavailable,
-            backend::RuntimeScreen::Unobserved if sent => Sample::Unavailable,
+            backend::RuntimeScreen::Unavailable => Sample::Missing,
+            backend::RuntimeScreen::Unobserved if sent => Sample::ReadFailed,
             backend::RuntimeScreen::Unobserved => return Ok(()),
         }
     };

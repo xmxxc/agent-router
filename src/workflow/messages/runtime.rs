@@ -1,5 +1,5 @@
 //! Observe the existing worker binding while a controller is waiting.
-use super::{body_hash, recovery, Assignment, Identity, Inbox, Message};
+use super::{body_hash, recovery, Assignment, Identity, Inbox, InputResult, Message};
 use crate::workflow::{assignment, backend, controller, herdr, valid_id, view, write_json};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -131,9 +131,16 @@ impl Monitor {
             if ledger.is_none() {
                 ledger = Some(Inbox::snapshot(state)?);
             }
-            if finished(&row, &history(&row, ledger.as_deref().unwrap_or_default())?) {
+            let messages = ledger.as_deref().unwrap_or_default();
+            if finished(&row, &history(&row, messages)?) {
                 continue;
             }
+            let Ok(identity) = Identity::deserialize(&row) else {
+                continue;
+            };
+            // The atomic ledger snapshot predates the read. Any intervening
+            // reply transition makes this observation ineligible at commit.
+            let input = InputVersion::read(&identity, messages);
             let Some(scope) = row_scope(&row) else {
                 continue;
             };
@@ -158,7 +165,7 @@ impl Monitor {
                 break;
             }
             self.probe = Some(Probe::start(
-                state, &row, previous, &salt, budget, generation,
+                state, &row, previous, &salt, budget, generation, input,
             )?);
             break;
         }
@@ -243,6 +250,9 @@ impl Monitor {
                     .collect(),
             )
         } else {
+            if probe.input != InputVersion::read(&assignment.worker, &inbox.messages) {
+                return Ok(false);
+            }
             self.evaluate(&row, watch, observed.sample, &history, now)
         };
         let sent = !notices.is_empty();
@@ -282,13 +292,15 @@ impl Monitor {
             fingerprint,
             salt,
             fault,
-            nonblank,
+            mut activity,
         } = sample
         else {
             let notice = Notice::Unavailable;
+            let unavailable = matches!(sample, Sample::Missing)
+                || (matches!(sample, Sample::ReadFailed) && previous.is_some());
             return (
                 None,
-                (previous.is_some() && !was_unreadable)
+                (unavailable && !was_unreadable)
                     .then_some(notice)
                     .into_iter()
                     .collect(),
@@ -299,6 +311,8 @@ impl Monitor {
         // capture establishes a baseline without claiming fresh activity.
         let comparable = previous.filter(|w| w.normalized);
         let changed = comparable.is_none_or(|w| w.fingerprint != fingerprint);
+        let earlier_activity = comparable.and_then(|w| w.activity.as_ref());
+        let fresh_activity = earlier_activity.is_some_and(|before| activity.adds_to(before));
         let reset = changed || was_unreadable || previous.is_some_and(|w| w.paused != paused);
         let since = if reset {
             now
@@ -312,12 +326,20 @@ impl Monitor {
             .unwrap_or(now);
         let total = (now - started).max(0.0);
         let mut notices = Vec::new();
+        let recovered = fault.is_none() && !paused && fresh_activity && fault_open;
+        if !recovered && (fault_open || fault.is_some()) {
+            // A line can disappear temporarily and reappear in a redraw.
+            // Keep previously seen evidence through the whole open episode.
+            if let Some(earlier) = earlier_activity {
+                activity.include(earlier);
+            }
+        }
         if let Some(notice) = fault {
             if !seen(&notice) {
                 notices.push(notice);
             }
         } else if !paused {
-            if changed && nonblank && comparable.is_some() && fault_open {
+            if recovered {
                 notices.push(Notice::Recovered);
             } else if !was_unreadable
                 && !fault_open
@@ -341,7 +363,7 @@ impl Monitor {
         {
             notices.push(deadline);
         }
-        let next = reset.then(|| Watch {
+        let next = (reset || previous.is_some_and(|w| w.activity.is_none())).then(|| Watch {
             at: now,
             attempt: row["attempt"].as_str().unwrap_or_default().into(),
             round: row["round"].as_u64().unwrap_or_default(),
@@ -350,6 +372,7 @@ impl Monitor {
             salt,
             fingerprint,
             normalized: true,
+            activity: Some(activity),
             since,
             paused,
         });
@@ -467,6 +490,36 @@ fn current_messages<'a, 'row>(
     })
 }
 
+#[derive(PartialEq, Eq)]
+struct InputVersion(Vec<(u64, String, u64, InputResult)>);
+
+impl InputVersion {
+    fn read(worker: &Identity, ledger: &[Message]) -> Self {
+        Self(
+            ledger
+                .iter()
+                .filter(|message| {
+                    let identity = &message.worker;
+                    identity.dispatch == worker.dispatch
+                        && identity.attempt == worker.attempt
+                        && identity.round == worker.round
+                        && identity.role == worker.role
+                        && identity.scope() == worker.scope()
+                })
+                .filter_map(|message| {
+                    let reply = message.reply_payload.as_ref()?;
+                    Some((
+                        message.id,
+                        message.message_id.clone(),
+                        message.delivery.status_version,
+                        reply.input_result,
+                    ))
+                })
+                .collect(),
+        )
+    }
+}
+
 fn history(row: &Value, ledger: &[Message]) -> Result<Vec<Value>> {
     view::merged_history(
         row,
@@ -540,6 +593,8 @@ struct Watch {
     fingerprint: String,
     #[serde(default)]
     normalized: bool,
+    #[serde(default)]
+    activity: Option<ActivityEvidence>,
     since: f64,
     #[serde(default)]
     paused: bool,
@@ -570,9 +625,11 @@ enum Sample {
         fingerprint: String,
         salt: String,
         fault: Option<Notice>,
-        nonblank: bool,
+        activity: ActivityEvidence,
     },
-    Unavailable,
+    Missing,
+    ReadFailed,
+    Terminal,
 }
 
 fn phrase(line: &str, choices: &[&str]) -> bool {
@@ -657,58 +714,112 @@ fn screen_content(screen: &str) -> String {
         .join("\n")
 }
 
-fn classify(host: &str, screen: &str) -> Option<Notice> {
-    if host == "codex" && crate::tmux::codex_read_only(screen) {
-        return Some(Notice::Permission);
+// Salted membership evidence for normalized activity lines. A Bloom filter
+// can hide a novelty when hashes overlap, but cannot make an old line new.
+// Its fixed size keeps both the watch and the isolated response bounded.
+#[derive(Deserialize, PartialEq, Serialize)]
+struct ActivityEvidence([[u64; 32]; 4]);
+
+impl ActivityEvidence {
+    fn record(&mut self, salt: &str, line: &str) {
+        let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        let digest = body_hash(&format!("{salt}{normalized}"));
+        for (i, words) in self.0.iter_mut().enumerate() {
+            let hash = usize::from_str_radix(&digest[i * 4..i * 4 + 4], 16)
+                .expect("body hash uses hexadecimal");
+            let bit = hash % (words.len() * 64);
+            words[bit / 64] |= 1 << (bit % 64);
+        }
     }
-    // Unknown footer text does not take precedence over visible fault evidence.
-    for original in screen.lines().rev() {
-        let line = screen_line(original);
-        let explicit_activity = phrase(&line, &["working", "processing", "resumed activity"]);
-        let assistant_output = host == "codex"
-            && original.starts_with("• ")
-            && line
-                .split_whitespace()
-                .any(|word| word.chars().next().is_some_and(char::is_alphabetic));
-        let prefix = |choices| phrase(&line, choices);
-        let notice = if prefix(&[
-            "quota exceeded",
-            "usage limit reached",
-            "rate limit exceeded",
-            "rate limit reached",
-            "insufficient credits",
-            "error: quota exceeded",
-        ]) {
-            Notice::Quota
-        } else if prefix(&[
-            "approval required",
-            "permission required",
-            "waiting for approval",
-            "read-only session",
-            "trust this workspace",
-        ]) {
-            Notice::Permission
-        } else if prefix(&[
-            "connection reset",
-            "protocol disconnected",
-            "connection lost",
-            "broken pipe",
-        ]) {
-            Notice::Disconnected
-        } else if prefix(&["login required", "authentication failed", "unauthorized"]) {
-            Notice::Authentication
-        } else if prefix(&["policy rejected", "policy denied", "forbidden by policy"]) {
-            Notice::Policy
-        } else if prefix(&["request timed out", "operation timed out", "host timeout"]) {
-            Notice::HostTimeout
-        } else if assistant_output || explicit_activity {
-            return None;
-        } else {
-            continue;
-        };
-        return Some(notice);
+
+    fn adds_to(&self, earlier: &Self) -> bool {
+        self.0
+            .iter()
+            .flatten()
+            .zip(earlier.0.iter().flatten())
+            .any(|(new, old)| new & !old != 0)
     }
-    None
+
+    fn include(&mut self, earlier: &Self) {
+        for (new, old) in self.0.iter_mut().flatten().zip(earlier.0.iter().flatten()) {
+            *new |= old;
+        }
+    }
+}
+
+enum ScreenSignal {
+    Fault(Notice),
+    Activity,
+}
+
+fn screen_signal(host: &str, original: &str) -> Option<ScreenSignal> {
+    let line = screen_line(original);
+    let explicit_activity = phrase(&line, &["working", "processing", "resumed activity"]);
+    let assistant_output = host == "codex"
+        && original.starts_with("• ")
+        && line
+            .split_whitespace()
+            .any(|word| word.chars().next().is_some_and(char::is_alphabetic));
+    let prefix = |choices| phrase(&line, choices);
+    let fault = if prefix(&[
+        "quota exceeded",
+        "usage limit reached",
+        "rate limit exceeded",
+        "rate limit reached",
+        "insufficient credits",
+        "error: quota exceeded",
+    ]) {
+        Notice::Quota
+    } else if prefix(&[
+        "approval required",
+        "permission required",
+        "waiting for approval",
+        "read-only session",
+        "trust this workspace",
+    ]) {
+        Notice::Permission
+    } else if prefix(&[
+        "connection reset",
+        "protocol disconnected",
+        "connection lost",
+        "broken pipe",
+    ]) {
+        Notice::Disconnected
+    } else if prefix(&["login required", "authentication failed", "unauthorized"]) {
+        Notice::Authentication
+    } else if prefix(&["policy rejected", "policy denied", "forbidden by policy"]) {
+        Notice::Policy
+    } else if prefix(&["request timed out", "operation timed out", "host timeout"]) {
+        Notice::HostTimeout
+    } else if assistant_output || explicit_activity {
+        return Some(ScreenSignal::Activity);
+    } else {
+        return None;
+    };
+    Some(ScreenSignal::Fault(fault))
+}
+
+fn screen_evidence(host: &str, screen: &str, salt: &str) -> (Option<Notice>, ActivityEvidence) {
+    let mut newest = None;
+    let mut activity = ActivityEvidence([[0; 32]; 4]);
+    for line in screen.lines().rev() {
+        if let Some(signal) = screen_signal(host, line) {
+            if matches!(signal, ScreenSignal::Activity) {
+                activity.record(salt, line);
+            }
+            if newest.is_none() {
+                newest = Some(signal);
+            }
+        }
+    }
+    let fault = if host == "codex" && crate::tmux::codex_read_only(screen) {
+        Some(Notice::Permission)
+    } else if let Some(ScreenSignal::Fault(fault)) = newest {
+        Some(fault)
+    } else {
+        None
+    };
+    (fault, activity)
 }
 
 #[derive(Deserialize, Serialize)]
@@ -819,13 +930,13 @@ pub(in crate::workflow) fn project(row: &mut Value, history: &[Value]) {
     let latest = if pending {
         current()
             .rev()
-            .take_while(|m| m["type"] != "question")
+            .filter(|m| m["kind"] == OBSERVATION)
+            .take_while(|m| m["fault"]["evidence"] != "changed_activity")
             .find(|m| {
-                m["kind"] == OBSERVATION
-                    && matches!(
-                        m["fault"]["evidence"].as_str(),
-                        Some("screen_notice" | "verified_exit")
-                    )
+                matches!(
+                    m["fault"]["evidence"].as_str(),
+                    Some("screen_notice" | "verified_exit")
+                )
             })
     } else {
         current().rfind(|m| m["kind"] == OBSERVATION && !is_read_event(m))
