@@ -76,7 +76,8 @@ fn call(state: &Path, row: &Value, mut request: Value) -> Result<Value> {
             if matches!(
                 reply["result"].as_str(),
                 Some("accepted" | "refused" | "definitely-not-sent" | "uncertain")
-            ) || (request["op"] == "close" && reply["result"] == "completed") =>
+            ) || (matches!(request["op"].as_str(), Some("close" | "revoke"))
+                && reply["result"] == "completed") =>
         {
             Ok(reply)
         }
@@ -156,7 +157,7 @@ fn existing(state: &Path, row: &Value, op: &str) -> Result<Value> {
             request["legacyLaunchId"] = json!(hint);
         }
     }
-    if op == "close" {
+    if matches!(op, "close" | "revoke") {
         request["closeOperationId"] = json!(close_operation(row)?);
     }
     call(state, row, request)
@@ -415,10 +416,12 @@ fn closed_worker(state: &Path, row: &Value, saved: &Value) -> Result<Value> {
 pub fn observe(state: &Path, row: &Value) -> Result<(Value, Value)> {
     let saved = archive(state, row)?.unwrap_or(Value::Null);
     if confirmed(row, &saved) {
-        return Ok((
-            closed_worker(state, row, &saved)?,
-            json!({"result":"completed","alive":false,"closeEffect":saved["closeEffect"]}),
-        ));
+        let mut observation =
+            json!({"result":"completed","alive":false,"closeEffect":saved["closeEffect"]});
+        if let Some(revocation) = saved.get("revocation") {
+            observation["revocation"] = revocation.clone();
+        }
+        return Ok((closed_worker(state, row, &saved)?, observation));
     }
     let mut inspection = existing(state, row, "inspect")
         .unwrap_or_else(|e| json!({"result":"uncertain","diagnostic":e.to_string()}));
@@ -490,7 +493,9 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
         );
     }
     let launch = inspect_launch(state, row, &observed)?;
-    let answer = existing(state, row, "close")?;
+    // An older backend must reject this verb instead of falling through to
+    // a normal close if the worker starts or the original socket returns.
+    let answer = existing(state, row, if recovery { "revoke" } else { "close" })?;
     ensure!(
         answer["result"] == "completed",
         "close {}: {}",
