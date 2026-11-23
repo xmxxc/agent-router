@@ -1,5 +1,8 @@
 //! One detached, single-threaded wfc owns and reaps one Linux worker tree.
-use super::{controller, messages, read_record, record_scope, state_dir, valid_id, valid_identity};
+use super::{
+    assignment, controller, messages, read_record, record_scope, state_dir, valid_id,
+    valid_identity,
+};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -162,60 +165,62 @@ pub fn close(id: &str, explicit_token: Option<&str>) -> Result<Value> {
     ensure!(valid_id(id), "invalid dispatch ID");
     let state = state_dir()?;
     let dir = state.join("dispatches");
-    let record = super::assignment::public_record(&dir, id)?
-        .with_context(|| format!("unknown dispatch {id}"))?;
-    ensure!(
-        record["publicationDiagnostic"].is_null(),
-        "close uncertain: {}",
-        record["publicationDiagnostic"]
-    );
-    ensure!(
-        record.get("controllerOwner").is_none_or(Value::is_null),
-        "controller owner authorization required"
-    );
-    let scope = record_scope(&record).context("invalid dispatch scope")?;
+    let read =
+        || assignment::public_record(&dir, id)?.with_context(|| format!("unknown dispatch {id}"));
+    let initial = read()?;
+    validate_close(&initial)?;
+    let scope = record_scope(&initial).context("invalid dispatch scope")?;
     let token = controller::token(explicit_token);
     let authorize = || controller::Owners::read(&state)?.require(scope, token.as_deref(), "close");
-    let hosted = record["host"].is_string();
-    let controlled = record.get("worker").is_some();
-    let receipt = |already_gone| {
-        let mut receipt = json!({"operation":"close","result":"completed","dispatch":id,
-            "round":record["round"],"attempt":record["attempt"]});
-        if already_gone {
-            receipt["diagnostic"] = json!("session was already gone");
-        }
-        receipt
-    };
-    if !authorize()? {
-        // A confirmed archive can be read before taking a write lock. Any
-        // inconclusive or failed read goes through the usual locked path.
-        let archived = if hosted {
-            super::backend::read_only_close(&state, &record)
-        } else if controlled {
-            open_owner(&dir, &record, false).and_then(|(owner, finished)| {
+    let replay = |record: &Value| {
+        if record["host"].is_string() {
+            super::backend::read_only_close(&state, record)
+        } else if record.get("worker").is_some() {
+            open_owner(&dir, record, false).and_then(|(owner, finished)| {
                 if !finished {
                     return Ok(None);
                 }
                 outcome(&owner)?;
-                Ok(Some(receipt(true)))
+                Ok(Some(raw_close_receipt(record, true)))
             })
         } else {
             Ok(None)
-        };
-        if let Ok(Some(receipt)) = archived {
-            if !authorize()? {
+        }
+    };
+    if !authorize()? {
+        // A confirmed archive can be read before taking a write lock. Any
+        // inconclusive or failed read goes through the usual locked path.
+        if let Ok(Some(receipt)) = replay(&initial) {
+            if read()? == initial && !authorize()? {
                 return Ok(receipt);
             }
         }
     }
     let _scope_lock = controller::lock_scope(&state, scope)?;
     authorize()?;
-    if hosted {
+    let record = read()?;
+    ensure!(
+        record_scope(&record) == Some(scope)
+            && ["dispatch", "round", "attempt", "executionId"]
+                .iter()
+                .all(|key| record[*key] == initial[*key]),
+        "assignment changed while waiting to close; inspect status and retry"
+    );
+    validate_close(&record)?;
+    if let Some(event) = assignment::unresolved_lifecycle(&record) {
+        // Older builds could confirm the close while this audit was
+        // unresolved. Replay that receipt without asking the backend to close.
+        if let Ok(Some(receipt)) = replay(&record) {
+            return Ok(receipt);
+        }
+        return Err(assignment::lifecycle_reconcile_required(&record, event));
+    }
+    if record["host"].is_string() {
         return super::backend::close(&state, &record);
     }
     // Older foreground records were only published after successful exit.
     let mut already_gone = true;
-    if controlled {
+    if record.get("worker").is_some() {
         let (reader, unlocked) = open_owner(&dir, &record, false)?;
         let _lock;
         let (owner, unlocked) = if unlocked {
@@ -223,7 +228,7 @@ pub fn close(id: &str, explicit_token: Option<&str>) -> Result<Value> {
         } else {
             // A verified finished archive can be replayed read-only. Only
             // a live attempt needs the write lock and a fresh owner check.
-            _lock = super::assignment::close_lock(&state, &record)?;
+            _lock = assignment::close_lock(&state, &record)?;
             let (reader, unlocked) = open_owner(&dir, &record, false)?;
             if unlocked {
                 (reader, true)
@@ -247,7 +252,29 @@ pub fn close(id: &str, explicit_token: Option<&str>) -> Result<Value> {
         }
         outcome(&owner)?;
     }
-    Ok(receipt(already_gone))
+    Ok(raw_close_receipt(&record, already_gone))
+}
+
+fn validate_close(record: &Value) -> Result<()> {
+    ensure!(
+        record["publicationDiagnostic"].is_null(),
+        "close uncertain: {}",
+        record["publicationDiagnostic"]
+    );
+    ensure!(
+        record.get("controllerOwner").is_none_or(Value::is_null),
+        "controller owner authorization required"
+    );
+    Ok(())
+}
+
+fn raw_close_receipt(record: &Value, already_gone: bool) -> Value {
+    let mut receipt = json!({"operation":"close","result":"completed","dispatch":record["dispatch"],
+        "round":record["round"],"attempt":record["attempt"]});
+    if already_gone {
+        receipt["diagnostic"] = json!("session was already gone");
+    }
+    receipt
 }
 
 pub fn run(args: &[OsString]) -> Result<()> {

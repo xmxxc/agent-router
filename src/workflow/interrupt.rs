@@ -42,12 +42,18 @@ impl<'a> Interrupt<'a> {
         let initial = read()?;
         let scope = record_scope(&initial).context("invalid dispatch scope")?;
         let token = controller::token(self.owner_token);
-        controller::Owners::read(&state)?.require(scope, token.as_deref(), "interrupt")?;
+        let authorize = || -> Result<Value> {
+            let owners = controller::Owners::read(&state)?;
+            owners.require(scope, token.as_deref(), "interrupt")?;
+            Ok(owners.public(scope)?.unwrap_or(Value::Null)["generation"].clone())
+        };
+        authorize()?;
         ensure!(
             verified_assignment(&initial),
             "interrupt requires a confirmed native tmux worker assignment"
         );
-        let (_scope, _execution) = lock_execution(&state, &initial, scope, token.as_deref())?;
+        let (scope_lock, execution_lock) =
+            lock_execution(&state, &initial, scope, token.as_deref())?;
         let row = read()?;
         ensure!(
             record_scope(&row) == Some(scope)
@@ -59,18 +65,14 @@ impl<'a> Interrupt<'a> {
         if let Some(event) =
             assignment::unresolved_lifecycle(&row).or_else(|| assignment::interrupt_fence(&row))
         {
-            return Err(controller::ControllerError::from_detail(json!({
-                "error":"lifecycle_reconcile_required","dispatch":self.dispatch,
-                "operation":event["operation"],"audit":event["id"],"result":event["result"],
-                "round":row["round"],"attempt":row["attempt"],
-                "diagnostic":"previous lifecycle operation or interrupt fence requires explicit follow-up"
-            })).into());
+            return Err(assignment::lifecycle_reconcile_required(&row, event));
         }
         ensure!(
             row == initial,
             "assignment changed while preparing interrupt"
         );
-        let (worker, inspected) = backend::observe(&state, &mut row.clone())?;
+        let mut projected = row.clone();
+        let (worker, inspected) = backend::observe(&state, &mut projected)?;
         let launch = inspected["launchId"].as_str();
         ensure!(
             inspected["result"] == "accepted"
@@ -84,18 +86,16 @@ impl<'a> Interrupt<'a> {
             "interrupt requires the live original tmux writer; inspect status"
         );
         let launch = launch.context("missing verified tmux launch")?;
+        projected["worker"] = worker;
 
-        let (mut next, index) = {
+        let (mut next, index, generation) = {
             let _ledger = messages::lock_for_publish(&state)?;
-            let owners = controller::Owners::read(&state)?;
-            owners.require(scope, token.as_deref(), "interrupt")?;
-            let generation = owners.public(scope)?.unwrap_or(Value::Null)["generation"].clone();
+            let generation = authorize()?;
             ensure!(
                 read()? == row,
                 "assignment changed while preparing interrupt"
             );
             let history = view::merged_history(&row, messages::history(&state, self.dispatch)?)?;
-            let mut projected = row.clone();
             view::project(&mut projected, &history, Some(true), false)?;
 
             let mut next = row.clone();
@@ -130,14 +130,12 @@ impl<'a> Interrupt<'a> {
             }));
             write_json(&path, &next, None)?;
             messages::sync_directory(&dir)?;
-            (next, index)
+            (next, index, generation)
         };
 
         // The backend rechecks the live pane and process in its guarded
         // command. From the first send, missing confirmation is ambiguous.
-        let outcome = backend::interrupt(&state, &row, launch).unwrap_or_else(
-            |error| json!({"result":"uncertain","diagnostic":format!("{error:#}")}),
-        );
+        let outcome = backend::interrupt(&state, &row, launch, [&scope_lock, &execution_lock]);
         let result = match (outcome["result"].as_str(), outcome["inputResult"].as_str()) {
             (Some("accepted"), _) => "accepted",
             (Some("refused"), _) => "refused",
@@ -151,6 +149,10 @@ impl<'a> Interrupt<'a> {
             "attempt":row["attempt"],"audit":index + 1,"result":result
         });
         let _ledger = messages::lock_for_publish(&state)?;
+        ensure!(
+            authorize()? == generation,
+            "controller generation changed before interrupt settlement"
+        );
         ensure!(
             read()? == next,
             "assignment changed before interrupt settlement"

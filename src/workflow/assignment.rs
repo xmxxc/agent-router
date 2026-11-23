@@ -76,6 +76,17 @@ pub(super) fn unresolved_lifecycle(row: &Value) -> Option<&Value> {
         .find(|event| matches!(event["result"].as_str(), Some("pending" | "uncertain")))
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn lifecycle_reconcile_required(row: &Value, event: &Value) -> anyhow::Error {
+    super::controller::ControllerError::from_detail(json!({
+        "error":"lifecycle_reconcile_required","dispatch":row["dispatch"],
+        "operation":event["operation"],"audit":event["id"],"result":event["result"],
+        "round":row["round"],"attempt":row["attempt"],
+        "diagnostic":"previous lifecycle operation or interrupt fence requires explicit follow-up"
+    }))
+    .into()
+}
+
 pub(super) fn public_record(dir: &Path, id: &str) -> Result<Option<Value>> {
     let (file, path) = match open_assignment(dir, id) {
         Ok(pair) => pair,

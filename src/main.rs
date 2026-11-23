@@ -125,7 +125,12 @@ fn run() -> anyhow::Result<ExitCode> {
             return host_launch::supervise(&spec);
         }
         #[cfg(target_os = "linux")]
-        Some("--tmux-backend") if args.is_empty() => {
+        Some("--tmux-backend")
+            if args.is_empty() || (args.len() == 3 && args[0] == "--lifecycle-lock-fds") =>
+        {
+            if let [_, scope, execution] = args.as_slice() {
+                tmux::retain_lifecycle_locks([scope, execution])?;
+            }
             let request = serde_json::from_reader(std::io::stdin().lock())?;
             println!("{}", tmux::execute(&workflow::state_dir()?, request)?);
         }

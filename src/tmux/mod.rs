@@ -861,6 +861,24 @@ pub(crate) fn attach(state: &Path, dispatch: &str, socket: &Path, token: &str) -
     Ok(())
 }
 
+// Keep the controller's locks through this operation even if it exits.
+// Restore CLOEXEC before tmux starts so its children cannot retain them.
+pub(crate) fn retain_lifecycle_locks(fds: [&std::ffi::OsStr; 2]) -> Result<()> {
+    for fd in fds {
+        let fd: std::os::fd::RawFd = fd
+            .to_str()
+            .context("invalid lifecycle lock descriptor")?
+            .parse()?;
+        ensure!(fd > 2, "invalid lifecycle lock descriptor");
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1
+        {
+            return Err(std::io::Error::last_os_error()).context("retain inherited lifecycle lock");
+        }
+    }
+    Ok(())
+}
+
 pub fn execute(state: &Path, request: Request) -> Result<Value> {
     ensure!(
         matches!(request.backend.as_deref(), None | Some("" | "tmux")),

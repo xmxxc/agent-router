@@ -7,7 +7,7 @@ use std::{
     fs::File,
     io::ErrorKind,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
 };
 
 // Public assignments published with the session-aware tmux protocol.
@@ -32,6 +32,11 @@ pub fn tmux_socket() -> Result<PathBuf> {
 }
 
 fn call(state: &Path, row: &Value, mut request: Value) -> Result<Value> {
+    let child = command(state, row, &mut request)?.spawn()?;
+    exchange(child, &request)
+}
+
+fn command(state: &Path, row: &Value, request: &mut Value) -> Result<Command> {
     ensure!(
         row["backend"] == "tmux",
         "{} backend adapter is unavailable in this build",
@@ -44,14 +49,17 @@ fn call(state: &Path, row: &Value, mut request: Value) -> Result<Value> {
     if let Some(socket) = row["tmuxSocket"].as_str() {
         command.env("WFC_TMUX_SOCKET", socket);
     }
-    let mut child = command
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    Ok(command)
+}
+
+fn exchange(mut child: Child, request: &Value) -> Result<Value> {
     let sent = serde_json::to_writer(
         child.stdin.take().context("missing backend input")?,
-        &request,
+        request,
     );
     // Once the pipe has been offered the request, a failed wait/read cannot
     // establish that the backend did nothing. Keep the caller's assignment.
@@ -168,12 +176,43 @@ fn existing(state: &Path, row: &Value, op: &str) -> Result<Value> {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn interrupt(state: &Path, row: &Value, launch: &str) -> Result<Value> {
-    call(
-        state,
-        row,
-        json!({"op":"interrupt","executionId":row["executionId"],"launchId":launch}),
-    )
+pub(super) fn interrupt(state: &Path, row: &Value, launch: &str, locks: [&File; 2]) -> Value {
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+
+    let mut request = json!({"op":"interrupt","executionId":row["executionId"],"launchId":launch});
+    let fds = locks.map(|lock| lock.as_raw_fd());
+    let start = command(state, row, &mut request).and_then(|mut command| {
+        ensure!(
+            fds.iter().all(|&fd| fd > 2),
+            "invalid lifecycle lock descriptor"
+        );
+        command
+            .arg("--lifecycle-lock-fds")
+            .args(fds.map(|fd| fd.to_string()));
+        super::worker_owner::new_session(&mut command);
+        // Only this child inherits the locked descriptions. It restores
+        // CLOEXEC before it invokes tmux, which must not retain the locks.
+        unsafe {
+            command.pre_exec(move || {
+                for fd in fds {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags == -1
+                        || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        command.spawn().context("start tmux backend")
+    });
+    match start {
+        Err(error) => json!({"result":"definitely-not-sent","diagnostic":format!("{error:#}")}),
+        Ok(child) => exchange(child, &request).unwrap_or_else(
+            |error| json!({"result":"uncertain","diagnostic":format!("{error:#}")}),
+        ),
+    }
 }
 
 fn receipt_id(row: &Value) -> Result<Option<&str>> {

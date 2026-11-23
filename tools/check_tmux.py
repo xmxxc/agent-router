@@ -1,6 +1,7 @@
 """Exercise the public CLI and private backend with a fresh tmux server and state roots."""
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -159,13 +160,28 @@ class Backend(unittest.TestCase):
         self.assertFalse((history / "controller-owners.json").exists())
         archive = history / "dispatches" / archive_name
         saved = archive.read_bytes()
-        with read_only_tree(history):
-            replay = data(*close, state=history)
-            for field in ("dispatch", "round", "attempt", "result", "closeOperationId", "closeEffect"):
-                self.assertEqual(replay[field], first[field])
-            self.assertEqual(replay["diagnostic"], "session was already gone")
-            self.assertEqual(archive.read_bytes(), saved)
-            self.assertFalse(list(history.glob("relay-*.lock")))
+
+        def assert_read_only_replay():
+            with read_only_tree(history):
+                replay = data(*close, state=history)
+                for field in ("dispatch", "round", "attempt", "result", "closeOperationId", "closeEffect"):
+                    self.assertEqual(replay[field], first[field])
+                self.assertEqual(replay["diagnostic"], "session was already gone")
+                self.assertEqual(archive.read_bytes(), saved)
+                self.assertFalse(list(history.glob("relay-*.lock")))
+                return replay
+
+        replay = assert_read_only_replay()
+        # R2 could close this execution with an unresolved interrupt audit.
+        # Its same-execution archive still permits a read-only replay.
+        assignment_path = history / "dispatches" / assignment
+        record = json.loads(assignment_path.read_text())
+        record["audit"] = [dict(id=1, operation="interrupt", dispatch=worker["dispatch"], round=worker["round"],
+                                attempt=worker["attempt"], result="uncertain", scopeFence=True)]
+        legacy = json.dumps(record)
+        assignment_path.write_text(legacy)
+        self.assertEqual(assert_read_only_replay(), replay)
+        self.assertEqual(assignment_path.read_text(), legacy)
 
         ambiguous = json.loads(saved)
         ambiguous["round"] += 1
@@ -187,7 +203,8 @@ class Backend(unittest.TestCase):
         self.assertEqual(data(*close, "--owner-token", b["token"])["closeOperationId"],
                          replay["closeOperationId"])
         print(json.dumps({"readOnlyClose": replay, "unlockedFirstCloseRefused": True,
-                          "ambiguousArchiveRefused": True, "managedReplayRequiresLock": True,
+                          "legacyUnresolvedArchiveReplayed": True, "ambiguousArchiveRefused": True,
+                          "managedReplayRequiresLock": True,
                           "staleTokenRefused": True, "euid": os.geteuid()}), flush=True)
 
     def test_managed_dispatch_callback_survives_takeover(self):
@@ -2291,21 +2308,33 @@ with open(attempt + ".keys", "wb", buffering=0) as keys:
 
         shim = self.work / "tmux"
         shim.write_text(f"""#!{sys.executable}
-import os, subprocess, sys, time
+import json, os, subprocess, sys, time
 from pathlib import Path
 
 args = sys.argv[1:]
 real = {TMUX!r}
 work = Path({str(self.work)!r})
 mode = os.environ.get("INTERRUPT_TEST_MODE")
+def hold():
+    (work / "at-interrupt-key").touch()
+    deadline = time.monotonic() + 25
+    while not (work / "allow-interrupt-key").exists():
+        if time.monotonic() >= deadline:
+            sys.exit(2)
+        time.sleep(.02)
+
+if mode == "before-backend-start" and "list-panes" in args:
+    hold()
 if mode and "if-shell" in args and any("send-keys -t " in a and " C-c" in a for a in args):
     if mode == "hold":
-        (work / "at-interrupt-key").touch()
-        deadline = time.monotonic() + 12
-        while not (work / "allow-interrupt-key").exists():
-            if time.monotonic() >= deadline:
-                sys.exit(2)
-            time.sleep(.02)
+        links = []
+        for fd in Path("/proc/self/fd").iterdir():
+            try:
+                links.append(os.readlink(fd))
+            except FileNotFoundError:
+                pass
+        (work / "interrupt-client-fds").write_text(json.dumps(links))
+        hold()
     elif mode == "lose-response":
         result = subprocess.run([real, *args], stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, close_fds=False)
@@ -2317,11 +2346,29 @@ os.execv(real, [real, *args])
         shim.chmod(0o700)
         return cli, dispatch, env
 
-    def wait_interrupt_fixture(self, ready):
-        deadline = time.monotonic() + 6
+    def wait_interrupt_fixture(self, ready, timeout=6):
+        deadline = time.monotonic() + timeout
         while not ready():
             self.assertLess(time.monotonic(), deadline, "interrupt fixture did not reach its boundary")
             time.sleep(.025)
+
+    @contextmanager
+    def gated_interrupt(self, env, dispatch, *, mode="hold", binary=WFC):
+        env = {**env, "PATH": str(self.work) + ":" + env["PATH"], "INTERRUPT_TEST_MODE": mode}
+        with subprocess.Popen([binary, "interrupt", dispatch], cwd=self.work, env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, start_new_session=True) as process:
+            try:
+                self.wait_interrupt_fixture((self.work / "at-interrupt-key").exists)
+                yield process
+            finally:
+                (self.work / "allow-interrupt-key").touch()
+                try:
+                    process.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+                    raise
 
     def test_public_interrupt_fences_before_tmux_key(self):
         cli, dispatch, env = self.public_interrupt_fixture()
@@ -2413,9 +2460,143 @@ os.execv(real, [real, *args])
         audit, = status["audit"]
         self.assertEqual((audit["scopeFence"], audit["ownerGeneration"], audit["result"]),
                          (True, None, "uncertain"))
+        refused = json.loads(cli("close", identity[0], code=1))
+        self.assertEqual((refused["error"], refused["audit"], refused["result"]),
+                         ("lifecycle_reconcile_required", 1, "uncertain"))
+        self.assertFalse((self.state / "dispatches" / f"{identity[0]}.{identity[1]}.closed").exists())
+        self.active_pane(identity[0])
         self.assertEqual(keys.read_bytes(), b"\x03")
         self.assertEqual(foreign_keys.read_bytes(), b"")
         subprocess.run(self.tmux + ["has-session", "-t", foreign_session], env=self.env, check=True)
+
+    def test_public_interrupt_holds_both_locks_after_controller_exit(self):
+        cli, dispatch, env = self.public_interrupt_fixture()
+        scope = "interrupt-controller-exit"
+        owner = cli("acquire", "--scope", scope, "--owner", "A")
+        target, _, keys = dispatch(scope, WFC_OWNER_TOKEN=owner["token"])
+        neighbor, _, other_keys = dispatch("interrupt-neighbor")
+        dispatch_id, attempt = target["dispatch"], target["attempt"]
+        scope_lock = self.state / ("relay-" + hashlib.sha256(scope.encode()).hexdigest() + ".lock")
+        attempt_lock = self.state / "close-locks" / f"{dispatch_id}.{attempt}"
+        path = self.state / "dispatches" / f"{dispatch_id}.json"
+        pending = None
+        try:
+            with self.gated_interrupt({**env, "WFC_OWNER_TOKEN": owner["token"]}, dispatch_id) as process:
+                os.killpg(process.pid, signal.SIGKILL)
+                self.assertEqual(process.wait(timeout=5), -signal.SIGKILL)
+                saved = path.read_bytes()
+                audit, = json.loads(saved)["audit"]
+                self.assertEqual((audit["id"], audit["result"], audit["ownerGeneration"]), (1, "pending", 1))
+                links = json.loads((self.work / "interrupt-client-fds").read_text())
+                for lock_path in (scope_lock, attempt_lock):
+                    self.assertNotIn(str(lock_path), links)
+                    with lock_path.open("rb") as lock:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                pending = subprocess.Popen([WFC, "takeover", "--scope", scope, "--owner", "B"],
+                                           cwd=self.work, env=env, text=True,
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+                def opened_scope():
+                    for fd in Path(f"/proc/{pending.pid}/fd").iterdir():
+                        try:
+                            if os.readlink(fd) == str(scope_lock):
+                                return True
+                        except FileNotFoundError:
+                            pass
+                    return False
+
+                self.wait_interrupt_fixture(opened_scope)
+                self.assertIsNone(pending.poll())
+                self.assertEqual(keys.read_bytes(), b"")
+            out, err = pending.communicate(timeout=10)
+            self.assertEqual(pending.returncode, 0, (out, err))
+            current = json.loads(out)
+        finally:
+            if pending is not None:
+                if pending.poll() is None:
+                    pending.kill()
+                pending.communicate(timeout=5)
+        self.wait_interrupt_fixture(lambda: keys.read_bytes() == b"\x03")
+        self.assertEqual((current["generation"], path.read_bytes()), (2, saved))
+        for operation in ("close", "interrupt"):
+            blocked = json.loads(cli(operation, dispatch_id, code=1, WFC_OWNER_TOKEN=current["token"]))
+            self.assertEqual((blocked["error"], blocked["audit"], blocked["result"]),
+                             ("lifecycle_reconcile_required", 1, "pending"))
+        self.assertFalse((self.state / "dispatches" / f"{dispatch_id}.{attempt}.closed").exists())
+        self.active_pane(dispatch_id)
+        self.active_pane(neighbor["dispatch"])
+        self.assertEqual((keys.read_bytes(), other_keys.read_bytes()), (b"\x03", b""))
+        print(json.dumps({"controllerExited": True, "bothLocksHeld": True, "tmuxInheritedLocks": False,
+                          "takeoverGeneration": current["generation"], "audit": audit}), flush=True)
+
+    def test_public_interrupt_leaves_pending_when_owner_expires(self):
+        cli, dispatch, env = self.public_interrupt_fixture()
+        scope = "interrupt-expiry"
+        owner = cli("acquire", "--scope", scope, "--owner", "A")
+        credentials = {"WFC_OWNER_TOKEN": owner["token"]}
+        target, _, keys = dispatch(scope, **credentials)
+        neighbor, _, other_keys = dispatch("expiry-neighbor")
+        dispatch_id = target["dispatch"]
+        path = self.state / "dispatches" / f"{dispatch_id}.json"
+
+        cli("renew", "--scope", scope, "--lease", "5", **credentials)
+        expires = json.loads((self.state / "controller-owners.json").read_text())[scope]["until"]
+        with self.gated_interrupt({**env, **credentials}, dispatch_id) as process:
+            saved = path.read_bytes()
+            audit, = json.loads(saved)["audit"]
+            self.assertEqual((audit["result"], audit["ownerGeneration"]), ("pending", owner["generation"]))
+            self.assertEqual(keys.read_bytes(), b"")
+            self.wait_interrupt_fixture(lambda: time.time() > expires, timeout=10)
+            (self.work / "allow-interrupt-key").touch()
+            out, err = process.communicate(timeout=10)
+        self.assertEqual((process.returncode, out), (1, ""), err)
+        stale = json.loads(err)
+        self.assertEqual((stale["error"], stale["generation"], stale["active"]),
+                         ("stale_controller_owner", owner["generation"], False))
+        self.wait_interrupt_fixture(lambda: keys.read_bytes() == b"\x03")
+        self.assertEqual(path.read_bytes(), saved)
+        current = cli("takeover", "--scope", scope, "--owner", "B")
+        again = json.loads(cli("interrupt", dispatch_id, code=1, WFC_OWNER_TOKEN=current["token"]))
+        self.assertEqual((again["error"], again["audit"], again["result"]),
+                         ("lifecycle_reconcile_required", 1, "pending"))
+        self.active_pane(dispatch_id)
+        self.active_pane(neighbor["dispatch"])
+        self.assertEqual((keys.read_bytes(), other_keys.read_bytes()), (b"\x03", b""))
+        print(json.dumps({"staleOwner": stale, "pendingUnchanged": True, "nextOwner": current["generation"]}),
+              flush=True)
+
+    def test_public_interrupt_backend_spawn_failure_is_definitely_not_sent(self):
+        cli, dispatch, env = self.public_interrupt_fixture()
+        target, _, keys = dispatch("interrupt-no-spawn")
+        neighbor, _, other_keys = dispatch("no-spawn-neighbor")
+        dispatch_id, attempt = target["dispatch"], target["attempt"]
+        binary = self.work / "controller-copy"
+        shutil.copy2(WFC, binary)
+        with self.gated_interrupt(env, dispatch_id, mode="before-backend-start", binary=binary) as process:
+            # The original inspect backend is already running. Only the next
+            # backend exec on the fixture copy can fail with EACCES.
+            binary.chmod(0o600)
+            (self.work / "allow-interrupt-key").touch()
+            out, err = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, (out, err))
+        result = json.loads(out)
+        self.assertEqual((result["result"], result["attempt"], result["audit"]),
+                         ("definitely-not-sent", attempt, 1))
+        self.assertIn("start tmux backend", result["diagnostic"])
+        record = self.state / "dispatches" / f"{dispatch_id}.json"
+        audit, = json.loads(record.read_text())["audit"]
+        self.assertEqual((audit["result"], audit["scopeFence"]), ("definitely-not-sent", True))
+        self.assertTrue(audit["settledAt"])
+        blocked = json.loads(cli("interrupt", dispatch_id, code=1))
+        self.assertEqual((blocked["error"], blocked["audit"], blocked["result"]),
+                         ("lifecycle_reconcile_required", 1, "definitely-not-sent"))
+        self.active_pane(dispatch_id)
+        self.active_pane(neighbor["dispatch"])
+        self.assertEqual((keys.read_bytes(), other_keys.read_bytes()), (b"", b""))
+        self.assertEqual(cli("close", dispatch_id)["closeEffect"], "session_closed")
+        self.active_pane(neighbor["dispatch"])
+        print(json.dumps({"definiteFailure": result, "targetKeys": 0, "neighborKeys": 0}), flush=True)
 
     def test_lifecycle(self):
         # Keep the worker alive across Ctrl-C so close tests the active-session path.
