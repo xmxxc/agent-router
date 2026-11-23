@@ -1,0 +1,111 @@
+name: Linux OpenCode owner regressions from the fixed package
+on:
+  push:
+    branches: [rust-router/38-opencode-owner-artifact-ci]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  owner-artifact:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    env:
+      PRODUCT_SHA: 453fe04cd18dfccd525c8070ebfe33e659146a1a
+      PRODUCT_TREE: a30c73e0c4fdb8bab531079edcbf622e9f59d560
+      TARGET: x86_64-unknown-linux-gnu
+      EVIDENCE: ${{ github.workspace }}/linux-opencode-owner-artifact-evidence
+      LC_ALL: C.UTF-8
+    steps:
+      - name: Record the verification run
+        run: |
+          mkdir -p "$EVIDENCE"
+          printf 'workflow=%s\nrun=%s\nattempt=%s\nproduct=%s\ntree=%s\n' \
+            "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PRODUCT_SHA" "$PRODUCT_TREE" |
+            tee "$EVIDENCE/run.log"
+      - name: Check out the CI helpers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: ci
+          persist-credentials: false
+      - name: Check out the frozen fixture sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - name: Download the original run artifact
+        id: download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            endpoint="repos/$GITHUB_REPOSITORY/actions/artifacts/14847864563"
+            timeout --kill-after=5s 60s gh api "$endpoint" > "$EVIDENCE/original-artifact.json"
+            timeout --kill-after=5s 60s gh api "$endpoint/zip" > "$RUNNER_TEMP/original-artifact.zip"
+            printf 'Downloaded artifact 14847864563 from run 45233658606\n'
+          } 2>&1 | tee "$EVIDENCE/download.log"
+      - name: Verify the original checksums and staged ELF identity
+        id: identity
+        working-directory: product
+        run: |
+          {
+            test "$(git -C ../ci rev-parse HEAD)" = "$GITHUB_SHA"
+            test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+            test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+            sha256sum --check --strict vendor/INPUTS.sha256
+            cat /etc/os-release
+            uname -srm
+            getconf GNU_LIBC_VERSION
+            test "$(id -u)" -ne 0
+            bin="$RUNNER_TEMP/wfc-fixed/wfc"
+            mkdir "$RUNNER_TEMP/wfc-fixed"
+            python3 -Bu ../ci/tools/ci/opencode-relay/unpack_owner_artifact.py \
+              "$RUNNER_TEMP/original-artifact.zip" "$EVIDENCE/original-artifact.json" "$bin"
+            sha256sum "$bin" | tee "$EVIDENCE/binary.sha256"
+            readelf -hW -nW "$bin" | tee "$EVIDENCE/elf.log"
+            grep -Fq 'Build ID: 9f3a831f64f2953db1379b69cca7e227c6b55255' "$EVIDENCE/elf.log"
+            dependencies=$(ldd "$bin")
+            printf '%s\n' "$dependencies"
+            [[ "$dependencies" != *'not found'* ]]
+            version=$(env -i PATH=/usr/bin:/bin LANG=C.UTF-8 "$bin" --version)
+            printf '%s\n' "$version"
+            [[ "$version" == *"(Rust, $TARGET, release, build $PRODUCT_SHA)" ]]
+          } 2>&1 | tee "$EVIDENCE/identity.log"
+      - name: Run only the two owner methods using the archived ELF
+        id: owners
+        working-directory: product
+        run: |
+          RELAY_TEST_BINARY="$RUNNER_TEMP/wfc-fixed/wfc" \
+            bash ../ci/tools/ci/opencode-relay/verify.sh owner-only 2>&1 |
+            tee "$EVIDENCE/owners-step.log"
+      - name: Checksum available evidence
+        if: ${{ always() }}
+        env:
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          IDENTITY_OUTCOME: ${{ steps.identity.outcome }}
+          OWNERS_OUTCOME: ${{ steps.owners.outcome }}
+        run: |
+          mkdir -p "$EVIDENCE"
+          cd "$EVIDENCE"
+          printf 'download=%s\nidentity=%s\nowners=%s\n' \
+            "$DOWNLOAD_OUTCOME" "$IDENTITY_OUTCOME" "$OWNERS_OUTCOME" > outcomes.log
+          shopt -s nullglob
+          sha256sum -- *.log *.json *.sha256 > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+      - name: Upload verification logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-opencode-owner-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 14
