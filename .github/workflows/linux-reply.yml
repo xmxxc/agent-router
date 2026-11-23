@@ -1,7 +1,7 @@
 name: Linux reply boundaries and controller takeover
 on:
   push:
-    branches: [rust-router/11-reply-owner-combination]
+    branches: [rust-router/11-reply-r7-combination]
   workflow_dispatch:
 
 permissions:
@@ -18,6 +18,7 @@ jobs:
     env:
       WFC_BUILD_ID: ${{ github.sha }}
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+      HERDR_SOURCE_SHA: 2ecf19a92fc3a7fff75b6ce3655ef04f4625ec01
       CARGO_BUILD_JOBS: '2'
       PYTHONUTF8: '1'
       EVIDENCE: ${{ github.workspace }}/linux-reply-evidence
@@ -79,6 +80,7 @@ jobs:
         run: |
           herdr="$RUNNER_TEMP/herdr-0.9.5"
           {
+            printf 'Herdr v0.9.5 release source %s\n' "$HERDR_SOURCE_SHA"
             curl --fail --silent --show-error --location --retry 3 --max-time 120 \
               https://github.com/herdrdev/herdr/releases/download/v0.9.5/herdr-linux-x86_64 -o "$herdr"
             printf '%s  %s\n' 14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d "$herdr" \
@@ -100,6 +102,9 @@ jobs:
             PublicLifecycle.test_public_reply_keeps_claim_when_herdr_draft_reappears \
             PublicLifecycle.test_public_reply_preserves_herdr_draft_with_ambiguous_footer \
             PublicLifecycle.test_public_reply_distinguishes_zero_write_deadline_and_lost_receipt \
+            PublicLifecycle.test_public_reply_distinguishes_authored_herdr_text_from_dim_placeholder \
+            PublicLifecycle.test_public_reply_requires_a_writable_herdr_chat_prompt \
+            PublicLifecycle.test_public_reply_retains_claim_when_herdr_empty_composer_cannot_be_confirmed \
             PublicLifecycle.test_managed_herdr_reply_rechecks_owner_while_waiting \
             2>&1 | tee "$EVIDENCE/herdr-public.log"
       - name: Verify tmux takeover during a queued reply

@@ -23,15 +23,22 @@ if reply_worker:
 else:
     os.write(1, b'old history\r\n' * 260)
 draft = {
+    'existing-scroll': 'original draft ↑'.encode(),
     'ambiguous-footer': b'original draft',
     'compact-placeholder': b'AskCodextodoanything',
+    'plain-placeholder-draft': b'Ask Codex to do anything',
+    'folded-placeholder-draft': b'Ask Codex to do\n  anything',
+    'ultra-draft': b'original Ultra draft',
+    'shell': b'echo untouched',
     'styled-compact-draft': '\n  model · dir'.encode(),
     'unstyled-compact-draft': '\n  model · dir'.encode(),
 }.get(reply_mode, b'')
-protect_draft = reply_worker
+protect_draft = reply_mode in ('ambiguous-footer', 'ambiguous-continuation')
 compact = reply_mode in (
     'styled-compact-empty', 'styled-compact-draft', 'unstyled-compact-empty', 'unstyled-compact-draft',
 )
+prompt = {'shell': '!', 'unknown': '❯', 'ultra-empty': '»', 'ultra-draft': '»'}.get(reply_mode, '›')
+disabled = reply_mode == 'disabled'
 accepted = False
 submit_first = '--submit-first' in sys.argv[2:]
 
@@ -39,24 +46,29 @@ submit_first = '--submit-first' in sys.argv[2:]
 def draw():
     if compact:
         background = b'\x1b[48;2;20;30;40m' if reply_mode.startswith('styled-') else b''
+        glyph = b'\x1b[1m' + '› '.encode() if background else '› '.encode()
         reset = b'\x1b[0m' if background else b''
         footer = '  keys · help'
         if reply_mode.endswith('-empty'):
             footer = '  model · dir\r\n' + footer
-        os.write(1, b'\x1b[2J\x1b[H' + background + '› '.encode() + draft.replace(b'\n', b'\r\n') +
+        os.write(1, b'\x1b[2J\x1b[H' + background + glyph + draft.replace(b'\n', b'\r\n') +
                  reset + b'\r\n' + footer.encode() + b'\r\n')
         return
-    body = draft.replace(b' tail ', b'\r\n  tail ')
-    if protect_draft and reply_mode != 'compact-placeholder':
+    body = draft.replace(b' tail ', b'\n  tail ').replace(b'\n', b'\r\n')
+    if protect_draft:
         body += '\r\n  tail · value'.encode()
     elif reply_worker and not body:
-        body = b'Ask Codex to do\r\n  anything' if reply_mode == 'compact-placeholder' else b'Ask Codex to do anything'
+        folded = reply_mode in ('compact-placeholder', 'folded-placeholder-draft')
+        placeholder = b'Ask Codex to do\r\n  anything' if folded else b'Ask Codex to do anything'
+        body = b'\x1b[2m' + placeholder + b'\x1b[0m'
     footer = '\r\n  model · dir\r\n'
     if sys.argv[1] == 'two':
         footer += '  keys · help\r\n'
-    if not protect_draft and not draft and (reply_worker or not submit_first):
+    if (reply_worker and not protect_draft and not (reply_mode == 'compact-placeholder' and draft)
+            or not reply_worker and not draft and not submit_first):
         footer = '\r\n' + footer
-    os.write(1, '\x1b[2J\x1b[H› '.encode() + body + footer.encode())
+    prompt_style = b'\x1b[2m' if disabled else b'\x1b[1m'
+    os.write(1, b'\x1b[2J\x1b[H' + prompt_style + prompt.encode() + b'\x1b[0m ' + body + footer.encode())
 
 
 draw()
@@ -68,6 +80,9 @@ while True:
             draft = b''
             protect_draft = False
             compact = False
+            disabled = False
+            if prompt not in ('›', '»'):
+                prompt = '›'
             draw()
         if accepted and Path('finish').exists():
             Path('finish').unlink()
@@ -81,13 +96,15 @@ while True:
     if not key:
         break
     if key in (b'\r', b'\n'):
-        if drop_next_enter:
+        if reply_mode == 'always-drop':
+            pass
+        elif drop_next_enter:
             drop_next_enter = False
         else:
             with Path('accepted' if reply_worker else 'events').open('ab') as log:
                 log.write(draft + b'\n')
             accepted = True
-            draft = b''
+            draft = b'Ask Codex to do anything' if reply_mode == 'plain-after-send' else b''
     else:
         draft += key
     draw()

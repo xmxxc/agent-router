@@ -116,6 +116,7 @@ pub struct Binding {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Screen {
     pub text: String,
+    /// Herdr 0.9.5 reports zero for pane.read, independently of content changes.
     pub revision: u64,
     pub truncated: bool,
 }
@@ -455,6 +456,11 @@ impl Handle {
         codex: bool,
         save: impl FnMut(&Self) -> std::io::Result<()>,
     ) -> Result<()> {
+        if !codex {
+            return Err(Failure::unsent(
+                "a writable chat composer could not be verified for this Herdr host",
+            ));
+        }
         self.submit_input(text, codex, true, save)
     }
 
