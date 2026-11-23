@@ -77,12 +77,13 @@ impl Tmux<'_> {
     }
 
     pub(super) fn observed_launch(&self, execution: &str) -> Reply<Option<String>> {
-        let launch = match self.claim()? {
-            Some(Claim::Observed {
-                execution: Some(active),
-                receipt,
-                ..
-            }) if active == execution => receipt,
+        let claim = self.claim()?;
+        let launch = match &claim {
+            Some(observed @ Claim::Observed { receipt, .. })
+                if observed.execution_id() == Some(execution) =>
+            {
+                receipt.clone()
+            }
             _ => self.registry()?.legacy_launches.get(execution).cloned(),
         };
         Ok(launch.filter(|id| {
@@ -140,19 +141,13 @@ impl Tmux<'_> {
         let mut registry = self.registry()?;
         let before = registry.closed.len();
         registry.closed.insert(id.to_owned());
-        if let Claim::Observed {
-            token,
-            receipt,
-            execution,
-            ..
-        } = claim
-        {
+        if let Claim::Observed { token, receipt, .. } = claim {
             registry.closed.insert(token.clone());
             registry.closed.extend(receipt.iter().cloned());
-            if let (Some(execution), Some(launch)) = (execution, receipt) {
+            if let Some(launch) = receipt {
                 registry
                     .legacy_launches
-                    .insert(execution.clone(), launch.clone());
+                    .insert(id.to_owned(), launch.clone());
                 // Persist the association even when a prior release already archived the IDs.
                 return self.save_registry(&registry);
             }

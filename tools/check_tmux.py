@@ -947,6 +947,28 @@ os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
         check_association(self.call("inspect", **args))
         self.assertTrue(self.call("inspect", executionId="new-A")["owned"])
 
+    @unittest.skipUnless(LEGACY_WFC, "set WFC_TEST_R1_BINARY to the R1 executable for the upgrade test")
+    def test_r1_origin_and_anonymous_adoption_token(self):
+        first = self.call("create", binary=LEGACY_WFC, **self.launch)
+        sibling = self.call("create", dispatch="d-sibling", binary=LEGACY_WFC, **self.launch)
+        self.assertEqual((first["result"], sibling["result"]), ("accepted", "accepted"))
+        receipt = Path(first["receipt"])
+        original = self.active_pane()
+        token = self.call("inspect")["attach"][-1]
+        args = dict(legacyExecutionId=token, legacyLaunchId=receipt.stem)
+        subprocess.run(self.tmux + ["new-window", "-t", "=wfc-d-abc12345:", "/bin/cat"], check=True, env=self.env)
+        subprocess.run(self.tmux + ["move-window", "-s", original, "-t", "=wfc-d-sibling:"], check=True, env=self.env)
+        wrong = self.call("inspect", dispatch="d-sibling", **args)
+        self.assertNotIn("receipt", wrong)
+        self.assertFalse(wrong.get("workerBound", False))
+        subprocess.run(self.tmux + ["move-window", "-s", original, "-t", "=wfc-d-abc12345:"], check=True, env=self.env)
+        live = self.call("inspect", **args)
+        self.assertEqual((live.get("legacyExecutionId"), live.get("receipt")), (token, str(receipt)))
+        self.assertEqual(self.call("close", legacyExecutionId=token)["closeEffect"], "session_closed")
+        closed = self.call("inspect", legacyExecutionId=token)
+        self.assertFalse(closed["alive"])
+        self.assertEqual((closed.get("launchId"), closed.get("receipt")), (receipt.stem, str(receipt)))
+
     def test_lost_create_recovers_only_the_registered_execution(self):
         trigger = self.root / "exit-41"
         launch = {**self.launch, "argv": [sys.executable, "-c",
