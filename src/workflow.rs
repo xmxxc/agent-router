@@ -472,7 +472,75 @@ fn decode_record(file: File, path: &Path) -> Result<Value> {
 }
 
 pub fn status(id: Option<&OsStr>, active: bool) -> Result<Value> {
+    #[cfg(target_os = "linux")]
+    if let Some(state) = legacy_status_state(id)? {
+        let dispatch = id
+            .map(|id| id.to_str().context("invalid dispatch ID"))
+            .transpose()?;
+        return wfc_legacy_state::status(&state, dispatch, active);
+    }
     status_with_history(id, active, messages::history)
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_status_state(id: Option<&OsStr>) -> Result<Option<PathBuf>> {
+    let configured = env::var_os("WFC_STATE");
+    if configured.as_ref().is_some_and(|value| value.is_empty()) {
+        return Ok(Some(wfc_legacy_state::state_dir()?));
+    }
+    let legacy = wfc_legacy_state::state_dir()
+        .and_then(|state| Ok(state.join("router.db").try_exists()?.then_some(state)));
+    if matches!(legacy, Ok(None)) {
+        return Ok(None);
+    }
+    let native = state_dir()?;
+    let ledger = native.join("messages.json");
+    match fs::metadata(&ledger) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_file(),
+                "{} is not a regular file",
+                ledger.display()
+            );
+            return Ok(None);
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", ledger.display())),
+    }
+    let dispatches = native.join("dispatches");
+    // Opening a known assignment only requires traversal permission. A list
+    // still needs to enumerate the directory and reports permission errors.
+    if let Some(id) = id.and_then(OsStr::to_str).filter(|id| valid_id(id)) {
+        match assignment::open_assignment(&dispatches, id) {
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("open dispatch record {id}")),
+        }
+    }
+    // Prefer the original Rust view when both stores have records. Their dispatch
+    // and receipt IDs are independent, so one query must use a single store.
+    if !assignment::ids(&dispatches)?.is_empty() || !messages::relay::waiters(&native)?.is_empty() {
+        return Ok(None);
+    }
+    // ~account/dir is also a valid literal Rust path. A missing account is
+    // reported without a system error by legacy discovery.
+    let named_home = configured.as_deref().is_some_and(|path| {
+        Path::new(path)
+            .components()
+            .find(|part| *part != Component::CurDir)
+            .is_some_and(|part| {
+                matches!(part, Component::Normal(name)
+                if name != "~" && name.as_encoded_bytes().starts_with(b"~"))
+            })
+    });
+    match legacy {
+        Err(error)
+            if named_home && !error.is::<std::io::Error>() && error.chain().nth(1).is_none() =>
+        {
+            Ok(None)
+        }
+        result => result,
+    }
 }
 
 // The integrated message ledger supplies #7's read-only messages::history.
