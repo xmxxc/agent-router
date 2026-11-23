@@ -171,6 +171,10 @@ for line in sys.stdin:
             'ambiguous-continuation': '›\n  tail · value\n  model · dir',
             'compact-placeholder': '› AskCodextodoanything\n  model · dir',
         }
+        compact = '›\n  model · dir\n  keys · help'
+        draft_screens.update({mode: compact for mode in (
+            'styled-compact-empty', 'styled-compact-draft', 'unstyled-compact-empty', 'unstyled-compact-draft',
+        )})
         if mode in draft_screens:
             args = [repo/'crates/herdr/tests/composer.py', 'one', '--submit-first', '--reply-worker', mode]
         else:
@@ -183,9 +187,9 @@ for line in sys.stdin:
         live.wait_for(lambda: prompt in '\n'.join(line.rstrip() for line in self.reply_screen().splitlines()))
         return receipt
 
-    def reply_screen(self):
-        return self.service.api('pane.read', pane_id=self.h['pane'], source='recent', format='text',
-                                strip_ansi=True, lines=50)['read']['text']
+    def reply_screen(self, format='text'):
+        return self.service.api('pane.read', pane_id=self.h['pane'], source='recent', format=format,
+                                strip_ansi=format == 'text', lines=50)['read']['text']
 
     def reply_attempts(self):
         return [m for m in self.status()['messages'] if m['type'] == 'reply']
@@ -493,6 +497,65 @@ for line in sys.stdin:
             self.assertTrue(self.status()['pendingInput'])
             self.assert_reply_worker_finished(question, 'uncertain', earlier=('definitely-not-sent',) * 2)
             self.assertEqual(sends, ['pane.send_input'])
+
+    def test_public_reply_accepts_styled_compact_herdr_empty_composer(self):
+        reads, sends = [], []
+
+        def observe(req, reply):
+            if req['method'] == 'pane.read':
+                reads.append(req['params']['format'])
+            elif req['method'] in ('pane.send_input', 'pane.send_keys'):
+                sends.append(req['method'])
+            return reply
+
+        with self.service.fault_proxy(observe) as proxy:
+            question = self.setup_reply_worker(proxy, mode='styled-compact-empty')
+            plain = '\n'.join(line.rstrip() for line in self.reply_screen().strip().splitlines())
+            self.assertEqual(plain, '›\n  model · dir\n  keys · help')
+            self.assertIn('\x1b[48;', self.reply_screen('ansi'))
+            reads.clear()
+            self.cli('reply', question['message'], 'once')
+            self.assertEqual(reads, ['text', 'ansi'] * 3)
+            self.assertFalse(self.status()['pendingInput'])
+            self.assert_reply_worker_finished(question, 'accepted')
+            self.assertEqual(sends, ['pane.send_input'])
+
+    def test_public_reply_protects_compact_herdr_drafts_without_footer_proof(self):
+        sends = []
+
+        def count(req, reply):
+            if req['method'] in ('pane.send_input', 'pane.send_keys'):
+                sends.append(req['method'])
+            return reply
+
+        with self.service.fault_proxy(count) as proxy:
+            indistinguishable = None
+            for mode in ('styled-compact-draft', 'unstyled-compact-empty', 'unstyled-compact-draft'):
+                sends.clear()
+                for filename in ('accepted', 'question.json'):
+                    (self.root/filename).unlink(missing_ok=True)
+                question = self.setup_reply_worker(proxy, mode=mode)
+                plain, styled = self.reply_screen(), self.reply_screen('ansi')
+                self.assertEqual('\n'.join(line.rstrip() for line in plain.strip().splitlines()),
+                                 '›\n  model · dir\n  keys · help')
+                if mode == 'styled-compact-draft':
+                    self.assertIn('\x1b[48;', styled)
+                elif indistinguishable is None:
+                    indistinguishable = styled
+                else:
+                    self.assertEqual(styled, indistinguishable)
+                self.cli('reply', question['message'], 'unsent', error='unverified footer boundary')
+                self.assertEqual(sends, [], mode)
+                self.assertEqual((self.reply_screen(), self.reply_screen('ansi')), (plain, styled), mode)
+                self.assertFalse((self.root/'accepted').exists(), mode)
+                self.assertFalse(self.status()['pendingInput'], mode)
+                attempt, = self.reply_attempts()
+                self.assertEqual(attempt['inputResult'], 'definitely-not-sent', mode)
+                (self.root/'clear-draft').touch()
+                live.wait_for(lambda: 'Ask Codex to do anything' in self.reply_screen())
+                self.cli('reply', question['message'], 'once')
+                self.assert_reply_worker_finished(question, 'accepted', earlier=('definitely-not-sent',))
+                self.assertEqual(sends, ['pane.send_input'], mode)
 
     def test_managed_herdr_reply_rechecks_owner_while_waiting(self):
         sends = []

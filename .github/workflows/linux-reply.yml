@@ -89,6 +89,8 @@ jobs:
             test "$version" = 'herdr 0.9.5'
           } 2>&1 | tee "$EVIDENCE/herdr-input.log"
           python -Bu tests/herdr_public.py "$herdr" target/release/wfc -v \
+            PublicLifecycle.test_public_reply_accepts_styled_compact_herdr_empty_composer \
+            PublicLifecycle.test_public_reply_protects_compact_herdr_drafts_without_footer_proof \
             PublicLifecycle.test_public_reply_protects_herdr_placeholder_like_and_ambiguous_drafts \
             PublicLifecycle.test_public_reply_retries_after_herdr_presend_checkpoint_failure \
             PublicLifecycle.test_public_reply_on_bound_herdr_pane \

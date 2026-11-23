@@ -387,11 +387,21 @@ impl Handle {
     }
 
     pub fn read(&self) -> Result<Screen> {
+        self.read_screen("text")
+    }
+
+    fn read_ansi(&self) -> Result<Screen> {
+        self.read_screen("ansi")
+    }
+
+    fn read_screen(&self, format: &str) -> Result<Screen> {
         let rpc = self.session()?;
         self.guarded(&rpc, false)?;
-        let data = rpc.call("pane.read",json!({"pane_id":self.pane,"source":"recent","format":"text","strip_ansi":true,"lines":200}))?;
+        let data = rpc.call("pane.read",json!({"pane_id":self.pane,"source":"recent","format":format,"strip_ansi":format != "ansi","lines":200}))?;
         if data["read"]["pane_id"].as_str() != self.pane.as_deref()
             || data["read"]["workspace_id"].as_str() != self.workspace.as_deref()
+            || (format == "ansi"
+                && (data["read"]["format"] != "ansi" || data["read"]["source"] != "recent"))
         {
             return Err(INVALID);
         }
@@ -466,8 +476,8 @@ impl Handle {
         if screen::read_only(&before.text) {
             return Err(Failure::refused("worker input is paused"));
         }
-        if codex && confirm_reply && screen::has_codex_draft(&before) {
-            return Err(Failure::unsent("Codex composer already contains a draft"));
+        if codex && confirm_reply {
+            screen::require_empty_reply_box(self, &before).map_err(before_input)?;
         }
         // Preparation performs only observation and local checkpoints. An
         // incomplete response to the subsequent input call may be post-effect.
