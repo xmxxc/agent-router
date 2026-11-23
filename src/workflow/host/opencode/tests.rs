@@ -139,7 +139,13 @@ impl Fixture {
         record
     }
 
-    fn assert_resume(&self, original: &Value, id: &str, message: &str) -> Value {
+    fn assert_resume(
+        &self,
+        original: &Value,
+        id: &str,
+        message: &str,
+        source: StorageSource,
+    ) -> Value {
         let before = fs::read(&self.store).unwrap();
         self.assert_rejected(
             original,
@@ -168,7 +174,7 @@ impl Fixture {
         assert_eq!(next["hostSession"], id);
         assert_eq!(
             next["opencodeSession"],
-            json!({"project":"project","firstMessage":message,"adoptedAttempt":ATTEMPT,"currentAttempt":NEXT_ATTEMPT,"session":id})
+            json!({"project":"project","firstMessage":message,"adoptedAttempt":ATTEMPT,"currentAttempt":NEXT_ATTEMPT,"session":id,"storageSource":source})
         );
         assert_eq!(next["opencodeOpening"], original["opencodeOpening"]);
         assert_eq!(fs::read(&self.store).unwrap(), before);
@@ -314,12 +320,22 @@ fn legacy_first_real_user_opening_and_explicit_argv() {
         [],
     )
     .unwrap();
-    let saved = fixture.assert_resume(&record, "ses_original", "msg_original");
+    let saved = fixture.assert_resume(
+        &record,
+        "ses_original",
+        "msg_original",
+        StorageSource::Legacy,
+    );
     let mut recheck = saved.clone();
     recheck["attempt"] = json!("a-44444444444444444444444444444444");
     let (launch, _) =
         Options::prepare_opencode_resume(&fixture.root, &saved, &mut recheck).unwrap();
     assert_eq!(launch.argv.last().unwrap(), "ses_original");
+    // An identical formal projection appearing later cannot replace the pinned legacy source.
+    modern(&db, "session");
+    modern_message(&db, "ses_original", "msg_original", 2, "user", &brief);
+    fixture.assert_rejected(&saved, "recorded OpenCode storage source changed");
+    db.execute_batch("DROP TABLE session_message").unwrap();
     db.execute(
         "UPDATE session SET project_id='other' WHERE id='ses_original'",
         [],
@@ -355,7 +371,12 @@ fn historical_root_sequence_and_adopted_id_ignore_other_roots() {
     modern_message(&db, "ses_later", "msg_later", 2, "user", &brief);
     modern_message(&db, "ses_fork", "msg_fork", 1, "user", &brief);
     modern_message(&db, "ses_child", "msg_child", 1, "user", &brief);
-    fixture.assert_resume(&record, "ses_original", "msg_first");
+    fixture.assert_resume(
+        &record,
+        "ses_original",
+        "msg_first",
+        StorageSource::SessionV2,
+    );
     db.execute(
         "INSERT INTO session VALUES('ses_duplicate','project',?1,NULL)",
         [fixture.cwd.to_str().unwrap()],
@@ -370,7 +391,32 @@ fn historical_root_sequence_and_adopted_id_ignore_other_roots() {
         &brief,
         false,
     );
-    fixture.assert_resume(&record, "ses_original", "msg_first");
+    let saved = fixture.assert_resume(
+        &record,
+        "ses_original",
+        "msg_first",
+        StorageSource::SessionV2,
+    );
+
+    // Separate historical and legacy session rows cannot claim the same ID,
+    // even when the user message and its ID are identical.
+    put_legacy_root(&fixture, &db, "ses_original", "msg_first", &brief);
+    for change in ["", "DROP TABLE session_message"] {
+        db.execute_batch(change).unwrap();
+        let mut conflicting = record.clone();
+        let err = adopt_opencode_session(
+            &fixture.root,
+            &mut conflicting,
+            fixture.receipt("ses_original", "msg_first"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ambiguous OpenCode session ID"));
+        assert_eq!(conflicting, record);
+        fixture.assert_rejected(&saved, "ambiguous OpenCode session ID");
+    }
+    db.execute("DELETE FROM session_v2 WHERE id='ses_original'", [])
+        .unwrap();
+    fixture.assert_rejected(&saved, "recorded OpenCode storage source changed");
 }
 
 #[test]
@@ -400,7 +446,12 @@ fn unified_sessions_use_recorded_worktree_and_actual_user_sequence() {
     modern_message(&db, "ses_original", "msg_opening", 2, "user", &brief);
     modern_message(&db, "ses_stale", "msg_new_opening", 1, "user", "unrelated");
     legacy_message(&db, "ses_stale", "msg_stale", 1, "user", &brief, false);
-    let saved = fixture.assert_resume(&record, "ses_original", "msg_opening");
+    let saved = fixture.assert_resume(
+        &record,
+        "ses_original",
+        "msg_opening",
+        StorageSource::Unified,
+    );
     db.execute(
         "UPDATE session_message SET id='msg_replaced' WHERE id='msg_opening'",
         [],
@@ -416,6 +467,52 @@ fn unified_sessions_use_recorded_worktree_and_actual_user_sequence() {
         .contains("invalid OpenCode session identity"));
     modern_message(&db, "ses_original", "msg_same_seq", 2, "user", "other");
     fixture.assert_rejected(&saved, "does not match the original first user message");
+}
+
+#[test]
+fn adopted_unified_message_cannot_fall_back_to_same_id_legacy_message() {
+    let fixture = Fixture::new();
+    let (record, brief) = fixture.launch();
+    let db = fixture.db();
+    legacy(&db);
+    modern(&db, "session");
+    put_legacy_root(&fixture, &db, "ses_original", "msg_opening", &brief);
+    modern_message(&db, "ses_original", "msg_opening", 1, "user", &brief);
+
+    let adopted = fixture.adopted(&record, "ses_original", "msg_opening");
+    let saved = fixture.assert_resume(
+        &record,
+        "ses_original",
+        "msg_opening",
+        StorageSource::Unified,
+    );
+    let mut old = saved.clone();
+    old["opencodeSession"]
+        .as_object_mut()
+        .unwrap()
+        .remove("storageSource");
+    fixture.assert_rejected(
+        &old,
+        "missing verified original OpenCode adoption receipt or storage source",
+    );
+
+    for change in ["DELETE FROM session_message", "DROP TABLE session_message"] {
+        db.execute_batch(change).unwrap();
+        let before = fs::read(&fixture.store).unwrap();
+        fixture.assert_rejected(&saved, "recorded OpenCode storage source changed");
+        let mut repeated = adopted.clone();
+        let err = adopt_opencode_session(
+            &fixture.root,
+            &mut repeated,
+            fixture.receipt("ses_original", "msg_opening"),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("recorded OpenCode storage source changed"));
+        assert_eq!(repeated, adopted);
+        assert_eq!(fs::read(&fixture.store).unwrap(), before);
+    }
 }
 
 #[test]

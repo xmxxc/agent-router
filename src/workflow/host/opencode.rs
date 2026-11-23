@@ -30,11 +30,20 @@ struct Opening {
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Proof {
+    storage_source: StorageSource,
     adopted_attempt: String,
     current_attempt: String,
     session: String,
     project: String,
     first_message: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum StorageSource {
+    Legacy,
+    SessionV2,
+    Unified,
 }
 
 fn effective_setting(launch: &Map<String, Value>, key: &str) -> Option<PathBuf> {
@@ -133,21 +142,43 @@ pub(crate) fn adopt_opencode_session(
             && receipt.database == opening.database,
         "OpenCode adoption receipt belongs to a different launch"
     );
+    let previous = if record["hostSession"].is_null() && record["opencodeSession"].is_null() {
+        None
+    } else {
+        let proof = saved_proof(record, &opening)?;
+        ensure!(
+            proof.session == receipt.session && proof.first_message == receipt.first_message,
+            "OpenCode adoption conflicts with the recorded session"
+        );
+        Some(proof)
+    };
     let proof = verify_session(
         &opening,
         receipt.attempt,
         receipt.session,
         receipt.first_message,
+        previous.as_ref().map(|proof| proof.storage_source),
     )?;
-    let proof = serde_json::to_value(proof)?;
     ensure!(
-        (record["hostSession"].is_null() && record["opencodeSession"].is_null())
-            || (record["hostSession"] == receipt.session && record["opencodeSession"] == proof),
-        "OpenCode adoption conflicts with the recorded session"
+        previous.as_ref().is_none_or(|previous| previous == &proof),
+        "recorded OpenCode session proof changed"
     );
+    let proof = serde_json::to_value(proof)?;
     record["hostSession"] = json!(receipt.session);
     record["opencodeSession"] = proof;
     Ok(())
+}
+
+fn saved_proof(record: &Value, opening: &Opening) -> Result<Proof> {
+    let proof = Proof::deserialize(&record["opencodeSession"])
+        .context("missing verified original OpenCode adoption receipt or storage source")?;
+    ensure!(
+        record["hostSession"] == proof.session
+            && proof.adopted_attempt == opening.attempt
+            && record["attempt"] == proof.current_attempt,
+        "recorded OpenCode adoption conflicts with the launch"
+    );
+    Ok(proof)
 }
 
 pub(super) fn prepare(
@@ -166,20 +197,14 @@ pub(super) fn prepare(
                 .is_none_or(|path| path == &opening.database),
             "configured OpenCode store differs from the original dispatch"
         );
-        let mut previous = Proof::deserialize(&original["opencodeSession"])
-            .context("missing verified original OpenCode adoption receipt")?;
-        ensure!(
-            original["hostSession"] == previous.session
-                && previous.adopted_attempt == opening.attempt
-                && original["attempt"] == previous.current_attempt,
-            "recorded OpenCode adoption conflicts with the launch"
-        );
+        let mut previous = saved_proof(original, &opening)?;
         ensure!(
             verify_session(
                 &opening,
                 &previous.current_attempt,
                 &previous.session,
-                &previous.first_message
+                &previous.first_message,
+                Some(previous.storage_source),
             )? == previous,
             "recorded OpenCode session proof changed"
         );
@@ -282,28 +307,82 @@ fn in_project(
 
 // Current builds use session_message with session, while earlier v2 uses
 // session_v2. The foreign key gives the association even when tables coexist.
-fn modern_query(
-    db: &Connection,
-    tables: &HashSet<String>,
-) -> Result<Option<(&'static str, String)>> {
+fn modern_source(db: &Connection, tables: &HashSet<String>) -> Result<Option<StorageSource>> {
     if !tables.contains("session_message") {
         return Ok(None);
     }
     let mut foreign = db.prepare(
-        "SELECT [table] FROM pragma_foreign_key_list('session_message')\n\
-        WHERE [from]='session_id' AND [to]='id'",
+        "SELECT [table] FROM pragma_foreign_key_list('session_message')
+         WHERE [from]='session_id' AND [to]='id'",
     )?;
     let parents = foreign
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let (parent, root) = match parents.as_slice() {
+    match parents.as_slice() {
         [table] if table == "session_v2" && tables.contains(table) => {
-            ("session_v2", "AND s.fork_session_id IS NULL")
+            Ok(Some(StorageSource::SessionV2))
         }
-        [table] if table == "session" && tables.contains(table) => ("session", ""),
+        [table] if table == "session" && tables.contains(table) => Ok(Some(StorageSource::Unified)),
         _ => anyhow::bail!("unrecognized OpenCode session_message association"),
+    }
+}
+
+fn select_source(db: &Connection, tables: &HashSet<String>, id: &str) -> Result<StorageSource> {
+    let modern = modern_source(db, tables)?;
+    let legacy = ["session", "message", "part"]
+        .iter()
+        .all(|table| tables.contains(*table));
+    let exists = |sql: &str| db.query_row(sql, [id], |row| row.get::<_, bool>(0));
+    // Independent session tables can retain conflicting identity claims even
+    // when the formal message table is missing or now points elsewhere.
+    let historical_root = tables.contains("session_v2")
+        && exists("SELECT EXISTS(SELECT 1 FROM session_v2 WHERE id=?1)")?;
+    ensure!(
+        !historical_root
+            || !tables.contains("session")
+            || !exists("SELECT EXISTS(SELECT 1 FROM session WHERE id=?1)")?,
+        "ambiguous OpenCode session ID in historical and legacy session tables"
+    );
+    match modern {
+        Some(StorageSource::Unified) => {
+            // The unified session row can have both a formal message and an old
+            // projection. Any formal user entry takes precedence at adoption.
+            if exists(
+                "SELECT EXISTS(SELECT 1 FROM session_message WHERE session_id=?1 AND type='user')",
+            )? || !legacy
+            {
+                return Ok(StorageSource::Unified);
+            }
+        }
+        Some(StorageSource::SessionV2) => {
+            if historical_root || !legacy {
+                return Ok(StorageSource::SessionV2);
+            }
+        }
+        _ => (),
+    }
+    ensure!(legacy, "unrecognized OpenCode session storage schema");
+    Ok(StorageSource::Legacy)
+}
+
+fn session_query(source: StorageSource) -> String {
+    let (parent, root) = match source {
+        StorageSource::SessionV2 => ("session_v2", "AND s.fork_session_id IS NULL"),
+        StorageSource::Unified => ("session", ""),
+        StorageSource::Legacy => return
+            "SELECT s.id,m.id,s.project_id,p.worktree FROM session s
+             LEFT JOIN project p ON p.id=s.project_id
+             JOIN message m ON m.session_id=s.id AND m.id=(
+                SELECT first.id FROM message first WHERE first.session_id=s.id AND json_extract(first.data,'$.role')='user'
+                ORDER BY first.time_created,first.id LIMIT 1)
+             WHERE s.directory=?1 AND s.parent_id IS NULL AND s.id=?3
+             AND ?2=(SELECT CASE WHEN COUNT(*)=1 THEN MAX(wfc_opening_digest(json_extract(t.data,'$.text'))) END
+                FROM part t WHERE t.message_id=m.id AND t.session_id=s.id
+                AND json_extract(t.data,'$.type')='text' AND json_type(t.data,'$.text')='text'
+                AND COALESCE(json_extract(t.data,'$.synthetic'),0)=0 AND COALESCE(json_extract(t.data,'$.ignored'),0)=0)"
+            .into(),
     };
-    Ok(Some((parent, format!(
+    format!(
         "SELECT s.id,m.id,s.project_id,p.worktree FROM {parent} s
          LEFT JOIN project p ON p.id=s.project_id
          JOIN session_message m ON m.session_id=s.id AND m.type='user'
@@ -311,7 +390,7 @@ fn modern_query(
          AND m.seq=(SELECT MIN(first.seq) FROM session_message first WHERE first.session_id=s.id AND first.type='user')
          AND (SELECT COUNT(*) FROM session_message first WHERE first.session_id=s.id AND first.seq=m.seq)=1
          AND json_type(m.data,'$.text')='text' AND wfc_opening_digest(json_extract(m.data,'$.text'))=?2"
-    ))))
+    )
 }
 
 fn verify_session(
@@ -319,6 +398,7 @@ fn verify_session(
     current_attempt: &str,
     id: &str,
     first_message: &str,
+    expected_source: Option<StorageSource>,
 ) -> Result<Proof> {
     ensure!(
         id.strip_prefix("ses_").is_some_and(|s| !s.is_empty()
@@ -360,84 +440,54 @@ fn verify_session(
         .prepare("SELECT name FROM sqlite_schema WHERE type='table'")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<HashSet<_>>>()?;
-    let modern = modern_query(&db, &tables)?;
-    let mut queries = Vec::new();
-    if let Some((_, sql)) = &modern {
-        queries.push(sql.clone());
-    }
-    if ["session", "message", "part"]
-        .iter()
-        .all(|table| tables.contains(*table))
-    {
-        let unmigrated = if modern
-            .as_ref()
-            .is_some_and(|(parent, _)| *parent == "session")
-        {
-            "AND NOT EXISTS (SELECT 1 FROM session_message n WHERE n.session_id=s.id AND n.type='user')"
-        } else {
-            ""
-        };
-        queries.push(format!(
-            "SELECT s.id,m.id,s.project_id,p.worktree FROM session s
-             LEFT JOIN project p ON p.id=s.project_id
-             JOIN message m ON m.session_id=s.id AND m.id=(
-                SELECT first.id FROM message first WHERE first.session_id=s.id AND json_extract(first.data,'$.role')='user'
-                ORDER BY first.time_created,first.id LIMIT 1)
-             WHERE s.directory=?1 AND s.parent_id IS NULL AND s.id=?3 {unmigrated}
-             AND ?2=(SELECT CASE WHEN COUNT(*)=1 THEN MAX(wfc_opening_digest(json_extract(t.data,'$.text'))) END
-                FROM part t WHERE t.message_id=m.id AND t.session_id=s.id
-                AND json_extract(t.data,'$.type')='text' AND json_type(t.data,'$.text')='text'
-                AND COALESCE(json_extract(t.data,'$.synthetic'),0)=0 AND COALESCE(json_extract(t.data,'$.ignored'),0)=0)"
-        ));
-    }
+    let source = select_source(&db, &tables, id)?;
     ensure!(
-        !queries.is_empty(),
-        "unrecognized OpenCode session storage schema"
+        expected_source.is_none_or(|expected| expected == source),
+        "recorded OpenCode storage source changed"
     );
+    let mut query = db
+        .prepare(&session_query(source))
+        .context("cannot read OpenCode session schema")?;
+    let mut results = query.query(params![cwd, opening.brief_sha256, id])?;
     let mut matched = None;
-    for sql in queries {
-        let mut query = db
-            .prepare(&sql)
-            .context("cannot read OpenCode session schema")?;
-        let mut results = query.query(params![cwd, opening.brief_sha256, id])?;
-        while let Some(row) = results
-            .next()
-            .context("cannot read OpenCode session evidence")?
-        {
-            let proof = Proof {
-                adopted_attempt: opening.attempt.clone(),
-                current_attempt: current_attempt.into(),
-                session: row.get(0)?,
-                first_message: row.get(1)?,
-                project: row.get(2)?,
-            };
-            let worktree: Option<String> = row.get(3)?;
-            ensure!(
-                proof.session == id
-                    && proof.first_message == first_message
-                    && !proof.project.is_empty(),
-                "invalid OpenCode session identity"
-            );
-            ensure!(
-                in_project(
-                    &db,
-                    &tables,
-                    &proof.project,
-                    Path::new(
-                        worktree
-                            .as_deref()
-                            .context("OpenCode session has no project record")?
-                    ),
-                    Path::new(cwd)
-                )?,
-                "matching OpenCode session belongs to a different project"
-            );
-            ensure!(
-                matched.as_ref().is_none_or(|previous| *previous == proof),
-                "conflicting OpenCode session proof"
-            );
-            matched = Some(proof);
-        }
+    while let Some(row) = results
+        .next()
+        .context("cannot read OpenCode session evidence")?
+    {
+        let proof = Proof {
+            storage_source: source,
+            adopted_attempt: opening.attempt.clone(),
+            current_attempt: current_attempt.into(),
+            session: row.get(0)?,
+            first_message: row.get(1)?,
+            project: row.get(2)?,
+        };
+        let worktree: Option<String> = row.get(3)?;
+        ensure!(
+            proof.session == id
+                && proof.first_message == first_message
+                && !proof.project.is_empty(),
+            "invalid OpenCode session identity"
+        );
+        ensure!(
+            in_project(
+                &db,
+                &tables,
+                &proof.project,
+                Path::new(
+                    worktree
+                        .as_deref()
+                        .context("OpenCode session has no project record")?
+                ),
+                Path::new(cwd)
+            )?,
+            "matching OpenCode session belongs to a different project"
+        );
+        ensure!(
+            matched.as_ref().is_none_or(|previous| *previous == proof),
+            "conflicting OpenCode session proof"
+        );
+        matched = Some(proof);
     }
     matched.context("adopted OpenCode session does not match the original first user message")
 }
