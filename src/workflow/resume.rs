@@ -66,17 +66,11 @@ impl<'a> Resume<'a> {
             row == initial,
             "dispatch changed while preparing resume; inspect status and retry"
         );
-        if row["backend"] == "tmux" && row["host"] == "opencode" {
-            return Ok(reconcile(
-                &row,
-                Value::Null,
-                "public OpenCode resume requires an authenticated adoption and terminal readiness path",
-            ));
-        }
         let claude = row["host"] == "claude";
+        let opencode = row["host"] == "opencode";
         ensure!(
-            row["backend"] == "tmux" && (row["host"] == "codex" || claude),
-            "resume requires a Linux Codex or Claude dispatch using the tmux backend"
+            row["backend"] == "tmux" && (row["host"] == "codex" || claude || opencode),
+            "resume requires a Linux Codex, Claude or OpenCode dispatch using the tmux backend"
         );
         ensure!(
             assignment::identified(&row) && row["controllerOwner"].is_null(),
@@ -208,11 +202,12 @@ impl<'a> Resume<'a> {
         } else {
             "[router] Your session was interrupted and has been resumed. Check the worktree and what you already did, then continue"
         };
-        let (mut launch, claude_proof, session) = if claude {
+        let (mut launch, claude_proof, mut opencode_plan, session) = if claude {
             match options.prepare_claude_resume(&state, &row, &mut next, opening) {
                 Ok((launch, proof)) => (
                     launch,
                     Some(proof),
+                    None,
                     next["hostSession"]
                         .as_str()
                         .context("missing Claude session")?
@@ -223,6 +218,27 @@ impl<'a> Resume<'a> {
                         &row,
                         Value::Null,
                         &format!("cannot verify the original Claude conversation: {e}"),
+                    ));
+                }
+            }
+        } else if opencode {
+            let prepared = (|| -> Result<_> {
+                let (mut launch, brief) =
+                    host::Options::prepare_opencode_resume(&state, &row, &mut next, opening)?;
+                let plan =
+                    host::opencode::resume::Prepared::new(&state, &next, &mut launch, brief)?;
+                let session = next["hostSession"]
+                    .as_str()
+                    .context("missing OpenCode session")?;
+                Ok((launch, None, Some(plan), session.to_owned()))
+            })();
+            match prepared {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    return Ok(reconcile(
+                        &row,
+                        Value::Null,
+                        &format!("cannot verify the original OpenCode conversation: {e}"),
                     ));
                 }
             }
@@ -255,13 +271,20 @@ impl<'a> Resume<'a> {
             };
             launch.argv.insert(launch.argv.len() - 1, session.clone());
             next["hostSession"] = json!(session);
-            (launch, None, session)
+            (launch, None, None, session)
         };
         super::bind_worker_callback(&mut next, Some(&mut launch));
 
         let path = dir.join(format!("{}.json", self.dispatch));
+        let lock_for_publication = || {
+            if opencode {
+                messages::lock_for_private_publish(&state)
+            } else {
+                messages::lock_for_publish(&state)
+            }
+        };
         let event = {
-            let ledger = messages::lock_for_publish(&state)?;
+            let ledger = lock_for_publication()?;
             ensure!(
                 authorize()? == generation && read()? == row,
                 "assignment or owner changed while preparing resume"
@@ -322,7 +345,19 @@ impl<'a> Resume<'a> {
                     ));
                 }
             } else {
+                if let Some(plan) = &opencode_plan {
+                    if let Err(error) = plan.recheck(&state, &row, &next) {
+                        return Ok(reconcile(
+                            &row,
+                            Value::Null,
+                            &format!("cannot publish OpenCode resume: {error}"),
+                        ));
+                    }
+                }
                 super::write_json(&path, &next, None)?;
+                if let Some(plan) = &mut opencode_plan {
+                    plan.published();
+                }
                 messages::sync_directory(&dir)?;
             }
             event
@@ -345,8 +380,26 @@ impl<'a> Resume<'a> {
         if claude && answer["result"] == "accepted" {
             host::claude::wait_for_resume_adoption(&state, &next);
         }
+        if let Some(plan) = &opencode_plan {
+            answer["inputResult"] = json!("definitely-not-sent");
+            if answer["result"] == "accepted" {
+                let permitted = {
+                    let _ledger = lock_for_publication()?;
+                    ensure!(
+                        read()? == next,
+                        "assignment changed during OpenCode resume; inspect its lifecycle audit"
+                    );
+                    plan.authorize_input()
+                };
+                if let Ok(expires_at) = permitted {
+                    plan.wait_for_delivery(&state, &next, expires_at);
+                }
+            } else if launch_result != "definitely-not-sent" {
+                answer["adoptionResult"] = json!("uncertain");
+            }
+        }
         {
-            let ledger = messages::lock_for_publish(&state)?;
+            let ledger = lock_for_publication()?;
             ensure!(
                 read()? == next,
                 "assignment changed during resume; inspect its lifecycle audit"
@@ -361,6 +414,30 @@ impl<'a> Resume<'a> {
                     answer["category"] = json!("host_adoption_unconfirmed");
                     answer["diagnostic"] =
                         json!("Claude did not confirm adoption of the resumed session");
+                }
+            }
+            if let Some(plan) = opencode_plan.filter(|_| answer["result"] == "accepted") {
+                let adopted = plan.adopted();
+                let delivered = adopted && plan.delivered(&state, &next).is_ok_and(|done| done);
+                answer["adoptionResult"] = json!(if adopted { "accepted" } else { "uncertain" });
+                if delivered {
+                    answer["inputResult"] = json!("accepted");
+                } else {
+                    if adopted {
+                        answer["inputResult"] = json!("uncertain");
+                    }
+                    answer["result"] = json!("uncertain");
+                    answer["error"] = json!("lifecycle_reconcile_required");
+                    answer["category"] = json!(if adopted {
+                        "input_uncertain"
+                    } else {
+                        "host_adoption_unconfirmed"
+                    });
+                    answer["diagnostic"] = json!(if adopted {
+                        "OpenCode did not confirm one committed resume brief"
+                    } else {
+                        "OpenCode did not confirm the original session and a focused composer"
+                    });
                 }
             }
             for field in ["dispatch", "round", "attempt"] {

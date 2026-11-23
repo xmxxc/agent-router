@@ -17,7 +17,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let root = env::temp_dir().join(format!("wfc-opencode-{}", Uuid::new_v4()));
-        fs::create_dir(&root).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
         let root = root.canonicalize().unwrap();
         let cwd = root.join("checkout with space");
         fs::create_dir(&cwd).unwrap();
@@ -32,7 +32,8 @@ impl Fixture {
             store,
         };
         fixture.configure(
-            json!({"WFC_OPENCODE_ISOLATED_STORE":"1","OPENCODE_DB":"","WFC_OPENCODE_DB":""}),
+            json!({"WFC_OPENCODE_ISOLATED_STORE":"1","OPENCODE_DB":"","WFC_OPENCODE_DB":"",
+                   "OPENCODE_CONFIG_CONTENT":"","OPENCODE_CONFIG":"","OPENCODE_CONFIG_DIR":""}),
         );
         fixture
     }
@@ -91,9 +92,20 @@ impl Fixture {
         assert!(!record.to_string().contains(&brief));
         assert!(record["hostSession"].is_null());
         assert!(!self.store.exists());
+        let defaults: Value =
+            serde_json::from_str(launch.env["OPENCODE_CONFIG_CONTENT"].as_str().unwrap()).unwrap();
+        assert_eq!(defaults["permission"]["external_directory"]["*"], "allow");
+        assert_eq!(defaults["permission"]["read"]["*.env"], "allow");
+        let overlay: Value = serde_json::from_slice(
+            &fs::read(launch.env["OPENCODE_CONFIG"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let plugin = self.store.with_file_name("wfc-adoption.mjs");
+        assert_eq!(overlay["plugin"][0][0], json!(plugin));
+        assert!(plugin.is_file());
         assert_eq!(
             fs::read_dir(self.store.parent().unwrap()).unwrap().count(),
-            0
+            4
         );
         (record, brief)
     }
@@ -106,7 +118,8 @@ impl Fixture {
             NEXT_ATTEMPT
         });
         next["round"] = json!(2);
-        let (launch, input) = Options::prepare_opencode_resume(&self.root, original, &mut next)?;
+        let (launch, input) =
+            Options::prepare_opencode_resume(&self.root, original, &mut next, "Resume opening")?;
         Ok((launch, input, next))
     }
 
@@ -329,7 +342,8 @@ fn legacy_first_real_user_opening_and_explicit_argv() {
     let mut recheck = saved.clone();
     recheck["attempt"] = json!("a-44444444444444444444444444444444");
     let (launch, _) =
-        Options::prepare_opencode_resume(&fixture.root, &saved, &mut recheck).unwrap();
+        Options::prepare_opencode_resume(&fixture.root, &saved, &mut recheck, "Resume opening")
+            .unwrap();
     assert_eq!(launch.argv.last().unwrap(), "ses_original");
     // An identical formal projection appearing later cannot replace the pinned legacy source.
     modern(&db, "session");
@@ -459,9 +473,10 @@ fn unified_sessions_use_recorded_worktree_and_actual_user_sequence() {
     .unwrap();
     let mut next = saved.clone();
     next["attempt"] = json!("a-55555555555555555555555555555555");
-    let error = Options::prepare_opencode_resume(&fixture.root, &saved, &mut next)
-        .err()
-        .unwrap();
+    let error =
+        Options::prepare_opencode_resume(&fixture.root, &saved, &mut next, "Resume opening")
+            .err()
+            .unwrap();
     assert!(error
         .to_string()
         .contains("invalid OpenCode session identity"));

@@ -153,6 +153,22 @@ fn run() -> anyhow::Result<ExitCode> {
         Some("--tmux-host") if args.len() == 1 => {
             return tmux::launch::run_host(Path::new(&args[0]));
         }
+        #[cfg(target_os = "linux")]
+        Some("--opencode-adopt") if args.is_empty() => {
+            return Ok(if workflow::host::opencode_first_message() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            });
+        }
+        #[cfg(target_os = "linux")]
+        Some("--opencode-resume-ready") if args.is_empty() => {
+            return Ok(if workflow::host::opencode_resume_ready() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            });
+        }
         Some("--kernel") if args.is_empty() => kernel::run()?,
         Some(name @ ("dispatch" | "status" | "done" | "ask" | "wait" | "ack" | "resolve"))
             if args == ["--help"]

@@ -193,7 +193,6 @@ impl<'a> Dispatch<'a> {
                     .is_none_or(|host| host.backend != "herdr"),
             "Herdr dispatch requires an unowned scope"
         );
-        fs::create_dir_all(&records).context("create dispatch state directory")?;
         let default_report = cwd.join(format!("report-{dispatch}.md"));
         let report = report_destination(self.report.unwrap_or(&default_report))?;
         let report_dir = report
@@ -276,6 +275,17 @@ impl<'a> Dispatch<'a> {
                 Err(err) => {
                     #[cfg(target_os = "linux")]
                     if let Some(failure) = err.downcast_ref::<host::ScriptUnavailable>() {
+                        if host.name == "opencode" && host.backend == "tmux" {
+                            use std::os::unix::fs::DirBuilderExt;
+
+                            // The script check precedes private OpenCode store
+                            // setup. Keep both directories private for a retry.
+                            fs::DirBuilder::new()
+                                .recursive(true)
+                                .mode(0o700)
+                                .create(&records)
+                                .context("create OpenCode state directory")?;
+                        }
                         // Owner changes lock scope then ledger. Herdr must
                         // stay unowned through the same publication boundary.
                         let _scope = (host.backend == "herdr")
@@ -290,6 +300,7 @@ impl<'a> Dispatch<'a> {
                         if host.backend == "herdr" {
                             herdr::native_state(&state)?;
                         }
+                        fs::create_dir_all(&records).context("create dispatch state directory")?;
                         record["create"] = json!({"result":"definitely-not-sent","category":failure.category(),
                             "dispatch":dispatch,"attempt":attempt,"round":round,"scope":scope});
                         record["worker"] =
@@ -304,6 +315,7 @@ impl<'a> Dispatch<'a> {
         } else {
             None
         };
+        fs::create_dir_all(&records).context("create dispatch state directory")?;
         #[cfg(target_os = "linux")]
         {
             record["worker"] = json!({"state":"running"});
@@ -324,7 +336,19 @@ impl<'a> Dispatch<'a> {
             return Ok(output);
         }
 
+        #[cfg(target_os = "linux")]
+        let opencode_opening = record["opencodeOpening"].is_object();
         let (pending, callback) = {
+            #[cfg(target_os = "linux")]
+            let private_ledger = opencode_opening
+                .then(|| messages::lock_for_private_publish(&state))
+                .transpose()?;
+            #[cfg(target_os = "linux")]
+            let _ledger = private_ledger
+                .is_none()
+                .then(|| messages::lock_for_publish(&state))
+                .transpose()?;
+            #[cfg(not(target_os = "linux"))]
             let _ledger = messages::lock_for_publish(&state)?;
             let managed = authorize()?;
             // Raw commands on unowned scopes can still act as controllers,
@@ -334,9 +358,21 @@ impl<'a> Dispatch<'a> {
             (assignment::reserve(&records, &dispatch, &record)?, callback)
         };
         let mut preserve_binding = false;
+        #[cfg(target_os = "linux")]
+        let mut adoption_ledger = None;
         let result = (|| -> Result<()> {
             if let Some(launch) = launch {
-                let mut answer = backend::create(&state, &record, launch)?;
+                let answer = backend::create(&state, &record, launch);
+                #[cfg(target_os = "linux")]
+                if opencode_opening {
+                    // The hook can publish during create. Serialize promotion
+                    // or cleanup with the same publisher before reading it back.
+                    preserve_binding = true;
+                    adoption_ledger = Some(messages::lock_for_private_publish(&state)?);
+                    host::preserve_opencode_adoption(&pending, &mut record)?;
+                    preserve_binding = !record["hostSession"].is_null();
+                }
+                let mut answer = answer?;
                 let accepted = answer["result"] == "accepted";
                 if accepted
                     || answer["result"] == "uncertain"
@@ -355,11 +391,21 @@ impl<'a> Dispatch<'a> {
                     write_json(&published, &record, None).with_context(|| {
                         format!("could not publish launch evidence for {dispatch}; retaining its pending assignment")
                     })?;
+                    fs::remove_file(&pending)?;
                     #[cfg(target_os = "linux")]
-                    if backend::publish_unconfirmed_tmux_exit(&state, &record).is_err() {
+                    if adoption_ledger.is_some() {
+                        messages::sync_directory(&records)?;
+                    }
+                    #[cfg(target_os = "linux")]
+                    if backend::publish_unconfirmed_tmux_exit(
+                        &state,
+                        &record,
+                        adoption_ledger.take(),
+                    )
+                    .is_err()
+                    {
                         eprintln!("wfc: could not publish confirmed startup failure");
                     }
-                    fs::remove_file(&pending)?;
                 }
                 ensure!(
                     accepted,

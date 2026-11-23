@@ -108,11 +108,14 @@ pub fn create(state: &Path, row: &Value, launch: Launch) -> Result<Value> {
 
 #[cfg(target_os = "linux")]
 pub(super) fn resume(state: &Path, row: &Value, launch: Launch) -> Result<Value> {
+    // The OpenCode TUI owns submission after it proves adoption and claims
+    // the brief. Use tmux for launch only on this public path.
+    let host = (row["host"] != "opencode").then_some(&row["host"]);
     call(
         state,
         row,
         json!({"op":"resume","executionId":row["executionId"],"cwd":row["cwd"],
-            "label":row["label"],"argv":launch.argv,"env":launch.env,"host":row["host"],
+            "label":row["label"],"argv":launch.argv,"env":launch.env,"host":host,
             "probe_read_only":true}),
     )
 }
@@ -342,13 +345,18 @@ fn private_receipt(state: &Path, launch: Option<&str>) -> Result<Value> {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn publish_unconfirmed_tmux_exit(state: &Path, row: &Value) -> Result<()> {
+pub(super) fn publish_unconfirmed_tmux_exit(
+    state: &Path,
+    row: &Value,
+    ledger: Option<super::messages::PublishLock>,
+) -> Result<()> {
     if let Some(receipt) = verified_unconfirmed_tmux_receipt(state, row)? {
         super::startup::unconfirmed_tmux_exit(
             state,
             row,
             receipt["launchId"].as_str().context("missing launch ID")?,
             &receipt,
+            ledger,
         )?;
     }
     Ok(())
@@ -1016,7 +1024,7 @@ mod tests {
             ] {
                 row["create"] = answer.clone();
                 row["create"][field] = value;
-                publish_unconfirmed_tmux_exit(&state, &row)?;
+                publish_unconfirmed_tmux_exit(&state, &row, None)?;
             }
             for (field, value) in [
                 ("exitCode", json!(17)),
@@ -1028,11 +1036,12 @@ mod tests {
             ] {
                 row["create"] = answer.clone();
                 row["create"][field] = value;
-                assert!(publish_unconfirmed_tmux_exit(&state, &row).is_err());
+                assert!(publish_unconfirmed_tmux_exit(&state, &row, None).is_err());
             }
             assert!(super::super::messages::history(&state, dispatch)?.is_empty());
             row["create"] = answer;
-            publish_unconfirmed_tmux_exit(&state, &row)?;
+            let ledger = super::super::messages::lock_for_private_publish(&state)?;
+            publish_unconfirmed_tmux_exit(&state, &row, Some(ledger))?;
             let history = super::super::messages::history(&state, dispatch)?;
             assert_eq!(history.len(), 1);
             assert!(history[0]["fault"]["exitCode"].is_null());

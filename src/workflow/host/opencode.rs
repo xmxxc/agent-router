@@ -1,4 +1,6 @@
 //! Proof of the OpenCode session that accepted an original worker launch.
+pub(super) mod adoption;
+pub(in crate::workflow) mod resume;
 #[cfg(test)]
 mod tests;
 
@@ -46,7 +48,7 @@ enum StorageSource {
     Unified,
 }
 
-fn effective_setting(launch: &Map<String, Value>, key: &str) -> Option<PathBuf> {
+pub(super) fn effective_setting(launch: &Map<String, Value>, key: &str) -> Option<PathBuf> {
     launch
         .get(key)
         .and_then(Value::as_str)
@@ -124,11 +126,20 @@ pub(crate) struct OpencodeAdoption<'a> {
     pub first_message: &'a str,
 }
 
-#[allow(dead_code)] // Wired by the shared resume transaction after host adoption is verified.
-pub(crate) fn adopt_opencode_session(
+#[cfg(test)]
+fn adopt_opencode_session(
     state: &Path,
     record: &mut Value,
     receipt: OpencodeAdoption<'_>,
+) -> Result<()> {
+    adopt_receipt(state, record, receipt, None)
+}
+
+fn adopt_receipt(
+    state: &Path,
+    record: &mut Value,
+    receipt: OpencodeAdoption<'_>,
+    hook_source: Option<StorageSource>,
 ) -> Result<()> {
     let opening = verify_opening(state, record)?;
     ensure!(
@@ -152,12 +163,19 @@ pub(crate) fn adopt_opencode_session(
         );
         Some(proof)
     };
+    let saved_source = previous.as_ref().map(|proof| proof.storage_source);
+    ensure!(
+        saved_source
+            .zip(hook_source)
+            .is_none_or(|(saved, hook)| saved == hook),
+        "OpenCode hook conflicts with the recorded storage source"
+    );
     let proof = verify_session(
         &opening,
         receipt.attempt,
         receipt.session,
         receipt.first_message,
-        previous.as_ref().map(|proof| proof.storage_source),
+        saved_source.or(hook_source),
     )?;
     ensure!(
         previous.as_ref().is_none_or(|previous| previous == &proof),
@@ -228,6 +246,7 @@ pub(super) fn prepare(
             configured.is_none(),
             "private OpenCode launch cannot use a configured database"
         );
+        adoption::prepare_state(state)?;
         let dispatch = record["dispatch"].as_str().context("missing dispatch")?;
         let attempt = record["attempt"].as_str().context("missing attempt")?;
         let cwd = PathBuf::from(record["cwd"].as_str().context("missing cwd")?);
@@ -400,22 +419,25 @@ fn verify_session(
     first_message: &str,
     expected_source: Option<StorageSource>,
 ) -> Result<Proof> {
-    ensure!(
-        id.strip_prefix("ses_").is_some_and(|s| !s.is_empty()
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')))
-            && !first_message.is_empty(),
-        "invalid OpenCode adoption identity"
-    );
-    let cwd = opening
-        .cwd
-        .to_str()
-        .context("invalid OpenCode launch directory")?;
+    let mut db = open_read_only(opening)?;
+    let db = db.transaction()?;
+    read_session(
+        &db,
+        opening,
+        current_attempt,
+        id,
+        first_message,
+        expected_source,
+    )
+}
+
+fn open_read_only(opening: &Opening) -> Result<Connection> {
+    adoption::check_store_files(&opening.database)?;
     ensure!(
         fs::symlink_metadata(&opening.database).is_ok_and(|info| info.is_file()),
         "the recorded OpenCode store is missing or inaccessible"
     );
-    let mut db = Connection::open_with_flags(
+    let db = Connection::open_with_flags(
         &opening.database,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
@@ -435,12 +457,33 @@ fn verify_session(
             })
         },
     )?;
-    let db = db.transaction()?;
+    Ok(db)
+}
+
+fn read_session(
+    db: &Connection,
+    opening: &Opening,
+    current_attempt: &str,
+    id: &str,
+    first_message: &str,
+    expected_source: Option<StorageSource>,
+) -> Result<Proof> {
+    ensure!(
+        id.strip_prefix("ses_").is_some_and(|s| !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')))
+            && !first_message.is_empty(),
+        "invalid OpenCode adoption identity"
+    );
+    let cwd = opening
+        .cwd
+        .to_str()
+        .context("invalid OpenCode launch directory")?;
     let tables = db
         .prepare("SELECT name FROM sqlite_schema WHERE type='table'")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<HashSet<_>>>()?;
-    let source = select_source(&db, &tables, id)?;
+    let source = select_source(db, &tables, id)?;
     ensure!(
         expected_source.is_none_or(|expected| expected == source),
         "recorded OpenCode storage source changed"
@@ -471,7 +514,7 @@ fn verify_session(
         );
         ensure!(
             in_project(
-                &db,
+                db,
                 &tables,
                 &proof.project,
                 Path::new(

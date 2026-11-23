@@ -47,9 +47,11 @@ wfc status --active
 
 默认使用 tmux。此组合调用同一可执行文件中的 tmux 后端（#31）。宿主可选 codex、opencode 或 claude，`--launch-config` 或 `WFC_LAUNCH_CONFIG` 指向带有 env、hosts 的 JSON 配置。每个宿主可指定 command、runtime 参数数组及 env。完整参数见 `wfc dispatch --help`。bundled 后端由对应工单接入。
 
-Linux 上，Codex 或 Claude 的 tmux worker 退出后可用 `wfc resume DISPATCH` 回到原会话，继续读同一份任务并写同一份报告。任务已完成时，用 `wfc resume DISPATCH --task task2.md --report reports/04-review/r2.md` 开下一轮。报告须在原目录，且该派发从未用过此文件名。两条路径都生成新 attempt，已认领的 scope 需要当前 owner 凭据。旧 attempt 的回执仍可在 `wfc status --dispatch DISPATCH` 查到。
+Linux 上，Codex、Claude 或受控 OpenCode 的 tmux worker 退出后可用 `wfc resume DISPATCH` 回到原会话，继续读同一份任务并写同一份报告。任务已完成时，用 `wfc resume DISPATCH --task task2.md --report reports/04-review/r2.md` 开下一轮。报告须在原目录，且该派发从未用过此文件名。两条路径都生成新 attempt，已认领的 scope 需要当前 owner 凭据。旧 attempt 的回执仍可在 `wfc status --dispatch DISPATCH` 查到。
 
-恢复需要核实旧执行已离线。Codex 用原开场消息确认会话，Claude 用原 attempt 的 SessionStart 收据和同一配置下的会话文件确认 UUID。重启 Claude 时，新 attempt 的 SessionStart 收据确认采用同一会话。收据到达前拒绝新提问和完成回执。恢复会重新读取原启动配置，启动前先写入审计，启动后记录结果。若执行或会话身份有疑问，先核对 `status`。有待确认的启动审计时，重复运行 `resume` 会保留原证据。OpenCode 的公共恢复仍待认证采用回执和终端就绪接入。
+恢复需要核实旧执行已离线。Codex 用原开场消息确认会话，Claude 用已验证的 SessionStart 收据和同一配置下的会话文件确认 UUID。重启 Claude 时，新 attempt 的 SessionStart 收据确认采用同一会话。收据到达前拒绝新提问和完成回执。恢复会重新读取原启动配置，启动前先写入审计，启动后记录结果。若执行或会话身份有疑问，先核对 `status`。有待确认的启动审计时，重复运行 `resume` 会保留原证据。
+
+OpenCode 公共恢复适用于 OpenCode 1.19.5 v1 TUI 和 tmux。首派须在私有 `WFC_STATE` 下启用 `WFC_OPENCODE_ISOLATED_STORE=1` 并取得正式首消息回执。恢复以只读方式复核原会话和消息，打开同一会话后从已聚焦的空白输入框提交一次新简报。控制端确认该简报落盘后，才接收该轮的新提问和完成回执。受控启动的私有插件使用 OpenCode 的配置来源，现有内联 JSONC 及其变量继续由 OpenCode 读取。
 
 Linux 也支持 Herdr 0.9.5（协议 22）。先启动自己的 Herdr 服务，再把仅当前用户可访问的 socket 绝对路径交给派发命令。也可用 `WFC_HERDR_ENDPOINT` 指定，命令行优先。
 

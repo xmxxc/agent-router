@@ -202,13 +202,20 @@ pub(super) fn unconfirmed_tmux_exit(
     row: &Value,
     launch_id: &str,
     receipt: &Value,
+    ledger: Option<super::messages::PublishLock>,
 ) -> Result<()> {
     if let Some(failure) = tmux_failure(launch_id, receipt)? {
         let Some((dispatch, attempt)) = row["dispatch"].as_str().zip(row["attempt"].as_str())
         else {
             return Ok(());
         };
-        super::messages::publish_startup_failure(state, dispatch, attempt, &failure)?;
+        let ledger = match ledger {
+            Some(ledger) => ledger,
+            None => super::messages::lock_for_publish(state)?,
+        };
+        super::messages::publish_startup_failure_locked(
+            state, dispatch, attempt, &failure, ledger,
+        )?;
     }
     Ok(())
 }
@@ -450,6 +457,7 @@ mod tests {
                     "category":"process_exited","exitCode":17,
                     "startupExit":{"exitCode":17,"signal":null,"pid":1,"processStart":null},
                 }),
+                None,
             )?;
             let history = super::super::messages::history(&state, dispatch)?;
             assert_eq!(history.len(), 2);

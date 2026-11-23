@@ -39,7 +39,7 @@ class StartupFailure(unittest.TestCase):
         self.assertEqual(result.returncode, code, (args, result.stdout, result.stderr))
         return json.loads(result.stdout) if result.stdout else result.stderr.strip()
 
-    def deploy(self, scope, argv, *, host=None, runtime=None, backend=None, code=0):
+    def deploy(self, scope, argv, *, host=None, runtime=None, backend=None, code=0, extra=None):
         args = ["dispatch", "--task", "task", "--cwd", ".", "--report", "report",
                 "--scope", scope, "--role", "startup-check"]
         if host is None:
@@ -53,7 +53,7 @@ class StartupFailure(unittest.TestCase):
             args += ["--host", host, "--launch-config", str(config)]
             if backend == "herdr":
                 args += ["--backend", "herdr", "--herdr-endpoint", str(self.cwd / "unused-herdr.sock")]
-        return self.cli(*args, code=code)
+        return self.cli(*args, code=code, extra=extra)
 
     def wait(self, scope):
         empty = self.cli("wait", "--scope", "unrelated", "--timeout", "0", code=3)
@@ -319,6 +319,39 @@ class StartupFailure(unittest.TestCase):
         self.assertEqual(row["worker"]["exit_code"], 0)
         self.assertNotIn("startupFailure", row)
         self.assertFalse(self.cli("wait", "--scope", "host-zero-done", "--timeout", "0", code=3)["messages"])
+
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_private_opencode_startup_failure_and_retry(self):
+        self.addCleanup(os.umask, os.umask(0o002))
+        self.start_tmux()
+        self.assertFalse(self.state.exists())
+        script = self.cwd / (SECRET + ".py")
+        options = {"host": "opencode", "runtime": [sys.executable],
+                   "extra": {"WFC_OPENCODE_ISOLATED_STORE": "1"}, "code": 1}
+        error = self.deploy("private-opencode-missing", [str(script)], **options)
+        self.assertIn("missing configured script", error)
+        self.assertNotIn(SECRET, error)
+        blocked = self.wait("private-opencode-missing")
+        self.assertEqual((blocked["host"], blocked["type"], blocked["fault"]["category"]),
+                         ("opencode", "blocked", "executable_missing"))
+        self.assertEqual(self.check_ack(blocked)["worker"]["state"], "not_started")
+        self.assertEqual(stat.S_IMODE(self.state.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((self.state / "dispatches").stat().st_mode), 0o700)
+
+        script.write_text("raise SystemExit(0)\n")
+        self.deploy("private-opencode-zero", [str(script)], **options)
+        private = self.wait("private-opencode-zero")
+        self.assertEqual((private["host"], private["type"], private["fault"]["exitCode"]),
+                         ("opencode", "exited", 0))
+        row = self.check_ack(private)
+        self.assertEqual(row["opencodeOpening"]["attempt"], private["attempt"])
+        self.assertEqual(row["worker"]["exit_code"], 0)
+        self.assertIsNone(row.get("hostSession"))
+        self.assertFalse((self.state / "dispatches" / f'{private["dispatch"]}.pending').exists())
+        old, = self.cli("status", "--dispatch", blocked["dispatch"])["dispatches"][0]["messages"]
+        self.assertEqual((old["id"], old["messageId"], old["state"]),
+                         (blocked["id"], blocked["messageId"], "processed"))
+        print("Private OpenCode early exit published once and was acknowledged", flush=True)
 
     def hold_tmux_create(self, gate):
         real_tmux = self.tmux[0]
