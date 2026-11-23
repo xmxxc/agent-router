@@ -882,3 +882,35 @@ fn old_host_archive_preserves_known_exit_but_rechecks_session_cleanup() {
         assert_eq!(fs::read_to_string(&path).unwrap(), saved);
     }
 }
+
+#[test]
+fn unresolved_reservations_stay_visible_without_claiming_other_assignments() {
+    let f = Fixture::new();
+    let dir = f.0.join("state/dispatches");
+    fs::create_dir_all(&dir).unwrap();
+    let id = "d-ffeeddcc";
+    fs::write(dir.join(format!("{id}.pending")), b"{").unwrap();
+    fs::write(dir.join("d-12345678.reserving"), b"{").unwrap();
+    let all = run(f.wfc().args(["status", "--active"]));
+    let rows = all["dispatches"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["dispatch"], id);
+    assert_eq!(rows[0]["worker"]["state"], "unknown");
+    assert_eq!(rows[0]["rounds"], json!([]));
+    let named = run(f.wfc().args(["status", "--dispatch", id]));
+    assert_eq!(named["dispatches"][0]["createPending"], true);
+    #[cfg(target_os = "linux")]
+    assert!(!f
+        .wfc()
+        .args(["close", id])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let published = json!({"dispatch":id,"round":1,"attempt":"a-aaaabbbbcccc"});
+    fs::write(dir.join(format!("{id}.json")), published.to_string()).unwrap();
+    let all = run(f.wfc().arg("status"));
+    assert_eq!(all["dispatches"].as_array().unwrap().len(), 1);
+    assert!(all["dispatches"][0].get("createPending").is_none());
+    assert_eq!(all["dispatches"][0]["attempt"], published["attempt"]);
+}

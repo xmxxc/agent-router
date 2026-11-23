@@ -219,6 +219,12 @@ fn inspect_launch<'a>(
         let selector = legacy_selector(row)?;
         if inspection["launchId"].is_null() {
             ensure!(
+                row["createPending"] != true
+                    || known.is_some()
+                    || (row["legacyWorkerPane"].is_string() && inspection["workerBound"] == true),
+                "missing verified launch or worker for legacy reservation"
+            );
+            ensure!(
                 legacy_launch_hint(row)?.is_none() || known.is_some(),
                 "unconfirmed legacy launch hint"
             );
@@ -398,12 +404,18 @@ pub fn observe(state: &Path, row: &Value) -> Result<(Value, Value)> {
 
 pub fn close(state: &Path, row: &Value) -> Result<Value> {
     let id = row["dispatch"].as_str().context("missing dispatch")?;
-    // This immutable assignment file serializes competing closes, including
-    // across a restart. Completed archives need only read access.
-    let lock = File::open(state.join("dispatches").join(format!("{id}.json")))?;
-    lock.lock()?;
+    // Archived replay works on read-only state. A first close serializes on a
+    // stable per-attempt file regardless of which publication the reader saw.
+    let saved = archive(state, row)?.filter(confirmed);
+    let _lock;
+    let saved = if saved.is_some() {
+        saved
+    } else {
+        _lock = super::assignment::close_lock(state, row)?;
+        archive(state, row)?.filter(confirmed)
+    };
     let mut receipt = json!({"dispatch":id,"operation":"close","result":"completed","round":row["round"],"attempt":row["attempt"]});
-    if let Some(saved) = archive(state, row)?.filter(confirmed) {
+    if let Some(saved) = saved {
         receipt["worker"] = closed_worker(state, row, &saved)?;
         for field in ["closeOperationId", "closeEffect"] {
             if let Some(value) = saved.get(field) {
