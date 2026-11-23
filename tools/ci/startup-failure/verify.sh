@@ -34,9 +34,11 @@ run_group controlled python3 -Bu tests/startup_failure.py "$binary" -v \
     StartupFailure.test_controlled_failures_and_completion \
     StartupFailure.test_close_distinguishes_natural_exit_and_cancellation
 run_group hosted-tmux python3 -Bu tests/startup_failure.py "$binary" -v \
-    StartupFailure.test_hosted_failures
+    StartupFailure.test_hosted_failures \
+    StartupFailure.test_tmux_zero_follows_the_create_confirmation \
+    StartupFailure.test_script_lookup_permission_failure
 run_group startup-unit cargo test --locked --release --target "$TARGET" --bin wfc \
-    workflow::startup::tests -- --test-threads=1
+    startup -- --test-threads=1
 run_group scope-relay python3 -Bu tests/relay.py "$binary" -v \
     Relay.test_startup_failure_uses_the_existing_scope_and_ack
 

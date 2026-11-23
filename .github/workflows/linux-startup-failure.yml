@@ -8,20 +8,21 @@ permissions:
 
 jobs:
   linux-startup-failure:
-    name: '#13 startup failure review regressions'
+    name: '#13 startup failure boundary regressions'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     defaults:
       run:
         shell: bash
     env:
-      PRODUCT_SHA: ba7f5f793a68d08103b9ee363105cb754e394ec6
-      PRODUCT_TREE: 3e1d63ceea177803ca1a9226fe6d7eada564a278
+      PRODUCT_SHA: 4213998e5d22edcee4caa26d23c8421fca1aecf0
+      PRODUCT_TREE: 26e60bd5b1d9cd3941ff899ad8db184eeccefd7d
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TARGET: x86_64-unknown-linux-gnu
       TEST_GROUP: startup-review
       BASELINE_RUN: '45219721058'
       PREVIOUS_HOSTED_RUN: '45222227720'
+      PREVIOUS_REVIEW_RUN: '45227192225'
       CARGO_BUILD_JOBS: '2'
       PYTHONUTF8: '1'
       PYTHONDONTWRITEBYTECODE: '1'
@@ -32,7 +33,8 @@ jobs:
           mkdir -p "$EVIDENCE"
           printf '%s\n' "workflow=$GITHUB_SHA" "run=$GITHUB_RUN_ID" "attempt=$GITHUB_RUN_ATTEMPT" \
             "expectedProduct=$PRODUCT_SHA" "expectedTree=$PRODUCT_TREE" "testGroup=$TEST_GROUP" \
-            "baselineRun=$BASELINE_RUN" "previousHostedRun=$PREVIOUS_HOSTED_RUN" |
+            "baselineRun=$BASELINE_RUN" "previousHostedRun=$PREVIOUS_HOSTED_RUN" \
+            "previousReviewRun=$PREVIOUS_REVIEW_RUN" |
             tee "$EVIDENCE/run.log"
       - name: Check out the CI scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -129,11 +131,13 @@ jobs:
             [[ "$version" == *"(Rust, $TARGET, release, build $PRODUCT_SHA)" ]]
             sha256sum "$binary"
           } 2>&1 | tee "$EVIDENCE/build.log"
-      - name: Verify startup failure review regressions
+      - name: Verify startup failure boundary regressions
         working-directory: product
         env:
           WFC_BUILD_ID: ${{ env.PRODUCT_SHA }}
-        run: bash ../ci/tools/ci/startup-failure/verify.sh "$TEST_GROUP"
+        run: |
+          test "$(id -u)" -ne 0
+          bash ../ci/tools/ci/startup-failure/verify.sh "$TEST_GROUP"
       - name: Checksum the evidence logs
         if: ${{ always() }}
         run: |
