@@ -1,23 +1,27 @@
 """Check repeated completions and failed-then-successful resumes from pinned Python CLIs."""
+import hashlib
 import json
 import os
+import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 from contextlib import closing
 from pathlib import Path
 
 from python_recovery import backup, digest, dump
 
 
-def check(source, binary, dispatch, label, *, damage="", repair="", refuse=False):
+def check(source, binary, dispatch, label, *, damage="", repair="", refuse=False, diagnostic=""):
     original_sha = digest(source)
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         work = root / "router.db"
         backup(source, work)
         with closing(sqlite3.connect(work)) as db:
+            db.create_function("body_sha", 1, lambda body: hashlib.sha256(body.encode()).hexdigest())
             db.executescript(damage)
         before = digest(work)
         prior = dump(work)
@@ -34,6 +38,7 @@ def check(source, binary, dispatch, label, *, damage="", repair="", refuse=False
                                     capture_output=True, text=True, timeout=20)
             if refuse:
                 assert result.returncode == 1 and dispatch in result.stderr and not result.stdout, result
+                assert diagnostic in result.stderr, result.stderr
                 assert digest(work) == before and dump(work) == prior
             else:
                 assert result.returncode == 0, result.stderr
@@ -59,6 +64,16 @@ def repeated(e, binary):
     e.report.write_text("completed")
     first = e.json("done", "--report", str(e.report), dispatch=did)
     source = e.state / "router.db"
+    gaps = "UPDATE dispatch_round SET result=NULL, completed=NULL;"
+    check(source, binary, did, "matching-body-hash", damage=gaps, repair="""
+        UPDATE dispatch_round SET result=(SELECT body FROM message WHERE type='done'),
+            completed=(SELECT created FROM message WHERE type='done');
+    """)
+    changed = """UPDATE message SET body=replace(body,'"dirty": false','"dirty": true') WHERE type='done';"""
+    for label, damage in [("missing-final", gaps), ("complete", ""), ("missing-role", "UPDATE dispatch SET role=NULL;"),
+                          ("old-schema", "ALTER TABLE dispatch_round DROP COLUMN callback_hash;")]:
+        check(source, binary, did, "changed-body-hash-" + label, damage=changed + damage,
+              refuse=True, diagnostic="body hash")
     reset = "DELETE FROM message WHERE type='done'; UPDATE dispatch_round SET state='running';"
     check(source, binary, did, "running-result-without-receipt", damage=reset,
           repair="UPDATE dispatch_round SET state='completed';")
@@ -138,6 +153,72 @@ def resumed(e, binary):
         (SELECT from_attempt FROM lifecycle_event WHERE result='definitely-not-sent') WHERE result='accepted';""", refuse=True)
 
 
+def reconciled(e, binary):
+    # Dropping the endpoint's ping leaves create uncertain. Its disappearance
+    # makes the subsequent resume inspection uncertain on this same attempt.
+    endpoint = e.bin.parent / "herdr.sock"
+    env = {"HOME": str(e.bin.parent)}
+    with socket.socket(socket.AF_UNIX) as server:
+        server.bind(str(endpoint))
+        endpoint.chmod(0o600)
+        server.listen(1)
+        server.settimeout(30)
+        def drop_ping():
+            with closing(server.accept()[0]) as conn:
+                conn.settimeout(15)
+                conn.recv(4096)
+        thread = threading.Thread(target=drop_ping)
+        thread.start()
+        try:
+            created = e.run("dispatch", "--host", "claude", "--backend", "herdr", "--herdr-endpoint", str(endpoint),
+                            "--cwd", str(e.cwd), "--task", str(e.task), "--report", str(e.report), env=env, timeout=90)
+            assert created.returncode == 1, created
+        finally:
+            thread.join()
+
+    did = e.json("status")["dispatches"][0]["dispatch"]
+    source = e.state / "router.db"
+    def accept(operation):
+        status = e.json("status", "--dispatch", did)["dispatches"][0]
+        event = status["audit"][-1]
+        assert (event["operation"], event["result"]) == (operation, "uncertain"), event
+        e.json("reconcile", did, str(event["id"]), "--result", "accepted", "--actor", "test",
+               "--evidence", "private fixture", env=env)
+
+    accept("create")
+    resume = e.run("resume", did, env=env, timeout=90)
+    assert resume.returncode == 1 and "lifecycle_reconcile_required" in resume.stderr, resume
+    check(source, binary, did, "uncertain-inspection")
+    accept("resume")
+    with closing(sqlite3.connect(source)) as db:
+        row = db.execute("SELECT attempt,state,result,completed FROM dispatch_round").fetchone()
+        assert row[1] == "running" and json.loads(row[2])["backend"] == "herdr" and row[3] is not None
+        assert db.execute("SELECT count(*) FROM message WHERE type='done'").fetchone() == (0,)
+        audit = db.execute("SELECT attempt,result,resolver_actor,resolved_at FROM lifecycle_event WHERE operation='resume'").fetchone()
+        assert audit[:3] == (row[0], "accepted", "test") and audit[3] >= row[3]
+        print("accepted backend observation", did, row, "audit", audit)
+    check(source, binary, did, "accepted-inspection")
+    check(source, binary, did, "accepted-inspection-without-create-result",
+          damage="UPDATE dispatch_round SET result=NULL;")
+    check(source, binary, did, "accepted-inspection-with-partial-done",
+          damage="UPDATE dispatch_round SET result=json_set(result,'$.dirty',json('false'));", refuse=True)
+    check(source, binary, did, "accepted-inspection-with-mixed-result",
+          damage="""UPDATE dispatch_round SET result=json_set(result,'$.report',report,'$.head',NULL,'$.dirty',NULL);""",
+          refuse=True, diagnostic="mixes task completion")
+    check(source, binary, did, "inspection-without-resolution",
+          damage="DELETE FROM lifecycle_event WHERE operation='resume';", refuse=True)
+    e.report.write_text("completed after reconciliation")
+    e.json("done", "--report", str(e.report), "--attempt", row[0], dispatch=did, env=env)
+    check(source, binary, did, "completed-after-reconciliation")
+    diagnostic_hex = row[2].encode().hex()
+    check(source, binary, did, "done-with-stale-backend-result",
+          damage=f"UPDATE dispatch_round SET state='running',result=CAST(X'{diagnostic_hex}' AS TEXT),completed={row[3]};",
+          refuse=True, diagnostic="backend diagnostic")
+    check(source, binary, did, "done-with-stale-observation-time",
+          damage=f"UPDATE dispatch_round SET state='running',result=NULL,completed={row[3]};",
+          refuse=True, diagnostic="time precedes")
+
+
 if __name__ == "__main__":
     checkout = Path(sys.argv[1]).resolve()
     revision = subprocess.check_output(["git", "-C", checkout, "rev-parse", "HEAD"], text=True).strip()
@@ -150,7 +231,7 @@ if __name__ == "__main__":
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     sys.path[:0] = [str(checkout / "tests"), str(checkout)]
     from test_router import Env
-    for probe in (repeated, resumed):
+    for probe in (repeated, resumed, reconciled):
         fixture = Env()
         try:
             probe(fixture, Path(sys.argv[2]).resolve())

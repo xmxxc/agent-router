@@ -116,6 +116,11 @@ def run(source, binary):
                         db.execute("UPDATE message SET body=json_set(body,'$.task','/wrong') WHERE type='continue'")
                     if mode == "partial-continue":
                         db.execute("UPDATE message SET body=json_set(json_remove(body,'$.attempt'),'$.report','/wrong') WHERE type='continue'")
+                    if mode in ("wrong-report", "wrong-continue", "partial-continue"):
+                        # Keep the digest valid to exercise the separate identity conflict.
+                        for mid, body in db.execute("SELECT id,body FROM message").fetchall():
+                            db.execute("UPDATE message SET body_hash=? WHERE id=?",
+                                       (hashlib.sha256(body.encode()).hexdigest(), mid))
                     if mode in ("cancelled", "cancelled-no-role"):
                         db.execute("UPDATE dispatch_round SET state='cancelled' WHERE round=2")
                         if mode == "cancelled-no-role":

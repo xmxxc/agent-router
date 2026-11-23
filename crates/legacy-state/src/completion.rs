@@ -31,7 +31,6 @@ struct Snapshot {
     completed: Option<f64>,
     receipt: Option<Done>,
     varying_results: bool,
-    repeated_attempt: bool,
     missing_report: bool,
     current: bool,
 }
@@ -104,21 +103,35 @@ impl Snapshot {
             // in the same transaction. Numeric message ID is the commit order.
             let modern = body["round"].as_i64() == Some(self.round)
                 && body["attempt"].as_str() == Some(self.attempt.as_str());
-            self.repeated_attempt |= modern;
             if previous.raw != raw {
                 let old = previous.body.as_object().unwrap();
                 let new = body.as_object().unwrap();
                 let pre_attempt = !old.contains_key("round") && !old.contains_key("attempt");
+                // The earliest Python writer stored only the path. Git fields
+                // first appeared together; an isolated missing field is damage.
+                let before_git = pre_attempt
+                    && !old.contains_key("head")
+                    && !old.contains_key("dirty")
+                    && previous.body["report"]
+                        .as_str()
+                        .is_some_and(|p| !p.is_empty());
                 let compatible = old
                     .iter()
                     .all(|(k, v)| matches!(k.as_str(), "head" | "dirty") || new.get(k) == Some(v))
                     && new.keys().all(|k| {
                         old.contains_key(k)
+                            || before_git && matches!(k.as_str(), "head" | "dirty")
                             || pre_attempt
                                 && matches!(k.as_str(), "round" | "attempt" | "scope" | "role")
                     });
                 ensure!(
-                    modern && has_git_result(&previous.body) && has_git_result(&body) && compatible,
+                    (modern
+                        || before_git
+                            && !new.contains_key("round")
+                            && !new.contains_key("attempt"))
+                        && (before_git || has_git_result(&previous.body))
+                        && has_git_result(&body)
+                        && compatible,
                     "conflicting done results"
                 );
                 self.varying_results = true;
@@ -134,7 +147,57 @@ impl Snapshot {
         Ok(())
     }
 
-    fn update(self) -> Result<Option<Update>> {
+    fn running_completion(
+        &self,
+        db: &Connection,
+        dispatch: &str,
+        result: Option<&Value>,
+    ) -> Result<bool> {
+        if self.state.as_deref() != Some("running") {
+            return Ok(false);
+        }
+        let task_fields = result.is_some_and(|v| {
+            ["report", "head", "dirty"]
+                .iter()
+                .any(|k| v.get(k).is_some())
+        });
+        if task_fields {
+            ensure!(
+                result.is_some_and(has_git_result) && self.completed.is_some(),
+                "running snapshot has incomplete completion evidence"
+            );
+            ensure!(
+                !result
+                    .is_some_and(|v| ["backend", "diagnostic"].iter().any(|k| v.get(k).is_some())),
+                "running snapshot mixes task completion and backend diagnostics"
+            );
+            return Ok(true);
+        }
+
+        let Some(observed) = self.completed else {
+            return Ok(false);
+        };
+        // A failed backend inspection also timestamps this column. A later
+        // accepted reconciliation restores running on this same attempt.
+        let backend_only = result.is_none_or(|v| {
+            ["backend", "result", "diagnostic"]
+                .iter()
+                .all(|k| v[*k].as_str().is_some_and(|s| !s.is_empty()))
+        });
+        let reconciled = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lifecycle_event WHERE dispatch=?1 AND round=?2
+                AND coalesce(to_attempt,attempt)=?3 AND operation IN ('create','resume','handoff')
+                AND result='accepted' AND resolver_actor<>'' AND resolution_evidence<>'' AND resolved_at>=?4)",
+            params![dispatch, self.round, self.attempt, observed], |r| r.get::<_, bool>(0),
+        )?;
+        ensure!(
+            backend_only && reconciled,
+            "running snapshot has incomplete completion evidence"
+        );
+        Ok(false)
+    }
+
+    fn update(self, db: &Connection, dispatch: &str) -> Result<Option<Update>> {
         if !self.eligible() {
             return Ok(None);
         }
@@ -151,13 +214,17 @@ impl Snapshot {
                     "conflicting done results without a final snapshot result"
                 );
             }
-            if self.repeated_attempt {
-                if let (Some(saved_time), Some(observed)) = (self.completed, receipt.created) {
-                    ensure!(
-                        saved_time >= observed,
-                        "stored completion time precedes the final done receipt"
-                    );
-                }
+            ensure!(
+                !stored
+                    .as_ref()
+                    .is_some_and(|v| v.get("backend").is_some() || v.get("diagnostic").is_some()),
+                "stored backend diagnostic conflicts with done receipt"
+            );
+            if let (Some(saved_time), Some(observed)) = (self.completed, receipt.created) {
+                ensure!(
+                    saved_time >= observed,
+                    "stored completion time precedes the final done receipt"
+                );
             }
             if let Some(original) = &stored {
                 let fields = original
@@ -170,23 +237,8 @@ impl Snapshot {
                     "conflicting stored result and final done receipt"
                 );
             }
-        } else if !completed {
-            // Failed launches can leave a diagnostic result on a running attempt.
-            // The Python completion result records the report and both Git fields.
-            if self.state.as_deref() != Some("running")
-                || (self.completed.is_none()
-                    && !stored.as_ref().is_some_and(|v| {
-                        ["report", "head", "dirty"]
-                            .iter()
-                            .any(|key| v.get(key).is_some())
-                    }))
-            {
-                return Ok(None);
-            }
-            ensure!(
-                stored.as_ref().is_some_and(has_git_result) && self.completed.is_some(),
-                "running snapshot has incomplete completion evidence"
-            );
+        } else if !completed && !self.running_completion(db, dispatch, stored.as_ref())? {
+            return Ok(None);
         }
         let needs_update =
             !completed || self.missing_report || self.result.is_none() || self.completed.is_none();
@@ -285,7 +337,6 @@ pub fn plan(db: &Connection) -> Result<Completions> {
             completed: r.get(7)?,
             receipt: None,
             varying_results: false,
-            repeated_attempt: false,
             missing_report,
             current: r.get(9)?,
         };
@@ -327,7 +378,7 @@ pub fn plan(db: &Connection) -> Result<Completions> {
         for snapshot in rounds {
             let round = snapshot.round;
             if let Some(update) = snapshot
-                .update()
+                .update(db, &id)
                 .with_context(|| format!("dispatch {id}, round {round}"))?
             {
                 updates.push(update);

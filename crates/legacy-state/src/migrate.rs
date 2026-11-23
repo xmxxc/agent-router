@@ -50,8 +50,8 @@ fn register_functions(db: &Connection) -> Result<()> {
         Ok(Uuid::new_v4().simple().to_string())
     })?;
     db.create_scalar_function("body_sha", 1, flags, |ctx| {
-        let body: String = ctx.get(0)?;
-        Ok(format!("{:x}", Sha256::digest(body.as_bytes())))
+        let body = ctx.get_raw(0).as_bytes()?;
+        Ok(format!("{:x}", Sha256::digest(body)))
     })?;
     db.create_scalar_function("legacy_role", 1, flags, |ctx| {
         let dir: Option<String> = ctx.get(0)?;
@@ -76,7 +76,6 @@ fn register_functions(db: &Connection) -> Result<()> {
 }
 
 fn repair(db: &Connection, ids: Vec<String>) -> Result<()> {
-    register_functions(db)?;
     db.execute(
         &format!(
             "UPDATE message SET
@@ -127,23 +126,43 @@ pub fn open_offline_copy(state: &Path) -> Result<(Connection, Option<PathBuf>)> 
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (gaps, has_ledger) = schema::inspect(&tx)?;
     let mut original = None;
-    let candidates = if gaps.is_empty() {
-        Some(crate::recovery::candidates(&tx)?)
-    } else {
-        None
-    };
-    if candidates.as_ref().is_none_or(|ids| !ids.is_empty()) || has_repairs(&tx)? {
-        if has_ledger {
+    let mut preserve = || -> Result<()> {
+        if has_ledger && original.is_none() {
             original = Some(backup(&state).context("preserve pre-migration router.db")?);
         }
+        Ok(())
+    };
+    register_functions(&tx)?;
+    let upgrade = !gaps.is_empty();
+    if upgrade {
+        preserve()?;
         tx.execute_batch(schema::SCHEMA)?;
         for gap in gaps {
             gap.upgrade(&tx)?;
         }
-        let ids = match candidates {
-            Some(ids) => ids,
-            None => crate::recovery::candidates(&tx)?,
-        };
+    }
+
+    // Python hashes the exact UTF-8 text stored in message.body. Validate its
+    // surviving witness before any query uses a receipt to reconstruct state.
+    let corrupt = tx
+        .query_row(
+            "SELECT dispatch,id FROM message WHERE body_hash<>'' AND
+            CASE WHEN typeof(body)='text' THEN body_hash<>body_sha(body) ELSE 1 END LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    if let Some((id, message)) = corrupt {
+        preserve()?;
+        bail!(
+            "dispatch {}, message {message}: body hash mismatch",
+            id.as_deref().unwrap_or("<missing>")
+        );
+    }
+
+    let ids = crate::recovery::candidates(&tx)?;
+    if upgrade || !ids.is_empty() || has_repairs(&tx)? {
+        preserve()?;
         repair(&tx, ids).with_context(|| format!("repair offline copy in {}", state.display()))?;
     }
     // A current identity authorizes writes only when that exact snapshot exists.
@@ -163,14 +182,12 @@ pub fn open_offline_copy(state: &Path) -> Result<(Connection, Option<PathBuf>)> 
         )
         .optional()?;
     if let Some((id, round, attempt)) = mismatch {
-        if original.is_none() && has_ledger {
-            backup(&state).context("preserve pre-migration router.db")?;
-        }
+        preserve()?;
         bail!("dispatch {id}, round {round}, attempt {attempt} has no matching current snapshot");
     }
     let completions = crate::completion::plan(&tx);
-    if original.is_none() && has_ledger && !completions.as_ref().is_ok_and(|p| p.is_empty()) {
-        original = Some(backup(&state).context("preserve pre-migration router.db")?);
+    if !completions.as_ref().is_ok_and(|p| p.is_empty()) {
+        preserve()?;
     }
     completions?.apply(&tx)?;
     tx.commit()?;

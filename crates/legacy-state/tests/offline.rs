@@ -695,3 +695,71 @@ fn missing_transition_round_requires_one_consistent_target_round() {
         assert_eq!(fs::read(path).unwrap(), before);
     }
 }
+
+#[test]
+fn invalid_utf8_body_with_existing_digest_keeps_a_restorable_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("router.db");
+    let (db, _) = wfc_legacy_state::open_offline_copy(dir.path()).unwrap();
+    db.execute_batch(
+        "INSERT INTO message(dispatch,body,body_hash)
+        VALUES('damaged',CAST(X'FF' AS TEXT),'wrong')",
+    )
+    .unwrap();
+    drop(db);
+    let original = std::fs::read(&path).unwrap();
+    for count in 1..=2 {
+        let err = wfc_legacy_state::open_offline_copy(dir.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("dispatch damaged, message 1: body hash mismatch"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|p| {
+                p.file_name()
+                    .to_string_lossy()
+                    .starts_with("router.before-")
+            })
+            .collect();
+        assert_eq!(backups.len(), count);
+        for file in backups {
+            let db = rusqlite::Connection::open(file.path()).unwrap();
+            let row: (String, String) = db
+                .query_row("SELECT hex(body),body_hash FROM message", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(row, ("FF".into(), "wrong".into()));
+        }
+    }
+}
+
+#[test]
+fn utf16_ledger_checks_and_backfills_the_python_utf8_digest() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let db = rusqlite::Connection::open(dir.path().join("router.db")).unwrap();
+    db.execute_batch("PRAGMA encoding='UTF-16le'; CREATE TABLE message(id INTEGER PRIMARY KEY, body TEXT, body_hash TEXT)").unwrap();
+    let digest = format!("{:x}", Sha256::digest("中文".as_bytes()));
+    db.execute(
+        "INSERT INTO message(body,body_hash) VALUES ('中文',?),('中文',NULL)",
+        [&digest],
+    )
+    .unwrap();
+    drop(db);
+    let (db, saved) = wfc_legacy_state::open_offline_copy(dir.path()).unwrap();
+    assert!(saved.is_some());
+    let matches: i64 = db
+        .query_row(
+            "SELECT count(*) FROM message WHERE body_hash=?",
+            [&digest],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(matches, 2);
+    drop(db);
+    assert!(wfc_legacy_state::open_offline_copy(dir.path())
+        .unwrap()
+        .1
+        .is_none());
+}
