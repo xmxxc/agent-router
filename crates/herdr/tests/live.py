@@ -244,7 +244,7 @@ for line in sys.stdin:
         self.driver('close','completed')
 
     @contextlib.contextmanager
-    def fault_proxy(self, change):
+    def fault_proxy(self, change, *, read_frame=None):
         endpoint = self.root / 'proxy.sock'
         errors = []
         stop = threading.Event()
@@ -261,7 +261,10 @@ for line in sys.stdin:
                         except socket.timeout:
                             continue
                         with conn, conn.makefile('rb') as stream:
-                            req = json.loads(stream.readline())
+                            frame = read_frame(stream) if read_frame else stream.readline()
+                            if frame is None:
+                                continue
+                            req = json.loads(frame)
                             response = json.loads(exchange(self.endpoint,req))
                             reply = change(req,response)
                             if reply is not None:
@@ -295,6 +298,62 @@ for line in sys.stdin:
             wait_for(lambda: events.exists() and events.read_text().splitlines() == ['one input'])
             self.driver('close','completed')
 
+    def test_disconnect_during_input_request_keeps_claim(self):
+        prefixes = []
+
+        def cut_input(stream):
+            prefix = stream.readline(512)
+            if b'x' * 64 in prefix and not prefix.endswith(b'\n'):
+                prefixes.append(prefix)
+                return None
+            return prefix if prefix.endswith(b'\n') else prefix + stream.readline()
+
+        with self.fault_proxy(lambda req, reply: reply, read_frame=cut_input) as endpoint:
+            self.create(endpoint)
+            text = 'x' * (1024 * 1024)
+            self.driver('submit','uncertain',text=text,host='codex')
+            self.assertTrue(self.state()['pendingInput'])
+            self.driver('submit','pending',text=text,host='codex')
+            self.assertEqual(len(prefixes),1)
+            self.assertEqual(len(prefixes[0]),512)
+            self.assertIn(b'pane.send_input',prefixes[0])
+            self.assertFalse((self.root/'events').exists())
+            self.driver('close','completed')
+
+    def test_compact_empty_composer_releases_confirmed_input(self):
+        writes = []
+        def trace(req, reply):
+            if req['method'] in ('pane.send_input','pane.send_keys'):
+                writes.append((req['method'],req['params'].get('text'),reply['result']['type']))
+            return reply
+
+        with self.fault_proxy(trace) as endpoint:
+            host = Path(__file__).with_name('composer.py').resolve()
+            self.create(endpoint,[sys.executable,'-u',str(host),'two','--submit-first'])
+            (self.root/'show-history').touch()
+            frame = '›\n  model · dir\n  keys · help'
+            def empty_box():
+                return self.driver('read')['screen']['text'].rstrip().endswith(frame)
+            wait_for(empty_box)
+            events = self.root/'events'
+            received = []
+            for text in ['hello from review','next message']:
+                self.driver('submit',text=text,host='codex')
+                received.append(text)
+                self.assertEqual(writes,[('pane.send_input',line,'ok') for line in received])
+                wait_for(lambda: events.exists() and events.read_text().splitlines() == received)
+                self.assertFalse(self.state()['pendingInput'])
+                wait_for(empty_box)
+
+            # With the same frame, one plausible draft now equals the input.
+            text = 'model · dir'
+            self.driver('submit','uncertain',text=text,host='codex')
+            self.assertTrue(self.state()['pendingInput'])
+            self.driver('submit','pending',text=text,host='codex')
+            self.assertEqual(writes,[('pane.send_input',line,'ok') for line in [*received,text]])
+            wait_for(lambda: events.exists() and events.read_text().splitlines() == [*received,text])
+            self.driver('close','completed')
+
     def test_long_history_with_two_footer_lines(self):
         self.long_history_submit(lose_key=False, footer='two')
 
@@ -321,7 +380,7 @@ for line in sys.stdin:
             (self.root/'show-history').touch()
             def complete():
                 screen = self.driver('read')['screen']
-                return screen['truncated'] and 'fixture · model' in screen['text']
+                return screen['truncated'] and 'model · dir' in screen['text']
             wait_for(complete)
             calls.clear()
             text = 'one draft tail · value'
@@ -350,13 +409,16 @@ for line in sys.stdin:
         exact = '› draft\n  fixture · model'
         with self.fault_proxy(render) as endpoint:
             self.create(endpoint)
-            for pair in [(exact,'› changed\n  fixture · model'), (exact, '› draft ↓\n  fixture · model'),
+            empty = '›\n\n  fixture · model'
+            ambiguous = '› draft\n  tail · value\n  model · dir'
+            for pair in [(empty,ambiguous), (ambiguous,empty), (exact,'› changed\n  fixture · model'), (exact, '› draft ↓\n  fixture · model'),
                          ('› draft ↑\n  fixture · model',exact),
                          ('› draft\n  extra · text\n  model · dir\n  keys · info',)*2]:
                 calls.clear()
                 frames[:] = ['›\n\n  model · dir\n  keys · info',*pair]
                 self.driver('submit',text='draft',host='codex')
                 self.assertEqual(calls,['pane.read','pane.send_input','pane.read','pane.read'])
+                self.assertFalse(self.state()['pendingInput'])
             calls.clear()
             frames[:] = ['›\n\n  fixture · model'] + ['› draft\n  tail · value\n  fixture · model']*2
             self.driver('submit',text='draft',host='codex')
