@@ -9,6 +9,10 @@ case "$group" in
         selectors=(
             Backend.test_public_interrupt_fences_before_tmux_key
             Backend.test_public_interrupt_lost_confirmation_keeps_fence_and_refuses_foreign_writer
+            Backend.test_public_interrupt_holds_both_locks_after_controller_exit
+            Backend.test_public_interrupt_leaves_pending_when_owner_expires
+            Backend.test_public_interrupt_backend_spawn_failure_is_definitely_not_sent
+            Backend.test_read_only_unowned_close_replays_confirmed_archive
         )
         ;;
     codex-home-paths)
