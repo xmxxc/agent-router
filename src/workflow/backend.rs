@@ -108,11 +108,14 @@ pub fn create(state: &Path, row: &Value, launch: Launch) -> Result<Value> {
 
 #[cfg(target_os = "linux")]
 pub(super) fn resume(state: &Path, row: &Value, launch: Launch) -> Result<Value> {
+    // The OpenCode TUI owns submission after it proves adoption and claims
+    // the brief. Use tmux for launch only on this public path.
+    let host = (row["host"] != "opencode").then_some(&row["host"]);
     call(
         state,
         row,
         json!({"op":"resume","executionId":row["executionId"],"cwd":row["cwd"],
-            "label":row["label"],"argv":launch.argv,"env":launch.env,"host":row["host"],
+            "label":row["label"],"argv":launch.argv,"env":launch.env,"host":host,
             "probe_read_only":true}),
     )
 }

@@ -648,6 +648,28 @@ pub(super) fn lock_for_publish(dir: &Path) -> Result<PublishLock> {
     Ok(PublishLock::held(dir, lock))
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn lock_for_private_publish(dir: &Path) -> Result<PublishLock> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let lock = private_file()
+        .create(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dir.join("messages.lock"))
+        .context("open private Inbox lock")?;
+    let info = lock.metadata()?;
+    ensure!(
+        info.is_file()
+            && info.nlink() == 1
+            && info.mode() & 0o777 == 0o600
+            && info.uid() == unsafe { libc::geteuid() },
+        "unsafe private Inbox lock"
+    );
+    lock.lock().context("lock controller messages")?;
+    Ok(PublishLock::held(dir, lock))
+}
+
 pub(super) fn sync_directory(_dir: &Path) -> Result<()> {
     #[cfg(unix)]
     File::open(_dir)?.sync_all()?;
@@ -875,7 +897,7 @@ impl Inbox {
         if let Some(prior) = prior {
             return Ok(Some(prior.receipt(true)));
         }
-        self.require_claude_resume_adoption(row)?;
+        self.require_resume_adoption(row)?;
         let resume = super::assignment::resume_audit(row);
         if let Some(event) = resume {
             ensure!(
@@ -921,11 +943,21 @@ impl Inbox {
         })
     }
 
-    fn require_claude_resume_adoption(&self, row: &Value) -> Result<()> {
+    fn require_resume_adoption(&self, row: &Value) -> Result<()> {
         #[cfg(target_os = "linux")]
         if row["host"] == "claude" && super::assignment::resume_audit(row).is_some() {
             super::host::claude::resume_adopted(&self.lock, row)
                 .context("Claude resume adoption is unconfirmed")?;
+        }
+        if row["host"] == "opencode" {
+            if let Some(event) = super::assignment::resume_audit(row) {
+                ensure!(
+                    event["result"] == "accepted"
+                        && event["adoptionResult"] == "accepted"
+                        && event["inputResult"] == "accepted",
+                    "OpenCode resume adoption and brief are unconfirmed"
+                );
+            }
         }
         #[cfg(not(target_os = "linux"))]
         let _ = (row, &self.lock);
@@ -938,7 +970,7 @@ impl Inbox {
         row: &Value,
         attempt: Option<&str>,
     ) -> Result<()> {
-        self.require_claude_resume_adoption(row)?;
+        self.require_resume_adoption(row)?;
         let worker = &assignment.worker;
         let dispatch = worker.dispatch.as_str();
         let messages = || {

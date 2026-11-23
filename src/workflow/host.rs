@@ -13,10 +13,13 @@ pub(super) mod claude;
 pub(crate) use claude::session_start as claude_session_start;
 
 #[cfg(target_os = "linux")]
-mod opencode;
+pub(super) mod opencode;
 #[cfg(target_os = "linux")]
-#[allow(unused_imports)] // The shared lifecycle will call the adoption adapter under its lock.
-pub(crate) use opencode::{adopt_opencode_session, OpencodeAdoption};
+pub(crate) use opencode::adoption::first_message as opencode_first_message;
+#[cfg(target_os = "linux")]
+pub(super) use opencode::adoption::preserve_pending as preserve_opencode_adoption;
+#[cfg(target_os = "linux")]
+pub(crate) use opencode::resume::resume_ready as opencode_resume_ready;
 
 #[derive(Default)]
 pub struct Options<'a> {
@@ -199,11 +202,11 @@ impl Options<'_> {
     }
     // The resume transaction owns publication and the subsequent terminal input.
     #[cfg(target_os = "linux")]
-    #[allow(dead_code)] // Called when the shared resume transaction admits OpenCode.
     pub fn prepare_opencode_resume(
         state: &Path,
         original: &Value,
         next: &mut Value,
+        opening: &str,
     ) -> Result<(Launch, String)> {
         ensure!(
             original["host"] == "opencode" && original["backend"] == "tmux",
@@ -231,7 +234,7 @@ impl Options<'_> {
             git: original["git"] == true,
             ..Options::default()
         }
-        .prepare_launch(state, next, None, Some(original))?;
+        .prepare_launch(state, next, Some(opening), Some(original))?;
         Ok((launch, input.context("missing OpenCode resume input")?))
     }
 
@@ -385,7 +388,31 @@ impl Options<'_> {
                 } else {
                     a.extend(["--prompt".into(), brief]);
                 }
-                launch.env.insert("OPENCODE_CONFIG_CONTENT".into(),json!(json!({"permission":{"external_directory":{"*":"allow"},"read":{"*.env":"allow","*.env.*":"allow"}}}).to_string()));
+                let controlled = original.is_some() || record["opencodeOpening"].is_object();
+                #[cfg(target_os = "linux")]
+                let use_default_config = !controlled
+                    || [
+                        "OPENCODE_CONFIG_CONTENT",
+                        "OPENCODE_CONFIG",
+                        "OPENCODE_CONFIG_DIR",
+                    ]
+                    .iter()
+                    .all(|key| opencode::effective_setting(&launch.env, key).is_none());
+                #[cfg(not(target_os = "linux"))]
+                let use_default_config = !controlled;
+                #[cfg(target_os = "linux")]
+                if original.is_none() && record["opencodeOpening"].is_object() {
+                    opencode::adoption::configure(state, &mut launch.env, record)?;
+                }
+                if use_default_config {
+                    let config = json!({
+                        "permission":{"external_directory":{"*":"allow"},
+                                      "read":{"*.env":"allow","*.env.*":"allow"}}
+                    });
+                    launch
+                        .env
+                        .insert("OPENCODE_CONFIG_CONTENT".into(), json!(config.to_string()));
+                }
             }
             #[cfg(target_os = "linux")]
             "claude" => {
