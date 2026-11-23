@@ -27,6 +27,8 @@ pub struct Request {
     legacy_worker_pane: Option<String>,
     #[serde(rename = "legacyLaunchId")]
     legacy_launch_id: Option<String>,
+    #[serde(rename = "legacyRecovery")]
+    legacy_recovery: Option<binding::LegacyRecovery>,
     #[serde(default, rename = "freshDispatch")]
     fresh_dispatch: bool,
     backend: Option<String>,
@@ -68,6 +70,7 @@ struct Tmux<'a> {
     legacy_execution_id: Option<&'a str>,
     legacy_worker_pane: Option<&'a str>,
     legacy_launch_id: Option<&'a str>,
+    legacy_recovery: Option<&'a binding::LegacyRecovery>,
     input_request: bool,
     new_execution_id: Option<&'a str>,
     close_operation_id: Option<&'a str>,
@@ -143,9 +146,16 @@ impl Tmux<'_> {
     }
 
     fn run(&self, args: &[&str]) -> Reply<Output> {
+        self.run_with_tail(args, &[])
+    }
+
+    fn run_with_tail(&self, args: &[&str], tail: &[&str]) -> Reply<Output> {
         // Separate spawn from waiting: only a failed spawn proves tmux did nothing.
         let mut command = self.command();
         command.args(args.iter().map(|s| tmux_arg(s)));
+        if !tail.is_empty() {
+            command.arg(";").args(tail);
+        }
         use std::process::Stdio;
         let child = command
             .stdin(Stdio::null())
@@ -398,7 +408,35 @@ impl Tmux<'_> {
             })
     }
 
+    fn replay_unverified_revocation(&self, id: &str) -> Reply<Option<Value>> {
+        if !self.was_released(id)? {
+            return Ok(None);
+        }
+        let execution = self.archived_execution(id)?;
+        let Some((fact, path)) = self.unverified_released_cancellation(id, execution.as_deref())?
+        else {
+            return Ok(None);
+        };
+        let reply = failure(
+            "uncertain",
+            "worker launch was revoked but tmux session absence is unconfirmed",
+        );
+        let same_operation = self.close_execution.is_some()
+            && self.close_operation_id.is_some()
+            && self.close_operation_id == fact["closeOperationId"].as_str();
+        Ok(Some(if same_operation {
+            revocation_reply(reply, fact, path)
+        } else {
+            reply
+        }))
+    }
+
     fn operate(&self, op: Operation, fresh: bool) -> Reply<Value> {
+        if let Some(id) = self.legacy_execution_id {
+            if let Some(reply) = self.replay_unverified_revocation(id)? {
+                return Ok(reply);
+            }
+        }
         if matches!(op, Operation::Revoke) {
             return self
                 .revoke_only()?
@@ -412,16 +450,42 @@ impl Tmux<'_> {
             if let Some(operation) = self.close_operation_id {
                 match self.previous_close(id, operation)? {
                     Some(CloseOperation::Confirmed(effect)) => {
-                        return Ok(json!({"result":"completed","closeEffect":effect}))
+                        let reply = closed(effect);
+                        return match self.cancellation_proof(id)? {
+                            Some((fact, path)) => {
+                                let reply = if matches!(effect, CloseEffect::AlreadyAbsent)
+                                    && self.submission(id, self.close_execution).is_err()
+                                {
+                                    failure("uncertain", "worker launch was revoked but tmux session absence is unconfirmed")
+                                } else {
+                                    reply
+                                };
+                                Ok(revocation_reply(reply, fact, path))
+                            }
+                            None => Ok(reply),
+                        };
                     }
                     Some(CloseOperation::Pending) if self.was_released(id)? => {
-                        if self.cancellation_proof(id).is_some() {
+                        if let Some((fact, path)) = self.cancellation_proof(id)? {
+                            if !launch::missing(&self.launch_path(id, "cleanup")) {
+                                return Ok(revocation_reply(
+                                    failure(
+                                        "uncertain",
+                                        "retained session cleanup was not confirmed",
+                                    ),
+                                    fact,
+                                    path,
+                                ));
+                            }
+                            self.confirm_cancelled_absence(id, self.close_execution, true)?;
                             self.record_close(CloseOperation::Confirmed(
                                 CloseEffect::AlreadyAbsent,
                             ))?;
-                            return Ok(
-                                json!({"result":"completed","closeEffect":"already_absent"}),
-                            );
+                            return Ok(revocation_reply(
+                                closed(CloseEffect::AlreadyAbsent),
+                                fact,
+                                path,
+                            ));
                         }
                         return Err(failure(
                             "uncertain",
@@ -533,32 +597,110 @@ impl Tmux<'_> {
         }
     }
 
+    fn finish_cancelled_close(&self, effect: CloseEffect) -> Reply<Value> {
+        // Persist the session result before dropping its claim. Session action
+        // replay must not turn a confirmed cleanup into another kill.
+        self.record_close(CloseOperation::Confirmed(effect))?;
+        self.release()?;
+        Ok(closed(effect))
+    }
+
     fn revoke_only(&self) -> Reply<Option<Value>> {
-        let Some(id) = self.legacy_execution_id else {
+        let (Some(id), Some(operation)) = (self.legacy_execution_id, self.close_operation_id)
+        else {
             return Ok(None);
         };
-        if !self.was_released(id)? {
+        let released = self.was_released(id)?;
+        if !released {
             self.revoke_pending_launch()?;
         }
-        if self.cancellation_proof(id).is_none() {
+        let Some((fact, path)) = self.cancellation_proof(id)? else {
             return Ok(None);
-        }
-        if !self.was_released(id)? {
-            self.release()?;
-        }
-        self.record_close(CloseOperation::Confirmed(CloseEffect::AlreadyAbsent))?;
-        Ok(Some(
-            json!({"result":"completed", "closeEffect":CloseEffect::AlreadyAbsent}),
-        ))
+        };
+        let submission = self.submission(id, self.close_execution);
+        let reply = match self.previous_close(id, operation)? {
+            Some(CloseOperation::Confirmed(effect @ CloseEffect::UnstartedSessionClosed)) => {
+                closed(effect)
+            }
+            Some(CloseOperation::Confirmed(CloseEffect::AlreadyAbsent)) if submission.is_ok() => {
+                closed(CloseEffect::AlreadyAbsent)
+            }
+            _ if submission.is_ok_and(|s| s.phase == launch::SubmissionPhase::Prepared)
+                && self
+                    .confirm_cancelled_absence(id, self.close_execution, false)
+                    .is_ok() =>
+            {
+                if released {
+                    self.record_close(CloseOperation::Confirmed(CloseEffect::AlreadyAbsent))?;
+                    closed(CloseEffect::AlreadyAbsent)
+                } else {
+                    self.finish_cancelled_close(CloseEffect::AlreadyAbsent)?
+                }
+            }
+            _ => failure(
+                "uncertain",
+                "worker launch was revoked but tmux session absence is unconfirmed",
+            ),
+        };
+        Ok(Some(revocation_reply(reply, fact, path)))
     }
 
     fn close(&self) -> Reply<Value> {
-        if self.close_execution.is_some() {
-            if let Some(revoked) = self.revoke_only()? {
-                return Ok(revoked);
+        self.revoke_pending_launch()?;
+        if let Some(claim) = self.claim()? {
+            let launch = match claim {
+                binding::Claim::Registered { id, execution } => Some((id, Some(execution))),
+                binding::Claim::Launch(id) => Some((id, None)),
+                _ => None,
+            };
+            if let Some((id, execution)) = launch {
+                let execution = execution.as_deref();
+                let fact = if self.legacy_worker_cancelled(&id) {
+                    None
+                } else {
+                    self.cancellation(&id, execution)?
+                };
+                if let Some((fact, path)) = fact {
+                    let keyed_fact = self.close_execution == execution
+                        && execution.is_some()
+                        && fact["closeOperationId"].as_str() == self.close_operation_id
+                        && self.close_operation_id.is_some();
+                    let prepared = self
+                        .submission(&id, execution)
+                        .is_ok_and(|s| s.phase == launch::SubmissionPhase::Prepared);
+                    let create_rolled_back = fact["closeOperationId"].is_null();
+                    let reply = if prepared
+                        && (keyed_fact || create_rolled_back || self.close_execution.is_none())
+                    {
+                        self.confirm_cancelled_absence(&id, execution, false)
+                            .and_then(|()| self.finish_cancelled_close(CloseEffect::AlreadyAbsent))
+                    } else if self.close_execution.is_some() && !keyed_fact {
+                        Err(binding::unknown())
+                    } else {
+                        match self.target() {
+                            Ok(None) if !launch::missing(&self.launch_path(&id, "cleanup")) => Err(
+                                failure("uncertain", "retained session cleanup was not confirmed"),
+                            ),
+                            Ok(None) => self.finish_cancelled_close(CloseEffect::AlreadyAbsent),
+                            Ok(Some(target)) => {
+                                self.close_cancelled_session(&id, &target).and_then(|()| {
+                                    self.finish_cancelled_close(CloseEffect::UnstartedSessionClosed)
+                                })
+                            }
+                            Err(error) => Err(error),
+                        }
+                    };
+                    return if keyed_fact {
+                        Ok(revocation_reply(
+                            reply.unwrap_or_else(|error| error),
+                            fact,
+                            path,
+                        ))
+                    } else {
+                        reply
+                    };
+                }
             }
-        } else {
-            self.revoke_pending_launch()?;
         }
         let effect = if let Some(t) = self.target()? {
             if !t.owned {
@@ -629,12 +771,32 @@ impl Tmux<'_> {
     }
 }
 
+fn closed(effect: CloseEffect) -> Value {
+    json!({"result":"completed", "closeEffect":effect})
+}
+
+fn revocation_reply(mut reply: Value, fact: Value, path: PathBuf) -> Value {
+    for field in [
+        "category",
+        "dispatch",
+        "executionId",
+        "closeOperationId",
+        "launchId",
+    ] {
+        reply[field] = fact[field].clone();
+    }
+    reply["cancellationEvidence"] = json!(path);
+    reply
+}
+
 fn valid_dispatch(id: &str) -> bool {
     !id.is_empty()
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
+
+pub(crate) use binding::record_created_session;
 
 pub(crate) fn attach(state: &Path, dispatch: &str, socket: &Path, token: &str) -> Result<()> {
     ensure!(
@@ -651,6 +813,7 @@ pub(crate) fn attach(state: &Path, dispatch: &str, socket: &Path, token: &str) -
         legacy_execution_id: None,
         legacy_worker_pane: None,
         legacy_launch_id: None,
+        legacy_recovery: None,
         input_request: false,
         new_execution_id: None,
         close_operation_id: None,
@@ -756,6 +919,11 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
             || (request.execution_id.is_some() && request.close_operation_id.is_some()),
         "revoke requires the native execution and close operation IDs"
     );
+    ensure!(
+        request.legacy_recovery.is_none()
+            || (matches!(request.op, Operation::Inspect) && !request.fresh_dispatch),
+        "legacyRecovery requires ordinary inspect"
+    );
     let native_id;
     let mut backend = Tmux {
         state: &state,
@@ -764,6 +932,7 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
         legacy_execution_id: request.legacy_execution_id.as_deref(),
         legacy_worker_pane: request.legacy_worker_pane.as_deref(),
         legacy_launch_id: request.legacy_launch_id.as_deref(),
+        legacy_recovery: request.legacy_recovery.as_ref(),
         new_execution_id: request.execution_id.as_deref().filter(|_| launching),
         close_operation_id: request.close_operation_id.as_deref(),
         close_execution: request
@@ -802,6 +971,15 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
             let id = backend
                 .legacy_execution_id
                 .expect("resolved execution selector");
+            if accepted
+                && result["alive"] == false
+                && backend.legacy_worker_cancelled(id)
+                && backend
+                    .submission(id, Some(execution))
+                    .is_ok_and(|row| row.phase == launch::SubmissionPhase::LegacyAbsent)
+            {
+                return Ok(result);
+            }
             match backend.confirm_launch(id) {
                 Ok(worker) if accepted || worker == binding::Worker::Exited => {
                     result["executionId"] = json!(execution);
@@ -830,17 +1008,6 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
     if let Some(op) = &request.close_operation_id {
         if result["result"] == "completed" {
             result["closeOperationId"] = json!(op);
-            if result["closeEffect"] == "already_absent" {
-                if let Some((record, path)) = backend
-                    .legacy_execution_id
-                    .and_then(|id| backend.cancellation_proof(id))
-                {
-                    for field in ["category", "dispatch", "executionId", "launchId"] {
-                        result[field] = record[field].clone();
-                    }
-                    result["cancellationEvidence"] = json!(path);
-                }
-            }
         }
     }
     Ok(result)

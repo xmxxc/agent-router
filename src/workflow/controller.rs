@@ -269,7 +269,7 @@ impl<'a> Owner<'a> {
     pub fn run(self) -> Result<Value> {
         let state = state_dir()?;
         let _scope_lock = lock_scope(&state, &self.scope)?;
-        let _ledger_lock = messages::lock(&state)?;
+        let _ledger_lock = messages::lock_for_publish(&state)?;
         let mut owners = Owners::read(&state)?;
         let now = now();
         let until = now + self.lease;

@@ -52,7 +52,7 @@ jobs:
           git log -1 --format='Rust HEAD %H tree %T' | tee "$EVIDENCE/sources.log"
           test "$(git rev-parse HEAD)" = "$WFC_BUILD_ID"
           test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
-          sha256sum vendor/INPUTS.sha256 tests/owner.py tests/relay.py tests/receipts.py tools/check_tmux.py | tee "$EVIDENCE/inputs.log"
+          sha256sum vendor/INPUTS.sha256 tests/owner.py tests/relay.py tests/receipts.py tests/herdr_public.py tools/check_tmux.py | tee "$EVIDENCE/inputs.log"
           sha256sum -c vendor/INPUTS.sha256 2>&1 | tee -a "$EVIDENCE/inputs.log"
           rustup toolchain install 1.96.1 --profile minimal 2>&1 | tee "$EVIDENCE/toolchain.log"
           { rustc -vV; cargo --version; zig version; python --version; } | tee -a "$EVIDENCE/toolchain.log"
@@ -96,6 +96,26 @@ jobs:
             Backend.test_managed_dispatch_callback_survives_takeover \
             Backend.test_read_only_unowned_close_replays_confirmed_archive \
             2>&1 | tee -a "$EVIDENCE/tmux.log"
+      - name: Verify public Herdr lifecycle on the pinned Linux server
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: |
+          herdr="$RUNNER_TEMP/herdr-0.9.5"
+          {
+            curl --fail --silent --show-error --location --retry 3 --max-time 120 \
+              https://github.com/herdrdev/herdr/releases/download/v0.9.5/herdr-linux-x86_64 -o "$herdr"
+            printf '%s  %s\n' 14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d "$herdr" \
+              | sha256sum --check --strict
+            chmod 700 "$herdr"
+            version=$("$herdr" --version)
+            printf '%s\n' "$version"
+            test "$version" = 'herdr 0.9.5'
+          } 2>&1 | tee "$EVIDENCE/herdr-input.log"
+          python -Bu tests/herdr_public.py "$herdr" target/release/wfc -v \
+            PublicLifecycle.test_dispatch_current_execution_done_and_close \
+            PublicLifecycle.test_named_status_during_done_then_exit \
+            PublicLifecycle.test_close_after_scope_takeover_fences_stale_herdr_controls \
+            2>&1 | tee "$EVIDENCE/herdr-public.log"
       - name: Checksum evidence
         if: always()
         run: |

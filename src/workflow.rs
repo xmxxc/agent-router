@@ -18,6 +18,8 @@ pub mod worker_owner;
 
 mod assignment;
 mod backend;
+#[cfg(target_os = "linux")]
+pub mod herdr;
 pub mod host;
 mod view;
 
@@ -176,7 +178,15 @@ impl<'a> Dispatch<'a> {
         let token = controller::token(self.owner_token);
         let authorize =
             || controller::Owners::read(&state)?.require(&scope, token.as_deref(), "dispatch");
-        authorize()?;
+        let managed = authorize()?;
+        ensure!(
+            !managed
+                || self
+                    .host
+                    .as_ref()
+                    .is_none_or(|host| host.backend != "herdr"),
+            "Herdr dispatch requires an unowned scope"
+        );
         fs::create_dir_all(&records).context("create dispatch state directory")?;
         let default_report = cwd.join(format!("report-{dispatch}.md"));
         let report = report_destination(self.report.unwrap_or(&default_report))?;
@@ -222,23 +232,37 @@ impl<'a> Dispatch<'a> {
             record["model"] = json!(host.model);
             record["git"] = json!(host.git);
             record["tmux"] = json!(format!("wfc-{dispatch}"));
-            if let Some(endpoint) = host.endpoint {
-                record["endpoint"] = json!(endpoint);
-            }
             ensure!(
                 cfg!(target_os = "linux"),
                 "public backend is unavailable on this platform"
             );
             ensure!(
-                host.backend == "tmux",
+                matches!(host.backend, "tmux" | "herdr"),
                 "{} backend adapter is unavailable in this build",
                 host.backend
             );
             #[cfg(target_os = "linux")]
-            {
+            if host.backend == "herdr" {
+                let endpoint = host
+                    .endpoint
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        env::var_os("WFC_HERDR_ENDPOINT")
+                            .filter(|p| !p.is_empty())
+                            .map(PathBuf::from)
+                    })
+                    .context("Herdr requires --herdr-endpoint or WFC_HERDR_ENDPOINT")?;
+                ensure!(
+                    endpoint.is_absolute(),
+                    "Herdr requires an absolute socket path"
+                );
+                record["endpoint"] =
+                    json!(endpoint.to_str().context("Herdr endpoint must be UTF-8")?);
+            } else {
                 record["tmuxSocket"] = json!(backend::tmux_socket()?);
+                record["executionId"] = record["attempt"].clone();
+                record["tmuxLaunchProtocol"] = json!(backend::LAUNCH_PROTOCOL);
             }
-            record["executionId"] = record["attempt"].clone();
             Some(host.prepare(&state, &mut record)?)
         } else {
             None
@@ -248,21 +272,28 @@ impl<'a> Dispatch<'a> {
             record["worker"] = json!({"state":"running"});
         }
 
+        // Herdr R1 checkpoints the assignment before its first remote effect.
+        #[cfg(target_os = "linux")]
+        if record["backend"] == "herdr" {
+            let _scope = controller::lock_scope(&state, &scope)?;
+            ensure!(!authorize()?, "Herdr dispatch requires an unowned scope");
+            let mut launch = launch.context("missing Herdr launch")?;
+            bind_worker_callback(&mut record, Some(&mut launch));
+            let mut output = herdr::create(&state, &record, launch)?;
+            output
+                .as_object_mut()
+                .unwrap()
+                .remove(controller::CALLBACK_HASH);
+            return Ok(output);
+        }
+
         let (pending, callback) = {
-            let _ledger = messages::lock(&state)?;
+            let _ledger = messages::lock_for_publish(&state)?;
             let managed = authorize()?;
             // Raw commands on unowned scopes can still act as controllers,
             // including dispatching their own workers.
-            let callback = (managed || launch.is_some()).then(|| {
-                let secret = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-                record[controller::CALLBACK_HASH] = json!(messages::body_hash(&secret));
-                secret
-            });
-            if let (Some(launch), Some(secret)) = (&mut launch, &callback) {
-                launch
-                    .env
-                    .insert(controller::WORKER_CALLBACK.into(), json!(secret));
-            }
+            let callback = (managed || launch.is_some())
+                .then(|| bind_worker_callback(&mut record, launch.as_mut()));
             (assignment::reserve(&records, &dispatch, &record)?, callback)
         };
         let mut preserve_binding = false;
@@ -352,8 +383,23 @@ impl<'a> Dispatch<'a> {
     }
 }
 
+fn bind_worker_callback(record: &mut Value, launch: Option<&mut host::Launch>) -> String {
+    let secret = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    record[controller::CALLBACK_HASH] = json!(messages::body_hash(&secret));
+    if let Some(launch) = launch {
+        launch
+            .env
+            .insert(controller::WORKER_CALLBACK.into(), json!(secret));
+    }
+    secret
+}
+
 // Publish a complete generation while callback readers can still use .pending.
-fn write_json(path: &Path, value: &Value, permissions: Option<fs::Permissions>) -> Result<()> {
+pub(crate) fn write_json(
+    path: &Path,
+    value: &Value,
+    permissions: Option<fs::Permissions>,
+) -> Result<()> {
     let temp = path.with_extension(format!("{}.tmp", Uuid::new_v4().simple()));
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
@@ -496,24 +542,25 @@ fn status_with_history(
     let state = state_dir()?;
     let dir = state.join("dispatches");
     let mut dispatches = Vec::new();
-    let mut named_history = None;
+    let mut orphan_history = None;
     if let Some(id) = id {
         let id = id
             .to_str()
             .filter(|s| valid_id(s))
             .context("invalid dispatch ID")?;
-        let messages = history(&state, id)?;
         let row = match assignment::public_record(&dir, id)? {
             Some(row) => row,
             None => {
+                let messages = history(&state, id)?;
                 let last = messages
                     .last()
                     .with_context(|| format!("unknown dispatch {id}"))?;
-                json!({"dispatch":id,"round":last["round"],"attempt":last["attempt"],"scope":last["scope"],"role":last["role"],"report":last["report"]})
+                let row = json!({"dispatch":id,"round":last["round"],"attempt":last["attempt"],"scope":last["scope"],"role":last["role"],"report":last["report"]});
+                orphan_history = Some(messages);
+                row
             }
         };
         dispatches.push(row);
-        named_history = Some(messages);
     } else {
         for id in assignment::ids(&dir)? {
             if let Some(row) = assignment::public_record(&dir, &id)? {
@@ -525,28 +572,18 @@ fn status_with_history(
     let mut reclaimable = Vec::new();
     let owners = controller::Owners::read(&state)?;
     for record in &mut dispatches {
-        record
-            .as_object_mut()
-            .unwrap()
-            .remove(controller::CALLBACK_HASH);
-        if let Some(scope) = record_scope(record) {
-            if let Some(owner) = owners.public(scope)? {
-                record["controllerOwner"] = owner;
-            }
-        }
         if record["createPending"] == true && record["publicationDiagnostic"].is_string() {
             record["worker"] = json!({"state":"unknown"});
             record["backendResult"] = json!("uncertain");
             record["backendAlive"] = Value::Null;
         } else if record["host"].is_string() {
             let (worker, inspection) = backend::observe(&state, record)?;
-            for field in ["closeEffect", "revocation"] {
-                if let Some(value) = inspection.get(field) {
-                    record[field] = value.clone();
-                }
-            }
+            backend::copy_close_fields(&inspection, record);
             record["worker"] = worker;
             record["backendResult"] = inspection["result"].clone();
+            if record["backend"] == "herdr" && inspection["diagnostic"].is_string() {
+                record["backendDiagnostic"] = inspection["diagnostic"].clone();
+            }
             record["backendAlive"] = if inspection["alive"] == true && inspection["owned"] != true {
                 Value::Null
             } else {
@@ -567,7 +604,18 @@ fn status_with_history(
                 _ => json!(false),
             };
         }
-        let messages = match named_history.take() {
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove(controller::CALLBACK_HASH);
+        if let Some(scope) = record_scope(record) {
+            if let Some(owner) = owners.public(scope)? {
+                record["controllerOwner"] = owner;
+            }
+        }
+        // Read completion messages after observing the worker. A worker can
+        // publish done and exit while its backend is being queried.
+        let messages = match orphan_history.take() {
             Some(messages) => messages,
             None => history(
                 &state,
@@ -595,12 +643,19 @@ fn status_with_history(
         } else {
             view::project(record, &messages, alive, id.is_some())?;
         }
-        if active && record["state"] == "done" && alive == Some(true) {
-            reclaimable.push(json!({"dispatch":record["dispatch"],"label":record["label"],"tmux":record["tmux"]}));
-        }
     }
     if active {
-        dispatches.retain(|r| r["state"] != "done");
+        dispatches.retain(|row| {
+            if row["state"] != "done" || row["closePending"] == true {
+                return true;
+            }
+            if row["backendAlive"] == true {
+                reclaimable.push(
+                    json!({"dispatch":row["dispatch"],"label":row["label"],"tmux":row["tmux"]}),
+                );
+            }
+            false
+        });
     }
     undelivered.sort_by_key(|v| v["id"].as_u64());
     let mut response =
