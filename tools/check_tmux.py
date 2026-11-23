@@ -795,6 +795,147 @@ os.execv({TMUX!r}, [{TMUX!r}, *args])
                           "originalTreeStopped": True, "sameSiblingAlive": True,
                           "mismatchedProcessRefused": True}), flush=True)
 
+    def start_close_identity_fixture(self, *, hold_hangup=False):
+        release = self.work / "release"
+        script = """
+from pathlib import Path
+import signal
+import sys
+import time
+if sys.argv[1] == "hold":
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+Path("identity-fixture-ready").touch()
+deadline = time.monotonic() + 45
+while not Path("release").exists() and time.monotonic() < deadline:
+    time.sleep(.025)
+"""
+        config = self.work / "launch.json"
+        mode = "hold" if hold_hangup else "normal"
+        config.write_text(json.dumps({"hosts": {"codex": {"command": [sys.executable, "-c", script, mode]}}}))
+        (self.work / "task").write_text("controlled close identity fixture")
+        result = self.reclaim_cli("dispatch", "--host", "codex", "--scope", "close-identity",
+                                  "--cwd", ".", "--task", "task", "--report", "report",
+                                  "--launch-config", str(config))
+        worker = json.loads(result.stdout)
+        launch = Path(worker["create"]["receipt"])
+        stopped = launch.with_suffix(".stopped")
+
+        def release_fixture():
+            release.touch()
+            self.handoff_until(stopped.is_file)
+
+        self.addCleanup(release_fixture)
+        self.handoff_until((self.work / "identity-fixture-ready").is_file)
+        return worker, launch, stopped, release
+
+    def test_public_close_waits_for_unknown_identity_stop_proof(self):
+        worker, launch, stopped, release = self.start_close_identity_fixture()
+        dispatch, attempt, number = (worker[key] for key in ("dispatch", "attempt", "round"))
+        operation = f"close:{attempt}"
+        archive = self.state / "dispatches" / f"{dispatch}.{attempt}.closed"
+        started = json.loads(launch.read_bytes())
+        self.assertIsInstance(started["processStart"], str)
+        launch.write_text(json.dumps({**started, "processStart": None}))
+        proof = {"launchId": launch.stem, "dispatch": dispatch, "attempt": attempt, "round": str(number),
+                 "writerTreeStopped": True}
+        pane = self.active_pane(dispatch)
+        native = {"dispatch": dispatch, "executionId": attempt, "closeOperationId": operation}
+        args = ("close", dispatch)
+
+        def pending():
+            answer = self.call("close", **native)
+            self.assertEqual(answer["result"], "uncertain", answer)
+            self.assertNotIn("closeEffect", answer)
+            self.assertNotIn("closeOperationId", answer)
+            error = self.reclaim_cli(*args, code=1)
+            self.assertIn("original worker identity is unknown and its stop is unconfirmed", error.stderr)
+            self.assertFalse(archive.exists())
+
+        pending()
+        stopped.write_text(json.dumps(proof))
+        try:
+            pending()  # A stop marker cannot contradict a still-started receipt.
+            self.assertEqual(self.active_pane(dispatch), pane)
+            self.assertEqual(json.loads(launch.read_bytes())["category"], "started")
+        finally:
+            stopped.unlink()
+
+        release.touch()
+        self.handoff_until(stopped.is_file)
+        original_stop = stopped.read_bytes()
+        self.assertEqual(json.loads(original_stop), proof)
+        terminal = json.loads(launch.read_bytes())
+        self.assertEqual((terminal["category"], terminal["exitCode"]), ("process_exited", 0))
+        self.assertNotIn("processStart", terminal)
+        old_terminal = launch.read_bytes()
+        submission_path = launch.with_suffix(".submission")
+        submission = json.loads(submission_path.read_bytes())
+        self.assertEqual(submission.pop("round"), number)
+        submission_path.write_text(json.dumps(submission))
+        terminal.update(processStart=None, attempt=attempt, round=str(number))
+        terminal_bytes = json.dumps(terminal).encode()
+        launch.write_bytes(terminal_bytes)
+        stopped.unlink()
+        try:
+            pending()  # Direct exit and an absent session are insufficient.
+            # Simulate an old supervisor overwriting the null started receipt.
+            launch.write_bytes(old_terminal)
+            pending()
+            launch.write_bytes(terminal_bytes)
+            for field, wrong in (("launchId", "0" * 32), ("dispatch", "d-00000000"),
+                                 ("attempt", "a-000000000000"), ("round", str(number + 1)),
+                                 ("writerTreeStopped", False)):
+                with self.subTest(field=field):
+                    stopped.write_text(json.dumps({**proof, field: wrong}))
+                    pending()
+            for altered in ({"attempt": "a-000000000000"}, {"round": str(number + 1)},
+                            {"attempt": None, "round": None}):
+                with self.subTest(both_receipts=altered):
+                    launch.write_text(json.dumps({**terminal, **altered}))
+                    stopped.write_text(json.dumps({**proof, **altered}))
+                    pending()
+        finally:
+            launch.write_bytes(old_terminal)
+            stopped.write_bytes(original_stop)
+
+        result = json.loads(self.reclaim_cli(*args).stdout)
+        self.assertEqual((result["result"], result["closeOperationId"], result["resourceCleanup"],
+                          result["closeEffect"]), ("completed", operation, "confirmed", "already_absent"))
+        saved = archive.read_bytes()
+        stopped.unlink()
+        try:
+            for omit_launch in (False, True):
+                if omit_launch:
+                    launch.unlink()
+                self.assertEqual(self.call("close", **native)["result"], "uncertain")
+                self.assertEqual(self.reclaim_status(worker)["resourceCleanup"], "uncertain")
+                with read_only_tree(self.state):
+                    self.reclaim_cli(*args, code=1)
+                self.assertEqual(archive.read_bytes(), saved)
+        finally:
+            launch.write_bytes(old_terminal)
+            stopped.write_bytes(original_stop)
+        with read_only_tree(self.state):
+            replay = json.loads(self.reclaim_cli(*args).stdout)
+        self.assertEqual((replay["closeOperationId"], replay["closeEffect"]), (operation, "already_absent"))
+        self.assertEqual(archive.read_bytes(), saved)
+        self.assertEqual(self.call("close", **native)["closeOperationId"], operation)
+        print(json.dumps({"unknownCloseStayedPending": True, "rejectedStopMismatches": True,
+                          "stop": proof, "closeOperationId": operation, "readOnlyReplay": True,
+                          "legacyOverwriteKeptUnknown": True}), flush=True)
+
+    def test_public_close_keeps_session_only_for_old_missing_identity_field(self):
+        worker, launch, stopped, _ = self.start_close_identity_fixture(hold_hangup=True)
+        started = json.loads(launch.read_bytes())
+        self.assertIsInstance(started.pop("processStart"), str)
+        launch.write_text(json.dumps(started))
+        result = json.loads(self.reclaim_cli("close", worker["dispatch"]).stdout)
+        self.assertEqual((result["result"], result["closeEffect"], result["closeOperationId"]),
+                         ("completed", "session_closed", f"close:{worker['attempt']}"))
+        self.assertFalse(stopped.exists())
+        print(json.dumps({"oldMissingFieldSessionClose": result["closeOperationId"],
+                          "closeEffect": result["closeEffect"]}), flush=True)
+
     def test_managed_dispatch_callback_survives_takeover(self):
         env = {**self.env, "WFC_STATE": str(self.state)}
 

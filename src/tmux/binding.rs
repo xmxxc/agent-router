@@ -807,10 +807,13 @@ impl Tmux<'_> {
         if receipt["category"] != "started" || receipt["pid"] != *pid {
             return Err(unknown());
         }
-        let Some(start) = receipt.get("processStart").filter(|value| !value.is_null()) else {
-            // Launches without a creation identity keep session-only close.
+        let Some(start) = receipt.get("processStart") else {
+            // Old launch receipts precede creation-identity capture.
             return Ok(None);
         };
+        if start.is_null() {
+            return Err(failure("uncertain", super::launch::UNKNOWN_CLOSE_IDENTITY));
+        }
         let start = start.as_str().ok_or_else(unknown)?;
         let target = OpenOptions::new()
             .read(true)

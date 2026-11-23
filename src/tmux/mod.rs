@@ -1044,6 +1044,11 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
         };
         backend.legacy_execution_id = Some(&native_id);
     }
+    if matches!(&request.op, Operation::Close) {
+        if let Err(error) = backend.require_close_worker_tree(request.execution_id.as_deref()) {
+            return Ok(error);
+        }
+    }
     let mut result = backend
         .operate(request.op, request.fresh_dispatch)
         .unwrap_or_else(|mut error| {

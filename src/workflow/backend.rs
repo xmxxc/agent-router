@@ -597,6 +597,62 @@ fn confirmed(row: &Value, saved: &Value) -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn registered_tmux_round(
+    state: &Path,
+    dispatch: &str,
+    attempt: &str,
+    launch: &str,
+) -> Option<u64> {
+    let row = super::assignment::public_record(&state.join("dispatches"), dispatch).ok()??;
+    let expected = state.join("launches").join(format!("{launch}.json"));
+    if row["backend"] != "tmux"
+        || row["dispatch"] != dispatch
+        || row["attempt"] != attempt
+        || row["executionId"] != attempt
+        || receipt_id(&row).ok()? != Some(launch)
+        || row["create"]["receipt"].as_str().map(Path::new) != Some(expected.as_path())
+    {
+        return None;
+    }
+    row["round"].as_u64().filter(|round| *round > 0)
+}
+
+fn require_archived_worker_tree(
+    state: &Path,
+    row: &Value,
+    saved: &Value,
+    remember: bool,
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if saved_revocation(row, saved).is_none() {
+        let launch = receipt_id(row)?.or_else(|| {
+            (row["executionId"] == row["attempt"]
+                && saved["executionId"] == row["attempt"]
+                && close_operation(row).is_ok_and(|op| saved["closeOperationId"] == op))
+            .then(|| saved["launchId"].as_str().filter(|id| valid_launch(id)))
+            .flatten()
+        });
+        if let Some(launch) = launch {
+            let dispatch = row["dispatch"].as_str().context("missing dispatch")?;
+            if remember {
+                crate::tmux::launch::remember_unknown_close_identity(state, launch, dispatch)?;
+            }
+            ensure!(
+                crate::tmux::launch::close_worker_tree_ready(state, launch, dispatch, || Some((
+                    row["attempt"].as_str()?.to_owned(),
+                    row["round"].as_u64()?
+                )),),
+                "close uncertain: {}",
+                crate::tmux::launch::UNKNOWN_CLOSE_IDENTITY
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (state, row, saved, remember);
+    Ok(())
+}
+
 fn exited(evidence: &Value) -> Option<Value> {
     let code = evidence["exitCode"].as_u64().filter(|n| *n <= 255)?;
     (evidence["category"] == "process_exited")
@@ -796,7 +852,10 @@ pub(super) fn observe_with_mode(
         return super::herdr::observe(state, row, read_only);
     }
     let saved = archive(state, row)?.unwrap_or(Value::Null);
-    if confirmed(row, &saved) {
+    let archived = confirmed(row, &saved);
+    let archive_blocked =
+        archived && require_archived_worker_tree(state, row, &saved, false).is_err();
+    if archived && !archive_blocked {
         let mut observation = json!({"result":"completed","alive":false});
         copy_close_fields(&saved, &mut observation);
         let worker = closed_worker(state, row, &saved, true, read_only)?
@@ -809,7 +868,8 @@ pub(super) fn observe_with_mode(
     // A legacy release can replay an old absence from the backend's history,
     // even if the public archive never made it to disk.
     let legacy_absence = !supports_session_confirmation(row) && inspection["alive"] == false;
-    if revoked.is_some()
+    if archive_blocked
+        || revoked.is_some()
         || unverified_absence(&saved)
         || legacy_absence
         || saved["resourceCleanup"] == "uncertain"
@@ -904,6 +964,7 @@ pub(super) fn read_only_close(state: &Path, row: &Value) -> Result<Option<Value>
     }
     if row["backend"] == "tmux" {
         if let Some(saved) = archive(state, row)?.filter(|saved| confirmed(row, saved)) {
+            require_archived_worker_tree(state, row, &saved, false)?;
             return replay(state, row, &saved, false);
         }
     }
@@ -930,6 +991,7 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
         archive(state, row)?.unwrap_or(Value::Null)
     };
     if confirmed(row, &saved) {
+        require_archived_worker_tree(state, row, &saved, true)?;
         return replay(state, row, &saved, true)?.context("missing archived close receipt");
     }
 

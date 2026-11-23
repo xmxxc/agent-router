@@ -19,6 +19,8 @@ pub mod worker_owner;
 mod assignment;
 mod backend;
 #[cfg(target_os = "linux")]
+pub(crate) use backend::registered_tmux_round;
+#[cfg(target_os = "linux")]
 pub mod handoff;
 #[cfg(target_os = "linux")]
 pub mod herdr;
