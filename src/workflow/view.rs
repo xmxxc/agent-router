@@ -124,7 +124,7 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
         {
             let state = match row["worker"]["state"].as_str() {
                 Some("running") => "running",
-                Some("cancelled") => "cancelled",
+                Some("cancelled" | "not_started") => "cancelled",
                 Some("exited") => "failed", // An exit without a done receipt is unfinished work.
                 None if row.get("worker").is_none() => "completed", // #4 foreground success
                 _ => "unknown",
