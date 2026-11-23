@@ -41,13 +41,22 @@ case "${1:-}" in
             Relay.test_codex_unicode_appended_activity \
             Relay.test_runtime_scope_takeover_fences_the_inflight_read \
             Relay.test_runtime_notice_through_the_private_queue
-        run_group owner 2 python3 -Bu tests/owner.py "$binary" -v \
+        # Import the fixture so unittest receives the method selectors.
+        run_group owner 2 env PYTHONPATH=tests python3 -Bu -c '
+import unittest
+import owner
+
+unittest.main(module=owner)
+' "$binary" -v \
             Owner.test_takeover_fences_wait_and_ack_but_worker_keeps_its_callback \
             Owner.test_takeover_waits_for_scoped_delivery_and_unregisters_detached_relay
         run_group reclaim 3 env WFC_TEST_STICKY_OWNERSHIP=1 python3 -Bu tools/check_tmux.py "$binary" -v \
             Backend.test_public_reclaim_requires_sticky_ownership \
             Backend.test_public_reclaim_stops_on_scope_authority_loss \
             Backend.test_public_reclaim_rechecks_selected_execution_under_scope_lock
+        run_group resume 2 bash "$fixtures/verify-resume.sh" "$binary" -v \
+            Backend.test_public_resume_preserves_conversation_rounds_and_callback_fences \
+            Backend.test_public_resume_after_reclaim_preserves_history
         run_group relay-opencode 2 python3 -Bu tests/opencode_relay.py "$binary" -v \
             OpenCodeRelay.test_runtime_notice_preserves_the_explicit_opencode_target \
             OpenCodeRelay.test_204_detached_preserves_batch_order_scope_and_session

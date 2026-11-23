@@ -1,7 +1,7 @@
 name: Linux host diagnostics
 on:
   push:
-    branches: [rust-router/13-host-diagnostics-r7-ci]
+    branches: [rust-router/13-host-diagnostics-r9-callback-ci]
 
 permissions:
   contents: read
@@ -15,9 +15,9 @@ jobs:
       run:
         shell: bash
     env:
-      PRODUCT_SHA: 3bbb7d209bf4e1c0775d5f9b18e611b4f8dc3d4a
-      PRODUCT_TREE: f7a31b7c7b2f7f0a2d9d9d92dbe81c1548634e7d
-      PRODUCT_PARENTS: 'f8d5e713d3e5e41cf4eff94b7583c875034092c0 197f3d14a24d1fbd545453c7ac08a5c06c125585'
+      PRODUCT_SHA: 357f022fbef686f9716605c76114930df397b6f0
+      PRODUCT_TREE: e16e9a323c451e55299194517812f01c4c3145f4
+      PRODUCT_PARENTS: 'cc98f8a65b438a8eab65b7eefd5f1ecad6b9758e 3bbb7d209bf4e1c0775d5f9b18e611b4f8dc3d4a'
       REFERENCE_RUNS: '45246627284/2 45250815210/1'
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TARGET: x86_64-unknown-linux-gnu
@@ -70,7 +70,7 @@ jobs:
             git -C ../native-input show -s --format='native-input=%H tree=%T'
             printf '%s  %s\n' 17e88863f3600672ab49182f217281b6fc4d3c762bde361935e436a95214d05c \
               ../native-input/vendor/zlib-1.3.1.tar.gz | sha256sum --check --strict
-            printf '%s  %s\n' 509bbb2757bdf1145f4bffd8023f1244403611303d00ba1e2de5e4fa45078640 vendor/INPUTS.sha256 | sha256sum --check --strict
+            printf '%s  %s\n' 13ba59dd77daa7479cc7ea84def477acbfa06c2ca2f65160d42c9b7ad6a3e75a vendor/INPUTS.sha256 | sha256sum --check --strict
             sha256sum vendor/INPUTS.sha256
             sha256sum --check --strict vendor/INPUTS.sha256
           } 2>&1 | tee "$EVIDENCE/sources.log"
