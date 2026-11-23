@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import sqlite3
 import subprocess
 import sys
@@ -27,6 +28,23 @@ def run(source, binary):
     # The reference suite supplies its own host/tmux shims and private state.
     env = Env()
     try:
+        # Compare Python's path resolution in a disposable tree, including a
+        # named account from the system user database rather than the fake HOME.
+        sandbox = env.cwd
+        (sandbox / "alias").symlink_to("missing/target")
+        account = pwd.getpwuid(os.getuid())
+        named = f"~{account.pw_name}/" + os.path.relpath(sandbox / "named", account.pw_dir)
+        for value in ["~/copy", "./~/copy", "alias/state", named, "~wfc-no-such-user-3ef7f43c/copy"]:
+            settings = {"HOME": str(sandbox), "WFC_STATE": value}
+            python = env.run("status", env=settings, cwd=sandbox)
+            rust_path = subprocess.run([binary, "status"], env=env.router_env(env=settings),
+                                       cwd=sandbox, capture_output=True, text=True, check=False)
+            assert rust_path.returncode == python.returncode
+            if value.startswith("~wfc-no-such"):
+                assert python.returncode != 0 and "home directory" in rust_path.stderr
+            else:
+                actual = json.loads(rust_path.stdout)["state"]
+                assert actual == json.loads(python.stdout)["state"] and not Path(actual).exists()
         token = env.json("owner", "claim", "--scope", "verified")["token"]
         dispatch = env.dispatch(extra_args=["--scope", "verified", "--owner-token", token])
         auth = ["--owner-token", token]
@@ -38,11 +56,20 @@ def run(source, binary):
         env.json("continue", dispatch, "--task", str(task), "--report", str(env.report.with_name("r2.md")), *auth)
         current = env.json("status", "--dispatch", dispatch)["dispatches"][0]
         ask = env.json("ask", "second question", "--attempt", current["attempt"], *auth, dispatch=dispatch)
+        env.json("reply", str(ask["message"]), "yes", *auth)
         with sqlite3.connect(env.state / "router.db") as db:
+            db.execute("""INSERT INTO lifecycle_event(dispatch,operation,result,owner_generation,resolver_actor,
+                resolution_owner_generation,resolution_evidence,resolved_at,consumed_at)
+                VALUES(?, 'handoff','accepted',1,'fixture-reviewer',2,'fixture-evidence',17.9999,19.9999)""", (dispatch,))
             # Match #40's own unknown-receipt fixture. Also simulate a historical
             # partially backfilled hash, so the modern ledger takes the write path.
             db.execute("UPDATE message SET state='unknown', delivered=0, status_version=2, body_hash=NULL WHERE id=?",
                        (ask["message"],))
+        reference = env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        reference_reply = next(m for m in reference["messages"] if m["type"] == "reply")
+        reference_audit = reference["audit"][-1]
+        assert reference_reply["to"] == ask["message"]
+        assert (reference_audit["ownerGeneration"],reference_audit["resolution"]["ownerGeneration"]) == (1, 2)
         with tempfile.TemporaryDirectory() as copy:
             copy = Path(copy)
             source_db = env.state / "router.db"
@@ -69,6 +96,9 @@ def run(source, binary):
             msg = by_id[first["message"]]
             assert (msg["messageId"], msg["state"], msg["statusVersion"]) == (
                 received["messageId"], "received", received["statusVersion"])
+            assert by_id[reference_reply["id"]]["to"] == reference_reply["to"]
+            assert d["audit"][-1]["ownerGeneration"] == reference_audit["ownerGeneration"]
+            assert d["audit"][-1]["resolution"] == reference_audit["resolution"]
             unknown = by_id[ask["message"]]
             assert unknown["state"] == "unknown" and unknown["statusVersion"] == 2
             assert unknown["bodyHash"] == hashlib.sha256(unknown["body"].encode()).hexdigest()
@@ -86,7 +116,7 @@ def run(source, binary):
             ack = env.json("ack", msg["messageId"], *auth, env=copy_env)
             assert ack["state"] == "processed" and ack["statusVersion"] == msg["statusVersion"] + 1
             assert hashlib.sha256(source_db.read_bytes()).digest() == original
-        print(f"{revision[:8]}: two rounds, claimed scope, received/unknown, backup, full SQL comparison, Python ack OK")
+        print(f"{revision[:8]}: paths, two rounds, claimed scope, received/unknown, reply target, resolution generation, backup, full SQL comparison, Python ack OK")
     finally:
         env.close()
 

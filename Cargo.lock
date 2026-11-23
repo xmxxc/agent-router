@@ -695,6 +695,7 @@ name = "wfc-legacy-state"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "nix",
  "rusqlite",
  "serde_json",
  "sha2",

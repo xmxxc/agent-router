@@ -313,22 +313,148 @@ fn migration_rejects_aliased_database_files_and_preserves_original() {
 }
 
 #[test]
-fn partial_fault_history_survives_upgrade_and_explains_unknown_creation() {
+fn evidence_without_dispatch_rows_is_visible_before_and_after_migration() {
+    let original = tempfile::tempdir().unwrap();
+    let copy = tempfile::tempdir().unwrap();
+    let db_file = original.path().join("router.db");
+    let db = Connection::open(&db_file).unwrap();
+    db.execute_batch(r#"
+        CREATE TABLE fault_event(dispatch TEXT PRIMARY KEY,operation TEXT,diagnostic TEXT);
+        INSERT INTO fault_event VALUES('fault-only','create','writer unconfirmed');
+        CREATE TABLE message(id INTEGER PRIMARY KEY,dispatch TEXT,recipient TEXT,type TEXT,body TEXT,delivered INTEGER);
+        INSERT INTO message VALUES(41,'receipt-only','controller','done','{"report":"/old/r"}',1);
+        CREATE TABLE dispatch_round(dispatch TEXT,round INTEGER,attempt TEXT,state TEXT,report TEXT,
+            PRIMARY KEY(dispatch,round,attempt));
+        INSERT INTO dispatch_round VALUES('attempt-only',2,'a-old','completed','/old/round-two');
+        CREATE TABLE watchdog_fault(dispatch TEXT,round INTEGER,attempt TEXT,kind TEXT,fingerprint TEXT,
+            PRIMARY KEY(dispatch, round, attempt, kind, fingerprint));
+        INSERT INTO watchdog_fault VALUES('watchdog-only',2,'a-old','timeout','deadline');
+        CREATE TABLE host_error(dispatch TEXT PRIMARY KEY,turn TEXT);
+        INSERT INTO host_error VALUES('host-error-only','old-turn');
+        CREATE TABLE lifecycle_event(id INTEGER PRIMARY KEY,dispatch TEXT,operation TEXT,attempt TEXT);
+        INSERT INTO lifecycle_event VALUES(19,'audit-only','create','a-pending');"#).unwrap();
+    drop(db);
+    let original_hash = Sha256::digest(fs::read(&db_file).unwrap());
+    fs::copy(&db_file, copy.path().join("router.db")).unwrap();
+
+    for dir in [original.path(), copy.path()] {
+        if dir == copy.path() {
+            let (upgraded, backup) = wfc_legacy_state::open_offline_copy(dir).unwrap();
+            assert!(backup.unwrap().is_file());
+            assert_eq!(
+                upgraded
+                    .query_row("SELECT count(*) FROM dispatch", [], |r| r
+                        .get::<_, usize>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        let overview = json(command(dir).arg("status"));
+        let rows = overview["dispatches"].as_array().unwrap();
+        assert_eq!(rows.len(), 6);
+        for entry in rows {
+            for key in [
+                "attempt",
+                "round",
+                "host",
+                "backend",
+                "scope",
+                "task",
+                "report",
+                "backendAlive",
+            ] {
+                assert_eq!(entry.get(key), Some(&Value::Null), "{key}");
+            }
+            assert_eq!(entry["status"], "unknown");
+            assert!(entry["diagnostic"]
+                .as_str()
+                .unwrap()
+                .contains("dispatch row"));
+            let id = entry["dispatch"].as_str().unwrap();
+            let detail = json(command(dir).args(["status", "--dispatch", id]));
+            assert_eq!(detail["dispatches"][0], *entry);
+            let session = &json(command(dir).args(["reclaim", "--dispatch", id]))["sessions"][0];
+            assert_eq!(session["result"], "unknown");
+            assert!(session["backend"].is_null());
+            match id {
+                "fault-only" => assert_eq!(entry["fault"]["diagnostic"], "writer unconfirmed"),
+                "receipt-only" => {
+                    assert_eq!(entry["messages"][0]["id"], 41);
+                    assert_eq!(entry["messages"][0]["state"], "received");
+                    assert_eq!(entry["messages"][0]["report"], "/old/r");
+                }
+                "attempt-only" => assert_eq!(entry["rounds"][0]["attempt"], "a-old"),
+                "watchdog-only" => {
+                    assert_eq!(entry["watchdogFaults"][0]["kind"], "timeout");
+                    assert_eq!(entry["watchdogFaults"][0]["attempt"], "a-old");
+                }
+                "host-error-only" => assert_eq!(entry["hostError"]["turn"], "old-turn"),
+                "audit-only" => assert_eq!(entry["audit"][0]["attempt"], "a-pending"),
+                _ => panic!("unexpected dispatch {id}"),
+            }
+        }
+        assert!(overview["undelivered"].as_array().unwrap().is_empty());
+    }
+    assert_eq!(Sha256::digest(fs::read(db_file).unwrap()), original_hash);
+}
+
+#[test]
+fn conflicting_current_snapshot_refuses_fast_and_repair_paths() {
+    for pending_repair in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("router.db");
+        let (db, _) = wfc_legacy_state::open_offline_copy(dir.path()).unwrap();
+        db.execute_batch(
+            "INSERT INTO dispatch(id,backend,scope,role,current_round,current_attempt)
+            VALUES('old','tmux','s','worker',2,'a-current');
+            INSERT INTO dispatch_round(dispatch,round,attempt,state) VALUES
+            ('old',1,'a-current','completed'),('old',2,'a-previous','running');",
+        )
+        .unwrap();
+        if pending_repair {
+            db.execute("INSERT INTO message(body) VALUES('{}')", [])
+                .unwrap();
+        }
+        drop(db);
+        let before = Sha256::digest(fs::read(&path).unwrap());
+        let err = wfc_legacy_state::open_offline_copy(dir.path())
+            .unwrap_err()
+            .to_string();
+        for clue in ["old", "2", "a-current", "snapshot"] {
+            assert!(err.contains(clue), "{err}");
+        }
+        let view = details(dir.path());
+        assert_eq!(view["dispatches"][0]["status"], "unknown");
+        assert!(view["dispatches"][0]["diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("snapshot"));
+        assert_eq!(Sha256::digest(fs::read(path).unwrap()), before);
+    }
+}
+
+#[test]
+fn resolves_dangling_state_links_and_rejects_unknown_named_home() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    let db = Connection::open(dir.join("router.db")).unwrap();
-    db.execute_batch(
-        "CREATE TABLE fault_event(dispatch TEXT PRIMARY KEY,operation TEXT,diagnostic TEXT);
-        INSERT INTO fault_event VALUES('old','create','original writer unconfirmed');",
-    )
-    .unwrap();
-    drop(db);
-    let (db, backup) = wfc_legacy_state::open_offline_copy(dir).unwrap();
-    assert!(backup.unwrap().is_file());
-    db.execute("INSERT INTO dispatch(id) VALUES('old')", [])
-        .unwrap();
-    assert_eq!(
-        details(dir)["dispatches"][0]["fault"]["diagnostic"],
-        "original writer unconfirmed"
+    std::os::unix::fs::symlink("missing/target", dir.join("alias")).unwrap();
+    std::os::unix::fs::symlink("alias/../state", dir.join("chain")).unwrap();
+    let view = json(
+        command(dir)
+            .env("WFC_STATE", dir.join("chain/router"))
+            .arg("status"),
     );
+    assert_eq!(
+        view["state"],
+        dir.join("missing/state/router").to_str().unwrap()
+    );
+    assert!(!dir.join("missing").exists());
+    let result = command(dir)
+        .env("WFC_STATE", "~wfc-no-such-user-3ef7f43c/state")
+        .current_dir(dir)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("home directory"));
 }

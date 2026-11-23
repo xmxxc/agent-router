@@ -1,6 +1,8 @@
 use crate::{open, resolve, schema};
 use anyhow::{bail, ensure, Context, Result};
-use rusqlite::{functions::FunctionFlags, Connection, OpenFlags, TransactionBehavior};
+use rusqlite::{
+    functions::FunctionFlags, Connection, OpenFlags, OptionalExtension, TransactionBehavior,
+};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -8,9 +10,10 @@ use std::{
 };
 use uuid::Uuid;
 
-const RECEIPT: &str = "coalesce(message_uid,'')='' OR coalesce(body_hash,'')='' OR
-    coalesce(state,'')='' OR coalesce(status_version,0)=0 OR
-    (coalesce(delivered,0)=0 AND state='received') OR (delivered<>0 AND state='unsent')";
+const INCOMPLETE_RECEIPT: &str = "coalesce(message_uid,'')='' OR coalesce(body_hash,'')='' OR
+    coalesce(state,'')='' OR coalesce(status_version,0)=0";
+const DELIVERY_CONFLICT: &str =
+    "(coalesce(delivered,0)=0 AND state='received') OR (delivered<>0 AND state='unsent')";
 const IDENTITY: &str = "coalesce(backend,'')='' OR coalesce(scope,'')='' OR coalesce(role,'')=''
     OR coalesce(current_round,0)=0 OR coalesce(current_attempt,'')=''";
 const NO_SNAPSHOT: &str = "NOT EXISTS (SELECT 1 FROM dispatch_round r WHERE r.dispatch=d.id)";
@@ -28,7 +31,7 @@ const DONE_MATCH: &str = "FROM dispatch_round r JOIN message m ON m.dispatch=r.d
 fn has_repairs(db: &Connection) -> Result<bool> {
     Ok(db.query_row(
         &format!(
-            "SELECT EXISTS(SELECT 1 FROM message WHERE {RECEIPT})
+            "SELECT EXISTS(SELECT 1 FROM message WHERE {INCOMPLETE_RECEIPT} OR {DELIVERY_CONFLICT})
         OR EXISTS(SELECT 1 FROM dispatch d WHERE {IDENTITY} OR {NO_SNAPSHOT})
         OR EXISTS(SELECT 1 {DONE_MATCH})"
         ),
@@ -90,12 +93,11 @@ fn repair(db: &Connection) -> Result<()> {
             "UPDATE message SET
         message_uid=coalesce(nullif(message_uid,''),'m-'||new_uuid()),
         body_hash=coalesce(nullif(body_hash,''),body_sha(body)),
-        status_version=coalesce(nullif(status_version,0),1)+CASE WHEN
-            (coalesce(delivered,0)=0 AND state='received') OR (delivered<>0 AND state='unsent')
+        status_version=coalesce(nullif(status_version,0),1)+CASE WHEN {DELIVERY_CONFLICT}
             THEN 1 ELSE 0 END,
         state=CASE WHEN coalesce(state,'') IN ('','received','unsent') THEN
             CASE WHEN delivered THEN 'received' ELSE 'unsent' END ELSE state END
-        WHERE {RECEIPT}"
+        WHERE {INCOMPLETE_RECEIPT} OR {DELIVERY_CONFLICT}"
         ),
         [],
     )?;
@@ -161,6 +163,25 @@ pub fn open_offline_copy(state: &Path) -> Result<(Connection, Option<PathBuf>)> 
             gap.upgrade(&tx)?;
         }
         repair(&tx).with_context(|| format!("repair offline copy in {}", state.display()))?;
+    }
+    // A current identity authorizes writes only when that exact snapshot exists.
+    let mismatch = tx
+        .query_row(
+            "SELECT d.id, d.current_round, d.current_attempt FROM dispatch d
+        WHERE NOT EXISTS (SELECT 1 FROM dispatch_round r WHERE r.dispatch=d.id
+            AND r.round=d.current_round AND r.attempt=d.current_attempt) LIMIT 1",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((id, round, attempt)) = mismatch {
+        bail!("dispatch {id}, round {round}, attempt {attempt} has no matching current snapshot");
     }
     tx.commit()?;
     Ok((db, original))
