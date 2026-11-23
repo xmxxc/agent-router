@@ -72,9 +72,11 @@ pub(super) fn unresolved_resume(row: &Value) -> Option<&Value> {
 
 #[cfg(target_os = "linux")]
 pub(super) fn unresolved_lifecycle(row: &Value) -> Option<&Value> {
-    row["audit"].as_array()?.iter().rev().find(|event| {
-        matches!(event["result"].as_str(), Some("pending" | "uncertain"))
-    })
+    row["audit"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|event| matches!(event["result"].as_str(), Some("pending" | "uncertain")))
 }
 
 pub(super) fn public_record(dir: &Path, id: &str) -> Result<Option<Value>> {

@@ -97,6 +97,23 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
     if let Some(exit) = prior_exit {
         row["worker"] = exit;
     }
+    let startup_failure = history.iter().find(|message| {
+        message["kind"] == "startup_failure"
+            && message["dispatch"] == row["dispatch"]
+            && message["round"] == row["round"]
+            && message["attempt"] == row["attempt"]
+    });
+    if let Some(failure) = startup_failure {
+        row["startupFailure"] = failure["fault"].clone();
+        if row["worker"]["state"] == "unknown"
+            && matches!(
+                failure["fault"]["category"].as_str(),
+                Some("executable_missing" | "permission_denied" | "spawn_failed")
+            )
+        {
+            row["worker"] = json!({"state":"not_started","exit_code":null,"signal":null});
+        }
+    }
     let mut current = "unknown".to_owned();
     for round in &mut rounds {
         ensure!(round.is_object(), "invalid stored round");
@@ -143,7 +160,9 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
             let unconfirmed_resume = super::assignment::resume_audit(row)
                 .is_some_and(|event| event["result"] != "accepted");
             let state = match row["worker"]["state"].as_str() {
-                _ if unresolved_worker || unconfirmed_resume => "unknown",
+                _ if unconfirmed_resume => "unknown",
+                Some("exited" | "not_started") if startup_failure.is_some() => "failed",
+                _ if unresolved_worker => "unknown",
                 _ if unconfirmed_create && row["worker"]["state"] != "cancelled" => {
                     round["result"] = row["create"].clone();
                     "unknown"
@@ -173,6 +192,7 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
         "completed" => ("done", "completed"),
         "running" if alive == Some(true) && awaiting_answer => ("asking", "waiting-human"),
         "running" if alive == Some(true) => ("working", "online"),
+        "failed" if row["worker"]["state"] == "not_started" => ("not_started", "failed"),
         "failed" => ("exited", "failed"),
         "cancelled" => ("cancelled", "cancelled"),
         _ => ("unknown", "unknown"),
