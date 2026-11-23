@@ -880,7 +880,9 @@ fn status_with_history(
             messages
                 .iter()
                 .filter(|m| {
-                    m["to"] == "controller" && (m["state"] == "unsent" || m["state"] == "unknown")
+                    m["legacyArchiveOnly"] != true
+                        && m["to"] == "controller"
+                        && (m["state"] == "unsent" || m["state"] == "unknown")
                 })
                 .cloned(),
         );

@@ -1,4 +1,6 @@
 //! Publish a complete native archive for an attested, stopped SQLite copy.
+mod history;
+
 use super::{controller, host, messages, valid_id, valid_identity, write_json};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -245,6 +247,9 @@ fn assignments(
         row["legacyBackend"] = json!(legacy_backend);
         row["rounds"] = json!([]);
         row["legacyAudit"] = json!([]);
+        row["legacyResolutions"] = json!([]);
+        row["watchdogFaults"] = json!([]);
+        row["messages"] = json!([]);
         ensure!(
             records.insert(id, row).is_none(),
             "duplicate legacy dispatch"
@@ -310,81 +315,6 @@ fn matching_round<'a>(row: &'a Value, body: &Value, report: Option<&str>) -> Res
         "receipt matches more than one legacy round"
     );
     Ok(round)
-}
-
-fn convert_message(record: &Value, row: &Value) -> Result<Value> {
-    ensure!(
-        row["recipient"] == "controller",
-        "unsupported legacy message recipient"
-    );
-    let raw = text(row, "body")?;
-    let digest = text(row, "bodyHash")?;
-    ensure!(
-        messages::body_hash(raw) == digest,
-        "legacy message body hash mismatch"
-    );
-    let body: Value = serde_json::from_str(raw).context("read legacy message body")?;
-    ensure!(
-        body.is_object()
-            && body
-                .get("dispatch")
-                .is_none_or(|v| v == &record["dispatch"])
-            && body.get("scope").is_none_or(|v| v == &record["scope"])
-            && body.get("role").is_none_or(|v| v == &record["role"]),
-        "legacy message identity mismatch"
-    );
-    let kind = text(row, "type")?;
-    let report = match kind {
-        "done" => Some(text(&body, "report")?),
-        "question" => None,
-        _ => anyhow::bail!("unsupported legacy message type {kind}"),
-    };
-    let round = matching_round(record, &body, report)?;
-    if kind == "done" {
-        ensure!(
-            round["state"] == "completed",
-            "legacy done is attached to a non-completed round"
-        );
-    }
-    let state = text(row, "state")?;
-    let delivered = row["delivered"]
-        .as_i64()
-        .context("invalid legacy delivery flag")?;
-    ensure!(
-        (matches!(state, "received" | "processed") && delivered == 1)
-            || (matches!(state, "unknown" | "unsent") && delivered == 0),
-        "invalid legacy delivery state"
-    );
-    ensure!(
-        valid_identity(text(row, "messageId")?, "m-")
-            && row["id"].as_u64().is_some_and(|id| id > 0)
-            && row["statusVersion"]
-                .as_u64()
-                .is_some_and(|version| version > 0),
-        "invalid legacy receipt identity"
-    );
-    let mut message = json!({"dispatch":record["dispatch"],"role":record["role"],"scope":record["scope"],
-        "round":round["round"],"attempt":round["attempt"],"id":row["id"],"messageId":row["messageId"],
-        "state":state,"statusVersion":row["statusVersion"],"body_hash":digest,
-        "legacy_body":raw,"request_key":row["request_key"],"created_at":row["at"],"legacyCreated":row["created"]});
-    if let Some(report) = report {
-        message["report"] = json!(report);
-        for field in ["head", "dirty"] {
-            if let Some(value) = body.get(field) {
-                message[field] = value.clone();
-            }
-        }
-    } else {
-        let question = body["question"]
-            .as_str()
-            .context("invalid legacy question")?;
-        message["question_payload"] = json!({"text":question,"options":body["options"]});
-    }
-    if !row["resolver_actor"].is_null() {
-        message["resolution"] = json!({"actor":row["resolver_actor"],"source":row["resolution_source"],
-            "reason":row["resolution_reason"],"evidence":row["resolution_evidence"],"at":row["resolvedAt"]});
-    }
-    Ok(message)
 }
 
 fn summary(record: &Import, duplicate: bool) -> Value {
@@ -515,24 +445,36 @@ pub fn run(args: &[OsString]) -> Result<Value> {
     backup.sync_all()?;
     drop(backup);
     let ledger = stopped_ledger(&database)?;
-    let records = assignments(ledger.dispatches, ledger.rounds, ledger.audit)?;
-    let mut seen = BTreeSet::new();
-    let converted = ledger
-        .messages
-        .iter()
-        .map(|message| {
-            let id = text(message, "dispatch")?;
-            ensure!(
-                seen.insert(text(message, "messageId")?),
-                "duplicate legacy messageId"
-            );
+    let mut records = assignments(ledger.dispatches, ledger.rounds, ledger.audit)?;
+    for (rows, key) in [
+        (ledger.faults, "fault"),
+        (ledger.host_errors, "hostError"),
+        (ledger.screen_watches, "screenObservedSince"),
+        (ledger.watchdog_faults, "watchdogFaults"),
+    ] {
+        for mut item in rows {
+            let dispatch = text(&item, "dispatch")?;
             let record = records
-                .get(id)
-                .with_context(|| format!("legacy receipt has no dispatch {id}"))?;
-            convert_message(record, message)
-                .with_context(|| format!("legacy dispatch {id} receipt {}", message["id"]))
-        })
-        .collect::<Result<Vec<_>>>()?;
+                .get_mut(dispatch)
+                .with_context(|| format!("legacy {key} has no dispatch {dispatch}"))?;
+            if key == "watchdogFaults" {
+                ensure!(
+                    item["round"].is_u64() && item["attempt"].is_string(),
+                    "legacy watchdog fault lacks attempt identity"
+                );
+                matching_round(record, &item, None)
+                    .context("unverified legacy watchdog fault attempt")?;
+                item.as_object_mut().unwrap().remove("dispatch");
+                record[key].as_array_mut().unwrap().push(item);
+            } else if key == "fault" {
+                item.as_object_mut().unwrap().remove("dispatch");
+                record[key] = item;
+            } else {
+                record[key] = item[key].clone();
+            }
+        }
+    }
+    let converted = history::receipts(&mut records, &ledger.messages, ledger.resolutions)?;
     let dispatch_dir = staged.join("dispatches");
     private_dir(&dispatch_dir)?;
     for (id, record) in &records {
@@ -543,7 +485,7 @@ pub fn run(args: &[OsString]) -> Result<Value> {
         controller::stage_legacy_owners(&staged, ledger.owners, proof.owner_replacements)?;
     import.message_high_water = ledger.high_water;
     import.dispatch_count = records.len();
-    import.message_count = converted.len();
+    import.message_count = ledger.messages.len();
     write_json(&staged.join(MARKER), &serde_json::to_value(&import)?, None)?;
     for directory in [&archive, &dispatch_dir, &staged] {
         File::open(directory)?.sync_all()?;

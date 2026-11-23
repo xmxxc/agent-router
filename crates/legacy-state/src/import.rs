@@ -11,6 +11,11 @@ pub struct StoppedLedger {
     pub messages: Vec<Value>,
     pub owners: Vec<Value>,
     pub audit: Vec<Value>,
+    pub faults: Vec<Value>,
+    pub watchdog_faults: Vec<Value>,
+    pub host_errors: Vec<Value>,
+    pub screen_watches: Vec<Value>,
+    pub resolutions: Vec<Value>,
     pub high_water: u64,
 }
 
@@ -69,5 +74,13 @@ pub fn stopped_ledger(database: &Path) -> Result<StoppedLedger> {
             from_host AS fromHost,to_host AS toHost,result,diagnostic,owner_generation AS ownerGeneration,
             resolver_actor,resolution_evidence,resolution_owner_generation,resolved_at,consumed_at,created
             FROM lifecycle_event ORDER BY id", [])?,
+        faults: rows(&db, "SELECT dispatch,operation,outcome,category,diagnostic,created
+            FROM fault_event ORDER BY dispatch", [])?,
+        watchdog_faults: rows(&db, "SELECT dispatch,round,attempt,kind,fingerprint
+            FROM watchdog_fault ORDER BY dispatch,round,attempt,kind,fingerprint", [])?,
+        host_errors: rows(&db, "SELECT dispatch,turn AS hostError FROM host_error ORDER BY dispatch", [])?,
+        screen_watches: rows(&db, "SELECT dispatch,since AS screenObservedSince FROM screen_watch ORDER BY dispatch", [])?,
+        resolutions: rows(&db, "SELECT id,message,actor,source,reason,evidence,body_hash AS bodyHash,
+            from_state AS fromState,to_state AS toState,created FROM message_resolution ORDER BY id", [])?,
     })
 }
