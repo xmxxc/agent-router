@@ -1,0 +1,229 @@
+name: Linux regression evidence
+on:
+  push:
+    branches: [rust-router/linux-ci-regression]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONUTF8: '1'
+  CARGO_BUILD_JOBS: '2'
+  TRIPLE: x86_64-unknown-linux-gnu
+  EVIDENCE: ${{ github.workspace }}/linux-regression-evidence
+
+jobs:
+  legacy-state:
+    name: '#30 Python ledger and migration'
+    # The Python fixtures use SQLite's ->> operator, added in SQLite 3.38.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      PRODUCT_SHA: 21d56c27a2d3d00c8fa5359d1905bf7279ac213c
+      PYTHON_39_SHA: 2409c40b469e0e40bd5c55326df3d5ebb86ca81b
+      PYTHON_40_SHA: 60d7d76e4bb861ac9e0bbb043aa1a36946578397
+    steps:
+      - name: Record run identity
+        run: |
+          mkdir -p "$EVIDENCE"
+          printf 'Workflow %s\nRun %s attempt %s\nExpected product %s\n' \
+            "$GITHUB_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PRODUCT_SHA" | tee "$EVIDENCE/run.log"
+          uname -a | tee -a "$EVIDENCE/run.log"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          persist-credentials: false
+      - name: Check out the historical Python CLI fixture
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: xmxxc/workflow-core
+          ref: ${{ env.PYTHON_39_SHA }}
+          path: python-39
+          persist-credentials: false
+      - name: Check out the frozen Python CLI and its historical Git objects
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: xmxxc/workflow-core
+          ref: ${{ env.PYTHON_40_SHA }}
+          fetch-depth: 0
+          path: python-40
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - name: Verify checkouts and install Rust
+        working-directory: product
+        run: |
+          git log -1 --format='Rust HEAD %H tree %T' | tee "$EVIDENCE/sources.log"
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+          for checkout in python-39 python-40; do
+            git -C "../$checkout" log -1 --format="$checkout HEAD %H tree %T" | tee -a "$EVIDENCE/sources.log"
+          done
+          test "$(git -C ../python-39 rev-parse HEAD)" = "$PYTHON_39_SHA"
+          test "$(git -C ../python-40 rev-parse HEAD)" = "$PYTHON_40_SHA"
+          sha256sum vendor/INPUTS.sha256 | tee "$EVIDENCE/inputs.log"
+          sha256sum -c vendor/INPUTS.sha256 2>&1 | tee -a "$EVIDENCE/inputs.log"
+          rustup toolchain install 1.96.1 --profile minimal 2>&1 | tee "$EVIDENCE/toolchain.log"
+          {
+            rustc -vV
+            cargo --version
+            python --version
+            python -c 'import sqlite3; print("Python SQLite", sqlite3.sqlite_version); assert sqlite3.sqlite_version_info >= (3, 38)'
+          } 2>&1 | tee -a "$EVIDENCE/toolchain.log"
+      - name: Build the offline migration CLI
+        id: build
+        working-directory: product
+        run: |
+          cargo build --release --locked --target "$TRIPLE" -p wfc-legacy-state 2>&1 | tee "$EVIDENCE/build.log"
+          bin="target/$TRIPLE/release/wfc-legacy-state"
+          sha256sum "$bin" | tee "$EVIDENCE/binaries.log"
+          "$bin" --help | tee -a "$EVIDENCE/binaries.log"
+      - name: Run Rust offline regressions
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: cargo test --release --locked --target "$TRIPLE" -p wfc-legacy-state 2>&1 | tee "$EVIDENCE/rust-tests.log"
+      - name: Run the Python ledger, receipt and migration regressions
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: |
+          bin="target/$TRIPLE/release/wfc-legacy-state"
+          fixtures=crates/legacy-state/tests
+          failed=0
+          for probe in python_equivalent python_pre_attempt; do
+            python -Bu "$fixtures/$probe.py" ../python-39 ../python-40 "$bin" 2>&1 \
+              | tee "$EVIDENCE/$probe.log" || failed=1
+          done
+          for checkout in python-39 python-40; do
+            for probe in python_ledger python_fields python_history python_recovery; do
+              python -Bu "$fixtures/$probe.py" "../$checkout" "$bin" 2>&1 \
+                | tee "$EVIDENCE/$checkout-$probe.log" || failed=1
+            done
+          done
+          exit "$failed"
+      - name: Checksum the evidence logs
+        if: ${{ always() }}
+        run: |
+          cd "$EVIDENCE"
+          sha256sum -- *.log > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() }}
+        with:
+          name: linux-30-${{ env.PRODUCT_SHA }}-attempt-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  herdr:
+    name: '#32 Herdr 0.9.5 public CLI and backend'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      WFC_BUILD_ID: 1861bbc896e5be668bf60c4179613e8e3c2c564b
+      NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+      HERDR_SHA256: 14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d
+    steps:
+      - name: Record run identity
+        run: |
+          mkdir -p "$EVIDENCE"
+          printf 'Workflow %s\nRun %s attempt %s\nExpected product %s\n' \
+            "$GITHUB_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$WFC_BUILD_ID" | tee "$EVIDENCE/run.log"
+          uname -a | tee -a "$EVIDENCE/run.log"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.WFC_BUILD_ID }}
+          path: product
+          persist-credentials: false
+      - name: Check out the verified native CI zlib archive
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.NATIVE_INPUT_SHA }}
+          path: native-input
+          sparse-checkout: vendor/zlib-1.3.1.tar.gz
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        with:
+          version: '0.16.0'
+      - name: Verify sources and prepare the native build
+        id: prepare
+        working-directory: product
+        run: |
+          git log -1 --format='Rust HEAD %H tree %T' | tee "$EVIDENCE/sources.log"
+          test "$(git rev-parse HEAD)" = "$WFC_BUILD_ID"
+          git -C ../native-input log -1 --format='zlib source checkout HEAD %H tree %T' | tee -a "$EVIDENCE/sources.log"
+          test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
+          sha256sum vendor/INPUTS.sha256 | tee "$EVIDENCE/inputs.log"
+          sha256sum -c vendor/INPUTS.sha256 2>&1 | tee -a "$EVIDENCE/inputs.log"
+          rustup toolchain install 1.96.1 --profile minimal 2>&1 | tee "$EVIDENCE/toolchain.log"
+          { rustc -vV; cargo --version; zig version; python --version; } 2>&1 | tee -a "$EVIDENCE/toolchain.log"
+          zlib=../native-input/vendor/zlib-1.3.1.tar.gz
+          sha256sum "$zlib" | tee -a "$EVIDENCE/inputs.log"
+          python tools/prepare.py --zlib-archive "$zlib" 2>&1 | tee -a "$EVIDENCE/inputs.log"
+      - name: Download and verify the Herdr 0.9.5 Linux release asset
+        id: herdr-download
+        run: |
+          asset=herdr-linux-x86_64
+          release="$GITHUB_SERVER_URL/herdrdev/herdr/releases/download/v0.9.5"
+          metadata="$GITHUB_API_URL/repos/herdrdev/herdr/releases/tags/v0.9.5"
+          cd "$RUNNER_TEMP"
+          curl --fail --silent --show-error --location --retry 3 "$metadata" \
+            | jq -e --arg asset "$asset" '.assets[] | select(.name == $asset) | {name,digest,browser_download_url}' \
+            | tee "$EVIDENCE/herdr-release.log"
+          jq -e --arg digest "sha256:$HERDR_SHA256" --arg url "$release/$asset" \
+            '.digest == $digest and .browser_download_url == $url' "$EVIDENCE/herdr-release.log"
+          curl --fail --silent --show-error --location --retry 3 "$release/$asset" -o "$asset"
+          printf '%s  %s\n' "$HERDR_SHA256" "$asset" | sha256sum -c | tee -a "$EVIDENCE/herdr-release.log"
+          chmod +x "$asset"
+          version=$("./$asset" --version)
+          printf '%s\n' "$version" | tee -a "$EVIDENCE/herdr-release.log"
+          test "$version" = 'herdr 0.9.5'
+      - name: Build the native wfc CLI and Herdr example
+        id: build
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        working-directory: product
+        run: |
+          cargo build --release --locked --target "$TRIPLE" -p wfc --bin wfc 2>&1 | tee "$EVIDENCE/build.log"
+          cargo build --release --locked --target "$TRIPLE" -p wfc-herdr --example herdr_unit 2>&1 | tee -a "$EVIDENCE/build.log"
+          dir="target/$TRIPLE/release"
+          sha256sum "$dir/wfc" "$dir/examples/herdr_unit" | tee "$EVIDENCE/binaries.log"
+          version=$("$dir/wfc" --version)
+          printf '%s\n' "$version" | tee -a "$EVIDENCE/binaries.log"
+          [[ "$version" == *"(Rust, $TRIPLE, release, build $WFC_BUILD_ID)" ]]
+      - name: Run Rust Herdr regressions
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: cargo test --release --locked --target "$TRIPLE" -p wfc-herdr 2>&1 | tee "$EVIDENCE/rust-tests.log"
+      - name: Exercise public commands with a real protocol 22 service
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.herdr-download.outcome == 'success' }}
+        working-directory: product
+        run: |
+          python -Bu tests/herdr_public.py "$RUNNER_TEMP/herdr-linux-x86_64" \
+            "target/$TRIPLE/release/wfc" -v 2>&1 | tee "$EVIDENCE/herdr-public.log"
+      - name: Run the live Herdr backend regressions
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.herdr-download.outcome == 'success' }}
+        working-directory: product
+        run: |
+          python -Bu crates/herdr/tests/live.py "$RUNNER_TEMP/herdr-linux-x86_64" \
+            "target/$TRIPLE/release/examples/herdr_unit" -v 2>&1 | tee "$EVIDENCE/herdr-backend.log"
+      - name: Checksum the evidence logs
+        if: ${{ always() }}
+        run: |
+          cd "$EVIDENCE"
+          sha256sum -- *.log > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() }}
+        with:
+          name: linux-32-${{ env.WFC_BUILD_ID }}-attempt-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 14
