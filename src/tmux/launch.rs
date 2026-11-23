@@ -55,7 +55,7 @@ fn read_private_json(path: &Path) -> Option<Value> {
     serde_json::from_reader(file).ok()
 }
 
-pub(super) fn read_receipt(path: &Path) -> Option<Value> {
+pub(crate) fn read_receipt(path: &Path) -> Option<Value> {
     let record = read_private_json(path)?;
     if record
         .get("launchId")
@@ -711,15 +711,15 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
     }
     let started_receipt = json!({"category":"started","pid":child.id(),"launchId":id});
-    let (status, observed, started) = crate::workflow::startup::wait_host(&mut child, || {
+    let (status, _, started) = crate::workflow::startup::wait_host(&mut child, || {
         super::binding::save(&receipt, &started_receipt)
     })?;
     let code = status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
     let mut terminal = json!({"category":"process_exited","exitCode":code,"launchId":id});
-    if let Some(zero) = watching.and_then(|watching| watching.tmux_exited(status, observed)) {
-        terminal["startupZero"] = zero;
+    if let Some(watching) = watching {
+        terminal["startupExit"] = watching.tmux_exit_evidence(status);
     }
     super::binding::save(&receipt, &terminal)?;
     started?;

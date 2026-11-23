@@ -179,27 +179,75 @@ pub(crate) fn wait_host(
 // A native zero exit is a startup fault only when the public host adapter
 // actually rejected confirmation and selected this terminal receipt.
 pub(super) fn unconfirmed_zero(state: &Path, row: &Value, launch_id: &str, receipt: &Value) {
-    let evidence = &receipt["startupZero"];
-    if receipt["category"] != "process_exited" || receipt["exitCode"] != 0 {
+    if receipt["category"] != "process_exited"
+        || receipt["exitCode"] != 0
+        || !receipt["startupZero"]["pid"]
+            .as_u64()
+            .is_some_and(|pid| pid > 0 && pid <= u32::MAX as u64)
+    {
         return;
     }
-    let Some(((dispatch, attempt), pid)) =
-        row["dispatch"].as_str().zip(row["attempt"].as_str()).zip(
-            evidence["pid"]
-                .as_u64()
-                .and_then(|pid| u32::try_from(pid).ok())
-                .filter(|&pid| pid > 0),
-        )
-    else {
+    publish_unconfirmed_exit(
+        state,
+        row,
+        launch_id,
+        &receipt["startupZero"],
+        Some(0),
+        None,
+    );
+}
+
+pub(super) fn unconfirmed_tmux_exit(
+    state: &Path,
+    row: &Value,
+    launch_id: &str,
+    receipt: &Value,
+) -> Result<()> {
+    let Some(evidence) = receipt.get("startupExit") else {
+        // Older supervisors recorded raw identity only for an unconfirmed zero.
+        unconfirmed_zero(state, row, launch_id, receipt);
+        return Ok(());
+    };
+    let (exit_code, signal, encoded) =
+        match (evidence["exitCode"].as_i64(), evidence["signal"].as_i64()) {
+            (Some(code @ 0..=255), None) if evidence["signal"].is_null() => {
+                (Some(code as i32), None, code)
+            }
+            (None, Some(signal @ 1..=64)) if evidence["exitCode"].is_null() => {
+                (None, Some(signal as i32), 128 + signal)
+            }
+            _ => anyhow::bail!("invalid tmux startup exit evidence"),
+        };
+    anyhow::ensure!(
+        receipt["exitCode"] == encoded,
+        "tmux startup exit evidence does not match receipt"
+    );
+    publish_unconfirmed_exit(state, row, launch_id, evidence, exit_code, signal);
+    Ok(())
+}
+
+fn publish_unconfirmed_exit(
+    state: &Path,
+    row: &Value,
+    launch_id: &str,
+    evidence: &Value,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+) {
+    let Some((dispatch, attempt)) = row["dispatch"].as_str().zip(row["attempt"].as_str()) else {
         return;
     };
+    let pid = evidence["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|&pid| pid > 0);
     Startup::new(state, dispatch, attempt, Some(launch_id)).publish(Failure {
         category: "process_exited",
         diagnostic: "Worker exited before host startup was confirmed",
-        exit_code: Some(0),
-        signal: None,
+        exit_code,
+        signal,
         launch_id: Some(launch_id),
-        pid: Some(pid),
+        pid,
         process_start: evidence["processStart"].as_str(),
         requires_decision: true,
     });
@@ -228,24 +276,16 @@ impl Running<'_> {
             return None;
         }
         if status.success() {
-            return Some(self.zero_evidence());
+            return Some(json!({"pid":self.pid,"processStart":self.process_start}));
         }
         self.publish_exit(status);
         None
     }
 
-    pub(crate) fn tmux_exited(self, status: ExitStatus, observed: Instant) -> Option<Value> {
-        if status.success() {
-            // The create operation decides whether this launch passed its
-            // final session confirmation. Preserve the evidence until then.
-            return Some(self.zero_evidence());
-        }
-        self.exited(status, observed);
-        None
-    }
-
-    fn zero_evidence(&self) -> Value {
-        json!({"pid":self.pid,"processStart":self.process_start})
+    pub(crate) fn tmux_exit_evidence(self, status: ExitStatus) -> Value {
+        // Only create can tell whether this launch passed final confirmation.
+        json!({"pid":self.pid,"processStart":self.process_start,
+            "exitCode":status.code(),"signal":status.signal()})
     }
 
     fn publish_exit(&self, status: ExitStatus) {
@@ -372,14 +412,15 @@ mod tests {
             super::super::write_json(&state.join("messages.json"), &json!(messages), None)?;
             Startup::new(&state, dispatch, "a-987654321abc", None)
                 .spawn_failed(ErrorKind::NotFound);
-            unconfirmed_zero(
+            unconfirmed_tmux_exit(
                 &state,
                 &row,
                 "fixture-launch",
                 &json!({
-                    "category":"process_exited","exitCode":0,"startupZero":{"pid":1,"processStart":null},
+                    "category":"process_exited","exitCode":17,
+                    "startupExit":{"exitCode":17,"signal":null,"pid":1,"processStart":null},
                 }),
-            );
+            )?;
             let history = super::super::messages::history(&state, dispatch)?;
             assert_eq!(history.len(), 2);
             assert_eq!(history[1]["type"], "question");

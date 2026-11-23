@@ -1,9 +1,11 @@
 """Public Linux startup failure reports, delivered through the existing inbox."""
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -33,7 +35,7 @@ class StartupFailure(unittest.TestCase):
         self.assertEqual(result.returncode, code, (args, result.stdout, result.stderr))
         return json.loads(result.stdout) if result.stdout else result.stderr.strip()
 
-    def deploy(self, scope, argv, *, host=None, runtime=None, code=0):
+    def deploy(self, scope, argv, *, host=None, runtime=None, backend=None, code=0):
         args = ["dispatch", "--task", "task", "--cwd", ".", "--report", "report",
                 "--scope", scope, "--role", "startup-check"]
         if host is None:
@@ -45,6 +47,8 @@ class StartupFailure(unittest.TestCase):
                 settings["runtime"] = runtime
             config.write_text(json.dumps({"hosts": {host: settings}}))
             args += ["--host", host, "--launch-config", str(config)]
+            if backend == "herdr":
+                args += ["--backend", "herdr", "--herdr-endpoint", str(self.cwd / "unused-herdr.sock")]
         return self.cli(*args, code=code)
 
     def wait(self, scope):
@@ -313,7 +317,7 @@ class StartupFailure(unittest.TestCase):
         self.assertFalse(self.cli("wait", "--scope", "host-zero-done", "--timeout", "0", code=3)["messages"])
 
     @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
-    def test_tmux_zero_follows_the_create_confirmation(self):
+    def test_tmux_exit_follows_the_create_confirmation(self):
         self.start_tmux()
         real_tmux = self.tmux[0]
         shim_dir = self.cwd / "bin"
@@ -346,50 +350,171 @@ class StartupFailure(unittest.TestCase):
             import json
             import os
             from pathlib import Path
+            import signal
+            import subprocess
+            import sys
             import time
 
+            action = sys.argv[1]
+            pid = os.getpid()
+            boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+            ticks = int(Path("/proc/self/stat").read_bytes().rsplit(b")", 1)[1].split()[19])
             launches = Path(os.environ["WFC_STATE"]) / "launches"
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline:
                 for path in launches.glob("*.json"):
                     receipt = json.loads(path.read_text())
-                    if receipt.get("category") == "started" and receipt.get("pid") == os.getpid():
+                    if receipt.get("category") == "started" and receipt.get("pid") == pid:
                         ready = time.monotonic()
+                        if action == "done":
+                            subprocess.run([os.environ["WFC_BIN"], "done", "--report", os.environ["WFC_REPORT"],
+                                            "--attempt", os.environ["WFC_ATTEMPT"]], check=True)
                         time.sleep(.35)
                         elapsed = time.monotonic() - ready
                         Path("pre-confirmation-exit").write_text(json.dumps({"launchId": receipt["launchId"],
-                            "pid": os.getpid(), "startedToExitMs": int(elapsed * 1000)}))
-                        raise SystemExit(0)
+                            "pid": pid, "processStart": f"linux:{boot}:{ticks}", "startedToExitMs": int(elapsed * 1000)}))
+                        if action == "signal":
+                            os.kill(pid, signal.SIGTERM)
+                            raise SystemExit(125)
+                        raise SystemExit(17 if action == "done" else int(action))
                 time.sleep(.005)
             raise SystemExit(125)
         """)
-        old_path = self.env["PATH"]
-        self.env["PATH"] = f"{shim_dir}:{old_path}"
-        try:
-            self.deploy("late-zero", [sys.executable, "-c", probe], host="codex", code=1)
-        finally:
-            self.env["PATH"] = old_path
-        evidence = json.loads(gate.read_text())
-        self.assertGreaterEqual(evidence["startedToExitMs"], 350)
-        late = self.wait("late-zero")
-        fault = late["fault"]
-        self.assertEqual((late["type"], fault["exitCode"]), ("exited", 0))
-        self.assertEqual((fault["launchId"], fault["pid"]), (evidence["launchId"], evidence["pid"]))
-        self.assertEqual(self.check_ack(late)["worker"]["exit_code"], 0)
-        print(json.dumps({"case": "late-zero", "messageId": late["messageId"],
-                          "attempt": late["attempt"], "exitCode": fault["exitCode"], **evidence}), flush=True)
+        for case, action, code, signum in (("late-zero", "0", 0, None), ("late-nonzero", "17", 17, None),
+                                           ("late-signal", "signal", None, signal.SIGTERM), ("late-done", "done", 17, None)):
+            with self.subTest(case=case):
+                gate.unlink(missing_ok=True)
+                old_path = self.env["PATH"]
+                self.env["PATH"] = f"{shim_dir}:{old_path}"
+                try:
+                    self.deploy(case, [sys.executable, "-c", probe, action], host="codex", code=1)
+                finally:
+                    self.env["PATH"] = old_path
+                evidence = json.loads(gate.read_text())
+                self.assertGreaterEqual(evidence["startedToExitMs"], 350)
+                if action == "done":
+                    done, = self.cli("wait", "--scope", case, "--timeout", "0")["messages"]
+                    self.assertEqual(done["type"], "done")
+                    row = self.cli("status", "--dispatch", done["dispatch"])["dispatches"][0]
+                    self.assertEqual(row["worker"]["exit_code"], 17)
+                    self.assertNotIn("startupFailure", row)
+                    self.assertFalse(self.cli("wait", "--scope", case, "--timeout", "0", code=3)["messages"])
+                    continue
+                message = self.wait(case)
+                fault = message["fault"]
+                self.assertEqual((message["type"], fault["exitCode"], fault["signal"]), ("exited", code, signum))
+                for field in ("launchId", "pid", "processStart"):
+                    self.assertEqual(fault[field], evidence[field])
+                self.check_ack(message)
+                print(json.dumps({"case": case, "messageId": message["messageId"],
+                                  "attempt": message["attempt"], "exitCode": code, "signal": signum, **evidence}), flush=True)
 
-        accepted = self.deploy("accepted-zero", ["/bin/sh", "-c",
-            'for i in $(seq 200); do test ! -e release-accepted || exit 0; sleep .01; done; exit 125'],
-            host="codex")
-        (self.cwd / "release-accepted").touch()
-        dispatch = accepted["dispatch"]
-        self.until(lambda: self.cli("status", "--dispatch", dispatch)["dispatches"][0]["worker"]["state"] == "exited",
-                   "wait for accepted worker to exit")
-        row = self.cli("status", "--dispatch", dispatch)["dispatches"][0]
-        self.assertEqual(row["worker"]["exit_code"], 0)
-        self.assertNotIn("startupFailure", row)
-        self.assertFalse(self.cli("wait", "--scope", "accepted-zero", "--timeout", "0", code=3)["messages"])
+        for code in (0, 17):
+            with self.subTest(accepted=code):
+                scope = f"accepted-{code}"
+                release = self.cwd / f"release-{code}"
+                accepted = self.deploy(scope, ["/bin/sh", "-c",
+                    f'for i in $(seq 200); do test ! -e {release.name} || exit {code}; sleep .01; done; exit 125'],
+                    host="codex")
+                release.touch()
+                dispatch = accepted["dispatch"]
+                self.until(lambda: self.cli("status", "--dispatch", dispatch)["dispatches"][0]["worker"]["state"] == "exited",
+                           "wait for accepted worker to exit")
+                row = self.cli("status", "--dispatch", dispatch)["dispatches"][0]
+                self.assertEqual(row["worker"]["exit_code"], code)
+                self.assertNotIn("startupFailure", row)
+                self.assertFalse(self.cli("wait", "--scope", scope, "--timeout", "0", code=3)["messages"])
+
+        cancelled = self.deploy("accepted-close", ["/bin/sh", "-c", "exec /bin/sleep 10"], host="codex")
+        closed = self.cli("close", cancelled["dispatch"])
+        self.assertEqual((closed["attempt"], closed["closeEffect"]), (cancelled["attempt"], "session_closed"))
+        self.assertFalse(self.cli("wait", "--scope", "accepted-close", "--timeout", "0", code=3)["messages"])
+
+    @contextmanager
+    def read_only_history(self, history):
+        def snapshot():
+            return {path.relative_to(history): (path.stat().st_mode, path.stat().st_mtime_ns,
+                    path.read_bytes() if path.is_file() else None) for path in [history, *history.rglob("*")]}
+
+        modes = {path: stat.S_IMODE(path.stat().st_mode) for path in [history, *history.rglob("*")]}
+        for path, mode in modes.items():
+            path.chmod(mode & ~0o222)
+        try:
+            self.assertFalse(os.access(history, os.W_OK))
+            before = snapshot()
+            yield
+            self.assertEqual(snapshot(), before)
+        finally:
+            for path, mode in modes.items():
+                path.chmod(mode)
+
+    @unittest.skipIf(os.geteuid() == 0, "read-only close requires a regular user")
+    def test_script_preflight_close_replays_from_read_only_history(self):
+        restricted = self.cwd / SECRET
+        restricted.mkdir()
+        denied = restricted / "script.py"
+        denied.touch()
+        restricted.chmod(0)
+        self.addCleanup(restricted.chmod, 0o700)
+        with self.assertRaises(PermissionError):
+            denied.stat()
+        missing = self.cwd / "missing.py"
+        for backend in ("tmux", "herdr"):
+            for script, category in ((missing, "executable_missing"), (denied, "permission_denied")):
+                with self.subTest(backend=backend, category=category):
+                    scope = f"readonly-{backend}-{category}"
+                    self.deploy(scope, [str(script)], host="codex", runtime=[sys.executable], backend=backend, code=1)
+                    message = self.wait(scope)
+                    self.assertEqual(message["fault"]["category"], category)
+                    dispatch = message["dispatch"]
+                    first = self.cli("close", dispatch)
+                    self.assertEqual((first["result"], first["dispatch"], first["round"], first["attempt"], first["worker"]["state"]),
+                                     ("completed", dispatch, 1, message["attempt"], "not_started"))
+                    history = self.cwd / scope
+                    (history / "dispatches").mkdir(parents=True)
+                    target = history / "dispatches" / f"{dispatch}.json"
+                    raw = (self.state / "dispatches" / target.name).read_bytes()
+                    target.write_bytes(raw)
+                    extra = {"WFC_STATE": str(history)}
+                    self.assertFalse((history / "controller-owners.json").exists())
+                    with self.read_only_history(history):
+                        self.assertEqual(self.cli("close", dispatch, extra=extra), first)
+                        self.assertEqual(self.cli("close", dispatch, extra=extra), first)
+
+                    if backend == "tmux" and script == missing:
+                        historical = json.loads(raw)
+                        historical["create"].pop("scope")
+                        target.write_text(json.dumps(historical))
+                        with self.read_only_history(history):
+                            self.assertEqual(self.cli("close", dispatch, extra=extra), first)
+                        for key, value in (("round", 2), ("attempt", "a-0123456789ab"),
+                                           ("scope", "another-scope"), ("result", "uncertain")):
+                            changed = json.loads(raw)
+                            changed["create"][key] = value
+                            target.write_text(json.dumps(changed))
+                            with self.read_only_history(history):
+                                self.cli("close", dispatch, code=1, extra=extra)
+                    print(json.dumps({"case": "script-preflight-readonly", "backend": backend,
+                                      "category": category, "scope": scope, "close": first}), flush=True)
+
+    @unittest.skipIf(os.geteuid() == 0, "owner lock checks require a regular user")
+    def test_managed_script_preflight_close_keeps_scope_lock(self):
+        scope = "managed-preflight"
+        owner = self.cli("acquire", "--scope", scope, "--owner", "fixture")
+        self.env["WFC_CONTROLLER_TOKEN"] = owner["token"]
+        self.deploy(scope, [str(self.cwd / "missing.py")], host="codex", runtime=[sys.executable], code=1)
+        message = self.wait(scope)
+        dispatch = message["dispatch"]
+        first = self.cli("close", dispatch)
+        self.assertEqual((first["attempt"], first["worker"]["state"]), (message["attempt"], "not_started"))
+        with self.read_only_history(self.state):
+            denied = self.cli("close", dispatch, code=1)
+            self.assertIn("Permission denied", denied)
+            stale = self.cli("close", dispatch, code=1, extra={"WFC_CONTROLLER_TOKEN": "wrong"})
+            detail = json.loads(stale)
+            self.assertEqual((detail["error"], detail["scope"], detail["generation"]),
+                             ("stale_controller_owner", scope, owner["generation"]))
+        self.assertEqual(self.cli("close", dispatch), first)
 
 
 if __name__ == "__main__":
