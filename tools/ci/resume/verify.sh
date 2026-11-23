@@ -4,6 +4,13 @@ set -euo pipefail
 
 group=${1:?test group required}
 case "$group" in
+    public-interrupt)
+        fixture=tools/check_tmux.py
+        selectors=(
+            Backend.test_public_interrupt_fences_before_tmux_key
+            Backend.test_public_interrupt_lost_confirmation_keeps_fence_and_refuses_foreign_writer
+        )
+        ;;
     codex-home-paths)
         fixture=tools/check_tmux.py
         selectors=(
