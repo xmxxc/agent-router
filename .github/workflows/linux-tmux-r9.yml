@@ -1,0 +1,84 @@
+name: Linux integration tmux R9
+on:
+  push:
+    branches: [rust-router/04-tmux-r9-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  linux-tmux:
+    name: '#31 R9 and public Linux integration'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: '2'
+      PYTHONUTF8: '1'
+      EVIDENCE: ${{ github.workspace }}/linux-tmux-r9-evidence
+    steps:
+      - name: Record workflow run
+        run: |
+          mkdir -p "$EVIDENCE"
+          printf 'workflow=%s\nrun=%s\nattempt=%s\n' \
+            "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" | tee "$EVIDENCE/run.log"
+      - name: Check out the CI branch and all fixed-source ancestors
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          path: ci
+          persist-credentials: false
+      - name: Check out the verified native CI zlib input
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+          path: native-input
+          sparse-checkout: vendor/zlib-1.3.1.tar.gz
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        with:
+          version: '0.16.0'
+      - name: Prepare the Linux toolchain
+        run: |
+          {
+            rustup toolchain install 1.96.1 --profile minimal --component rustfmt
+            if ! command -v tmux >/dev/null; then
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends tmux
+            fi
+            uname -srm
+            rustc +1.96.1 -vV
+            cargo +1.96.1 --version
+            zig version
+            python3 --version
+            tmux -V
+            cc --version
+          } 2>&1 | tee "$EVIDENCE/toolchain.log"
+      - name: Build fixed sources and run the focused tmux and Herdr probes
+        working-directory: ci
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C ../native-input rev-parse HEAD)" = dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+          bash tools/ci/tmux-r9/verify.sh ../native-input/vendor/zlib-1.3.1.tar.gz
+      - name: Checksum the evidence logs
+        if: ${{ always() }}
+        run: |
+          cd "$EVIDENCE"
+          sha256sum -- *.log > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - name: Upload Linux integration evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-tmux-r9-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 14
