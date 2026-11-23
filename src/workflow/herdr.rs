@@ -19,7 +19,7 @@ use wfc_herdr::{FailureKind, Handle, Launch, Mapping, Process};
 
 pub const USAGE: &str = "wfc herdr-reconcile DISPATCH --pane P --terminal T --actor NAME --evidence TEXT [--workspace W] [--old-writer-evidence TEXT] [--owner-token TOKEN]";
 
-fn native_state(state: &Path) -> Result<()> {
+pub(super) fn native_state(state: &Path) -> Result<()> {
     ensure!(
         !state.join("router.db").try_exists()?,
         "legacy router database requires owner and assignment migration"
@@ -310,6 +310,11 @@ pub(super) fn create(state: &Path, row: &Value, launch: host::Launch) -> Result<
         let mut next = unit.row.clone();
         next["create"] = answer.clone();
         unit.save(next)?;
+        if answer["result"] != "accepted" {
+            if let Some(terminal) = host_launch::read_receipt(&files.receipt) {
+                super::startup::unconfirmed_zero(state, &unit.row, &files.id, &terminal);
+            }
+        }
     } else if !unit.path.try_exists()? {
         // No checkpoint means the provider never issued workspace.create.
         std::fs::remove_file(&files.receipt)?;

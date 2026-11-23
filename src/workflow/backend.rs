@@ -276,6 +276,34 @@ fn private_receipt(state: &Path, launch: Option<&str>) -> Result<Value> {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn publish_unconfirmed_zero(state: &Path, row: &Value) -> Result<()> {
+    let create = &row["create"];
+    if create["result"] == "accepted"
+        || create["category"] != "process_exited"
+        || create["exitCode"] != 0
+    {
+        return Ok(());
+    }
+    let id = receipt_id(row)?.context("missing early-exit launch receipt")?;
+    let receipt = private_receipt(state, Some(id))?;
+    ensure!(
+        receipt["launchId"] == id,
+        "early-exit launch identity mismatch"
+    );
+    super::startup::unconfirmed_zero(state, row, id, &receipt);
+    Ok(())
+}
+
+fn script_preflight_failed(row: &Value) -> bool {
+    row["create"]["result"] == "definitely-not-sent"
+        && matches!(
+            row["create"]["category"].as_str(),
+            Some("configured_script_missing" | "configured_script_permission_denied")
+        )
+        && row["worker"]["state"] == "not_started"
+}
+
 fn closed_path(state: &Path, row: &Value) -> Result<PathBuf> {
     let attempt = row["attempt"]
         .as_str()
@@ -573,6 +601,12 @@ pub(super) fn herdr_worker(evidence: &Value, inspection: &Value) -> Value {
 }
 
 pub fn observe(state: &Path, row: &mut Value) -> Result<(Value, Value)> {
+    if script_preflight_failed(row) {
+        return Ok((
+            row["worker"].clone(),
+            json!({"result":"definitely-not-sent","alive":false}),
+        ));
+    }
     #[cfg(target_os = "linux")]
     if row["backend"] == "herdr" {
         return super::herdr::observe(state, row);
@@ -681,6 +715,13 @@ pub(super) fn read_only_close(state: &Path, row: &Value) -> Result<Option<Value>
 }
 
 pub fn close(state: &Path, row: &Value) -> Result<Value> {
+    if script_preflight_failed(row) {
+        return Ok(
+            json!({"dispatch":row["dispatch"],"operation":"close","result":"completed",
+            "round":row["round"],"attempt":row["attempt"],"worker":row["worker"],
+            "diagnostic":"session was already gone"}),
+        );
+    }
     #[cfg(target_os = "linux")]
     if row["backend"] == "herdr" {
         return super::herdr::close(state, row);
