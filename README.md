@@ -202,4 +202,6 @@ OpenCode 控制端使用正在监听的 OpenCode TUI 或 `opencode serve` 的 HT
 wfc relay --opencode-url http://127.0.0.1:4096 --opencode-session ses_example --scope review --for 90 --detach
 ```
 
+`--opencode-url` 接受 ASCII DNS 主机名（可带一个末尾点）、四段十进制 IPv4 或方括号内的 IPv6，例如 `http://[::1]:4096`。IPv6 区域标识用 `%25` 加 1 到 15 个 ASCII 字母、数字或 `-._~`，例如 `[fe80::1%25eth0]`。端口可省略，显式端口用 `1` 到 `65535` 的十进制数字。URL 可带路径前缀。格式错误会在 relay 注册和领取回执前报错。
+
 两个 OpenCode 参数必须成对提供，与 Codex 目标互斥。`status.waiters` 显示 OpenCode 的目标 `session`。relay 向该地址的 `/session/<id>/prompt_async` POST 一批原回执；聊天仍用原 `messageId` 确认。HTTP 2xx 确认为 `received`，明确拒连则恢复为 `unsent`。重定向、其他 HTTP 状态、超时和连接中断均保留 `unknown`。relay 直连显式目标，使用系统 TLS 信任库，按 `WFC_QUEUE_TIMEOUT`（默认 60 秒）或剩余寿命中较短者设置请求超时。Linux 可执行文件链接系统 OpenSSL，HTTPS 验证使用系统信任库。

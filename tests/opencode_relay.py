@@ -212,20 +212,39 @@ class OpenCodeRelay(unittest.TestCase):
         ack = self.data("ack", receipt["messageId"])
         self.assertEqual((ack["state"], ack["statusVersion"]), ("processed", 4))
 
-    def test_invalid_ports_are_rejected_before_claiming(self):
+    def test_invalid_host_or_port_is_rejected_before_claiming(self):
         receipt = self.publish("ours")
-        for authority in ("127.0.0.1:65536", "127.0.0.1:xyz", "127.0.0.1:+80",
-                          "127.0.0.1:-1", "127.0.0.1:", "127.0.0.1:0", "[::1]:65536"):
-            with self.subTest(authority=authority):
-                self.cli("relay", *self.target(f"http://{authority}/api"), "--scope", "ours",
-                         "--for", ".2", code=2)
-                row = self.row(receipt)
-                self.assertEqual((row["messageId"], row["state"], row["statusVersion"]),
-                                 (receipt["messageId"], "unsent", 1))
-                self.assertEqual(self.posts, [])
-                self.assertEqual(self.data("status")["waiters"], [])
-        for url in ("http://127.0.0.1", "http://[::1]", "https://[::1]:65535"):
-            self.cli("relay", *self.target(url), "--scope", "empty", "--for", ".05")
+        cases = {
+            "host": ("[1]:4096", "[::gg]:4096", "[::1::2]:4096", "[127.0.0.1]:4096",
+                     "[v1.foo]:4096", "[fe80::1%25]:4096", "[fe80::1%eth0]:4096",
+                     "[fe80::1%25abcdefghijklmnop]:4096", "127.0.0.999:4096",
+                     "127.1:4096", "0177.0.0.1:4096", "0x7f.0x1:4096", "-bad.test:4096",
+                     "bad..test:4096", "under_score.test:4096", f"{'a' * 64}.test:4096"),
+            "port": ("127.0.0.1:65536", "127.0.0.1:xyz", "127.0.0.1:+80",
+                     "127.0.0.1:-1", "127.0.0.1:", "127.0.0.1:0", "[::1]:65536",
+                     "[::1]junk:4096"),
+        }
+        for reason, authorities in cases.items():
+            for authority in authorities:
+                with self.subTest(authority=authority, reason=reason):
+                    self.cli("relay", *self.target(f"http://{authority}/api"), "--scope", "ours",
+                             "--for", ".2", code=2)
+                    row = self.row(receipt)
+                    self.assertEqual((row["id"], row["messageId"], row["state"], row["statusVersion"]),
+                                     (receipt["message"], receipt["messageId"], "unsent", 1))
+                    self.assertEqual(self.posts, [])
+                    self.assertEqual(self.data("status")["waiters"], [])
+        state = Path(self.env["WFC_STATE"])
+        # Registration leaves the directory behind even if the waiter exits.
+        self.assertFalse((state / "relays").exists())
+        self.assertFalse((state / "relay.log").exists())
+
+        # An empty scope exercises target acceptance without contacting these hosts.
+        for url in ("http://127.0.0.1", "http://localhost", "https://controller-1.example.test.:443",
+                    "http://[::1]", "https://[2001:db8:0:1:2:3:4:5]:65535",
+                    "http://[::ffff:127.0.0.1]:4096", "http://[fe80::1%25abcdefghijklmno]:4096"):
+            with self.subTest(url=url):
+                self.cli("relay", *self.target(url), "--scope", "empty", "--for", ".05")
         self.assertEqual(self.posts, [])
         self.send()
         post, = self.posts

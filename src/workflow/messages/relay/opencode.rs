@@ -4,6 +4,7 @@ use anyhow::{ensure, Context, Result};
 use curl::easy::{Easy2, Handler, HttpVersion, List, NetRc};
 use http::Uri;
 use serde_json::json;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 pub(super) struct Target<'a> {
@@ -33,6 +34,51 @@ impl Handler for ResponseHeaders {
     }
 }
 
+fn valid_host(host: &str) -> bool {
+    if let Some(literal) = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+    {
+        if let Some((address, zone)) = literal.split_once("%25") {
+            // libcurl's MAX_ZONEID_LEN includes the terminating NUL.
+            return (1..=15).contains(&zone.len())
+                && zone
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b))
+                && address.parse::<Ipv6Addr>().is_ok();
+        }
+        return literal.parse::<Ipv6Addr>().is_ok();
+    }
+    if host.parse::<Ipv4Addr>().is_ok() {
+        return true;
+    }
+
+    let name = host.strip_suffix('.').unwrap_or(host);
+    let last_label = name.rsplit('.').next().unwrap_or_default();
+    // Keep dotted decimal as the only IPv4 syntax. libcurl also interprets
+    // names made entirely of decimal, octal or 0x-prefixed parts as addresses.
+    name.len() <= 253
+        && last_label.bytes().any(|b| b.is_ascii_alphabetic())
+        && !name.split('.').all(|label| {
+            label.bytes().all(|b| b.is_ascii_digit())
+                || label
+                    .strip_prefix("0x")
+                    .or_else(|| label.strip_prefix("0X"))
+                    .is_some_and(|hex| {
+                        !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+        })
+        && name.split('.').all(|label| {
+            let bytes = label.as_bytes();
+            bytes.len() <= 63
+                && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+                && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+                && bytes
+                    .iter()
+                    .all(|&b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
 impl<'a> Target<'a> {
     pub fn parse(url: &'a str, session: &'a str) -> Result<Self> {
         // Keep the caller's origin and optional path prefix. Query, fragment,
@@ -43,13 +89,18 @@ impl<'a> Target<'a> {
         ensure!(
             matches!(uri.scheme_str(), Some("http" | "https"))
                 && !authority.as_str().contains('@')
-                && !authority.host().is_empty()
                 && !url.contains(['?', '#', '\\']),
             "{invalid}"
         );
+        let host = authority.host();
+        // http::Uri checks the authority structure without parsing IP literals.
+        ensure!(
+            valid_host(host),
+            "--opencode-url must use bracketed IPv6, dotted decimal IPv4 or an ASCII DNS name"
+        );
         // Authority::port() returns None for both absent and malformed ports.
         // The host includes brackets for IPv6, so only its suffix can be a port.
-        let suffix = &authority.as_str()[authority.host().len()..];
+        let suffix = &authority.as_str()[host.len()..];
         ensure!(
             suffix.is_empty()
                 || suffix.strip_prefix(':').is_some_and(|port| {
