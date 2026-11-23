@@ -1998,7 +1998,7 @@ os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
     def test_public_question_reuses_terminal_evidence(self):
         env = {**self.env, "WFC_STATE": str(self.state)}
         for key in ("WFC_WORKER_CALLBACK", "WFC_OWNER_TOKEN"):
-            env.pop(key)
+            env.pop(key, None)
 
         def cli(*args, expected=0, **overrides):
             result = subprocess.run([WFC, *args], env={**env, **overrides}, cwd=self.work,
@@ -2075,7 +2075,7 @@ sys.exit(41)
     def test_public_question_and_close_share_attempt_lock(self):
         env = {**self.env, "WFC_STATE": str(self.state)}
         for key in ("WFC_WORKER_CALLBACK", "WFC_OWNER_TOKEN"):
-            env.pop(key)
+            env.pop(key, None)
         shim = self.work / "tmux"
         shim.write_text(f"""#!{sys.executable}
 import os, subprocess, sys, time
