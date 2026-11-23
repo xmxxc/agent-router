@@ -1,4 +1,5 @@
 """Hosted acceptance of stopped #39/#40 worker, fault and delivery history."""
+import argparse
 from contextlib import closing
 import json
 import os
@@ -315,7 +316,18 @@ def verify_controller_ledger(binary, root, target, bodies, work):
                       "nextNativeId": native["message"]}), flush=True)
 
 
-def verify_combination(binary, root, source, target, work):
+def verify_combination(binary, root, target, source, work):
+    assert (source / "router.db").is_file() and not (target / "router.db").exists()
+    assert (target / "legacy-import.json").is_file() and (target / "messages.json").is_file()
+    archive, _ = lookup(binary, root, target, DISPATCH)
+    assert archive["legacyArchived"] is True and archive["backendAlive"] is False
+    archived = {item["id"]: item for item in archive["messages"]}
+    question = archived[39]
+    assert (question["type"], question["messageId"], question["bodyHash"]) == (
+        "question", identifier(39), digest(question["body"].encode()))
+    assert (archived[40]["recipient"], archived[40]["to"], archived[40]["questionMessageId"]) == (
+        "worker", 39, identifier(39))
+
     # The archive must be rejected before the transport is even selected.
     trap_bin = root / "old-host-transport"
     trap_bin.mkdir()
@@ -325,9 +337,12 @@ def verify_combination(binary, root, source, target, work):
     old_call = root / "old-host-called"
     old_env = {"PATH": str(trap_bin), "WFC_TEST_OLD_HOST_CALL": str(old_call)}
     before = snapshot(target)
-    denied(run(binary, root, target, "reply", "39", "archive must stay stopped", token=NEW, extra=old_env),
-           "offline legacy assignment has no writable worker")
+    refusal = run(binary, root, target, "reply", "39", "archive must stay stopped", token=NEW, extra=old_env)
+    assert (refusal.returncode, refusal.stdout, refusal.stderr) == (
+        1, "", "Error: offline legacy assignment has no writable worker\n"), refusal
     assert not old_call.exists() and snapshot(target) == before
+    print(json.dumps({"archivedQuestion": question["messageId"], "archivedReplySent": False,
+                      "archiveRefusal": refusal.stderr.strip()}), flush=True)
 
     # The same spelling selects the literal native directory and the expanded
     # Python directory. A synthetic DB at the latter still fences a reply.
@@ -339,8 +354,9 @@ def verify_combination(binary, root, source, target, work):
     shutil.copyfile(source / "router.db", legacy / "router.db")
     mixed_before = snapshot(legacy)
     denied(run(binary, root, target, "reply", "39", "mixed legacy state", token=NEW,
-               extra={**old_env, "WFC_STATE": "~/mixed"}), "legacy state write blocked")
+               extra={**old_env, "WFC_STATE": "~/mixed"}), f"legacy state write blocked at {legacy / 'router.db'}.")
     assert not old_call.exists() and snapshot(target) == before and snapshot(legacy) == mixed_before
+    print(json.dumps({"mixedWriteBlocked": True, "mixedSourceBeforeAfter": mixed_before["router.db"][1]}), flush=True)
 
     fixture = work / "live"
     fixture.mkdir()
@@ -377,7 +393,10 @@ def verify_combination(binary, root, source, target, work):
         reply, = (item for item in detail["messages"] if item["type"] == "reply")
         assert (reply["id"], reply["to"], reply["questionMessageId"], reply["inputResult"]) == (
             128, 127, question["messageId"], "accepted")
-        assert (fixture / "accepted").read_bytes() == b"[router] Answer to question 127: one native answer\n"
+        expected = b"[router] Answer to question 127: one native answer"
+        assert (fixture / "accepted").read_bytes() == expected + b"\n"
+        events = [json.loads(line) for line in log.read_text().splitlines()]
+        assert b"".join(bytes.fromhex(event[0]) for event in events[1:]) == expected + b"\r"
         (fixture / "finish").touch()
         received = output(run(binary, root, target, "wait", "--scope", SCOPE, "--dispatch", row["dispatch"], "--timeout", "8",
                               token=NEW, extra=tmux_env))
@@ -402,8 +421,9 @@ def verify_combination(binary, root, source, target, work):
         130, startup["messageId"], "startup_failure", "executable_missing")
     assert [item["id"] for item in ledger if item["id"] > 125] == [126, 127, 128, 129, 130]
     assert len({item["messageId"] for item in ledger}) == len(ledger)
-    print(json.dumps({"nativeQuestion": 127, "nativeReply": reply["id"], "nativeDone": completed["id"],
-                      "startupDiagnostic": notice["id"], "archivedReplySent": False, "mixedWriteBlocked": True}),
+    print(json.dumps({"nativeIds": [item["id"] for item in ledger if item["id"] > 125],
+                      "nativeQuestion": 127, "nativeReply": reply["id"], "nativeDone": completed["id"],
+                      "startupDiagnostic": notice["id"], "confirmedInputCount": 1}),
           flush=True)
 
 
@@ -452,27 +472,32 @@ def run_group(version, group, check, *args):
     return True
 
 
-def fixture(binary, schema, root, version, backend):
+def fixture(binary, schema, root, version, backend, combined_only):
     root.mkdir()
     (root / "home").mkdir()
     source, work, bodies = build_source(root, schema, backend)
     archived = seed_full_history(source, work)
     original = snapshot(source)
     target = root / "native"
-    checks = [run_group(version, "identity-rejections", rejects_unverified, binary, root, source)]
-    for scenario in ("head", "dirty", "duplicate-numeric-id"):
-        checks.append(run_group(version, f"consistency-{scenario}",
-                                rejects_inconsistent_ledger, binary, root, source, scenario))
-    checks.append(run_group(version, "owner-confirmations", rejects_owner_history, binary, root, source))
-    checks.append(run_group(version, "receipt-confirmations", rejects_receipt_history, binary, root, source))
-    checks.append(run_group(version, "reclaim-history", verify_reclaimed, binary, root, source))
+    checks = []
+    if not combined_only:
+        checks.append(run_group(version, "identity-rejections", rejects_unverified, binary, root, source))
+        for scenario in ("head", "dirty", "duplicate-numeric-id"):
+            checks.append(run_group(version, f"consistency-{scenario}",
+                                    rejects_inconsistent_ledger, binary, root, source, scenario))
+        checks.append(run_group(version, "owner-confirmations", rejects_owner_history, binary, root, source))
+        checks.append(run_group(version, "receipt-confirmations", rejects_receipt_history, binary, root, source))
+        checks.append(run_group(version, "reclaim-history", verify_reclaimed, binary, root, source))
     published = run_group(version, "publish-and-backup", verify_publication, binary, root, source, target, original)
     history_checks = (
-        ("resolution-history", verify_resolution_history, (work,)),
-        ("archive-direction", verify_archive_direction, (archived, work)),
         ("controller-ack-and-high-water", verify_controller_ledger, (bodies, work)),
         ("combined-numbering", verify_combination, (source, work)),
     )
+    if not combined_only:
+        history_checks = (
+            ("resolution-history", verify_resolution_history, (work,)),
+            ("archive-direction", verify_archive_direction, (archived, work)),
+        ) + history_checks
     for group, check, args in history_checks:
         if published:
             checks.append(run_group(version, group, check, binary, root, target, *args))
@@ -483,10 +508,14 @@ def fixture(binary, schema, root, version, backend):
 
 
 if __name__ == "__main__":
-    binary = Path(sys.argv[1]).resolve(strict=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("binary", type=Path)
+    parser.add_argument("--combined-numbering-only", action="store_true")
+    args = parser.parse_args()
+    binary = args.binary.resolve(strict=True)
     schema = Path(__file__).resolve().parents[1] / "crates/legacy-state/src/schema.sql"
     with tempfile.TemporaryDirectory(prefix="wfc-legacy-history-") as directory:
-        passed = [fixture(binary, schema, Path(directory) / version, version, backend)
+        passed = [fixture(binary, schema, Path(directory) / version, version, backend, args.combined_numbering_only)
                   for version, backend in (("39", "tmux"), ("40", "herdr"))]
     assert not Path(directory).exists()
     raise SystemExit(0 if all(passed) else 1)
