@@ -86,11 +86,7 @@ fn launch(thread: &OsStr, message: &OsStr) -> io::Result<(Child, fs::File, io::P
         .stderr(output.try_clone()?);
     // A session leader cannot move itself out of the owned process group.
     crate::workflow::worker_owner::new_session(&mut cmd);
-    for (name, _) in env::vars_os() {
-        if crate::tmux::launch::router_credential(&name.to_string_lossy()) {
-            cmd.env_remove(name);
-        }
-    }
+    crate::workflow::controller::strip_credentials(&mut cmd);
     let lifetime = guard_group(&mut cmd)?;
     Ok((cmd.spawn()?, output, lifetime))
 }

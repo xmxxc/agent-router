@@ -1,6 +1,9 @@
 //! R1 Herdr assignments. A stable lock covers inspection, input claims, close
 //! and reconciliation while atomic replacements publish complete record generations.
-use super::{backend, host, read_record, state_dir, valid_id, valid_identity, write_json};
+use super::{
+    backend, controller, host, read_record, record_scope, state_dir, valid_id, valid_identity,
+    write_json,
+};
 use crate::host_launch;
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
@@ -47,6 +50,23 @@ struct Assignment<'a> {
 }
 
 impl<'a> Assignment<'a> {
+    fn lock_unowned(state: &'a Path, id: &str, operation: &str) -> Result<(Self, File)> {
+        ensure!(valid_id(id), "invalid dispatch ID");
+        native_state(state)?;
+        let row = read_record(&state.join("dispatches").join(format!("{id}.json")))?;
+        let scope = record_scope(&row).context("invalid dispatch scope")?;
+        let authorize = || controller::Owners::read(state)?.require(scope, None, operation);
+        authorize()?;
+        let scope_lock = controller::lock_scope(state, scope)?;
+        authorize()?;
+        let unit = Self::lock(state, id, None)?;
+        ensure!(
+            record_scope(&unit.row) == Some(scope),
+            "Herdr scope changed"
+        );
+        Ok((unit, scope_lock))
+    }
+
     fn lock(state: &'a Path, id: &str, new: Option<Value>) -> Result<Self> {
         ensure!(valid_id(id), "invalid dispatch ID");
         native_state(state)?;
@@ -408,6 +428,17 @@ impl Assignment<'_> {
         receipt
     }
 
+    fn replay_close(&self, handle: &Handle) -> Result<Option<Value>> {
+        let Some(worker) = self.verified_archive(handle)? else {
+            return Ok(None);
+        };
+        let mut outcome = json!({"result":"completed","diagnostic":"session was already gone"});
+        if !valid_close_worker(&worker) {
+            outcome["closeWorkerDiagnostic"] = json!(INVALID_CLOSE_WORKER);
+        }
+        Ok(Some(self.close_receipt(outcome)))
+    }
+
     fn finish_close(&mut self, mut outcome: Value) -> Result<Value> {
         let mut next = self.row.clone();
         let event = next["audit"]
@@ -428,23 +459,29 @@ impl Assignment<'_> {
     }
 }
 
-pub(super) fn close(state: &Path, row: &Value) -> Result<Value> {
-    let mut unit = Assignment::lock(
+fn lock_close<'a>(state: &'a Path, row: &Value) -> Result<Assignment<'a>> {
+    let unit = Assignment::lock(
         state,
         row["dispatch"].as_str().context("missing dispatch")?,
         None,
     )?;
     ensure!(
-        unit.row["attempt"] == row["attempt"],
-        "Herdr attempt changed"
+        unit.row["attempt"] == row["attempt"] && record_scope(&unit.row) == record_scope(row),
+        "Herdr attempt or scope changed"
     );
+    Ok(unit)
+}
+
+pub(super) fn read_only_close(state: &Path, row: &Value) -> Result<Option<Value>> {
+    let unit = lock_close(state, row)?;
+    unit.replay_close(&unit.handle()?)
+}
+
+pub(super) fn close(state: &Path, row: &Value) -> Result<Value> {
+    let mut unit = lock_close(state, row)?;
     let mut handle = unit.handle()?;
-    if let Some(worker) = unit.verified_archive(&handle)? {
-        let mut outcome = json!({"result":"completed","diagnostic":"session was already gone"});
-        if !valid_close_worker(&worker) {
-            outcome["closeWorkerDiagnostic"] = json!(INVALID_CLOSE_WORKER);
-        }
-        return Ok(unit.close_receipt(outcome));
+    if let Some(receipt) = unit.replay_close(&handle)? {
+        return Ok(receipt);
     }
     let stopped = match handle.verified_stopped() {
         Ok(stopped) => stopped,
@@ -526,8 +563,9 @@ pub struct Input {
 
 pub fn submit(input: Input) -> Result<Value> {
     ensure!(input.op == "submit", "unsupported Herdr operation");
+    controller::require_controller("submit")?;
     let state = state_dir()?;
-    let mut unit = Assignment::lock(&state, &input.dispatch, None)?;
+    let (mut unit, _scope) = Assignment::lock_unowned(&state, &input.dispatch, "submit")?;
     ensure!(
         unit.row["round"] == input.round && unit.row["attempt"] == input.attempt,
         "stale Herdr input assignment"
@@ -607,6 +645,7 @@ impl Reconcile {
     }
 
     pub fn run(self) -> Result<Value> {
+        controller::require_controller("herdr-reconcile")?;
         ensure!(
             !self.mapping.actor.trim().is_empty() && !self.mapping.evidence.trim().is_empty(),
             "herdr-reconcile requires nonempty actor and evidence"
@@ -616,7 +655,8 @@ impl Reconcile {
             "controller owner authorization is unavailable"
         );
         let state = state_dir()?;
-        let mut unit = Assignment::lock(&state, &self.dispatch, None)?;
+        let (mut unit, _scope) =
+            Assignment::lock_unowned(&state, &self.dispatch, "herdr-reconcile")?;
         ensure!(
             unit.verified_archive(&unit.handle()?)?.is_none(),
             "Herdr dispatch closed"

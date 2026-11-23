@@ -1,8 +1,8 @@
 //! One detached, single-threaded wfc owns and reaps one Linux worker tree.
-use super::{read_record, state_dir, valid_id, valid_identity};
+use super::{controller, messages, read_record, record_scope, state_dir, valid_id, valid_identity};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::{
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-pub const CLOSE_USAGE: &str = "wfc close DISPATCH";
+pub const CLOSE_USAGE: &str = "wfc close DISPATCH [--owner-token TOKEN]";
 const POLL: Duration = Duration::from_millis(50);
 
 pub fn command(program: &Path) -> Result<Command> {
@@ -133,12 +133,16 @@ pub fn status(dir: &Path, record: &Value) -> Result<Value> {
     Ok(json!({"state":"running"}))
 }
 
-pub fn close(id: &OsStr) -> Result<Value> {
-    let id = id
-        .to_str()
-        .filter(|id| valid_id(id))
-        .context("invalid dispatch ID")?;
-    let dir = state_dir()?.join("dispatches");
+pub fn parse_close(args: &[OsString]) -> Result<(&str, Option<&str>)> {
+    let mut id = None;
+    let [token] = messages::options(args, ["--owner-token"], Some(&mut id))?;
+    Ok((id.context("missing dispatch ID")?, token))
+}
+
+pub fn close(id: &str, explicit_token: Option<&str>) -> Result<Value> {
+    ensure!(valid_id(id), "invalid dispatch ID");
+    let state = state_dir()?;
+    let dir = state.join("dispatches");
     let record = super::assignment::public_record(&dir, id)?
         .with_context(|| format!("unknown dispatch {id}"))?;
     ensure!(
@@ -150,8 +154,22 @@ pub fn close(id: &OsStr) -> Result<Value> {
         record.get("controllerOwner").is_none_or(Value::is_null),
         "controller owner authorization required"
     );
+    let scope = record_scope(&record).context("invalid dispatch scope")?;
+    let token = controller::token(explicit_token);
+    let authorize = || controller::Owners::read(&state)?.require(scope, token.as_deref(), "close");
+    if !authorize()? && record["host"].is_string() {
+        // A confirmed archive can be read before taking a write lock. Any
+        // inconclusive or failed read goes through the usual locked path.
+        if let Ok(Some(receipt)) = super::backend::read_only_close(&state, &record) {
+            if !authorize()? {
+                return Ok(receipt);
+            }
+        }
+    }
+    let _scope_lock = controller::lock_scope(&state, scope)?;
+    authorize()?;
     if record["host"].is_string() {
-        return super::backend::close(dir.parent().context("missing state directory")?, &record);
+        return super::backend::close(&state, &record);
     }
     // Older foreground records were only published after successful exit.
     let mut already_gone = true;

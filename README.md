@@ -45,7 +45,7 @@ wfc dispatch --host codex --task task.md --cwd . --report reports/04-review/r1.m
 wfc status --active
 ```
 
-默认使用 tmux。此组合调用同一可执行文件中的 tmux 后端（#31）。宿主可选 codex、opencode 或 claude，`--launch-config` 或 `WFC_LAUNCH_CONFIG` 指向带有 env、hosts 的 JSON 配置。每个宿主可指定 command、runtime 参数数组及 env。完整参数见 `wfc dispatch --help`。bundled 后端与控制器授权由对应工单接入。
+默认使用 tmux。此组合调用同一可执行文件中的 tmux 后端（#31）。宿主可选 codex、opencode 或 claude，`--launch-config` 或 `WFC_LAUNCH_CONFIG` 指向带有 env、hosts 的 JSON 配置。每个宿主可指定 command、runtime 参数数组及 env。完整参数见 `wfc dispatch --help`。bundled 后端由对应工单接入。
 
 Linux 也支持 Herdr 0.9.5（协议 22）。先启动自己的 Herdr 服务，再把仅当前用户可访问的 socket 绝对路径交给派发命令。也可用 `WFC_HERDR_ENDPOINT` 指定，命令行优先。
 
@@ -64,7 +64,7 @@ wfc close "$dispatch"
 
 关闭意图与新的 `done` 消息串行提交。首次回报按当前 dispatch、round 和 attempt 核对关闭记录。关闭待确认或已经确认时，同一键和报告可重取原消息号，新完成记录会被拒绝。待确认的派发始终列在 `status --active` 的 `dispatches` 中。已确认的任务结果（包括原失败退出码）继续显示，`closePending` 单独表示资源关闭进度。启动回执读取出错时，状态查询在 `launchDiagnostic` 中保留原因；已核实的关闭归档继续提供本轮结果和资源状态。对有根进程的绑定，归档须与当前绑定的根 PID 和创建标识一致，当前绑定可以记录更多后来发现的写者。归档身份异常时，`backendDiagnostic` 说明原因，资源关闭保持待确认。可信的启动回执仍能提供 worker 退出码。停机证明须为非空白文本，且绑定中已无任何写者。旧归档的 worker 结果损坏时，`closeWorkerDiagnostic` 保留原因，已核实的资源状态仍为已关闭。
 
-这组入口支持独立 Rust 状态目录里、本程序创建且未登记 controller owner 的第一轮派发。状态目录中出现 Python `router.db` 时，须先集成旧库和 owner 身份。受控服务联验可用 `python3 tests/herdr_public.py /path/to/herdr target/debug/wfc -v`。通过 `--herdr-backend` 向同一 `wfc` 的标准输入提供 `{"op":"submit","dispatch":"…","round":1,"attempt":"…","text":"…"}`，可验证投递认领与回执丢失后的处理。正式的 `reply`、跨轮复用、owner 接替与旧库身份迁移分别由对应工单集成。
+Herdr 首轮派发、输入和补绑使用独立 Rust 状态目录中的无主 scope。若随后认领该 scope，关闭须使用当前 owner 凭据。状态目录中出现 Python `router.db` 时，须先集成旧库和 owner 身份。受控服务联验可用 `python3 tests/herdr_public.py /path/to/herdr target/debug/wfc -v`。通过 `--herdr-backend` 向同一 `wfc` 的标准输入提供 `{"op":"submit","dispatch":"…","round":1,"attempt":"…","text":"…"}`，可验证投递认领与回执丢失后的处理。正式的 `reply`、跨轮复用和旧库身份迁移分别由对应工单集成。
 
 `--launch-config` 优先于 `WFC_LAUNCH_CONFIG`。启动参数依次为宿主的 `runtime` 数组、`command` 数组、wfc 为本次任务生成的 Codex 参数。路径含空格时直接写在同一个 JSON 字符串中。例如 npm 安装的 Codex 可以指定 Node 和脚本各自的绝对路径。
 
@@ -94,7 +94,7 @@ python3 tools/check_codex.py target/x86_64-unknown-linux-gnu/release/wfc \
 
 点名查询 `wfc status --dispatch ID` 返回当前 worker 进程状态、各轮任务结果及消息。接入 #6/#7 后，首条完成回报固定该轮的报告和 Git 快照，后续领取或进程退出仍能查回。已完成且会话仍存活的任务在 `status --active` 的 reclaimable 数组中。长编号和旧版短编号均可查询、关闭。
 
-tmux 会话的首次关闭动作记录在 `closeEffect` 中。若同一 worker 在会话关闭后才写出退出码，后续查询和重复关闭都会返回该退出码，并保留首次动作。创建响应丢失时按原 attempt 查询启动登记；关闭归档写入失败时，重试会按原 attempt 重放同一次关闭。证据不足时，关闭返回未决。
+tmux 会话的首次关闭动作记录在 `closeEffect` 中。若同一 worker 在会话关闭后才写出退出码，后续查询和重复关闭都会返回该退出码，并保留首次动作。创建响应丢失时按原 attempt 查询启动登记；关闭归档写入失败时，重试会按原 attempt 重放同一次关闭。无主 scope 的已确认关闭回执可从只读历史副本重取。证据不足时，关闭返回未决。
 
 `dispatch` 接收调用方指定的角色、任务文件和工作目录。`--` 后依次放受控 worker 的程序和参数。下面的 Bash 示例让 worker 在工作目录中写出它实际读到的任务，再由另一个 CLI 查回编号。
 
@@ -133,6 +133,10 @@ wfc wait --scope team-a --timeout 30
 `wait` 默认等待 3600 秒，`--timeout` 接受小数秒，设为 0 可立即查询。它按提交顺序返回 `messages`，包含派发、轮次、attempt、角色、scope、报告路径、Git 快照、数字编号 `id` 和 `messageId`。可按 `--scope NAME`、`--dispatch ID` 或两者共同筛选。首次提交为 `unsent`（版本 1），领取为 `received`（版本 2）。消息在输出前标记为已收取，其他等待者可领取剩余消息。超时返回 `{"messages":[],"timedOut":true}`，退出码为 3。
 
 总控重启后，运行 `wfc status --dispatch ID`，从 `dispatches[0].messages` 找回原消息。历史按提交顺序排列，查询不会改变回执。处理完报告后，用消息的数字编号或稳定编号运行 `wfc ack MESSAGE`。回执变为 `processed`，版本增加一次。并发确认时只有一个调用实际推进状态，其余调用和稍后的重试返回同一版本，并标记 `duplicate: true`。
+
+用 `wfc owner acquire --scope team-a --owner controller-a` 为该组认领默认 60 秒的租约。将返回的 `token` 保存在总控环境的 `WFC_CONTROLLER_TOKEN` 中，或在单次操作时用 `--owner-token` 指定。用 `wfc owner renew --scope team-a` 续租。另一位总控可用 `wfc owner takeover --scope team-a` 接管并领取新凭据。接管完成后，旧凭据的 `wait`、`ack` 和下一批 `relay` 会报 `stale_controller_owner`。
+
+状态目录一旦有租约记录，`wait` 和 `relay` 都需要指定 `--scope`。尚未认领的组仍可用原命令。普通总控可用 `status --dispatch ID` 查看组的 owner、代数和租约状态。
 
 外部投递结果为 `unknown` 时，先核实对方确已收到，再用下面的命令记录证据。
 

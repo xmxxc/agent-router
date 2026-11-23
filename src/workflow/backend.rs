@@ -39,6 +39,7 @@ fn call(state: &Path, row: &Value, mut request: Value) -> Result<Value> {
     );
     request["dispatch"] = row["dispatch"].clone();
     let mut command = Command::new(env::current_exe()?);
+    super::controller::strip_credentials(&mut command);
     command.arg("--tmux-backend").env("WFC_STATE", state);
     if let Some(socket) = row["tmuxSocket"].as_str() {
         command.env("WFC_TMUX_SOCKET", socket);
@@ -401,7 +402,12 @@ fn exited(evidence: &Value) -> Option<Value> {
 
 // The close effect describes the session. Its supervisor can still publish
 // a process exit later. Both archived reads and close replays use this view.
-fn closed_worker(state: &Path, row: &Value, saved: &Value) -> Result<Value> {
+fn closed_worker(
+    state: &Path,
+    row: &Value,
+    saved: &Value,
+    inspect_legacy: bool,
+) -> Result<Option<Value>> {
     let worker = &saved["worker"];
     if saved["closeEffect"] == "session_closed" && worker["state"] == "cancelled" {
         let known = receipt_id(row)?;
@@ -433,6 +439,9 @@ fn closed_worker(state: &Path, row: &Value, saved: &Value) -> Result<Value> {
             // R2 embedded the original, unscoped create reply in the assignment.
             // Verify its selector with the backend before enriching an R3 archive.
             None if known.is_some() && row["round"] == 1 && row["executionId"].is_null() => {
+                if !inspect_legacy {
+                    return Ok(None);
+                }
                 match existing(state, row, "inspect") {
                     Ok(reply) if reply["result"] == "accepted" && reply["alive"] == false => known,
                     _ => None,
@@ -441,10 +450,10 @@ fn closed_worker(state: &Path, row: &Value, saved: &Value) -> Result<Value> {
             None => None,
         };
         if let Some(exit) = exited(&private_receipt(state, id)?) {
-            return Ok(exit);
+            return Ok(Some(exit));
         }
     }
-    Ok(worker.clone())
+    Ok(Some(worker.clone()))
 }
 
 #[cfg(target_os = "linux")]
@@ -572,7 +581,8 @@ pub fn observe(state: &Path, row: &mut Value) -> Result<(Value, Value)> {
     if confirmed(row, &saved) {
         let mut observation = json!({"result":"completed","alive":false});
         copy_close_fields(&saved, &mut observation);
-        return Ok((closed_worker(state, row, &saved)?, observation));
+        let worker = closed_worker(state, row, &saved, true)?.context("missing archived worker")?;
+        return Ok((worker, observation));
     }
 
     let (worker, mut inspection) = inspect_worker(state, row, &saved)?;
@@ -642,6 +652,34 @@ fn inspect_worker(state: &Path, row: &Value, saved: &Value) -> Result<(Value, Va
     Ok((worker, inspection))
 }
 
+fn close_receipt(row: &Value) -> Value {
+    json!({"dispatch":row["dispatch"],"operation":"close","result":"completed","round":row["round"],"attempt":row["attempt"]})
+}
+
+fn replay(state: &Path, row: &Value, saved: &Value, inspect_legacy: bool) -> Result<Option<Value>> {
+    let Some(worker) = closed_worker(state, row, saved, inspect_legacy)? else {
+        return Ok(None);
+    };
+    let mut receipt = close_receipt(row);
+    receipt["worker"] = worker;
+    copy_close_fields(saved, &mut receipt);
+    receipt["diagnostic"] = json!("session was already gone");
+    Ok(Some(receipt))
+}
+
+pub(super) fn read_only_close(state: &Path, row: &Value) -> Result<Option<Value>> {
+    #[cfg(target_os = "linux")]
+    if row["backend"] == "herdr" {
+        return super::herdr::read_only_close(state, row);
+    }
+    if row["backend"] == "tmux" {
+        if let Some(saved) = archive(state, row)?.filter(|saved| confirmed(row, saved)) {
+            return replay(state, row, &saved, false);
+        }
+    }
+    Ok(None)
+}
+
 pub fn close(state: &Path, row: &Value) -> Result<Value> {
     #[cfg(target_os = "linux")]
     if row["backend"] == "herdr" {
@@ -658,14 +696,11 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
         _lock = super::assignment::close_lock(state, row)?;
         archive(state, row)?.unwrap_or(Value::Null)
     };
-    let mut receipt = json!({"dispatch":id,"operation":"close","result":"completed","round":row["round"],"attempt":row["attempt"]});
     if confirmed(row, &saved) {
-        receipt["worker"] = closed_worker(state, row, &saved)?;
-        copy_close_fields(&saved, &mut receipt);
-        receipt["diagnostic"] = json!("session was already gone");
-        return Ok(receipt);
+        return replay(state, row, &saved, true)?.context("missing archived close receipt");
     }
 
+    let mut receipt = close_receipt(row);
     let (before, observed) = inspect_worker(state, row, &saved)?;
     let previous_revocation = saved_revocation(row, &saved);
     let pending_native = (row["createPending"] == true || row["create"]["result"] == "uncertain")

@@ -188,16 +188,27 @@ pub(super) fn queue(
     messages: &[Value],
     text: &str,
     limit: Duration,
+    scope_lock: Option<&std::fs::File>,
 ) -> Result<Outcome> {
     let ids: Vec<_> = messages.iter().map(|m| m["id"].as_u64().unwrap()).collect();
     let mut supervisor = Command::new(env::current_exe()?);
+    crate::workflow::controller::strip_credentials(&mut supervisor);
     supervisor
         .arg("--relay-queue")
         .arg(std::process::id().to_string())
         .arg(limit.as_secs_f64().to_string())
         .arg(thread)
-        .arg(text)
-        .stdin(Stdio::null());
+        .arg(text);
+    // The private supervisor keeps the claim's scope locked while it reaps a
+    // queue after relay death. Its external Codex child uses /dev/null.
+    let stdin = match scope_lock.map(std::fs::File::try_clone).transpose() {
+        Ok(stdin) => stdin,
+        Err(e) => {
+            println!("router relay: queue supervisor could not inherit scope lock for messages {ids:?}: {e}");
+            return Ok(Outcome::Failed);
+        }
+    };
+    supervisor.stdin(stdin.map_or_else(Stdio::null, Stdio::from));
     crate::workflow::worker_owner::new_session(&mut supervisor);
     let mut child = match supervisor.spawn() {
         Ok(child) => child,

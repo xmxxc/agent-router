@@ -1,0 +1,131 @@
+name: Linux scope ownership
+on:
+  push:
+    branches: [rust-router/15-owner]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  scope-ownership:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      WFC_BUILD_ID: ${{ github.sha }}
+      NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+      CARGO_BUILD_JOBS: '2'
+      PYTHONUTF8: '1'
+      EVIDENCE: ${{ github.workspace }}/linux-owner-evidence
+    steps:
+      - name: Record run identity
+        run: |
+          mkdir -p "$EVIDENCE"
+          printf 'Workflow %s\nRun %s attempt %s\nExpected product %s\n' \
+            "$GITHUB_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$WFC_BUILD_ID" | tee "$EVIDENCE/run.log"
+          uname -a | tee -a "$EVIDENCE/run.log"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.WFC_BUILD_ID }}
+          path: product
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.NATIVE_INPUT_SHA }}
+          path: native-input
+          sparse-checkout: vendor/zlib-1.3.1.tar.gz
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        with:
+          version: '0.16.0'
+      - name: Verify sources and prepare the native build
+        working-directory: product
+        run: |
+          git log -1 --format='Rust HEAD %H tree %T' | tee "$EVIDENCE/sources.log"
+          test "$(git rev-parse HEAD)" = "$WFC_BUILD_ID"
+          test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
+          sha256sum vendor/INPUTS.sha256 tests/owner.py tests/relay.py tests/receipts.py tests/herdr_public.py tools/check_tmux.py | tee "$EVIDENCE/inputs.log"
+          sha256sum -c vendor/INPUTS.sha256 2>&1 | tee -a "$EVIDENCE/inputs.log"
+          rustup toolchain install 1.96.1 --profile minimal 2>&1 | tee "$EVIDENCE/toolchain.log"
+          { rustc -vV; cargo --version; zig version; python --version; } | tee -a "$EVIDENCE/toolchain.log"
+          python tools/prepare.py --zlib-archive ../native-input/vendor/zlib-1.3.1.tar.gz 2>&1 | tee -a "$EVIDENCE/inputs.log"
+      - name: Build the Linux CLI
+        id: build
+        working-directory: product
+        run: |
+          cargo build --release --locked --bin wfc 2>&1 | tee "$EVIDENCE/build.log"
+          sha256sum target/release/wfc | tee "$EVIDENCE/binary.log"
+          version=$(target/release/wfc --version)
+          printf '%s\n' "$version" | tee -a "$EVIDENCE/binary.log"
+          [[ "$version" == *"(Rust, x86_64-unknown-linux-gnu, release, build $WFC_BUILD_ID)" ]]
+      - name: Verify controller ownership and receipt delivery
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: |
+          failed=0
+          for fixture in owner receipts relay; do
+            python -Bu "tests/$fixture.py" target/release/wfc 2>&1 | tee "$EVIDENCE/$fixture.log" || failed=1
+          done
+          exit "$failed"
+      - name: Ensure native tmux is available
+        id: tmux
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          if ! command -v tmux >/dev/null; then
+            sudo apt-get update 2>&1 | tee "$EVIDENCE/tmux-install.log"
+            sudo apt-get install -y --no-install-recommends tmux 2>&1 | tee -a "$EVIDENCE/tmux-install.log"
+          fi
+          tmux -V | tee "$EVIDENCE/tmux.log"
+      - name: Run the Rust CLI and dispatch regressions
+        if: ${{ !cancelled() && steps.tmux.outcome == 'success' }}
+        working-directory: product
+        run: cargo test --workspace --release --locked 2>&1 | tee "$EVIDENCE/workspace-tests.log"
+      - name: Verify the callback through an isolated tmux server
+        if: ${{ !cancelled() && steps.tmux.outcome == 'success' }}
+        working-directory: product
+        run: |
+          python -Bu tools/check_tmux.py target/release/wfc -v \
+            Backend.test_managed_dispatch_callback_survives_takeover \
+            Backend.test_read_only_unowned_close_replays_confirmed_archive \
+            2>&1 | tee -a "$EVIDENCE/tmux.log"
+      - name: Verify public Herdr lifecycle on the pinned Linux server
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: |
+          herdr="$RUNNER_TEMP/herdr-0.9.5"
+          {
+            curl --fail --silent --show-error --location --retry 3 --max-time 120 \
+              https://github.com/herdrdev/herdr/releases/download/v0.9.5/herdr-linux-x86_64 -o "$herdr"
+            printf '%s  %s\n' 14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d "$herdr" \
+              | sha256sum --check --strict
+            chmod 700 "$herdr"
+            version=$("$herdr" --version)
+            printf '%s\n' "$version"
+            test "$version" = 'herdr 0.9.5'
+          } 2>&1 | tee "$EVIDENCE/herdr-input.log"
+          python -Bu tests/herdr_public.py "$herdr" target/release/wfc -v \
+            PublicLifecycle.test_dispatch_current_execution_done_and_close \
+            PublicLifecycle.test_named_status_during_done_then_exit \
+            PublicLifecycle.test_close_after_scope_takeover_fences_stale_herdr_controls \
+            2>&1 | tee "$EVIDENCE/herdr-public.log"
+      - name: Checksum evidence
+        if: always()
+        run: |
+          cd "$EVIDENCE"
+          sha256sum -- *.log > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: linux-owner-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 14

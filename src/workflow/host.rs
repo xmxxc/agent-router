@@ -39,7 +39,9 @@ pub fn clean(value: &str) -> String {
 }
 
 fn git_dir(cwd: &Path, flag: &str) -> Result<PathBuf> {
-    let out = Command::new("git")
+    let mut command = Command::new("git");
+    super::controller::strip_credentials(&mut command);
+    let out = command
         .args(["rev-parse", flag])
         .current_dir(cwd)
         .output()?;
@@ -76,14 +78,7 @@ fn append_env(to: &mut Map<String, Value>, from: Option<&Value>) -> Result<()> {
                     && v.as_str().is_some_and(|s| !s.contains('\0')),
                 "invalid env"
             );
-            if ![
-                "WFC_CONTROLLER_TOKEN",
-                "WFC_OWNER_TOKEN",
-                "WFC_WORKER_CALLBACK",
-            ]
-            .iter()
-            .any(|name| k.eq_ignore_ascii_case(name))
-            {
+            if !super::controller::is_credential(k) {
                 to.insert(k.clone(), v.clone());
             }
         }

@@ -1,5 +1,5 @@
 //! Private launch files and worker process receipts for Herdr on Linux.
-use crate::tmux::launch::router_credential;
+use crate::workflow::controller::is_credential;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -69,7 +69,7 @@ pub(crate) fn prepare(
         let k = k
             .into_string()
             .map_err(|_| anyhow::anyhow!("invalid worker launch"))?;
-        if !router_credential(&k) {
+        if !is_credential(&k) {
             environment.insert(
                 k,
                 v.into_string()
@@ -78,7 +78,7 @@ pub(crate) fn prepare(
         }
     }
     for (k, v) in extra_env {
-        if !router_credential(&k) || k == "WFC_WORKER_CALLBACK" {
+        if !is_credential(&k) || k == "WFC_WORKER_CALLBACK" {
             environment.insert(k, v);
         }
     }

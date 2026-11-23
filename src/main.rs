@@ -9,6 +9,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::ExitCode;
+use workflow::controller::{self, ControllerError, Owner};
 use workflow::messages::{Confirm, Done, Wait, ACK_USAGE, DONE_USAGE, RESOLVE_USAGE, WAIT_USAGE};
 
 const RESERVED_COMMANDS: &[&str] = &[
@@ -28,6 +29,16 @@ const UNEXPECTED_ARGUMENTS: &str = "wfc: unexpected arguments. See wfc --help";
 const RECLAIM_USAGE: &str = "wfc reclaim [--dispatch ID] (read-only preview of Python history)";
 
 fn main() -> anyhow::Result<ExitCode> {
+    match run() {
+        Err(err) if err.is::<ControllerError>() => {
+            eprintln!("{}", err.downcast_ref::<ControllerError>().unwrap());
+            Ok(ExitCode::FAILURE)
+        }
+        result => result,
+    }
+}
+
+fn run() -> anyhow::Result<ExitCode> {
     let mut args = env::args_os();
     let program = args.next().unwrap_or_default();
     let command = args.next().unwrap_or_else(|| {
@@ -61,6 +72,7 @@ fn main() -> anyhow::Result<ExitCode> {
             println!("{}", workflow::messages::relay::USAGE);
             println!("{ACK_USAGE}");
             println!("{RESOLVE_USAGE}");
+            println!("{}", controller::USAGE);
             println!(
                 "Workflow commands reserved for later builds: {}",
                 RESERVED_COMMANDS.join(", ")
@@ -153,18 +165,53 @@ fn main() -> anyhow::Result<ExitCode> {
         #[cfg(target_os = "linux")]
         Some("--worker-owner") => workflow::worker_owner::run(&args)?,
         #[cfg(target_os = "linux")]
-        Some("close") => match args.as_slice() {
-            [help] if help == "--help" || help == "-h" => {
-                println!("{}", workflow::worker_owner::CLOSE_USAGE)
+        Some("close") => {
+            use workflow::worker_owner::{close, parse_close, CLOSE_USAGE};
+            if args == ["--help"] || args == ["-h"] {
+                println!("{CLOSE_USAGE}");
+            } else {
+                let (id, token) = match parse_close(&args) {
+                    Ok(request) => request,
+                    Err(err) => {
+                        eprintln!("wfc: {err}. {CLOSE_USAGE}");
+                        return Ok(ExitCode::from(2));
+                    }
+                };
+                controller::require_controller("close")?;
+                println!("{}", close(id, token)?);
             }
-            [id] if !id.as_encoded_bytes().starts_with(b"-") => {
-                println!("{}", workflow::worker_owner::close(id)?)
+        }
+        Some(name) if name == "owner" || controller::ALIASES.contains(&name) => {
+            let (action, options) = if name == "owner" {
+                match args.split_first() {
+                    Some((action, rest)) => (action.to_str().unwrap_or_default(), rest),
+                    None => ("", args.as_slice()),
+                }
+            } else {
+                (name, args.as_slice())
+            };
+            if args == ["--help"]
+                || args == ["-h"]
+                || (controller::ALIASES.contains(&action)
+                    && (options == ["--help"] || options == ["-h"]))
+            {
+                println!("{}", controller::USAGE);
+            } else {
+                if !controller::ALIASES.contains(&action) {
+                    eprintln!("wfc: {}", controller::USAGE);
+                    return Ok(ExitCode::from(2));
+                }
+                let request = match Owner::parse(action, options) {
+                    Ok(request) => request,
+                    Err(err) => {
+                        eprintln!("wfc: {err}. {}", controller::USAGE);
+                        return Ok(ExitCode::from(2));
+                    }
+                };
+                controller::require_controller(name)?;
+                println!("{}", request.run()?);
             }
-            _ => {
-                eprintln!("wfc: {}", workflow::worker_owner::CLOSE_USAGE);
-                return Ok(ExitCode::from(2));
-            }
-        },
+        }
         Some("dispatch") => {
             let request = match workflow::Dispatch::parse(&args) {
                 Ok(request) => request,
@@ -173,6 +220,7 @@ fn main() -> anyhow::Result<ExitCode> {
                     return Ok(ExitCode::from(2));
                 }
             };
+            controller::require_controller("dispatch")?;
             println!("{}", request.run()?);
         }
         Some("status") => {
@@ -185,6 +233,7 @@ fn main() -> anyhow::Result<ExitCode> {
                     return Ok(ExitCode::from(2));
                 }
             };
+            controller::require_controller("status")?;
             println!("{}", workflow::status(id, active)?);
         }
         #[cfg(target_os = "linux")]
@@ -210,6 +259,7 @@ fn main() -> anyhow::Result<ExitCode> {
                     return Ok(ExitCode::from(2));
                 }
             };
+            controller::require_controller("reclaim")?;
             let state = wfc_legacy_state::state_dir()?;
             println!("{}", wfc_legacy_state::reclaim_preview(&state, dispatch)?);
         }
@@ -236,6 +286,7 @@ fn main() -> anyhow::Result<ExitCode> {
                     return Ok(ExitCode::from(2));
                 }
             };
+            controller::require_controller(name)?;
             println!("{}", request.run()?);
         }
         #[cfg(target_os = "linux")]
@@ -251,6 +302,7 @@ fn main() -> anyhow::Result<ExitCode> {
                         return Ok(ExitCode::from(2));
                     }
                 };
+                controller::require_controller("relay")?;
                 relay.run()?;
             }
         }
@@ -262,6 +314,7 @@ fn main() -> anyhow::Result<ExitCode> {
                     return Ok(ExitCode::from(2));
                 }
             };
+            controller::require_controller("wait")?;
             let messages = request.run()?;
             if messages.is_empty() {
                 println!("{}", serde_json::json!({"messages": [], "timedOut": true}));

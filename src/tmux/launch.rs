@@ -32,16 +32,6 @@ struct Spec {
     env: BTreeMap<String, String>,
 }
 
-pub(crate) fn router_credential(key: &str) -> bool {
-    [
-        "WFC_CONTROLLER_TOKEN",
-        "WFC_OWNER_TOKEN",
-        "WFC_WORKER_CALLBACK",
-    ]
-    .iter()
-    .any(|name| key.eq_ignore_ascii_case(name))
-}
-
 fn private_file(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut f = OpenOptions::new()
         .create_new(true)
@@ -434,12 +424,12 @@ impl Tmux<'_> {
         let mut environment = BTreeMap::new();
         for (k, v) in env::vars_os() {
             let k = k.into_string().map_err(|_| bad())?;
-            if !router_credential(&k) {
+            if !crate::workflow::controller::is_credential(&k) {
                 environment.insert(k, v.into_string().map_err(|_| bad())?);
             }
         }
         for (k, v) in launch.env {
-            if !router_credential(&k) || k == "WFC_WORKER_CALLBACK" {
+            if !crate::workflow::controller::is_credential(&k) || k == "WFC_WORKER_CALLBACK" {
                 environment.insert(k, v);
             }
         }

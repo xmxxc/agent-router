@@ -1,3 +1,4 @@
+pub mod controller;
 mod git_snapshot;
 pub mod messages;
 use anyhow::{ensure, Context, Result};
@@ -23,7 +24,7 @@ pub mod host;
 mod view;
 
 pub const DISPATCH_USAGE: &str =
-    "wfc dispatch --host {codex,opencode,claude} --task FILE --cwd DIR --report FILE [--backend {tmux,herdr,bundled}] [--herdr-endpoint PATH] [--launch-config FILE] [--scope S] [--role R] [--model M] [--effort E] [--label L] [--git] [--network]\n    wfc dispatch --role ROLE --task FILE --cwd DIR [--report FILE] [--scope S] -- PROGRAM [ARG ...]";
+    "wfc dispatch --host {codex,opencode,claude} --task FILE --cwd DIR --report FILE [--backend {tmux,herdr,bundled}] [--herdr-endpoint PATH] [--launch-config FILE] [--scope S] [--role R] [--model M] [--effort E] [--label L] [--git] [--network] [--owner-token TOKEN]\n    wfc dispatch --role ROLE --task FILE --cwd DIR [--report FILE] [--scope S] [--owner-token TOKEN] -- PROGRAM [ARG ...]";
 pub const STATUS_USAGE: &str = "wfc status [--dispatch ID | --active]";
 
 pub struct Dispatch<'a> {
@@ -33,6 +34,7 @@ pub struct Dispatch<'a> {
     cwd: &'a Path,
     report: Option<&'a Path>,
     scope: Option<&'a str>,
+    owner_token: Option<&'a str>,
     worker: &'a [OsString],
 }
 
@@ -80,7 +82,10 @@ impl<'a> Dispatch<'a> {
             );
             let value = it
                 .next()
-                .filter(|v| !v.is_empty() && !v.as_encoded_bytes().starts_with(b"--"))
+                .filter(|v| {
+                    (!v.is_empty() || flag == "--owner-token")
+                        && !v.as_encoded_bytes().starts_with(b"--")
+                })
                 .with_context(|| format!("missing value for {flag}"))?;
             ensure!(values.insert(flag, value).is_none(), "duplicate {flag}");
         }
@@ -93,10 +98,6 @@ impl<'a> Dispatch<'a> {
                 })
                 .transpose()
         };
-        ensure!(
-            !values.contains_key("--owner-token"),
-            "controller owner authorization is unavailable"
-        );
         let role = string("--role")?;
         let report = values.get("--report").copied().map(Path::new);
         let host = if worker.is_empty() {
@@ -136,7 +137,7 @@ impl<'a> Dispatch<'a> {
                 flags.is_empty()
                     && values.keys().all(|k| matches!(
                         *k,
-                        "--role" | "--task" | "--cwd" | "--report" | "--scope"
+                        "--role" | "--task" | "--cwd" | "--report" | "--scope" | "--owner-token"
                     )),
                 "host options require public dispatch without -- PROGRAM"
             );
@@ -149,6 +150,7 @@ impl<'a> Dispatch<'a> {
             cwd: Path::new(values.get("--cwd").copied().context("missing --cwd")?),
             report,
             scope: string("--scope")?,
+            owner_token: string("--owner-token")?,
             worker,
         })
     }
@@ -164,7 +166,6 @@ impl<'a> Dispatch<'a> {
 
         let state = state_dir()?;
         let records = state.join("dispatches");
-        fs::create_dir_all(&records).context("create dispatch state directory")?;
         let dispatch = format!("d-{}", Uuid::new_v4().simple());
         let attempt = format!("a-{}", Uuid::new_v4().simple());
         let round = 1;
@@ -172,8 +173,21 @@ impl<'a> Dispatch<'a> {
         let scope = if scope.is_empty() {
             format!("s-{}", Uuid::new_v4().simple())
         } else {
-            scope.chars().take(120).collect()
+            scope
         };
+        let token = controller::token(self.owner_token);
+        let authorize =
+            || controller::Owners::read(&state)?.require(&scope, token.as_deref(), "dispatch");
+        let managed = authorize()?;
+        ensure!(
+            !managed
+                || self
+                    .host
+                    .as_ref()
+                    .is_none_or(|host| host.backend != "herdr"),
+            "Herdr dispatch requires an unowned scope"
+        );
+        fs::create_dir_all(&records).context("create dispatch state directory")?;
         let default_report = cwd.join(format!("report-{dispatch}.md"));
         let report = report_destination(self.report.unwrap_or(&default_report))?;
         let report_dir = report
@@ -206,7 +220,7 @@ impl<'a> Dispatch<'a> {
         record["created"] = json!(std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs_f64());
-        let launch = if let Some(host) = &self.host {
+        let mut launch = if let Some(host) = &self.host {
             let label = host::clean(host.label.unwrap_or(""));
             record["label"] = json!(if label.is_empty() {
                 host::default_label(&cwd, report_dir)
@@ -258,13 +272,30 @@ impl<'a> Dispatch<'a> {
             record["worker"] = json!({"state":"running"});
         }
 
-        // Herdr checkpoints the assignment before its first remote effect.
+        // Herdr R1 checkpoints the assignment before its first remote effect.
         #[cfg(target_os = "linux")]
         if record["backend"] == "herdr" {
-            return herdr::create(&state, &record, launch.context("missing Herdr launch")?);
+            let _scope = controller::lock_scope(&state, &scope)?;
+            ensure!(!authorize()?, "Herdr dispatch requires an unowned scope");
+            let mut launch = launch.context("missing Herdr launch")?;
+            bind_worker_callback(&mut record, Some(&mut launch));
+            let mut output = herdr::create(&state, &record, launch)?;
+            output
+                .as_object_mut()
+                .unwrap()
+                .remove(controller::CALLBACK_HASH);
+            return Ok(output);
         }
 
-        let pending = assignment::reserve(&records, &dispatch, &record)?;
+        let (pending, callback) = {
+            let _ledger = messages::lock_for_publish(&state)?;
+            let managed = authorize()?;
+            // Raw commands on unowned scopes can still act as controllers,
+            // including dispatching their own workers.
+            let callback = (managed || launch.is_some())
+                .then(|| bind_worker_callback(&mut record, launch.as_mut()));
+            (assignment::reserve(&records, &dispatch, &record)?, callback)
+        };
         let mut preserve_binding = false;
         let result = (|| -> Result<()> {
             if let Some(launch) = launch {
@@ -303,6 +334,10 @@ impl<'a> Dispatch<'a> {
             let mut command = worker_owner::command(&program)?;
             #[cfg(not(target_os = "linux"))]
             let mut command = Command::new(program);
+            controller::strip_credentials(&mut command);
+            if let Some(secret) = callback {
+                command.env(controller::WORKER_CALLBACK, secret);
+            }
             command
                 .args(&self.worker[1..])
                 .current_dir(&cwd)
@@ -340,8 +375,23 @@ impl<'a> Dispatch<'a> {
         fs::rename(&pending, records.join(format!("{dispatch}.json"))).with_context(|| {
             format!("worker succeeded but publishing dispatch {dispatch} failed")
         })?;
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove(controller::CALLBACK_HASH);
         Ok(record)
     }
+}
+
+fn bind_worker_callback(record: &mut Value, launch: Option<&mut host::Launch>) -> String {
+    let secret = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    record[controller::CALLBACK_HASH] = json!(messages::body_hash(&secret));
+    if let Some(launch) = launch {
+        launch
+            .env
+            .insert(controller::WORKER_CALLBACK.into(), json!(secret));
+    }
+    secret
 }
 
 // Publish a complete generation while callback readers can still use .pending.
@@ -435,6 +485,14 @@ pub(crate) fn state_dir() -> Result<PathBuf> {
 
 fn valid_id(id: &str) -> bool {
     valid_identity(id, "d-")
+}
+
+fn record_scope(record: &Value) -> Option<&str> {
+    if record["scope"].is_null() {
+        record["dispatch"].as_str()
+    } else {
+        record["scope"].as_str()
+    }
 }
 
 fn valid_identity(id: &str, prefix: &str) -> bool {
@@ -580,6 +638,7 @@ fn status_with_history(
     }
     let mut undelivered = Vec::new();
     let mut reclaimable = Vec::new();
+    let owners = controller::Owners::read(&state)?;
     for record in &mut dispatches {
         if record["createPending"] == true && record["publicationDiagnostic"].is_string() {
             record["worker"] = json!({"state":"unknown"});
@@ -612,6 +671,15 @@ fn status_with_history(
                 Some("unknown") => Value::Null,
                 _ => json!(false),
             };
+        }
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove(controller::CALLBACK_HASH);
+        if let Some(scope) = record_scope(record) {
+            if let Some(owner) = owners.public(scope)? {
+                record["controllerOwner"] = owner;
+            }
         }
         // Read completion messages after observing the worker. A worker can
         // publish done and exit while its backend is being queried.

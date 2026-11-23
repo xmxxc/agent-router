@@ -89,6 +89,8 @@ for line in sys.stdin:
         self.env['WFC_HERDR_ENDPOINT'] = '/missing/different.sock'
         view = self.status()
         self.assertTrue(view['backendAlive'])
+        self.assertNotIn('workerCallbackHash', self.row)
+        self.assertNotIn('workerCallbackHash', view)
         self.assertEqual(view['backendHandle']['service']['pid'], self.service.server.pid)
         self.assertTrue(view['backendHandle']['writerProcesses'][0]['creation'].startswith('linux:'))
         assignment = json.loads(live.wait_for(lambda: (self.root/'assignment').exists() and (self.root/'assignment').read_text()))
@@ -113,6 +115,25 @@ for line in sys.stdin:
         self.assertEqual(self.service.api('pane.process_info',pane_id=other)['process_info']['shell_pid'],pid)
         os.kill(pid, 0)
         self.assertEqual((self.root/'events').read_text().splitlines(), ['finish'])
+
+    def test_close_after_scope_takeover_fences_stale_herdr_controls(self):
+        self.dispatch()
+        scope = self.row['scope']
+        first = self.cli('acquire', '--scope', scope, '--owner', 'A')
+        current = self.cli('takeover', '--scope', scope, '--owner', 'B')
+        self.env['WFC_CONTROLLER_TOKEN'] = first['token']
+        self.submit('old text', error='stale_controller_owner')
+        self.reconcile(error='stale_controller_owner')
+        self.cli('close', self.dispatch_id, error='stale_controller_owner')
+        view = self.status()
+        self.assertTrue(view['backendAlive'])
+        self.assertEqual(view['controllerOwner']['generation'], current['generation'])
+        self.assertNotIn('workerCallbackHash', view)
+        self.assertFalse((self.root/'events').exists())
+        closed = self.cli('close', self.dispatch_id, '--owner-token', current['token'])
+        self.assertEqual((closed['result'], closed['attempt']), ('completed', self.row['attempt']))
+        print(json.dumps({'herdrOwnerGeneration': current['generation'],
+                          'herdrClosedAttempt': closed['attempt']}), flush=True)
 
     def test_claim_survives_lost_ack_and_reconcile(self):
         sends = []

@@ -141,11 +141,7 @@ impl Tmux<'_> {
             .env_remove("WFC_STATE")
             .env_remove("WFC_DISPATCH")
             .env_remove("WFC_TMUX_LAUNCH");
-        for (key, _) in env::vars_os() {
-            if launch::router_credential(&key.to_string_lossy()) {
-                command.env_remove(key);
-            }
-        }
+        crate::workflow::controller::strip_credentials(&mut command);
         command
     }
 
