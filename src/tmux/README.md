@@ -5,7 +5,7 @@
 | op | 输入和返回证据 |
 | --- | --- |
 | create | 必填 `cwd`、非空 `argv` 字符串数组，可选窗口名 `label` 和字符串映射 `env`。以 detached 方式启动 `wfc-<dispatch>`。启动结果引用私有 `receipt` 文件，记录宿主已启动、启动失败或已退出。 |
-| inspect | 返回 `alive`、`owned`。已确认归属时还返回同一 wfc 程序的 `attach` 参数数组，可在交互终端直接执行，执行时由 `--tmux-attach` 复核原服务的进程身份并固定 socket，再由原生 tmux 核对会话、pane、启动标记、窗口独占性和会话级 WFC_STATE，成功后可用 tmux 的 detach 键离开。 |
+| inspect | 返回 `alive`、`owned`。已确认归属时还返回原 worker 窗格是否已知的 `workerBound` 和同一 wfc 程序的 `attach` 参数数组，可在交互终端直接执行，执行时由 `--tmux-attach` 复核原服务的进程身份并固定 socket，再由原生 tmux 核对会话、pane、启动标记、窗口独占性和会话级 WFC_STATE，成功后可用 tmux 的 detach 键离开。 |
 | read | 返回当前 pane 的 `screen`。 |
 | submit | 必填 `text`，可选 `host`。在登记的 worker pane 上检查画面并按字面发送一次文字。每次按键都复核目标 pane 的会话归属和窗口独占性。Codex 有稳定匹配草稿时，最多补两次 Enter。 |
 | interrupt | 向登记且仍归该会话独占的 worker pane 发送 C-c。 |
@@ -28,9 +28,14 @@ printf '%s\n' '{"op":"read","dispatch":"d-abc12345"}' | WFC_STATE=/path/to/state
 
 用同一 `WFC_STATE` 与同一 tmux 服务访问会话。独立服务可用 `WFC_TMUX_SOCKET` 指定绝对 socket 路径，缺省沿用 tmux 的服务选择。调度层负责持久化服务选择、串行化同一 attempt 的业务操作，并向当前 worker 提供专用的 `env.WFC_WORKER_CALLBACK`。
 
-公开 CLI 首次派发时省略 `legacyExecutionId`。接管已有旧执行时，传入旧记录中该次实际启动的稳定唯一标识（如 attempt ID），以及原 state、dispatch 和服务选择。同一旧执行的重试使用相同标识；同一 dispatch 被旧客户端再次启动时使用新标识。即使首次操作是 create，也要传入旧执行信息。首次核验前会保存未决记录，服务失联、同名会话缺席、切换到另一显式 socket 或归属不符时返回 `uncertain`。后续省略该字段无法清除未决记录。关闭证明只适用于已核销的那次启动。若已有登记属于另一次执行，须先在原服务上证实前次执行已结束，再核验新传入的旧记录。R2 已登记的执行可直接沿用登记；如需给它传入标识，使用原登记中的启动编号或接管标记。对未提供此字段且无登记的兼容请求，create 可以在新服务上启动；其他操作首次发现服务不可达时会保存未决记录。
+### 公开 CLI 的调用约定
 
-旧服务恢复后，以完整会话名和会话级 WFC_STATE 确认归属。旧执行记录如有原 worker 的 tmux pane ID（如 `%3`），同时传 `legacyWorkerPane`。后端保存该提示并在原会话中核验。缺少提示时，仅在该会话只含一个 pane 时接管；多个 pane 的旧会话保留未决，直到调用方提供可信的原 pane ID。调用方须定位原服务；升级前仅有名称和 state 的记录无法区分另一台逐项复制旧会话的服务。
+- **新派工预检。** 已知是全新派工时，inspect 或 create 传 `freshDispatch: true`。空 state、原 socket 尚不存在时，inspect 返回缺席，随后 create 可启动。无标识的兼容预检在服务不可达时可以返回未决，且不写入匿名待接管记录。显式新派工还可清理同一 socket 上 R3/R4 遗留的无身份预检记录。已有具体执行身份的登记始终参与核验。
+- **原生启动。** #42 在调用 create 或 resume 之前保存本次新启动的 `executionId`（如唯一 attempt ID）。后端在启动 tmux 前将该 ID 与私有启动编号关联。同一 dispatch 的下一次实际启动使用新 ID。启动前中断仍可按原 ID 核销尚未消费的预留；核销关闭后，该 ID 只用于查询或重放。启动响应丢失时，以同一 state、dispatch、服务选择及 `executionId` 调 inspect。已核实原启动后，返回 `executionId`、32 位小写十六进制 `launchId` 和 `receipt` 路径。worker 已退出时也可取得关联。公开层核对自己的 dispatch、round、attempt、返回的执行标识及 state 下的 `launches/<launchId>.json`，再读取该 worker 的终态。未登记或证据不足时维持未决。普通 inspect 也可沿用旧接口。
+- **旧执行。** 首次探测前传历史记录的稳定 `legacyExecutionId` 以及原 state、dispatch 和服务选择，即使首次操作为 create 或 resume。可信原窗格传 `legacyWorkerPane`。R1 的私有启动回执编号可传 `legacyLaunchId`，如果它本身就是 `legacyExecutionId` 可省略。后端在原会话中核对监督进程的启动参数、私有 started 回执及其 worker 的父进程，保存匹配的回执编号。若使用通用 attempt ID，且它也是 32 位十六进制字符串，请另传真正的 `legacyLaunchId`。原 pane 已离开整个服务、同一回执随后记录退出时，可清理剩余独占窗口。
+- **观察与业务输入。** `owned` 表示会话归属，已知原 worker 窗格时 inspect 同时返回 `workerBound: true`。首次接管时即使只剩一个 pane，也须有可信原 pane 或可核验的原启动关联才能发送文字、Enter 或 C-c。未建立绑定的会话仍可 inspect/read；业务输入和关闭保留未决。旧 Observed 记录中可能猜测出来的窗格也需要补证。只有会话名和 state 时，调用方须先定位原服务。
+- **按执行重放。** 普通 close 延续“本次动作”的语义。需要重放时，#42 在首次 close 前保存稳定的 `closeOperationId`（例如 `close:<attempt>`），与 `executionId` 或已核验的 `legacyExecutionId` 一起发送。公开归档失败后用同一对 ID 重试，返回首次已确认的 `closeEffect` 及 `closeOperationId`，不会再次关闭会话。若后端只保存了操作意图且无法证实动作，返回 uncertain。其他执行或操作的事实不能为它补证。历史执行的 inspect/close 从本方核销记录作答，同名后继会话保留自己的登记。最近一次已核销执行仍可按现有约定 resume。
+- **输入未送达。** 已登记执行的 submit 或 interrupt 无法启动首个只读 tmux 客户端时，返回 `definitely-not-sent / input_not_delivered`，并带 `inspectionResult=uncertain`。当前请求没有发送按键，原 worker 的生存状态仍需核实。文字已经送达后丢失响应继续按未决输入处理。
 
 创建前，后端在 state 下为该 dispatch 预留启动编号。宿主必须先成功取走一次性启动文件，再登记服务的 Linux 启动标识、PID 命名空间、进程启动时间、会话和 pane 编号，然后启动 worker。创建失败或明确请求 close 时，如果后端先取回该文件，会记录 `not_started`，可以用同一 dispatch 重试。若写入启动回执失败，会尝试留下独立的无凭据撤销标记，并在创建结果的 `cancellationEvidence` 中返回路径。两种证据均无法落盘时，后续核验保留未决。若文件已被取走、服务身份及回执均缺失，则保留 `uncertain`。已登记的服务失联后，恢复原服务可重新核验；确认原服务已退出，或在原服务确认原会话和原 pane 均已消失后，才能按缺席处理。核验使用 Linux procfs 和可写的 state。
 
@@ -38,4 +43,4 @@ resume 创建成功后，`launchResult` 为 `accepted`，`receipt` 指向启动�
 
 请求格式错误或选择了其他后端时，进程非零退出。有效操作从 JSON 的 `result` 取结果。`accepted` 表示后端确认操作，`completed` 表示完成关闭，`definitely-not-sent` 表示确认未送，`refused` 表示归属或宿主拒绝，`uncertain` 需检查现场。文字写入后丢失 Enter 回执，归入 `input_uncertain`，调用方须保留未决输入，避免重放。宿主实际产生几条正式消息、当前 attempt 是否完成，由调度层查宿主记录和业务回执。
 
-真实后端测试使用新建的临时 socket、state 和受控终端程序。先构建 Rust 的 wfc，再运行 `python3 tools/check_tmux.py target/debug/wfc -v`。
+真实后端测试使用新建的临时 socket、state 和受控终端程序。先构建 Rust 的 wfc，再运行 `python3 tools/check_tmux.py target/debug/wfc -v`。设置 `WFC_TEST_R1_BINARY` 为 R1 固定件的路径可同时运行真实跨版本回归。
