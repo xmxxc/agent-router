@@ -65,29 +65,68 @@ pub(super) struct Group {
     pub identity: Value,
 }
 
+#[derive(Debug)]
+pub(super) struct AllocationFailure {
+    pub diagnostic: anyhow::Error,
+    pub group_cleanup: &'static str,
+    pub path: Option<PathBuf>,
+}
+
+// Before mkdir succeeds, no group is owned and no rollback is necessary.
+impl From<anyhow::Error> for AllocationFailure {
+    fn from(diagnostic: anyhow::Error) -> Self {
+        Self {
+            diagnostic,
+            group_cleanup: "not-created",
+            path: None,
+        }
+    }
+}
+
 impl Group {
-    pub fn create(root: &Path) -> Result<Self> {
+    pub fn create(root: &Path) -> Result<Self, AllocationFailure> {
         let parent = directory(root)?;
         check_cgroup(&parent)?;
         let name = format!("wfc-{}", fresh());
         let relative = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(&name);
         fs::create_dir(&relative).context("create delegated cgroup")?;
-        let result = (|| {
+        Self::open_new(parent, root, name)
+    }
+
+    fn open_new(parent: File, root: &Path, name: String) -> Result<Self, AllocationFailure> {
+        let path = root.join(&name);
+        let initialized = (|| -> Result<_> {
             let dir = child_file(&parent, OsStr::new(&name), libc::O_DIRECTORY)?;
             let stat = dir.metadata()?;
             child_file(&dir, OsStr::new("cgroup.kill"), libc::O_WRONLY)?;
-            let identity = json!({"kind":"cgroup-v2","path":root.join(&name),"device":stat.dev(),"inode":stat.ino()});
-            Ok(Self {
+            let identity =
+                json!({"kind":"cgroup-v2","path":path,"device":stat.dev(),"inode":stat.ino()});
+            Ok((dir, identity))
+        })();
+        match initialized {
+            Ok((dir, identity)) => Ok(Self {
                 parent,
                 dir,
                 name,
                 identity,
-            })
-        })();
-        if result.is_err() {
-            let _ = fs::remove_dir(relative);
+            }),
+            Err(error) => {
+                let relative =
+                    PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(name);
+                let (group_cleanup, diagnostic) = match fs::remove_dir(relative) {
+                    Ok(()) => ("removed", error),
+                    Err(rollback) => (
+                        "unknown",
+                        error.context(format!("removing new cgroup failed: {rollback}")),
+                    ),
+                };
+                Err(AllocationFailure {
+                    diagnostic,
+                    group_cleanup,
+                    path: Some(path),
+                })
+            }
         }
-        result
     }
 
     fn file(&self, name: &str, flags: i32) -> Result<File> {
@@ -146,4 +185,34 @@ fn remove_empty_tree(dir: &File, name: &Path) -> Result<()> {
     );
     fs::remove_dir(name)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initialization_failure_reports_whether_the_new_directory_was_removed() {
+        let root = std::env::temp_dir().join(fresh());
+        fs::create_dir(&root).unwrap();
+        let name = "owned";
+        let path = root.join(name);
+        for nonempty in [false, true] {
+            fs::create_dir(&path).unwrap();
+            if nonempty {
+                fs::write(path.join("kept"), "").unwrap();
+            }
+            // Force the post-mkdir control-file open to fail on a private fixture.
+            let failure = Group::open_new(directory(&root).unwrap(), &root, name.into())
+                .err()
+                .unwrap();
+            assert_eq!(failure.path.as_deref(), Some(path.as_path()));
+            assert_eq!(
+                failure.group_cleanup,
+                if nonempty { "unknown" } else { "removed" }
+            );
+            assert_eq!(path.exists(), nonempty);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 }

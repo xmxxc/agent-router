@@ -4,15 +4,17 @@ use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use wire::{Wire, FRAME, LIMIT, PREAUTH};
 
-pub fn guard(spec: Value) -> Result<()> {
-    let store = attached_store(&spec)?;
+pub fn guard(spec: &Value, store: Store) -> Result<()> {
     let guardian = store::identity(std::process::id())?;
-    let group = match group::Group::create(&group::root()?) {
+    let group = match group::root()
+        .map_err(group::AllocationFailure::from)
+        .and_then(|root| group::Group::create(&root))
+    {
         Ok(group) => group,
-        Err(_) => {
+        Err(failure) => {
             store.save_signed(
                 "unstarted",
-                json!({"reason":"cannot create delegated cgroup"}),
+                json!({"reason":format!("{:#}",failure.diagnostic),"group_cleanup":failure.group_cleanup,"path":failure.path}),
             )?;
             bail!("delegation unavailable")
         }
@@ -20,8 +22,9 @@ pub fn guard(spec: Value) -> Result<()> {
     // From group creation onwards every return passes through empty+remove.
     let mut actual = json!({"guardian":guardian, "containment":group.identity});
     let outcome = (|| -> Result<&str> {
+        store.save_signed("starting", actual.clone())?;
         let (reader, writer) = UnixStream::pair()?;
-        let mut cmd = store::stage_cmd("--bundled-runtime", &store.run, &spec, &store.token)?;
+        let mut cmd = store::stage_cmd("--bundled-runtime", &store.run, spec, &store.token)?;
         cmd.stdout(OwnedFd::from(writer));
         let mut child = match group.launch(&mut cmd) {
             Ok(child) => child,
@@ -30,6 +33,7 @@ pub fn guard(spec: Value) -> Result<()> {
         actual["service"] = store::identity(child.id())?;
         let mut boot = Wire::new(reader);
         let started = (|| -> Result<()> {
+            store.save_signed("starting", actual.clone())?;
             let details = boot.read(LIMIT, Instant::now() + TIMEOUT)?;
             for key in ["kernel", "kernel_generation", "worker", "endpoint"] {
                 actual[key] = details
@@ -51,11 +55,17 @@ pub fn guard(spec: Value) -> Result<()> {
             _ => "faulted",
         })
     })();
-    group.clean()?;
+    let cleanup = group.clean();
     if matches!(outcome, Ok("unstarted")) {
-        store.save_signed("unstarted", json!({"reason":"runtime did not start"}))?;
+        store.save_signed(
+            "unstarted",
+            json!({"reason":"runtime did not start","path":group.identity["path"],
+            "group_cleanup":if cleanup.is_ok() {"removed"} else {"unknown"}}),
+        )?;
+        cleanup?;
         return Ok(());
     }
+    cleanup?;
     store.save_signed(
         "cleanup",
         json!({"proves":"execution-empty","state":outcome.unwrap_or("faulted"), "identity":actual}),
@@ -142,9 +152,8 @@ fn receive(socket: &mut Wire<TcpStream>, token: &str) -> Result<Value> {
     socket.read(LIMIT, Instant::now() + FRAME)
 }
 
-pub fn serve(spec: Value) -> Result<u8> {
-    let store = attached_store(&spec)?;
-    let mut kernel = Kernel::start(&spec)?;
+pub fn serve(spec: &Value, store: Store) -> Result<u8> {
+    let mut kernel = Kernel::start(spec)?;
     let spawn = &spec["request"];
     // Only argv/cwd belong on the kernel wire.
     let result = kernel.call(

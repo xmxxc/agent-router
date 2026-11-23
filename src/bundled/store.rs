@@ -93,6 +93,20 @@ pub fn stage_cmd(stage: &str, dir: &Path, spec: &Value, token: &str) -> Result<C
     serde_json::to_writer(&mut input, &json!({"spec":spec,"signature":signature}))?;
     input.seek(SeekFrom::Start(0))?;
     let mut cmd = Command::new("/proc/self/exe");
+    for name in std::env::vars_os().map(|(name, _)| name) {
+        if name
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(b"WFC_CONTROLLER_TOKEN")
+            || name
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(b"WFC_OWNER_TOKEN")
+            || name
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(b"WFC_WORKER_CALLBACK")
+        {
+            cmd.env_remove(name);
+        }
+    }
     cmd.arg(stage)
         .stdin(input)
         .stdout(Stdio::null())
@@ -172,16 +186,22 @@ impl Store {
     }
 
     pub fn save_signed(&self, kind: &str, data: Value) -> Result<()> {
+        // Promote the starting binding by rename. A ready file only appears
+        // once complete, and no weaker binding survives that transition.
+        let slot = if kind == "ready" { "starting" } else { kind };
         let body = json!({"version":1,"kind":kind,"ticket":self.ticket,"data":data});
         let mac = sign(&self.token, &serde_json::to_vec(&body)?);
-        publish(
-            &self.run.join(format!("{kind}.json")),
-            &json!({"body":body,"signature":mac}),
-        )
+        let path = self.run.join(format!("{slot}.json"));
+        publish(&path, &json!({"body":body,"signature":mac}))?;
+        if kind == "ready" {
+            fs::rename(path, self.run.join("ready.json"))?;
+            File::open(&self.run)?.sync_all()?;
+        }
+        Ok(())
     }
 
-    pub fn signed(&self, kind: &str) -> Result<Value> {
-        let obj = read(&self.run.join(format!("{kind}.json")))?;
+    fn signed_body(&self, slot: &str) -> Result<Value> {
+        let obj = read(&self.run.join(format!("{slot}.json")))?;
         let body = &obj["body"];
         verify(
             &self.token,
@@ -189,15 +209,222 @@ impl Store {
             field(&obj, "signature")?,
         )?;
         ensure!(
-            body["version"] == 1 && body["kind"] == kind && body["ticket"] == self.ticket,
+            body["version"] == 1 && body["ticket"] == self.ticket,
             "receipt identity mismatch"
         );
+        Ok(body.clone())
+    }
+
+    pub fn signed(&self, kind: &str) -> Result<Value> {
+        let body = self.signed_body(kind)?;
+        ensure!(body["kind"] == kind, "receipt kind mismatch");
         Ok(body["data"].clone())
+    }
+
+    fn authorizes_unstarted(&self) -> Result<bool> {
+        let info = self.signed("unstarted")?;
+        ensure!(
+            !self.run.join("ready.json").try_exists()?,
+            "execution reached ready"
+        );
+        if self.run.join("starting.json").try_exists()? {
+            let known = self.signed("starting")?;
+            ensure!(
+                known.get("service").is_none()
+                    && info["group_cleanup"] == "removed"
+                    && info["path"] == known["containment"]["path"],
+                "conflicting launch evidence"
+            );
+        }
+        Ok(matches!(
+            info["group_cleanup"].as_str(),
+            Some("not-created" | "removed")
+        ) || (self.ticket.get("version").is_none()
+            && matches!(
+                info["reason"].as_str(),
+                Some("guardian did not start" | "runtime did not start")
+            )))
+    }
+
+    pub fn replaceable(&self, current: &Value) -> bool {
+        self.authorizes_unstarted().unwrap_or(false)
+            || self
+                .proof()
+                .and_then(|proof| self.applied(current, &proof))
+                .unwrap_or(false)
+    }
+
+    pub fn applied(&self, current: &Value, proof: &Value) -> Result<bool> {
+        let indexed = current["applied"] == true;
+        if indexed && self.ticket["version"] == 2 {
+            ensure!(
+                current["appliedProof"] == digest(&serde_json::to_vec(proof)?),
+                "indexed proof changed"
+            );
+        }
+        if fs::symlink_metadata(self.run.join("applied.json"))
+            .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+        {
+            return Ok(indexed);
+        }
+        ensure!(
+            self.signed("applied")? == *proof,
+            "applied cleanup proof changed"
+        );
+        Ok(true)
     }
 
     pub fn proof(&self) -> Result<Value> {
         let receipt = self.signed("cleanup")?;
-        ensure!(receipt["proves"] == "execution-empty", "cleanup unknown");
+        let state = field(&receipt, "state")?;
+        ensure!(
+            receipt["proves"] == "execution-empty"
+                && matches!(state, "closed" | "exited" | "faulted"),
+            "invalid cleanup state"
+        );
+        let phase = if fs::symlink_metadata(self.run.join("ready.json"))
+            .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+        {
+            "starting"
+        } else {
+            "ready"
+        };
+        let identity = self.signed(phase)?;
+        ensure!(
+            identity == receipt["identity"],
+            "creation identity mismatch"
+        );
+        let group = &identity["containment"];
+        ensure!(
+            process_record(&identity["guardian"])
+                && group["kind"] == "cgroup-v2"
+                && Path::new(field(group, "path")?).is_absolute()
+                && group["device"].is_u64()
+                && group["inode"].as_u64().is_some_and(|i| i > 0),
+            "missing guardian or containment identity"
+        );
+        match phase {
+            "starting" => ensure!(
+                state == "faulted" && identity.get("service").is_none_or(process_record),
+                "invalid pre-ready cleanup"
+            ),
+            "ready" => ensure!(
+                ["service", "kernel", "worker"]
+                    .iter()
+                    .all(|k| process_record(&identity[*k]))
+                    && uuid::Uuid::parse_str(field(&identity, "kernel_generation")?).is_ok()
+                    && identity["endpoint"]
+                        .as_u64()
+                        .is_some_and(|p| (1..=65535).contains(&p)),
+                "incomplete ready identity"
+            ),
+            _ => bail!("invalid creation binding"),
+        }
         Ok(receipt)
     }
+}
+
+fn process_record(v: &Value) -> bool {
+    v["pid"]
+        .as_u64()
+        .is_some_and(|p| (1..=u32::MAX as u64).contains(&p))
+        && v["start_ticks"].is_u64()
+        && v["boot"]
+            .as_str()
+            .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok())
+}
+
+// The first format had an unsigned index and no supersession marker. An
+// old copy may point to an already-cleaned generation while a sibling runs.
+pub fn check_legacy_siblings(unit: &Path, selected: &Store) -> Result<()> {
+    if selected.ticket.get("version").is_some() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(unit)? {
+        let entry = entry?;
+        let dir = entry.path();
+        if dir == selected.run || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let slot = if dir.join("cleanup.json").try_exists()? {
+            "cleanup"
+        } else {
+            "unstarted"
+        };
+        let file = read(&dir.join(format!("{slot}.json")))?;
+        let ticket = &file["body"]["ticket"];
+        ensure!(
+            ticket["unit"] == selected.ticket["unit"]
+                && Some(std::ffi::OsStr::new(field(ticket, "generation")?)) == dir.file_name(),
+            "unexpected generation"
+        );
+        let sibling = Store::open(unit, ticket)?;
+        ensure!(
+            sibling.proof().is_ok() || sibling.authorizes_unstarted().unwrap_or(false),
+            "another generation lacks terminal evidence"
+        );
+    }
+    Ok(())
+}
+
+// Called with the unit lock held. Only a unit containing the lock alone is new.
+pub fn current(unit: &Path) -> Result<Option<(Value, Store)>> {
+    let path = unit.join("current.json");
+    if fs::symlink_metadata(&path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+        for entry in fs::read_dir(unit)? {
+            ensure!(
+                entry?.file_name() == "lock",
+                "missing current index with existing history"
+            );
+        }
+        return Ok(None);
+    }
+    let mut record = read(&path)?;
+    let ticket = &record["ticket"];
+    ensure!(
+        unit.file_name() == Some(std::ffi::OsStr::new(field(ticket, "unit")?))
+            && valid_name(field(ticket, "attempt")?)
+            && uuid::Uuid::parse_str(field(ticket, "nonce")?).is_ok()
+            && record["applied"].is_boolean()
+            && process_record(&record["creator"])
+            && record["pending_until_ms"].is_u64(),
+        "invalid current index"
+    );
+    let store = Store::open(unit, ticket)?;
+    ensure!(
+        !store.run.join("superseded.json").try_exists()?,
+        "superseded current index"
+    );
+    if ticket.get("version").is_some() {
+        ensure!(ticket["version"] == 2, "unsupported current ticket");
+        let tag = record
+            .as_object_mut()
+            .context("invalid current index")?
+            .remove("indexSignature")
+            .context("unsigned current index")?;
+        verify(
+            &store.token,
+            &serde_json::to_vec(&json!(["current", record]))?,
+            tag.as_str().context("invalid current signature")?,
+        )?;
+    }
+    if store.ticket.get("version").is_none() {
+        for slot in ["ready", "cleanup", "unstarted"] {
+            if store.run.join(format!("{slot}.json")).try_exists()? {
+                store.signed(slot)?;
+                break;
+            }
+        }
+    }
+    Ok(Some((record, store)))
+}
+
+pub fn publish_current(path: &Path, mut record: Value, store: &Store) -> Result<()> {
+    if store.ticket["version"] == 2 {
+        record["indexSignature"] = json!(sign(
+            &store.token,
+            &serde_json::to_vec(&json!(["current", record]))?
+        ));
+    }
+    publish(path, &record)
 }

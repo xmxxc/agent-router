@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-use store::{publish, read, Store};
+use store::{publish, Store};
 
 const TIMEOUT: Duration = Duration::from_secs(6);
 const TICK: Duration = Duration::from_millis(20);
@@ -42,11 +42,10 @@ fn unit_dir(name: &str) -> Result<PathBuf> {
 fn attached_store(spec: &Value) -> Result<Store> {
     let ticket = &spec["ticket"];
     let unit = unit_dir(field(ticket, "unit")?)?;
-    ensure!(
-        read(&unit.join("current.json"))?["ticket"] == *ticket,
-        "stale create"
-    );
-    Store::open(&unit, ticket)
+    let _guard = lock(&unit)?;
+    let (_, store) = store::current(&unit)?.context("missing current execution")?;
+    ensure!(store.ticket == *ticket, "stale create");
+    Ok(store)
 }
 
 fn lock(unit: &Path) -> Result<File> {
@@ -94,36 +93,32 @@ fn create(req: &Value) -> Result<Value> {
             );
         }
     }
+    let unit_path = unit_dir(unit)?;
+    let guard = lock(&unit_path)?;
+    let current_path = unit_path.join("current.json");
+    let current = match store::current(&unit_path) {
+        Ok(current) => current,
+        Err(_) => return Ok(unknown_cleanup()),
+    };
+    if let Some((record, prior)) = &current {
+        if req["previous"] != prior.ticket || prior.ticket["attempt"] == attempt {
+            return Ok(json!({"result":"refused","diagnostic":"current create fence"}));
+        }
+        if !prior.replaceable(record) || store::check_legacy_siblings(&unit_path, prior).is_err() {
+            return Ok(unknown_cleanup());
+        }
+    } else {
+        ensure!(req["previous"].is_null(), "missing previous create");
+    }
     let root = match group::root() {
         Ok(root) => root,
         Err(error) => {
             return Ok(json!({"result":"definitely-not-sent","diagnostic":error.to_string()}))
         }
     };
-    let unit_path = unit_dir(unit)?;
-    let guard = lock(&unit_path)?;
-    let current_path = unit_path.join("current.json");
-    if current_path.try_exists()? {
-        let current = read(&current_path)?;
-        let old = &current["ticket"];
-        if req["previous"] != *old || old["attempt"] == attempt {
-            return Ok(json!({"result":"refused","diagnostic":"current create fence"}));
-        }
-        // Re-check the actual receipt even after a previously successful apply.
-        let Ok(prior) = Store::open(&unit_path, old) else {
-            return Ok(json!({"result":"uncertain","cleanup":"unknown"}));
-        };
-        if prior.signed("unstarted").is_err()
-            && (current["applied"] != true || prior.proof().is_err())
-        {
-            return Ok(json!({"result":"uncertain","cleanup":"unknown"}));
-        }
-    } else {
-        ensure!(req["previous"].is_null(), "missing previous create");
-    }
     let generation = fresh();
     let token = format!("{}{}", fresh(), fresh());
-    let ticket = json!({"unit":unit,"attempt":attempt,"generation":generation,"nonce":fresh(),"capabilityHash":store::digest(token.as_bytes())});
+    let ticket = json!({"version":2,"unit":unit,"attempt":attempt,"generation":generation,"nonce":fresh(),"capabilityHash":store::digest(token.as_bytes())});
     let run = unit_path.join(&generation);
     store::private_dir(&run)?;
     publish(&run.join("key.json"), &json!(token))?;
@@ -141,15 +136,31 @@ fn create(req: &Value) -> Result<Value> {
     }
     let creator = store::identity(std::process::id())?;
     let expires = unix_ms()? + (TIMEOUT + TIMEOUT).as_millis() as u64;
-    publish(
-        &current_path,
-        &json!({"ticket":ticket,"applied":false,"creator":creator,"pending_until_ms":expires}),
-    )?;
     let store = Store::open(&unit_path, &ticket)?;
+    let index =
+        json!({"ticket":ticket,"applied":false,"creator":creator,"pending_until_ms":expires});
+    // A trusted recovery copy exists before retiring the prior generation.
+    // Retire it before installing any successor that could authorize a launch.
+    store::publish_current(&run.join("index.json"), index.clone(), &store)?;
+    if let Some((_, prior)) = current {
+        prior.save_signed("superseded", json!({"generation":generation}))?;
+    }
+    if let Err(error) = store::publish_current(&current_path, index, &store) {
+        store.save_signed(
+            "unstarted",
+            json!({"reason":"index publication failed","group_cleanup":"not-created"}),
+        )?;
+        return Ok(
+            json!({"result":"definitely-not-sent","ticket":ticket,"diagnostic":error.to_string()}),
+        );
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(_) => {
-            store.save_signed("unstarted", json!({"reason":"guardian did not start"}))?;
+            store.save_signed(
+                "unstarted",
+                json!({"reason":"guardian did not start","group_cleanup":"not-created"}),
+            )?;
             return Ok(json!({"result":"definitely-not-sent","ticket":ticket}));
         }
     };
@@ -159,10 +170,8 @@ fn create(req: &Value) -> Result<Value> {
         if let Ok(identity) = store.signed("ready") {
             return Ok(json!({"result":"accepted","ticket":ticket,"identity":identity}));
         }
-        if store.signed("unstarted").is_ok() {
-            return Ok(
-                json!({"result":"definitely-not-sent","ticket":ticket,"diagnostic":"delegation unavailable"}),
-            );
+        if let Ok(info) = store.signed("unstarted") {
+            return Ok(json!({"result":"definitely-not-sent","ticket":ticket,"unstarted":info}));
         }
         if child.try_wait()?.is_some() || Instant::now() >= end {
             return Ok(json!({"result":"uncertain","ticket":ticket}));
@@ -171,15 +180,16 @@ fn create(req: &Value) -> Result<Value> {
     }
 }
 
+fn service_changed() -> Value {
+    json!({"result":"uncertain","delivery":"definitely-not-sent","cleanup":"unknown","category":"bundled_restart","reconcile":true})
+}
+
 fn rpc(store: &Store, ready: &Value, req: &Value) -> Value {
+    if store::process_state(&ready["service"]) != "alive" {
+        return service_changed();
+    }
     let mut sent = false;
     let outcome = (|| -> Result<Value> {
-        let service = &ready["service"];
-        let pid = u32::try_from(service["pid"].as_u64().context("missing pid")?)?;
-        ensure!(
-            store::identity(pid)? == *service,
-            "runtime identity changed"
-        );
         let port = u16::try_from(ready["endpoint"].as_u64().context("missing port")?)?;
         let end = Instant::now() + TIMEOUT;
         let mut stream = wire::Wire::new(TcpStream::connect_timeout(
@@ -216,7 +226,16 @@ fn rpc(store: &Store, ready: &Value, req: &Value) -> Value {
         );
         Ok(reply)
     })();
-    outcome.unwrap_or_else(|_| json!({"result":if sent {"uncertain"} else {"definitely-not-sent"}, "cleanup":"unknown"}))
+    outcome.unwrap_or_else(|_| {
+        if !sent && store::process_state(&ready["service"]) != "alive" {
+            return service_changed();
+        }
+        json!({"result":if sent {"uncertain"} else {"definitely-not-sent"}, "cleanup":"unknown"})
+    })
+}
+
+fn unknown_cleanup() -> Value {
+    json!({"result":"uncertain","cleanup":"unknown"})
 }
 
 fn completed(store: &Store) -> Option<Value> {
@@ -240,18 +259,26 @@ fn operate(req: &Value) -> Result<Value> {
     }
     if op == "lookup" {
         let unit = unit_dir(field(req, "unit")?)?;
-        let current = read(&unit.join("current.json"))?;
+        let _guard = lock(&unit)?;
+        let (current, store) = match store::current(&unit) {
+            Ok(Some(c)) => c,
+            Ok(None) => bail!("unknown unit"),
+            Err(_) => return Ok(unknown_cleanup()),
+        };
         ensure!(
             current["ticket"]["attempt"] == req["attempt"],
             "wrong attempt"
         );
-        let store = Store::open(&unit, &current["ticket"]);
-        let phase = match store {
-            Err(_) => "unknown",
-            Ok(s) if s.proof().is_ok() => "cleaned",
-            Ok(s) if s.signed("unstarted").is_ok() => "unstarted",
-            Ok(s) if s.signed("ready").is_ok() => "ready",
-            Ok(_) => "pending",
+        let phase = if store.proof().is_ok() {
+            "cleaned"
+        } else if store.run.join("cleanup.json").try_exists()? {
+            "unknown"
+        } else if store.signed("unstarted").is_ok() {
+            "unstarted"
+        } else if store.signed("ready").is_ok() {
+            "ready"
+        } else {
+            "pending"
         };
         return Ok(
             json!({"result":"accepted","ticket":current["ticket"],"phase":phase,
@@ -263,24 +290,37 @@ fn operate(req: &Value) -> Result<Value> {
     let unit = unit_dir(field(ticket, "unit")?)?;
     let guard = lock(&unit)?;
     let path = unit.join("current.json");
-    let mut current = read(&path)?;
+    let (mut current, store) = match store::current(&unit) {
+        Ok(Some(c)) => c,
+        Ok(None) => bail!("unknown unit"),
+        Err(_) => return Ok(unknown_cleanup()),
+    };
     if current["ticket"] != *ticket {
         return Ok(json!({"result":"refused","diagnostic":"stale execution identity"}));
     }
-    let Ok(store) = Store::open(&unit, ticket) else {
-        return Ok(json!({"result":"uncertain","cleanup":"unknown"}));
-    };
     if matches!(op, "cleanup-receipt" | "reconcile") {
+        if store::check_legacy_siblings(&unit, &store).is_err() {
+            return Ok(unknown_cleanup());
+        }
         let Some(mut result) = completed(&store) else {
-            return Ok(json!({"result":"uncertain","cleanup":"unknown"}));
+            return Ok(unknown_cleanup());
         };
         if op == "reconcile" {
-            let first = current["applied"] == false;
-            if first {
-                current["applied"] = json!(true);
-                publish(&path, &current)?;
+            let proof = &result["proof"];
+            let Ok(applied) = store.applied(&current, proof) else {
+                return Ok(unknown_cleanup());
+            };
+            if !store.run.join("applied.json").try_exists()? {
+                store.save_signed("applied", proof.clone())?;
             }
-            result["newly_applied"] = json!(first);
+            if current["applied"] == false {
+                if store.ticket["version"] == 2 {
+                    current["appliedProof"] = json!(store::digest(&serde_json::to_vec(proof)?));
+                }
+                current["applied"] = json!(true);
+                store::publish_current(&path, current, &store)?;
+            }
+            result["newly_applied"] = json!(!applied);
         }
         return Ok(result);
     }
@@ -297,7 +337,7 @@ fn operate(req: &Value) -> Result<Value> {
     }
     let ready = match store.signed("ready") {
         Ok(v) => v,
-        Err(_) => return Ok(json!({"result":"uncertain","cleanup":"unknown"})),
+        Err(_) => return Ok(unknown_cleanup()),
     };
     let mut answer = rpc(&store, &ready, req);
     if op == "inspect" && answer["result"] == "accepted" {
@@ -310,15 +350,19 @@ fn operate(req: &Value) -> Result<Value> {
                 return Ok(result);
             }
             if Instant::now() >= end {
-                return Ok(json!({"result":"uncertain","cleanup":"unknown"}));
+                return Ok(unknown_cleanup());
             }
             thread::sleep(TICK);
         }
     }
     if observing && answer["result"] != "refused" && answer["result"] != "accepted" {
-        return Ok(
-            completed(&store).unwrap_or_else(|| json!({"result":"uncertain","cleanup":"unknown"}))
-        );
+        return Ok(completed(&store).unwrap_or_else(|| {
+            if answer["reconcile"] == true {
+                answer
+            } else {
+                unknown_cleanup()
+            }
+        }));
     }
     Ok(answer)
 }
@@ -347,9 +391,9 @@ pub fn run(stage: &str) -> Result<u8> {
                 .mode(0o600)
                 .open(store.run.join(stage))?;
             if stage == "--bundled-guardian" {
-                runtime::guard(spec.clone())?;
+                runtime::guard(spec, store)?;
             } else {
-                return runtime::serve(spec.clone());
+                return runtime::serve(spec, store);
             }
         }
         _ => println!(

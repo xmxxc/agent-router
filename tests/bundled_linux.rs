@@ -12,7 +12,13 @@ fn command(state: &Path, root: &Path) -> Command {
     let mut cmd = Command::new(
         std::env::var_os("WFC_TEST_BINARY").unwrap_or_else(|| env!("CARGO_BIN_EXE_wfc").into()),
     );
-    cmd.arg("--bundled")
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("WFC_CONTROLLER_TOKEN", "test-controller")
+        .env("WFC_OWNER_TOKEN", "test-owner")
+        .env("WFC_WORKER_CALLBACK", "test-old-callback")
+        .env("wFc_OwNeR_ToKeN", "test-mixed-case")
+        .arg("--bundled")
         .env("WFC_STATE", state)
         .env("WFC_BUNDLED_CGROUP_ROOT", root)
         .stdin(Stdio::piped());
@@ -135,6 +141,73 @@ fn lose_launcher(state: &Path, root: &Path, create: &Value) -> Value {
     call(state, root, json!({"op":"inspect","ticket":ticket}))
 }
 
+fn verify_stage_environment(info: &Value) {
+    for role in ["guardian", "service", "kernel", "worker"] {
+        let pid = info[role]["pid"].as_u64().unwrap();
+        let bytes = fs::read(format!("/proc/{pid}/environ")).unwrap();
+        let mut callback = None;
+        for item in bytes.split(|b| *b == 0) {
+            let Some(i) = item.iter().position(|b| *b == b'=') else {
+                continue;
+            };
+            let name = &item[..i];
+            assert!(
+                !name.eq_ignore_ascii_case(b"WFC_CONTROLLER_TOKEN")
+                    && !name.eq_ignore_ascii_case(b"WFC_OWNER_TOKEN"),
+                "{role} inherited a control credential"
+            );
+            if name.eq_ignore_ascii_case(b"WFC_WORKER_CALLBACK") {
+                callback = Some(&item[i + 1..]);
+            }
+        }
+        let expected =
+            matches!(role, "kernel" | "worker").then_some(b"test-current-callback".as_slice());
+        assert_eq!(callback, expected, "callback at {role}");
+    }
+}
+
+fn sign_fixture(body: &Value, key: &str) -> Vec<u8> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).unwrap();
+    mac.update(&serde_json::to_vec(body).unwrap());
+    serde_json::to_vec(
+        &json!({"body":body,"signature":format!("{:x}",mac.finalize().into_bytes())}),
+    )
+    .unwrap()
+}
+
+fn verify_history_recovery(state: &Path, root: &Path, created: &Value, create: &Value) {
+    let index = state.join("bundled/test/current.json");
+    let original = fs::read(&index).unwrap();
+    let mut changed: Value = serde_json::from_slice(&original).unwrap();
+    changed["ticket"]["attempt"] = json!("other");
+    let altered = serde_json::to_vec(&changed).unwrap();
+    fs::remove_file(&index).unwrap();
+    for corrupt in [None, Some(b"{".as_slice()), Some(altered.as_slice())] {
+        if let Some(bytes) = corrupt {
+            fs::write(&index, bytes).unwrap();
+        }
+        for req in [
+            create.clone(),
+            json!({"op":"lookup","unit":"test","attempt":"closed"}),
+            json!({"op":"reconcile","ticket":created["ticket"]}),
+        ] {
+            assert_eq!(call(state, root, req)["cleanup"], "unknown");
+        }
+    }
+    let backup = state
+        .join("bundled/test")
+        .join(created["ticket"]["generation"].as_str().unwrap())
+        .join("index.json");
+    assert_eq!(fs::read(&backup).unwrap(), original);
+    fs::copy(backup, index).unwrap();
+    let inspect = call(
+        state,
+        root,
+        json!({"op":"inspect","ticket":created["ticket"]}),
+    );
+    assert_eq!(inspect["identity"], created["identity"]);
+}
+
 #[test]
 #[ignore = "requires WFC_TEST_DELEGATION pointing at a disposable writable cgroup v2 delegation"]
 fn delegated_lifecycle() {
@@ -167,16 +240,20 @@ done"#;
     let mut previous = Value::Null;
     let mut old_receipt = Vec::new();
     for cause in ["closed", "exited", "faulted"] {
-        let create = json!({"op":"create","unit":"test","attempt":cause,"previous":previous,"cwd":dir,"argv":["/bin/sh","-c",worker]});
+        let create = json!({"op":"create","unit":"test","attempt":cause,"previous":previous,"cwd":dir,"env":{"WFC_WORKER_CALLBACK":"test-current-callback"},"argv":["/bin/sh","-c",worker]});
         let created = if cause == "closed" {
             lose_launcher(&state, &root, &create)
         } else {
-            backend(create)
+            backend(create.clone())
         };
         assert_eq!(created["result"], "accepted", "{created}");
         let ticket = &created["ticket"];
         let info = &created["identity"];
         let invoke = |op| backend(json!({"op":op,"ticket":ticket}));
+        verify_stage_environment(info);
+        if cause == "closed" {
+            verify_history_recovery(&state, &root, &created, &create);
+        }
         let path = Path::new(info["containment"]["path"].as_str().unwrap());
         let group = path.file_name().unwrap().to_str().unwrap();
         let members = fs::read_to_string(path.join("cgroup.procs")).unwrap();
@@ -207,6 +284,22 @@ done"#;
             fs::write(&receipt, &old_receipt).unwrap();
             assert_eq!(invoke("reconcile")["cleanup"], "unknown");
             fs::remove_file(&receipt).unwrap();
+        }
+        if cause == "closed" {
+            let ready = receipt.with_file_name("ready.json");
+            let original = fs::read(&ready).unwrap();
+            let key: String =
+                serde_json::from_slice(&fs::read(receipt.with_file_name("key.json")).unwrap())
+                    .unwrap();
+            let mut body = serde_json::from_slice::<Value>(&original).unwrap()["body"].clone();
+            let ticks = body["data"]["service"]["start_ticks"].as_u64().unwrap();
+            body["data"]["service"]["start_ticks"] = json!(ticks + 1);
+            fs::write(&ready, sign_fixture(&body, &key)).unwrap();
+            let stale = backend(json!({"op":"input","ticket":ticket,"seq":1,"text":"never"}));
+            assert_eq!(stale["result"], "uncertain");
+            assert_eq!(stale["delivery"], "definitely-not-sent");
+            assert_eq!(stale["reconcile"], true);
+            fs::write(ready, original).unwrap();
         }
         for field in ["generation", "nonce", "attempt"] {
             let mut bad = ticket.clone();
@@ -278,6 +371,15 @@ done"#;
         });
         assert_eq!(first, 1);
         assert_eq!(invoke("reconcile")["newly_applied"], false);
+        if cause == "closed" {
+            let marker = receipt.with_file_name("applied.json");
+            fs::remove_file(&marker).unwrap();
+            assert_eq!(invoke("reconcile")["newly_applied"], false);
+            assert!(marker.exists());
+            let index = state.join("bundled/test/current.json");
+            fs::copy(receipt.with_file_name("index.json"), index).unwrap();
+            assert_eq!(invoke("reconcile")["newly_applied"], false);
+        }
         old_receipt = fs::read(&receipt).unwrap();
         if std::env::var_os("WFC_TEST_PRINT_RECEIPTS").is_some() {
             eprintln!("verified_receipt {}", String::from_utf8_lossy(&old_receipt));
@@ -285,6 +387,45 @@ done"#;
         let mut tampered: Value = serde_json::from_slice(&old_receipt).unwrap();
         tampered["body"]["data"]["identity"]["guardian"]["pid"] = json!(1);
         let changed = serde_json::to_vec(&tampered).unwrap();
+        if cause == "closed" {
+            let key: String =
+                serde_json::from_slice(&fs::read(receipt.with_file_name("key.json")).unwrap())
+                    .unwrap();
+            for pointer in [
+                "/data/state",
+                "/data/identity/service/start_ticks",
+                "/data/identity/kernel/pid",
+                "/data/identity/guardian/pid",
+                "/data/identity/containment/inode",
+                "/data/identity/worker/boot",
+            ] {
+                let mut body: Value =
+                    serde_json::from_slice::<Value>(&old_receipt).unwrap()["body"].clone();
+                let slot = body.pointer_mut(pointer).unwrap();
+                *slot = if let Some(n) = slot.as_u64() {
+                    json!(n + 1)
+                } else {
+                    json!("active")
+                };
+                fs::write(&receipt, sign_fixture(&body, &key)).unwrap();
+                assert_eq!(invoke("reconcile")["cleanup"], "unknown", "{pointer}");
+                assert_eq!(
+                    backend(
+                        json!({"op":"create","unit":"test","previous":ticket,"attempt":"conflict","cwd":dir,"argv":["/bin/true"]})
+                    )["cleanup"],
+                    "unknown",
+                    "{pointer}"
+                );
+            }
+        }
+        for op in ["input", "resize"] {
+            let answer = backend(
+                json!({"op":op,"ticket":ticket,"seq":2,"text":"never","cols":55,"rows":20}),
+            );
+            assert_eq!(answer["result"], "uncertain");
+            assert_eq!(answer["delivery"], "definitely-not-sent");
+            assert_eq!(answer["reconcile"], true);
+        }
         for corrupt in [changed.as_slice(), b"{}".as_slice(), b"broken"] {
             fs::write(&receipt, corrupt).unwrap();
             assert_eq!(invoke("inspect")["cleanup"], "unknown");
@@ -309,5 +450,48 @@ done"#;
         }
         eprintln!("verified {cause}: {group} removed, receipt bound, input counted once");
     }
+    let early = backend(
+        json!({"op":"create","unit":"early","attempt":"missing-worker","cwd":dir,"argv":["/nonexistent-wfc-test-program"]}),
+    );
+    let early_ticket = &early["ticket"];
+    assert_eq!(early["result"], "uncertain");
+    let early_proof = backend(json!({"op":"reconcile","ticket":early_ticket}));
+    assert_eq!(early_proof["proof"]["state"], "faulted", "{early_proof}");
+    assert!(early_proof["proof"]["identity"]["service"].is_object());
+    assert!(early_proof["proof"]["identity"]["kernel"].is_null());
+    assert_eq!(early_proof["newly_applied"], true);
+    assert_eq!(
+        backend(json!({"op":"reconcile","ticket":early_ticket}))["newly_applied"],
+        false
+    );
+    eprintln!("verified pre-ready fault, signed identity and single apply");
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn lost_or_damaged_current_keeps_history_fenced() {
+    let state = std::env::temp_dir().join(format!("wfc-history-{}", Uuid::new_v4()));
+    let unit = state.join("bundled/history");
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(unit.join(Uuid::new_v4().to_string()))
+        .unwrap();
+    let current = unit.join("current.json");
+    for contents in [None, Some("broken"), Some("{}")] {
+        if let Some(bytes) = contents {
+            fs::write(&current, bytes).unwrap();
+        }
+        for req in [
+            json!({"op":"lookup","unit":"history","attempt":"a"}),
+            json!({"op":"reconcile","ticket":{"unit":"history"}}),
+            json!({"op":"create","unit":"history","attempt":"b","cwd":state,"argv":["/bin/true"]}),
+        ] {
+            let answer = call(&state, &state, req);
+            assert_eq!(answer["result"], "uncertain", "{answer}");
+            assert_eq!(answer["cleanup"], "unknown");
+        }
+    }
+    fs::remove_dir_all(state).unwrap();
 }
