@@ -1,4 +1,5 @@
 """Linux relay contracts through a single CLI, with a private Codex queue."""
+from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import hashlib
 import json
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from threading import Event
 import unittest
 import uuid
 
@@ -114,6 +116,24 @@ subprocess.run([sys.argv[1], 'ask', '选甲,乙？', '--options', '甲,乙',
         confirmed = self.data("ack", message["messageId"])
         self.assertEqual((confirmed["state"], confirmed["statusVersion"]), ("processed", 4))
         self.assertEqual(json.loads(ledger.read_bytes())[1:], [dict(row, request_key=None) for row in worker_history])
+
+    def test_startup_failure_uses_the_existing_scope_and_ack(self):
+        self.cli("dispatch", "--task", "task", "--role", "启动验证", "--scope", "failure",
+                 "--report", "task", "--cwd", ".", "--", str(self.root / "missing"), code=1)
+        unrelated = self.publish("other")
+        self.cli("relay", "--codex", "--scope", "failure", "--for", "1.5")
+        command, = self.calls()
+        notice, = json.loads(command[4][len(PREFIX):])["messages"]
+        self.assertEqual((notice["scope"], notice["kind"], notice["type"]),
+                         ("failure", "startup_failure", "blocked"))
+        self.assertEqual(notice["fault"]["category"], "executable_missing")
+        ack = self.data("ack", notice["messageId"])
+        self.assertEqual((ack["state"], ack["statusVersion"]), ("processed", 4))
+        self.assertTrue(self.data("ack", notice["messageId"])["duplicate"])
+        empty = self.data("wait", "--scope", "failure", "--timeout", "0", code=3)
+        self.assertFalse(empty["messages"])
+        other, = self.data("wait", "--scope", "other", "--timeout", "0")["messages"]
+        self.assertEqual((other["messageId"], other["type"]), (unrelated["messageId"], "done"))
 
     def test_detached_scope(self):
         other = self.publish("other")
@@ -517,6 +537,122 @@ while not Path('release').exists():
         call, = self.calls()
         row, = json.loads(call[4][len(PREFIX):])["messages"]
         self.assertEqual(row["messageId"], ready["messageId"])
+
+    def test_running_relay_refreshes_repaired_and_legacy_owner_records(self):
+        state = Path(self.env["WFC_STATE"])
+        directory = state / "dispatches"
+        blocked = self.publish("ours")
+        held = self.data("dispatch", "--task", "task", "--report", "task", "--role", "fixture",
+                         "--scope", "ours", "--cwd", ".", "--", "/bin/true")
+        owner = self.data("dispatch", "--task", "task", "--report", "task", "--role", "fixture",
+                          "--scope", "ours", "--cwd", ".", "--", "/bin/true")
+        other = self.publish("theirs")
+        undelivered = {m["messageId"]: m["dispatch"] for m in self.data("status")["undelivered"]}
+        blocked_dispatch, other_dispatch = (undelivered[r["messageId"]] for r in (blocked, other))
+        original = directory / f"{blocked_dispatch}.json"
+        pending = original.with_suffix(".pending")
+        pending.write_text("{")
+        # Finite historical records have no messages. They still belong to
+        # the legacy owner census, but cannot spend the short delivery window.
+        for index in range(1, 35):
+            ident = f"d-{index:08x}"
+            (directory / f"{ident}.json").write_text(json.dumps({
+                "dispatch": ident, "scope": "history", "round": 1, "attempt": "a-123456789abc",
+                "role": "fixture", "cwd": str(self.root), "report": str(self.root / "task"),
+            }))
+        for ident in (blocked_dispatch, held["dispatch"], owner["dispatch"], other_dispatch):
+            self.until(lambda: self.data("status", "--dispatch", ident)["dispatches"][0]
+                       ["worker"]["state"] == "exited")
+        directory_version = directory.stat().st_ctime_ns
+        relay = self.foreground(7)
+        self.until(lambda: any(w["pid"] == relay.pid for w in self.data("status")["waiters"]))
+        self.assertEqual(self.calls(), [])
+
+        pending.write_bytes(original.read_bytes())
+        self.assertEqual(directory.stat().st_ctime_ns, directory_version)
+        first, = self.until(self.calls)
+        repaired, = json.loads(first[4][len(PREFIX):])["messages"]
+        self.assertEqual(repaired["messageId"], blocked["messageId"])
+        self.until(lambda: any(m["messageId"] == repaired["messageId"] and m["state"] == "received"
+                               for row in self.data("status", "--dispatch", repaired["dispatch"])["dispatches"]
+                               for m in row["messages"]))
+        self.assertEqual(self.data("ack", repaired["messageId"])["state"], "processed")
+
+        guard = state / f"relay-{hashlib.sha256(b'ours').hexdigest()}.lock"
+        with guard.open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            wanted = self.data("done", "--report", "task", "--attempt", held["attempt"],
+                               WFC_DISPATCH=held["dispatch"])
+            path = directory / f"{owner['dispatch']}.json"
+            marked = json.loads(path.read_bytes())
+            marked["controllerOwner"] = {"owner": "historical fixture"}
+            path.write_text(json.dumps(marked))
+            self.assertEqual(directory.stat().st_ctime_ns, directory_version)
+            stdout, stderr = relay.communicate(timeout=4)
+            self.assertEqual((relay.returncode, stdout), (1, ""), stderr)
+            self.assertIn("controller owner authorization required for relay", stderr)
+        self.assertEqual(len(self.calls()), 1)
+
+        self.cli("relay", "--scope", "theirs", "--codex", "--for", ".2")
+        second = self.calls()[1]
+        neighbor, = json.loads(second[4][len(PREFIX):])["messages"]
+        self.assertEqual(neighbor["messageId"], other["messageId"])
+        self.assertEqual(self.data("ack", neighbor["messageId"])["state"], "processed")
+        remaining = self.data("status")["undelivered"]
+        self.assertEqual([(m["messageId"], m["state"]) for m in remaining],
+                         [(wanted["messageId"], "unsent")])
+        print(json.dumps({"repaired": repaired["messageId"], "ownerFence": wanted["messageId"],
+                          "neighbor": neighbor["messageId"], "sameRelayPid": relay.pid}), flush=True)
+
+    def test_short_relay_retries_across_ordinary_neighbor_updates(self):
+        target = self.publish("ours")
+        neighbor = self.publish("theirs")
+        messages = {m["messageId"]: m for m in self.data("status")["undelivered"]}
+        directory = Path(self.env["WFC_STATE"]) / "dispatches"
+        path = directory / (messages[neighbor["messageId"]]["dispatch"] + ".json")
+        row = json.loads(path.read_bytes())
+        for index in range(1, 41):
+            ident = f"d-{index:08x}"
+            (directory / f"{ident}.json").write_text(json.dumps({
+                "dispatch": ident, "scope": "ours", "round": 1, "attempt": "a-123456789abc",
+                "role": "fixture", "cwd": str(self.root), "report": str(self.root / "task"),
+            }))
+
+        stop, changed = Event(), Event()
+
+        def update_neighbor():
+            for revision in range(24):
+                scratch = path.with_suffix(".fixture")
+                scratch.write_text(json.dumps({**row, "fixtureRevision": revision}))
+                scratch.replace(path)
+                changed.set()
+                if stop.wait(.01):
+                    break
+            return revision + 1
+
+        with ThreadPoolExecutor(max_workers=1) as writers:
+            writer = writers.submit(update_neighbor)
+            try:
+                self.assertTrue(changed.wait(2))
+                short = self.foreground(.35)
+                _, stderr = short.communicate(timeout=5)
+                self.assertEqual(short.returncode, 0, stderr)
+                delivered_in_window = bool(self.calls())
+            finally:
+                stop.set()
+            updates = writer.result(timeout=2)
+        self.assertGreater(updates, 1)
+
+        self.cli("relay", "--scope", "ours", "--codex", "--for", ".5")
+        call, = self.calls()
+        message, = json.loads(call[4][len(PREFIX):])["messages"]
+        self.assertEqual((message["id"], message["messageId"]), (target["message"], target["messageId"]))
+        self.assertEqual(self.data("ack", target["messageId"])["state"], "processed")
+        remaining, = self.data("status")["undelivered"]
+        self.assertEqual((remaining["messageId"], remaining["state"]), (neighbor["messageId"], "unsent"))
+        print(json.dumps({"shortWindowDelivered": delivered_in_window, "neighborUpdates": updates,
+                          "target": target["messageId"],
+                          "neighborUnsent": neighbor["messageId"]}), flush=True)
 
     def test_thread_and_owner_preflight(self):
         args = ["relay", "--codex-thread", self.thread, "--scope", "ours", "--detach", "--for", ".1"]

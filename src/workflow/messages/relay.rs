@@ -6,16 +6,18 @@ pub(crate) mod queue_owner;
 mod registration;
 pub use registration::waiters;
 
-use super::{spaced_json, state_dir, Inbox, State};
-use crate::workflow::{controller, read_record, valid_id, worker_owner};
+use super::{
+    recovery::{GenerationStamps, Generations, Scan, Stamp},
+    spaced_json, state_dir, Identity, Inbox, State,
+};
+use crate::workflow::{controller, worker_owner};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     env,
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     fs::{self, File, TryLockError},
-    io::ErrorKind,
     os::unix::fs::OpenOptionsExt,
     path::Path,
     process::{Command, Stdio},
@@ -121,9 +123,12 @@ impl<'a> Relay<'a> {
         let preflight =
             || controller::Owners::read(&state)?.preflight(self.scope, token.as_deref(), "relay");
         preflight()?;
-        scope_assignments(&state, self.scope)?;
         let target = self.target.resolve()?;
         let timeout = seconds(&env::var("WFC_QUEUE_TIMEOUT").unwrap_or_else(|_| "60".into()))?;
+        // Legacy authorization is scope-wide. Complete it outside all
+        // transport locks before starting the delivery window.
+        let mut assignments = scope_assignments(&state, self.scope, None, || false)?
+            .context("initial relay authorization did not finish")?;
         if self.detach {
             fs::create_dir_all(&state)?;
             let log = state.join("relay.log");
@@ -184,25 +189,53 @@ impl<'a> Relay<'a> {
             Target::OpenCode(_) => usize::MAX, // The batch is an HTTP body, not an argument.
         };
         let mut diagnosed = HashSet::new();
+        let mut scan = Scan::default();
+        let mut recovery = Vec::new();
+        let mut first = true;
         while !remaining().is_zero() {
             preflight()?;
+            let was_first = std::mem::replace(&mut first, false);
+            if !was_first {
+                if recovery.is_empty() {
+                    recovery = scan.batch(&state, None, self.scope, remaining());
+                }
+                let Some(current) =
+                    scope_assignments(&state, self.scope, Some(assignments), || {
+                        remaining().is_zero()
+                    })?
+                else {
+                    break;
+                };
+                assignments = current;
+            }
+            if remaining().is_zero() {
+                break;
+            }
             let order = transport_lock(&state, self.scope)?;
             let batch = match &order {
-                Some(_) => match Inbox::try_open(&state)? {
-                    Some(mut inbox) => {
-                        preflight()?;
-                        let verified = scope_assignments(&state, self.scope)?;
-                        claim_batch(
-                            &mut inbox,
-                            self.scope,
-                            verified.as_ref(),
-                            budget,
-                            &mut diagnosed,
-                        )?
+                Some(_)
+                    if assignments.current_before_claim(&state, || remaining().is_zero())? =>
+                {
+                    match Inbox::try_open(&state)? {
+                        Some(mut inbox) if assignments.namespace_current(&state)? => {
+                            preflight()?;
+                            if self.scope.is_some() || !assignments.restricted {
+                                inbox.recover_startups(&mut scan, std::mem::take(&mut recovery))?;
+                            } else {
+                                recovery.clear();
+                            }
+                            claim_batch(
+                                &mut inbox,
+                                self.scope,
+                                &assignments,
+                                budget,
+                                &mut diagnosed,
+                            )?
+                        }
+                        _ => None,
                     }
-                    _ => None,
-                },
-                None => None,
+                }
+                _ => None,
             };
             if let Some((batch, text)) = batch {
                 let limit = remaining().min(timeout);
@@ -242,6 +275,10 @@ impl<'a> Relay<'a> {
                 if matches!(outcome, Outcome::Delivered | Outcome::TooLong) {
                     continue;
                 }
+            } else if was_first || (recovery.is_empty() && scan.in_progress()) {
+                // Advance an idle recovery scan promptly. A transport attempt
+                // that reaches the retry path still waits below.
+                continue;
             }
             drop(order);
             std::thread::sleep(remaining().min(Duration::from_millis(500)));
@@ -321,12 +358,13 @@ pub(super) enum Outcome {
 fn claim_batch(
     inbox: &mut Inbox,
     scope: Option<&str>,
-    verified: Option<&Assignments>,
+    assignments: &ScopeAssignments,
     budget: usize,
     diagnosed: &mut HashSet<u64>,
 ) -> Result<Option<(Vec<Value>, String)>> {
     let mut messages = Vec::new();
     let mut text = String::from(PREFIX);
+    let dispatches = inbox.dir.join("dispatches");
     for m in &mut inbox.messages {
         if !m.is_controller_message()
             || m.delivery.state != State::Unsent
@@ -334,13 +372,7 @@ fn claim_batch(
         {
             continue;
         }
-        if verified.is_some_and(|assignments| {
-            !assignments
-                .get(&m.worker.dispatch)
-                .is_some_and(|(attempt, round)| {
-                    attempt == &m.worker.attempt && *round == m.worker.round
-                })
-        }) {
+        if !assignments.permits(&dispatches, &m.worker) {
             continue;
         }
         let view = m.view_at(State::Unknown, m.delivery.next_version()?);
@@ -372,105 +404,138 @@ fn claim_batch(
     Ok(Some((messages, text)))
 }
 
-type Assignments = HashMap<String, (String, u64)>;
-
-// A truncated legacy reservation has no trustworthy scope or owner. In that
-// case a scoped relay can claim only independently verified assignments.
-// A global relay has no such target and must defer.
-fn scope_assignments(state: &Path, scope: Option<&str>) -> Result<Option<Assignments>> {
-    let dir = state.join("dispatches");
-    let entries = match fs::read_dir(&dir) {
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-        other => other?,
-    };
-    let mut ids = HashSet::new();
-    for entry in entries {
-        let path = entry?.path();
-        if matches!(
-            path.extension().and_then(OsStr::to_str),
-            Some("json" | "pending")
-        ) {
-            if let Some(id) = path
-                .file_stem()
-                .and_then(OsStr::to_str)
-                .filter(|id| valid_id(id))
-            {
-                ids.insert(id.to_owned());
-            }
-        }
-    }
-    let mut restricted = false;
-    let mut verified = Assignments::new();
-    for id in ids {
-        let mut damaged = false;
-        // A concurrent rename can expose both generations. Check both for
-        // ownership. A conflict cannot establish a delivery identity.
-        let pending = generation(&dir.join(format!("{id}.pending")), &mut damaged)?;
-        let published = generation(&dir.join(format!("{id}.json")), &mut damaged)?;
-        for row in pending.iter().chain(&published) {
-            if !row["controllerOwner"].is_null() {
-                let owned = if row["scope"].is_null() {
-                    Some(id.as_str())
-                } else {
-                    row["scope"].as_str()
-                };
-                ensure!(
-                    scope.is_some() && owned.is_some() && scope != owned,
-                    "controller owner authorization required for relay"
-                );
-            }
-        }
-        if let (Some(a), Some(b)) = (&pending, &published) {
-            damaged |= ["attempt", "round", "scope", "controllerOwner"]
-                .iter()
-                .any(|&k| a[k] != b[k]);
-        }
-        if damaged {
-            restricted = true;
-            continue;
-        }
-        if let Some(row) = published.or(pending) {
-            let assigned = if row["scope"].is_null() {
-                Some(id.as_str())
-            } else {
-                row["scope"].as_str()
-            };
-            if scope.is_some() && scope == assigned && row["controllerOwner"].is_null() {
-                if let (Some(attempt), Some(round)) =
-                    (row["attempt"].as_str(), row["round"].as_u64())
-                {
-                    if crate::workflow::valid_identity(attempt, "a-") && round > 0 {
-                        verified.insert(id, (attempt.to_owned(), round));
-                    }
-                }
-            }
-        }
-    }
-    Ok(restricted.then_some(verified))
+struct AssignmentProof {
+    stamps: Option<GenerationStamps>,
+    identity: Option<(String, u64)>,
+    damaged: bool,
 }
 
-// Missing generations are normal during handoff. Malformed contents (including
-// a filename/record identity mismatch) supply no evidence for this dispatch.
-fn generation(path: &Path, damaged: &mut bool) -> Result<Option<Value>> {
-    match read_record(path) {
-        Ok(record) => Ok(Some(record)),
-        Err(e) => {
-            if let Some(io) = e.downcast_ref::<std::io::Error>() {
-                return if io.kind() == ErrorKind::NotFound {
-                    Ok(None)
-                } else {
-                    Err(e)
-                };
-            }
-            if e.downcast_ref::<serde_json::Error>()
-                .is_some_and(|err| err.is_io())
-            {
-                return Err(e);
-            }
-            *damaged = true;
-            Ok(None)
-        }
+struct ScopeAssignments {
+    directory: Option<Stamp>,
+    proofs: HashMap<String, AssignmentProof>,
+    restricted: bool,
+}
+
+impl ScopeAssignments {
+    fn namespace_current(&self, state: &Path) -> Result<bool> {
+        Ok(Stamp::at(&state.join("dispatches"))? == self.directory)
     }
+
+    // Called after taking transport and scope locks and before taking the
+    // inbox lock. Check the whole proof, including records with no messages.
+    fn current_before_claim(&self, state: &Path, expired: impl Fn() -> bool) -> Result<bool> {
+        let dir = state.join("dispatches");
+        if !self.namespace_current(state)? {
+            return Ok(false);
+        }
+        for (id, proof) in &self.proofs {
+            if expired() || GenerationStamps::at(&dir, id).ok() != proof.stamps {
+                return Ok(false);
+            }
+        }
+        self.namespace_current(state)
+    }
+
+    fn permits(&self, dir: &Path, worker: &Identity) -> bool {
+        if let Some(proof) = self.proofs.get(&worker.dispatch) {
+            if proof.damaged
+                || !proof
+                    .stamps
+                    .is_some_and(|stamps| stamps.current(dir, &worker.dispatch))
+            {
+                return false;
+            }
+            return !self.restricted
+                || proof.identity.as_ref().is_some_and(|(attempt, round)| {
+                    attempt == &worker.attempt && *round == worker.round
+                });
+        }
+        !self.restricted
+    }
+}
+
+// A truncated reservation leaves the global relay without trustworthy
+// ownership. Scoped relays can still use independently verified assignments.
+fn scope_assignments(
+    state: &Path,
+    scope: Option<&str>,
+    previous: Option<ScopeAssignments>,
+    expired: impl Fn() -> bool,
+) -> Result<Option<ScopeAssignments>> {
+    let dir = state.join("dispatches");
+    let directory = Stamp::at(&dir)?;
+    let mut old = previous.unwrap_or_else(|| ScopeAssignments {
+        directory: None,
+        proofs: HashMap::new(),
+        restricted: false,
+    });
+    // The directory stamp only tracks the namespace. Recheck each pair's
+    // stamps before reusing its parsed metadata, including damaged entries.
+    let ids = if old.directory == directory {
+        old.proofs.keys().cloned().collect()
+    } else {
+        crate::workflow::assignment::ids(&dir)?
+    };
+    let mut result = ScopeAssignments {
+        directory,
+        proofs: HashMap::new(),
+        restricted: false,
+    };
+    for id in ids {
+        if expired() {
+            return Ok(None);
+        }
+        let stamps = GenerationStamps::at(&dir, &id).ok();
+        let cached = old
+            .proofs
+            .remove(&id)
+            .filter(|proof| stamps.is_some() && proof.stamps == stamps);
+        let proof = match cached {
+            Some(proof) => proof,
+            None => {
+                let generations = Generations::read(&dir, &id);
+                for row in generations.rows() {
+                    if !row["controllerOwner"].is_null() {
+                        let owned = if row["scope"].is_null() {
+                            Some(id.as_str())
+                        } else {
+                            row["scope"].as_str()
+                        };
+                        ensure!(
+                            scope.is_some() && owned.is_some() && scope != owned,
+                            "controller owner authorization required for relay"
+                        );
+                    }
+                }
+                let unchanged = stamps.is_some_and(|stamps| stamps.current(&dir, &id));
+                let identity = generations.assigned().and_then(|row| {
+                    let assigned = if row["scope"].is_null() {
+                        Some(id.as_str())
+                    } else {
+                        row["scope"].as_str()
+                    };
+                    if scope.is_none() || scope != assigned || !row["controllerOwner"].is_null() {
+                        return None;
+                    }
+                    row["attempt"]
+                        .as_str()
+                        .zip(row["round"].as_u64())
+                        .filter(|(attempt, round)| {
+                            crate::workflow::valid_identity(attempt, "a-") && *round > 0
+                        })
+                        .map(|(attempt, round)| (attempt.to_owned(), round))
+                });
+                AssignmentProof {
+                    stamps: stamps.filter(|_| unchanged),
+                    identity,
+                    damaged: !unchanged || generations.damaged,
+                }
+            }
+        };
+        result.restricted |= proof.damaged;
+        result.proofs.insert(id, proof);
+    }
+    Ok(Some(result))
 }
 
 fn settle(inbox: &mut Inbox, batch: &[Value], received: bool) -> Result<()> {
@@ -498,4 +563,50 @@ fn settle(inbox: &mut Inbox, batch: &[Value], received: bool) -> Result<()> {
         inbox.save()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_relay_rechecks_legacy_owner_proof_under_transport_lock() -> Result<()> {
+        let state = env::temp_dir().join(format!("wfc-relay-proof-{}", uuid::Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let dir = state.join("dispatches");
+            fs::create_dir_all(&dir)?;
+            let scope = "ours";
+            let target = json!({"dispatch":"d-aabbccdd","scope":scope,"role":"fixture",
+                "round":1,"attempt":"a-123456789abc"});
+            let worker: Identity = serde_json::from_value(target.clone())?;
+            let mut history = json!({"dispatch":"d-aabbccde","scope":scope,"role":"fixture",
+                "round":1,"attempt":"a-123456789abd"});
+            let path = dir.join("d-aabbccde.json");
+            fs::write(dir.join("d-aabbccdd.json"), serde_json::to_vec(&target)?)?;
+            fs::write(&path, serde_json::to_vec(&history)?)?;
+            let proof = scope_assignments(&state, Some(scope), None, || false)?
+                .context("missing original scope proof")?;
+
+            // The older marker changes on a different assignment while the
+            // relay's unlocked proof is in flight, using its existing locks.
+            let writer = transport_lock(&state, Some(scope))?.context("missing writer lock")?;
+            history["controllerOwner"] = json!({"owner":"historical fixture"});
+            fs::write(&path, serde_json::to_vec(&history)?)?;
+            drop(writer);
+
+            let delivery = transport_lock(&state, Some(scope))?.context("missing relay lock")?;
+            assert!(proof.namespace_current(&state)?);
+            assert!(proof.permits(&dir, &worker));
+            assert!(!proof.current_before_claim(&state, || false)?);
+            assert!(!state.join("messages.lock").exists());
+            drop(delivery);
+            assert!(scope_assignments(&state, Some(scope), None, || false).is_err());
+            let neighbor = scope_assignments(&state, Some("neighbor"), None, || false)?
+                .context("missing neighboring scope proof")?;
+            assert!(neighbor.current_before_claim(&state, || false)?);
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(state);
+        result
+    }
 }

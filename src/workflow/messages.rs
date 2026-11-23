@@ -2,6 +2,8 @@
 //! before printing it, so another waiter cannot deliver the same messages.
 mod receipt;
 #[cfg(target_os = "linux")]
+mod recovery;
+#[cfg(target_os = "linux")]
 pub mod relay;
 #[cfg(target_os = "linux")]
 mod reply;
@@ -276,6 +278,7 @@ struct Message {
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum MessageKind {
+    StartupFailure,
     Done,
     Question,
     Reply,
@@ -419,6 +422,10 @@ impl Message {
             .is_some_and(|tag| tag == "reclaimed")
         {
             MessageKind::Reclaimed
+        } else if self.additional_fields.get("kind").and_then(Value::as_str)
+            == Some("startup_failure")
+        {
+            MessageKind::StartupFailure
         } else if self.reply_payload.is_some() {
             MessageKind::Reply
         } else if self.question_payload.is_some() {
@@ -433,11 +440,22 @@ impl Message {
     }
 
     fn is_controller_message(&self) -> bool {
-        matches!(self.kind(), MessageKind::Done | MessageKind::Question)
+        matches!(
+            self.kind(),
+            MessageKind::Done | MessageKind::Question | MessageKind::StartupFailure
+        )
     }
 
     fn valid_payload(&self) -> bool {
         match self.kind() {
+            MessageKind::StartupFailure => {
+                self.question_payload.is_none()
+                    && self.reply_payload.is_none()
+                    && self
+                        .additional_fields
+                        .get("fault")
+                        .is_some_and(Value::is_object)
+            }
             MessageKind::Done => self.report.is_some(),
             MessageKind::Question => self.report.is_none(),
             MessageKind::Reply => self.report.is_none() && self.question_payload.is_none(),
@@ -457,6 +475,24 @@ impl Message {
         body
     }
 
+    fn is_startup_failure(&self) -> bool {
+        self.kind() == MessageKind::StartupFailure
+    }
+
+    fn message_type(&self) -> &str {
+        match self.kind() {
+            MessageKind::StartupFailure => self
+                .additional_fields
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            MessageKind::Done => "done",
+            MessageKind::Question => "question",
+            MessageKind::Reply => "reply",
+            MessageKind::Reclaimed => "reclaimed",
+        }
+    }
+
     fn body(&self) -> Map<String, Value> {
         if let Some(reply) = &self.reply_payload {
             let mut body = self.worker.fields();
@@ -468,6 +504,15 @@ impl Message {
             return question.body(&self.worker);
         }
         let mut body = self.original_body();
+        if self.is_startup_failure() {
+            body.insert("scope".into(), json!(self.worker.scope()));
+            for key in ["kind", "host", "message", "fault"] {
+                if let Some(value) = self.additional_fields.get(key) {
+                    body.insert(key.into(), value.clone());
+                }
+            }
+            return body;
+        }
         for key in ["head", "dirty"] {
             if let Some(value) = self.additional_fields.get(key) {
                 body.insert(key.into(), value.clone());
@@ -551,7 +596,7 @@ impl Message {
             ("id".into(), json!(self.id)),
             ("messageId".into(), json!(self.message_id)),
             ("dispatch".into(), json!(self.worker.dispatch)),
-            ("type".into(), json!(self.kind())),
+            ("type".into(), json!(self.message_type())),
             ("state".into(), json!(state)),
             ("statusVersion".into(), json!(version)),
         ]);
@@ -802,6 +847,51 @@ impl Inbox {
         Ok(batch)
     }
 
+    #[cfg(target_os = "linux")]
+    fn append_startup_failure(
+        &mut self,
+        assignment: Assignment,
+        host: &Value,
+        failure: &super::startup::Failure<'_>,
+    ) -> bool {
+        let worker = &assignment.worker;
+        if self.messages.iter().any(|m| {
+            m.is_controller_message()
+                && m.worker.dispatch == worker.dispatch
+                && m.worker.attempt == worker.attempt
+                && m.worker.round == worker.round
+        }) {
+            return false;
+        }
+        self.push_startup_failure(assignment, host, failure);
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn push_startup_failure(
+        &mut self,
+        assignment: Assignment,
+        host: &Value,
+        failure: &super::startup::Failure<'_>,
+    ) {
+        let worker = assignment.worker;
+        let key = format!(
+            "startup:{}:{}:{}",
+            worker.dispatch, worker.round, worker.attempt
+        );
+        let mut message = Message::new(self.messages.len() as u64 + 1, worker, Some(key));
+        message.report = assignment.report;
+        message.additional_fields = Map::from_iter([
+            ("type".into(), json!(failure.message_type())),
+            ("kind".into(), json!("startup_failure")),
+            ("host".into(), host.clone()),
+            ("message".into(), json!(failure.diagnostic())),
+            ("fault".into(), json!(failure)),
+        ]);
+        message.body_hash = Some(message.computed_hash());
+        self.messages.push(message);
+    }
+
     fn validate_done(
         &self,
         assignment: &Assignment,
@@ -866,9 +956,10 @@ impl Inbox {
                         && r["report"].as_str().map(Path::new) == Some(report)
                 });
             ensure!(
-                !reused_report && !history().any(|m| (m.worker.round != worker.round
-                    || m.worker.attempt != worker.attempt)
-                    && m.report.as_deref() == Some(report)),
+                !reused_report
+                    && !history().any(|m| (m.worker.round != worker.round
+                        || m.worker.attempt != worker.attempt)
+                        && m.report.as_deref() == Some(report)),
                 "ambiguous report for {}; supply --attempt",
                 worker.dispatch
             );
@@ -932,7 +1023,8 @@ impl Inbox {
         });
         let pending_resume = attempt.is_some()
             && controller::worker_callback().is_some()
-            && super::assignment::resume_audit(row).is_some_and(|event| event["result"] == "pending");
+            && super::assignment::resume_audit(row)
+                .is_some_and(|event| event["result"] == "pending");
         ensure!(
             !confirmed_done
                 && (pending_resume
@@ -988,6 +1080,130 @@ impl Inbox {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod startup_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn startup_recovery_rejects_replaced_assignment_and_preserves_existing_question() -> Result<()>
+    {
+        let state = env::temp_dir().join(format!("wfc-startup-recovery-{}", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let dispatch = "d-aabbccdd";
+            let round = 1;
+            let attempt = "a-123456789abc";
+            let launch = "0123456789abcdef0123456789abcdef";
+            let scope = "original-scope";
+            fs::create_dir_all(state.join("launches"))?;
+            fs::create_dir_all(state.join("dispatches"))?;
+            let receipt = state
+                .canonicalize()?
+                .join("launches")
+                .join(format!("{launch}.json"));
+            let path = state.join("dispatches").join(format!("{dispatch}.json"));
+            super::super::write_json(
+                &receipt,
+                &json!({"category":"process_exited","exitCode":17,"launchId":launch,
+                "startupExit":{"exitCode":17,"signal":null,"pid":123,"processStart":null}}),
+                None,
+            )?;
+            let row = json!({"dispatch":dispatch,"round":round,"attempt":attempt,"scope":scope,
+                "executionId":attempt,"role":"worker","cwd":state,"report":state.join("report"),
+                "backend":"tmux","host":"codex","create":{"result":"uncertain","category":"process_exited",
+                    "dispatch":dispatch,"round":round,"attempt":attempt,"exitCode":17,"receipt":receipt}});
+            super::super::write_json(&path, &row, None)?;
+            let mut scan = recovery::Scan::default();
+            let mut read = |scope| scan.batch(&state, Some(dispatch), Some(scope), recovery::SLICE);
+            assert!(read("wrong-scope").is_empty());
+            let lost = read(scope);
+            assert_eq!(lost.len(), 1);
+            let mut replaced = row.clone();
+            replaced["attempt"] = json!("a-aaaaaaaaaaaa");
+            super::super::write_json(&path, &replaced, None)?;
+            let mut inbox = Inbox::open(&state)?;
+            inbox.recover_startups(&mut scan, lost)?;
+            assert!(inbox.messages.is_empty());
+            drop(inbox);
+
+            super::super::write_json(&path, &row, None)?;
+            let lost = scan.batch(&state, Some(dispatch), Some(scope), recovery::SLICE);
+            assert_eq!(lost.len(), 1);
+            let pending = path.with_extension("pending");
+            super::super::write_json(&pending, &replaced, None)?;
+            let mut inbox = Inbox::open(&state)?;
+            inbox.recover_startups(&mut scan, lost)?;
+            assert!(inbox.messages.is_empty());
+            drop(inbox);
+            assert!(scan
+                .batch(&state, Some(dispatch), Some(scope), recovery::SLICE)
+                .is_empty());
+            fs::write(&pending, b"{")?;
+            assert!(scan
+                .batch(&state, Some(dispatch), Some(scope), recovery::SLICE)
+                .is_empty());
+            super::super::write_json(&pending, &row, None)?;
+            super::super::write_json(
+                &state.join("messages.json"),
+                &json!([{
+                    "id":1,"messageId":"m-question","dispatch":dispatch,"round":round,"attempt":attempt,
+                    "scope":scope,"role":"worker","question_payload":{"text":"Continue?","options":[]},
+                    "state":"received","statusVersion":2,
+                }]),
+                None,
+            )?;
+            let recovered = scan.batch(&state, Some(dispatch), Some(scope), recovery::SLICE);
+            assert_eq!(recovered.len(), 1);
+            let mut inbox = Inbox::open(&state)?;
+            inbox.recover_startups(&mut scan, recovered)?;
+            assert_eq!(inbox.messages.len(), 1);
+            assert_eq!(inbox.messages[0].message_id, "m-question");
+            assert_eq!(inbox.messages[0].view()["type"], "question");
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(state);
+        result
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn publish_startup_failure(
+    state: &Path,
+    dispatch: &str,
+    attempt: &str,
+    failure: &super::startup::Failure<'_>,
+) -> Result<()> {
+    publish_startup_failure_locked(state, dispatch, attempt, failure, lock_for_publish(state)?)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn publish_startup_failure_locked(
+    state: &Path,
+    dispatch: &str,
+    attempt: &str,
+    failure: &super::startup::Failure<'_>,
+    ledger: File,
+) -> Result<()> {
+    ensure!(
+        valid_id(dispatch) && super::valid_identity(attempt, "a-"),
+        "invalid startup identity"
+    );
+    let mut inbox = Inbox::read_locked(state, ledger)?;
+    let dir = state.join("dispatches");
+    let (file, path) = super::assignment::open_assignment(&dir, dispatch)?;
+    let row = super::decode_record(file, &path)?;
+    let assignment = Assignment::deserialize(&row)?;
+    ensure!(
+        assignment.worker.attempt == attempt
+            && assignment.worker.round > 0
+            && assignment.controller_owner.is_none(),
+        "startup failure does not match the current assignment"
+    );
+    if inbox.append_startup_failure(assignment, &row["host"], failure) {
+        inbox.save().context("publish startup failure")?;
+    }
+    Ok(())
+}
+
 // Writers publish complete snapshots by rename. A status reader can open
 // either generation without taking a lock or touching the state directory.
 pub(super) fn history(state: &Path, dispatch: &str) -> Result<Vec<Value>> {
@@ -997,7 +1213,7 @@ pub(super) fn history(state: &Path, dispatch: &str) -> Result<Vec<Value>> {
         .map(|m| {
             let mut view = m.view();
             match m.kind() {
-                MessageKind::Done | MessageKind::Question => {
+                MessageKind::Done | MessageKind::Question | MessageKind::StartupFailure => {
                     view["to"] = json!("controller");
                     view["delivered"] = json!(m.delivery.delivered());
                 }
@@ -1386,21 +1602,53 @@ impl<'a> Wait<'a> {
         let state = state_dir()?;
         let token = controller::token(self.owner_token);
         let start = Instant::now();
+        #[cfg(target_os = "linux")]
+        let (mut scan, mut pending, mut first) = (recovery::Scan::default(), None, true);
         loop {
             let preflight = || {
                 controller::Owners::read(&state)?.preflight(self.scope, token.as_deref(), "wait")
             };
             preflight()?;
+            #[cfg(target_os = "linux")]
+            let mut more = false;
+            #[cfg(target_os = "linux")]
+            if pending.is_none() {
+                let allowance = if first {
+                    recovery::SLICE
+                } else {
+                    self.timeout.saturating_sub(start.elapsed())
+                };
+                first = false;
+                pending = Some(scan.poll(&state, self.dispatch, self.scope, allowance));
+            }
             let batch = match Inbox::try_open(&state)? {
                 Some(mut inbox) => {
                     preflight()?;
-                    inbox.claim(self.dispatch, self.scope, State::Received)?
+                    #[cfg(target_os = "linux")]
+                    let mut advance = None;
+                    #[cfg(target_os = "linux")]
+                    if let Some(batch) = pending.take() {
+                        inbox.recover_startups(&mut scan, batch.candidates)?;
+                        advance = batch.advance;
+                        more = batch.more;
+                    }
+                    let claimed = inbox.claim(self.dispatch, self.scope, State::Received)?;
+                    drop(inbox);
+                    #[cfg(target_os = "linux")]
+                    if let Some(advance) = advance {
+                        advance.commit(&state, &mut scan);
+                    }
+                    claimed
                 }
                 None => Vec::new(),
             };
             let remaining = self.timeout.saturating_sub(start.elapsed());
             if !batch.is_empty() || remaining.is_zero() {
                 return Ok(batch);
+            }
+            #[cfg(target_os = "linux")]
+            if more {
+                continue;
             }
             std::thread::sleep(remaining.min(Duration::from_millis(100)));
         }
@@ -1409,7 +1657,7 @@ impl<'a> Wait<'a> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::sticky_owner_matches;
+    use super::*;
 
     #[test]
     fn sticky_replacement_requires_confirmed_owner() {
@@ -1419,5 +1667,77 @@ mod tests {
         assert!(!sticky_owner_matches(65534, 65534, 0, 65534));
         assert!(!sticky_owner_matches(65534, 0, 65534, 65534));
         assert!(!sticky_owner_matches(1001, 1001, 1001, 1001));
+    }
+
+    #[test]
+    fn startup_receipt_with_report_does_not_count_as_done() -> Result<()> {
+        let state = env::temp_dir().join(format!("wfc-startup-message-{}", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let dispatch = "d-aabbccdd";
+            let attempt = "a-123456789abc";
+            let report = state.join("report");
+            let row = json!({"dispatch":dispatch,"attempt":attempt,"round":1,
+                "scope":"notice-scope","role":"worker","cwd":state,"report":report});
+            let records = state.join("dispatches");
+            fs::create_dir_all(&records)?;
+            super::super::write_json(&records.join(format!("{dispatch}.json")), &row, None)?;
+            Reclaimed::prepare(&row)?.publish(&state)?;
+            let assignment = Assignment::deserialize(&row)?;
+            {
+                let mut inbox = Inbox::open(&state)?;
+                let mut reply = Message::new(2, assignment.worker.clone(), None);
+                reply.reply_payload = Some(ReplyRecord {
+                    to: 7,
+                    question_message_id: "m-fixture-question".into(),
+                    answer: "historical reply".into(),
+                    input_result: InputResult::Refused,
+                    diagnostic: None,
+                    category: None,
+                });
+                inbox.publish(reply)?;
+            }
+            for _ in 0..2 {
+                super::super::startup::Startup::new(&state, dispatch, attempt, None)
+                    .spawn_failed(ErrorKind::NotFound);
+            }
+            let mut inbox = Inbox::open(&state)?;
+            let [event, reply, notice] = inbox.messages.as_slice() else {
+                anyhow::bail!("expected reclaimed and reply history plus one startup message");
+            };
+            assert_eq!(event.view()["type"], "reclaimed");
+            assert!(!event.is_controller_message());
+            assert_eq!(reply.view()["type"], "reply");
+            assert_eq!(reply.view()["to"], 7);
+            assert!(!reply.is_controller_message());
+            assert_eq!(notice.view()["type"], "blocked");
+            assert_eq!(notice.view()["scope"], "notice-scope");
+            assert_eq!(notice.report.as_deref(), Some(report.as_path()));
+            assert!(inbox
+                .validate_done(
+                    &assignment,
+                    &row,
+                    &report,
+                    notice.request_key.as_deref(),
+                    Some(attempt)
+                )
+                .is_err());
+            assert!(inbox
+                .validate_done(
+                    &assignment,
+                    &row,
+                    &report,
+                    Some("fresh-done"),
+                    Some(attempt)
+                )?
+                .is_none());
+            inbox.require_question_round(&assignment, &row, Some(attempt))?;
+            let delivered = inbox.claim(None, Some("notice-scope"), State::Received)?;
+            assert_eq!(delivered.len(), 1);
+            assert_eq!(delivered[0]["type"], "blocked");
+            assert!(inbox.claim(None, None, State::Received)?.is_empty());
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(state);
+        result
     }
 }

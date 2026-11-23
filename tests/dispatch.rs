@@ -197,7 +197,17 @@ fn spawn_errors_and_worker_exit_codes_are_distinguished() {
         let bad = completed(&f, serde_json::from_slice(&failed.stdout).unwrap(), 7);
         let all = run(f.wfc().arg("status"));
         let rows = all["dispatches"].as_array().unwrap();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
+        let unstarted = rows
+            .iter()
+            .find(|row| row["worker"]["state"] == "not_started")
+            .unwrap();
+        assert_eq!(
+            unstarted["startupFailure"]["category"],
+            "executable_missing"
+        );
+        assert!(unstarted["startupFailure"]["exitCode"].is_null());
+        assert!(unstarted["startupFailure"]["pid"].is_null());
         for expected in [good, bad] {
             assert!(rows.iter().any(
                 |r| r["dispatch"] == expected["dispatch"] && r["worker"] == expected["worker"]

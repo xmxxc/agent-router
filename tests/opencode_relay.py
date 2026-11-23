@@ -146,23 +146,43 @@ class OpenCodeRelay(unittest.TestCase):
 
     def test_connection_refused_is_unsent_and_can_retry_original_id(self):
         receipt = self.publish("ours")
+        neighbor = self.publish("other")
+        original = (receipt["message"], receipt["messageId"])
+        self.assertEqual((receipt["state"], receipt["statusVersion"]), ("unsent", 1))
         with socket.socket() as closed:
             # Hold the port without listening so a different test cannot claim it.
             closed.bind(("127.0.0.1", 0))
             refused_url = f"http://127.0.0.1:{closed.getsockname()[1]}"
             log = self.send(".4", url=refused_url)
-        self.assertIn("connection refused", log)
+        self.assertEqual(sum("connection refused" in line for line in log.splitlines()), 1, log)
         row = self.row(receipt)
+        self.assertEqual((row["id"], row["messageId"]), original)
         self.assertEqual((row["state"], row["statusVersion"]), ("unsent", 3))
         self.assertEqual(self.posts, [])
         self.cli("ack", receipt["messageId"], code=1)
         self.send()
         post, = self.posts
         message, = self.batch(post)
-        self.assertEqual((message["id"], message["messageId"], message["statusVersion"]),
-                         (receipt["message"], receipt["messageId"], 4))
+        self.assertEqual((message["id"], message["messageId"]), original)
+        self.assertEqual((message["state"], message["statusVersion"], message["deliveryAttempt"]),
+                         ("unknown", 4, f"relay:{receipt['messageId']}:4"))
+        history, = self.data("status", "--dispatch", message["dispatch"])["dispatches"][0]["messages"]
+        self.assertEqual((history["id"], history["messageId"]), original)
+        self.assertEqual((history["state"], history["statusVersion"]), ("received", 5))
         ack = self.data("ack", receipt["messageId"])
+        self.assertEqual((ack["message"], ack["messageId"]), original)
         self.assertEqual((ack["state"], ack["statusVersion"]), ("processed", 6))
+        self.assertEqual(self.data("ack", receipt["messageId"]), {**ack, "duplicate": True})
+        other = self.row(neighbor)
+        self.assertEqual((other["id"], other["messageId"], other["state"], other["statusVersion"]),
+                         (neighbor["message"], neighbor["messageId"], "unsent", 1))
+        self.assertEqual(self.calls(), [])
+        print(json.dumps({
+            "message": original[0], "messageId": original[1], "refusals": 1, "acceptedPosts": 1,
+            "versions": [receipt["statusVersion"], row["statusVersion"], message["statusVersion"],
+                         history["statusVersion"], ack["statusVersion"]],
+            "neighbor": other["messageId"], "neighborVersion": other["statusVersion"],
+        }), flush=True)
 
     def test_errors_redirects_timeouts_and_eof_never_replay(self):
         for count, mode in enumerate((302, 307, 401, 500, "timeout", "incomplete_headers", "disconnect"), start=1):

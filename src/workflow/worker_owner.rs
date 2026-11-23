@@ -1,4 +1,4 @@
-//! One detached, single-threaded wfc owns and reaps one Linux worker tree.
+//! One detached wfc owns and reaps one Linux worker tree.
 use super::{controller, messages, read_record, record_scope, state_dir, valid_id, valid_identity};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
@@ -340,29 +340,52 @@ fn supervise(args: &[OsString]) -> Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(&path)?;
-    let start = (|| -> Result<_> {
-        file.lock()?;
-        file.write_all_at(header.as_bytes(), 0)?;
-        Command::new(program)
-            .args(argv)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("spawn worker")
-    })();
-    let child = match start {
+    if let Err(err) = file
+        .lock()
+        .and_then(|()| file.write_all_at(header.as_bytes(), 0))
+    {
+        fs::remove_file(path)?;
+        return Err(err.into());
+    }
+    let state = dir.parent().context("missing state directory")?;
+    let startup = super::startup::Startup::new(
+        state,
+        &id,
+        record["attempt"].as_str().context("missing attempt")?,
+        None,
+    );
+    let child = match Command::new(program)
+        .args(argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
         Ok(child) => child,
         Err(err) => {
-            fs::remove_file(path)?;
-            return Err(err);
+            let outcome = json!({"state":"not_started","exit_code":null,"signal":null});
+            file.write_all_at(outcome.to_string().as_bytes(), header.len() as u64)?;
+            file.sync_data()?;
+            fs::rename(&pending, dir.join(format!("{id}.json")))?;
+            startup.spawn_failed(err.kind());
+            return Err(err).context("spawn worker");
         }
     };
-    let published = fs::rename(&pending, dir.join(format!("{id}.json")));
+    let watching = startup.watch(&child);
+    let root = child.id() as i32;
+    let (published, observed_root) = publish_while_observing(root, || {
+        fs::rename(&pending, dir.join(format!("{id}.json")))
+    });
     if published.is_ok() {
         let _ = writeln!(io::stdout().lock(), "ready");
     }
-    let result = watch_tree(&file, child.id() as i32, published.is_err())?;
+    let result = watch_tree(
+        &file,
+        root,
+        published.is_err(),
+        published.is_ok().then_some(watching),
+        observed_root,
+    )?;
     if let Err(err) = published {
         fs::remove_file(path)?;
         return Err(err).context("publish dispatch record");
@@ -372,15 +395,58 @@ fn supervise(args: &[OsString]) -> Result<()> {
     Ok(())
 }
 
-fn watch_tree(file: &File, root: i32, mut closing: bool) -> Result<Value> {
+fn publish_while_observing(
+    root: i32,
+    publish: impl FnOnce() -> io::Result<()>,
+) -> (io::Result<()>, Option<Instant>) {
+    if exit_pending(root).unwrap_or(false) {
+        let observed = Instant::now();
+        return (publish(), Some(observed));
+    }
+    let (finished, publishing) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        // WNOWAIT leaves the child pinned for the owner, which still reaps
+        // and distinguishes natural exit from an actual close signal.
+        let observer = std::thread::Builder::new().spawn_scoped(scope, move || loop {
+            if exit_pending(root).unwrap_or(false) {
+                return Some(Instant::now());
+            }
+            match publishing.recv_timeout(Duration::from_millis(5)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (),
+                _ => return exit_pending(root).unwrap_or(false).then(Instant::now),
+            }
+        });
+        let published = publish();
+        let _ = finished.send(());
+        let observed = observer
+            .ok()
+            .and_then(|thread| thread.join().ok().flatten());
+        (published, observed)
+    })
+}
+
+fn watch_tree(
+    file: &File,
+    root: i32,
+    mut closing: bool,
+    mut startup: Option<super::startup::Running<'_>>,
+    mut observed_root: Option<Instant>,
+) -> Result<Value> {
     let mut root_exit = None;
     let mut killed_root = false;
-    loop {
+    'reap: loop {
         let mut status = 0;
         let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::__WALL) };
         if pid > 0 {
             if pid == root && root_exit.is_none() {
-                root_exit = Some(ExitStatus::from_raw(status));
+                let exit = ExitStatus::from_raw(status);
+                let observed = observed_root.unwrap_or_else(Instant::now);
+                root_exit = Some(exit);
+                if let Some(startup) = startup.take() {
+                    if !close_killed_root(killed_root, exit) {
+                        startup.exited(exit, observed);
+                    }
+                }
             }
             continue;
         }
@@ -419,6 +485,15 @@ fn watch_tree(file: &File, root: i32, mut closing: bool) -> Result<Value> {
                 }
                 owned = true;
                 if closing {
+                    if pid == root && root_exit.is_none() {
+                        if killed_root {
+                            continue;
+                        }
+                        if exit_pending(root)? {
+                            observed_root.get_or_insert_with(Instant::now);
+                            continue 'reap;
+                        }
+                    }
                     if unsafe { libc::kill(pid, libc::SIGKILL) } == -1 {
                         let err = io::Error::last_os_error();
                         if err.raw_os_error() != Some(libc::ESRCH) {
@@ -436,10 +511,89 @@ fn watch_tree(file: &File, root: i32, mut closing: bool) -> Result<Value> {
         std::thread::sleep(POLL);
     }
     let exit = root_exit.context("missing worker exit status")?;
-    let state = if killed_root && exit.signal() == Some(libc::SIGKILL) {
+    let state = if close_killed_root(killed_root, exit) {
         "cancelled"
     } else {
         "exited"
     };
     Ok(json!({"state":state,"exit_code":exit.code(),"signal":exit.signal()}))
+}
+
+fn close_killed_root(killed_root: bool, exit: ExitStatus) -> bool {
+    killed_root && exit.signal() == Some(libc::SIGKILL)
+}
+
+fn exit_pending(pid: i32) -> io::Result<bool> {
+    // A successful kill can also target an unreaped zombie. Check for a
+    // waitable natural exit before treating this as an active close.
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        if unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        } == 0
+        {
+            return Ok(unsafe { info.assume_init().si_pid() } == pid);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_observes_natural_exit_during_controlled_publication() -> Result<()> {
+        let state = std::env::temp_dir().join(format!("wfc-slow-publish-{}", uuid::Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let dispatch = "d-aabbccdd";
+            let attempt = "a-123456789abc";
+            let dir = state.join("dispatches");
+            fs::create_dir_all(&dir)?;
+            let pending = super::super::assignment::reserve(
+                &dir,
+                dispatch,
+                &json!({
+                    "dispatch":dispatch,"attempt":attempt,"round":1,"scope":"slow-publication",
+                    "role":"fixture","cwd":state,"report":state.join("report"),
+                }),
+            )?;
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", "read -r line; exit 17"])
+                .stdin(Stdio::piped())
+                .spawn()?;
+            let pid = child.id();
+            let startup = super::super::startup::Startup::new(&state, dispatch, attempt, None);
+            let watching = startup.watch(&child);
+            let (published, observed) = publish_while_observing(pid as i32, || {
+                drop(child.stdin.take());
+                std::thread::sleep(Duration::from_millis(350));
+                fs::rename(&pending, dir.join(format!("{dispatch}.json")))
+            });
+            let exit = child.wait()?;
+            published?;
+            assert_eq!(exit.code(), Some(17));
+            watching.exited(
+                exit,
+                observed.context("exit was not observed during publication")?,
+            );
+            let history = super::super::messages::history(&state, dispatch)?;
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0]["attempt"], attempt);
+            assert_eq!(history[0]["scope"], "slow-publication");
+            assert_eq!(history[0]["fault"]["exitCode"], 17);
+            assert_eq!(history[0]["fault"]["pid"], pid);
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(state);
+        result
+    }
 }

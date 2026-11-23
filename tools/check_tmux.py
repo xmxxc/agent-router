@@ -1380,10 +1380,29 @@ os.execv({TMUX!r}, [{TMUX!r}, *a])
                          (reclaim["message"], "worker", False))
         self.assertEqual([(m["id"], m["messageId"]) for m in status["undelivered"]],
                          [(m["id"], m["messageId"]) for m in (question, done)])
-        claimed = self.reply_cli("wait", "--dispatch", dispatch, "--timeout", "0")["messages"]
-        self.assertEqual([m["messageId"] for m in claimed], [question["messageId"], done["messageId"]])
-        for selector in (str(question["id"]), done["messageId"]):
-            self.assertEqual(self.reply_cli("ack", selector)["state"], "processed")
+        self.reply_cli("dispatch", "--task", "task", "--cwd", ".", "--report", "startup-report",
+                       "--role", "startup-check", "--scope", "failed-launch", "--",
+                       self.work / "missing-worker", expected=1)
+        status = self.reply_cli("status")
+        failed, = [row for row in status["dispatches"] if row["scope"] == "failed-launch"]
+        detail, = self.reply_cli("status", "--dispatch", failed["dispatch"])["dispatches"]
+        notice, = detail["messages"]
+        self.assertEqual((notice["kind"], notice["type"], notice["to"], notice["delivered"]),
+                         ("startup_failure", "blocked", "controller", False))
+        self.assertEqual(detail["startupFailure"], notice["fault"])
+        self.assertIn("no question with id", self.reply_cli("reply", notice["id"], "ignored", expected=1))
+        identities = [(m["id"], m["messageId"]) for m in (question, done, notice)]
+        for batch in (status["undelivered"], self.reply_cli("wait", "--timeout", "0")["messages"]):
+            self.assertEqual([(m["id"], m["messageId"]) for m in batch], identities)
+        selectors = (str(question["id"]), done["messageId"], notice["messageId"])
+        for entry, selector in zip((question, done, notice), selectors):
+            ack = self.reply_cli("ack", selector)
+            self.assertEqual((ack["message"], ack["messageId"], ack["state"]),
+                             (entry["id"], entry["messageId"], "processed"))
+        self.assertTrue(self.reply_cli("ack", str(notice["id"]))["duplicate"])
+        self.assertFalse(self.reply_cli("status")["undelivered"])
+        self.assertIn("no question with id", self.reply_cli("reply", done["id"], "ignored", expected=1))
+        self.assertIn("no question with id", self.reply_cli("reply", event["id"], "ignored", expected=1))
         for entry in (refused, accepted, event):
             for selector in (str(entry["id"]), entry["messageId"]):
                 self.assertIn("no controller message", self.reply_cli("ack", selector, expected=1))
