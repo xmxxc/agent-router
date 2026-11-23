@@ -174,3 +174,15 @@ cp -r vendor/portable-pty "$TMP/portable-pty"
 printf '\n[workspace]\n' >> "$TMP/portable-pty/Cargo.toml"
 cargo test --manifest-path "$TMP/portable-pty/Cargo.toml" windows_search_path_skips_directories
 ```
+
+## 0005 wait for the Windows child process to signal
+
+The agent-router Windows smoke test observes the original PowerShell process
+handle immediately after the kernel acknowledges close. TerminateProcess
+initiates termination asynchronously. Poll and wait on the process handle
+before reading the exit code, and report termination failures for a live child.
+Both the child and its cloned killer use the same termination check.
+
+Apply `vendor/patches/portable-pty/0005-wait-for-windows-child-exit.patch`
+after the four Herdr patches. Verify on Windows with
+`python tools/smoke.py <path-to-wfc.exe> --kernel`.
