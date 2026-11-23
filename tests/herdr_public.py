@@ -3,11 +3,13 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
 import threading
 import time
 import unittest
+import uuid
 
 import runtime_process
 
@@ -181,11 +183,14 @@ for line in sys.stdin:
 
     def test_runtime_read_evidence_and_independent_recovery(self):
         hold = threading.Event()
-        entered = threading.Event()
-        release = threading.Event()
-        returned = threading.Event()
         requests = []
         methods = []
+        withheld = []
+        peer_closed = []
+        trace = []
+        started = time.monotonic()
+        self.addCleanup(lambda: print(json.dumps({"case": "herdr-recovery-request-trace",
+                                                   "events": trace[-64:]}), flush=True))
         secret = "private-herdr-transport-token"
         screen = self.root / "screen"
         screen.write_text("Ready.")
@@ -202,15 +207,49 @@ while True:
 """)
         self.env["WFC_MAX_TURN_SECONDS"] = "0"
 
-        def observe_read(req, reply):
+        def record(req, phase):
+            trace.append({"method": req["method"], "requestId": req["id"],
+                          "phase": phase, "ms": int((time.monotonic() - started) * 1000)})
+
+        def read_request(stream):
+            frame = stream.readline()
+            if not frame:
+                return None
+            req = json.loads(frame)
             methods.append(req["method"])
+            poller = select.poll()
+            poller.register(stream, select.POLLHUP)
+            if any(flags & select.POLLHUP for _, flags in poller.poll(0)):
+                self.assertEqual(stream.read(1), b"", "a closed client carried another frame")
+                record(req, "closed_before_forward")
+                return None
+            if req["method"] != "pane.read":
+                return frame
+            pane = req["params"]["pane_id"]
+            key = (req["id"], pane)
+            requests.append(key)
+            if not hold.is_set():
+                return frame
+            # Forward the actual request once, then withhold only this reply.
+            reply = json.loads(live.exchange(self.service.endpoint, req))
+            self.assertEqual(reply["id"], req["id"])
+            self.assertEqual(reply["result"]["type"], "pane_read")
+            self.assertEqual(reply["result"]["read"]["pane_id"], pane)
+            withheld.append(key)
+            record(req, "withheld")
+
+            # Each probe owns its deadline. Releasing only when the outer
+            # wait exits would queue a later probe behind the withheld reply.
+            poller.modify(stream, select.POLLIN | select.POLLHUP)
+            self.assertTrue(poller.poll(3000), "the timed probe did not close its connection")
+            self.assertEqual(stream.read(1), b"", "a withheld connection carried another frame")
+            peer_closed.append(key)
+            record(req, "peer_closed")
+            return None
+
+        def observe_reply(req, reply):
             if req["method"] == "pane.read":
-                requests.append((req["id"], req["params"]["pane_id"]))
-                if hold.is_set():
-                    entered.set()
-                    release.wait(5)
-                    returned.set()
-                    return None
+                record(req, "reply")
             return reply
 
         def run_wait(timeout, quiet=False):
@@ -219,23 +258,27 @@ while True:
             result = self.cli(*args, error='"timedOut":true' if quiet else None)
             return json.loads(result)["messages"] if quiet else result["messages"]
 
-        def slow_wait(timeout, quiet=False):
-            start = len(requests)
-            entered.clear()
-            release.clear()
-            returned.clear()
+        def slow_wait(timeout, quiet=False, may_retry=False):
+            start = len(withheld)
             hold.set()
             try:
                 messages = run_wait(timeout, quiet)
-                self.assertTrue(entered.is_set(), "the bound pane.read was sent")
-                self.assertEqual(len(requests), start + 1)
-                self.assertEqual(requests[-1][1], self.h["pane"])
-                return messages
             finally:
                 hold.clear()
-                release.set()
-                if entered.is_set():
-                    self.assertTrue(returned.wait(2))
+            # The proxy serves one connection at a time. A fresh private ping
+            # proves it drained earlier connections before checking their EOFs.
+            ping = {"id": uuid.uuid4().hex, "method": "ping", "params": {}}
+            pong = json.loads(live.exchange(endpoint, ping))
+            self.assertEqual(pong["id"], ping["id"])
+            self.assertEqual(pong["result"]["type"], "pong")
+            record(ping, "proxy_drained")
+            reads = withheld[start:]
+            self.assertTrue(reads, "the bound pane.read reached Herdr")
+            if not may_retry:
+                self.assertEqual(len(reads), 1)
+            self.assertTrue(all(pane == self.h["pane"] for _, pane in reads))
+            self.assertEqual(peer_closed[start:], reads)
+            return messages
 
         def show(text):
             tmp = screen.with_suffix(".tmp")
@@ -257,7 +300,7 @@ while True:
             for message in notices:
                 ack(message)
 
-        with self.service.fault_proxy(observe_read) as endpoint:
+        with self.service.fault_proxy(observe_reply, read_frame=read_request) as endpoint:
             self.dispatch(endpoint=endpoint)
             self.assertFalse(run_wait("1.4", quiet=True))
             self.assertTrue(requests, "the original bound pane was read successfully")
@@ -277,10 +320,13 @@ while True:
             self.assertFalse(slow_wait(".65", quiet=True))
             first = slow_wait("3")
             verify(first, ["backend_unavailable"])
-            self.assertFalse(slow_wait("1.4", quiet=True))
+            self.assertFalse(slow_wait("1.4", quiet=True, may_retry=True))
 
             show(f"Quota exceeded: {secret}")
+            before = len(trace)
             quota_restored = run_wait("3")
+            self.assertTrue(any(event["phase"] == "reply" for event in trace[before:]),
+                            "the proxy accepted a fresh pane.read after the clipped retries")
             verify(quota_restored, ["screen_notice", "read_restored"])
             quota = self.status()["hostActivity"]
             self.assertEqual((quota["state"], quota["fault"]["category"], quota["readState"]),
