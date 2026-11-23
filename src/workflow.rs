@@ -233,6 +233,7 @@ impl<'a> Dispatch<'a> {
                 record["tmuxSocket"] = json!(backend::tmux_socket()?);
             }
             record["executionId"] = record["attempt"].clone();
+            record["tmuxLaunchProtocol"] = json!(backend::LAUNCH_PROTOCOL);
             Some(host.prepare(&state, &mut record)?)
         } else {
             None
@@ -492,11 +493,7 @@ fn status_with_history(
             record["backendAlive"] = Value::Null;
         } else if record["host"].is_string() {
             let (worker, inspection) = backend::observe(&state, record)?;
-            for field in ["closeEffect", "revocation"] {
-                if let Some(value) = inspection.get(field) {
-                    record[field] = value.clone();
-                }
-            }
+            backend::copy_close_fields(&inspection, record);
             record["worker"] = worker;
             record["backendResult"] = inspection["result"].clone();
             record["backendAlive"] = if inspection["alive"] == true && inspection["owned"] != true {
