@@ -142,6 +142,60 @@ for line in sys.stdin:
             self.assertEqual((self.root/'events').read_text().splitlines(), ['unique'])
             self.cli('close', self.dispatch_id)
 
+    def setup_reply_worker(self, endpoint=None):
+        fixture = Path(__file__).resolve().parents[1] / 'tools/check_tmux.py'
+        self.dispatch(endpoint=endpoint, command=[
+            sys.executable, str(fixture), '--reply-worker', 'empty', str(self.root/'reply.log'),
+        ])
+        question = self.root/'question.json'
+        receipt = json.loads(live.wait_for(lambda: question.exists() and question.read_bytes()))
+        live.wait_for(lambda: 'Ask Codex to do anything' in self.service.api(
+            'pane.read', pane_id=self.h['pane'], source='recent', format='text',
+            strip_ansi=True, lines=50)['read']['text'])
+        return receipt
+
+    def assert_reply_worker_finished(self, question, outcome):
+        reply, = [m for m in self.status()['messages'] if m['type'] == 'reply']
+        self.assertEqual(reply['inputResult'], outcome)
+        self.assertEqual(reply['questionMessageId'], question['messageId'])
+        self.assertEqual(reply['to'], question['message'])
+        for key in ('dispatch', 'round', 'attempt'):
+            self.assertEqual(reply[key], self.row[key])
+        self.cli('reply', question['message'], 'again', error='already answered')
+        accepted = self.root/'accepted'
+        received = live.wait_for(lambda: accepted.exists() and accepted.read_text())
+        self.assertEqual(received.splitlines(), [f"[router] Answer to question {question['message']}: once"])
+        first, = self.cli('wait', '--timeout', 0)['messages']
+        self.assertEqual(first['type'], 'question')
+        (self.root/'finish').touch()
+        done, = self.cli('wait', '--timeout', 8)['messages']
+        self.assertEqual((done['type'], done['attempt']), ('done', self.row['attempt']))
+        self.assertEqual(Path(done['report']).read_text(), 'original worker received the answer\n')
+        self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+
+    def test_public_reply_on_bound_herdr_pane(self):
+        question = self.setup_reply_worker()
+        self.assertEqual(self.cli('reply', question['message'], 'once'),
+                         {'replied': question['message'], 'dispatch': self.dispatch_id})
+        self.assertFalse(self.status()['pendingInput'])
+        self.assert_reply_worker_finished(question, 'accepted')
+
+    def test_public_reply_retains_claim_after_herdr_delivers_without_receipt(self):
+        sends = []
+
+        def lose(req, reply):
+            if req['method'] in ('pane.send_input', 'pane.send_keys'):
+                sends.append(req['method'])
+                return None
+            return reply
+
+        with self.service.fault_proxy(lose) as proxy:
+            question = self.setup_reply_worker(proxy)
+            self.cli('reply', question['message'], 'once', error='uncertain')
+            self.assertTrue(self.status()['pendingInput'])
+            self.assert_reply_worker_finished(question, 'uncertain')
+            self.assertEqual(sends, ['pane.send_input'])
+
     def drop_close(self, calls):
         def read(stream):
             frame = stream.readline()

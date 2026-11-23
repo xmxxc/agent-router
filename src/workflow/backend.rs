@@ -43,11 +43,20 @@ fn call(state: &Path, row: &Value, mut request: Value) -> Result<Value> {
     if let Some(socket) = row["tmuxSocket"].as_str() {
         command.env("WFC_TMUX_SOCKET", socket);
     }
-    let mut child = command
+    let child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn();
+    let mut child = match child {
+        Err(error) if request["op"] == "submit" => {
+            return Ok(
+                json!({"result":"definitely-not-sent","category":"input_not_delivered",
+                "diagnostic":format!("could not start tmux backend: {error}")}),
+            );
+        }
+        other => other?,
+    };
     let sent = serde_json::to_writer(
         child.stdin.take().context("missing backend input")?,
         &request,
@@ -140,11 +149,25 @@ fn legacy_launch_hint(row: &Value) -> Result<Option<&str>> {
 }
 
 fn existing(state: &Path, row: &Value, op: &str) -> Result<Value> {
+    existing_request(state, row, json!({"op":op}))
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn submit(state: &Path, row: &Value, text: &str) -> Result<Value> {
+    existing_request(
+        state,
+        row,
+        json!({
+            "op":"submit", "text":text, "host":row["host"], "confirm_reply":true
+        }),
+    )
+}
+
+fn existing_request(state: &Path, row: &Value, mut request: Value) -> Result<Value> {
     let attempt = row["attempt"]
         .as_str()
         .filter(|v| valid_identity(v, "a-"))
         .context("missing existing execution identity")?;
-    let mut request = json!({"op":op});
     if !row["executionId"].is_null() {
         ensure!(
             row["executionId"] == attempt,
@@ -160,7 +183,7 @@ fn existing(state: &Path, row: &Value, op: &str) -> Result<Value> {
             request["legacyLaunchId"] = json!(hint);
         }
     }
-    if matches!(op, "close" | "revoke") {
+    if matches!(request["op"].as_str(), Some("close" | "revoke")) {
         request["closeOperationId"] = json!(close_operation(row)?);
     }
     call(state, row, request)

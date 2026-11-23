@@ -115,6 +115,38 @@ pub(super) fn ids(dir: &Path) -> Result<BTreeSet<String>> {
 // The pending and published files can have different inodes. Close and new
 // questions must still serialize on the same attempt across that transition.
 pub(super) fn close_lock(state: &Path, row: &Value) -> Result<File> {
+    let file = attempt_lock_file(state, row)?;
+    file.lock()?;
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn reply_lock(state: &Path, row: &Value) -> Result<File> {
+    let file = attempt_lock_file(state, row)?;
+    lock_input(&file)?;
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn lock_input(file: &File) -> Result<()> {
+    use std::fs::TryLockError;
+    use std::time::{Duration, Instant};
+
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::WouldBlock) => {
+                let remaining = Duration::from_secs(30).saturating_sub(started.elapsed());
+                ensure!(!remaining.is_zero(), "input_lock_timeout");
+                std::thread::sleep(remaining.min(Duration::from_millis(50)));
+            }
+            Err(TryLockError::Error(error)) => return Err(error).context("lock worker input"),
+        }
+    }
+}
+
+fn attempt_lock_file(state: &Path, row: &Value) -> Result<File> {
     let dir = state.join("close-locks");
     let id = row["dispatch"]
         .as_str()
@@ -129,7 +161,5 @@ pub(super) fn close_lock(state: &Path, row: &Value) -> Result<File> {
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let file = options.open(dir.join(format!("{id}.{attempt}")))?;
-    file.lock()?;
-    Ok(file)
+    Ok(options.open(dir.join(format!("{id}.{attempt}")))?)
 }

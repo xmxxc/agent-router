@@ -113,25 +113,36 @@ fn codex_box<'a>(
     })
 }
 
+pub(super) fn has_codex_draft(screen: &Screen) -> bool {
+    codex_box(screen, &[], "").is_some_and(|composer| !composer.draft.is_empty())
+}
+
 pub(super) fn confirm_codex(
     handle: &mut Handle,
     text: &str,
     before: &Screen,
+    confirm_reply: bool,
     save: &mut impl FnMut(&Handle) -> std::io::Result<()>,
 ) -> Result<()> {
     let expected = compact(text);
     let footer = codex_box(before, &[], &expected)
         .and_then(|c| c.footer)
         .unwrap_or_default();
-    let sample = |handle: &Handle| {
+    let sample = |handle: &Handle| -> Result<Option<(String, bool)>> {
         sleep(Duration::from_millis(300));
         let screen = handle.read()?;
         if read_only(&screen.text) || refusals(&screen.text) > refusals(&before.text) {
             return Err(Failure::unknown("worker refused or paused input"));
         }
-        Ok(codex_box(&screen, &footer, &expected)
-            .filter(|c| !c.draft.is_empty() && compact(&c.draft) == expected)
-            .map(|c| (c.draft, c.footer.is_some())))
+        let composer = codex_box(&screen, &footer, &expected);
+        match composer {
+            Some(c) if !c.draft.is_empty() && compact(&c.draft) == expected => {
+                Ok(Some((c.draft, c.footer.is_some())))
+            }
+            Some(c) if c.draft.is_empty() && c.footer.is_some() => Ok(None),
+            _ if !confirm_reply => Ok(None),
+            _ => Err(Failure::unknown("Codex composer did not confirm the reply")),
+        }
     };
     for retry in 0..=2 {
         let first = sample(handle)?;
@@ -142,6 +153,11 @@ pub(super) fn confirm_codex(
             return Ok(());
         };
         if first_draft != second_draft {
+            if confirm_reply {
+                return Err(Failure::unknown(
+                    "Codex composer changed before Enter could be retried",
+                ));
+            }
             return Ok(());
         }
         if !first_certain || !second_certain {

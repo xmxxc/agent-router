@@ -12,8 +12,11 @@ use std::process::ExitCode;
 use workflow::messages::{
     Ask, Confirm, Done, Wait, ACK_USAGE, ASK_USAGE, DONE_USAGE, RESOLVE_USAGE, WAIT_USAGE,
 };
+#[cfg(target_os = "linux")]
+use workflow::messages::{Reply, REPLY_USAGE};
 
 const RESERVED_COMMANDS: &[&str] = &[
+    #[cfg(not(target_os = "linux"))]
     "reply",
     "continue",
     "nudge",
@@ -44,7 +47,7 @@ fn main() -> anyhow::Result<ExitCode> {
     let args: Vec<_> = args.collect();
     if let Some(
         name @ ("dispatch" | "status" | "close" | "wait" | "ack" | "resolve" | "relay"
-        | "herdr-reconcile"),
+        | "herdr-reconcile" | "reply"),
     ) = command.to_str()
     {
         anyhow::ensure!(
@@ -65,6 +68,8 @@ fn main() -> anyhow::Result<ExitCode> {
             println!("{}", workflow::herdr::USAGE);
             println!("{DONE_USAGE}");
             println!("{ASK_USAGE}");
+            #[cfg(target_os = "linux")]
+            println!("{REPLY_USAGE}");
             println!("{WAIT_USAGE}");
             #[cfg(target_os = "linux")]
             println!("{}", workflow::messages::relay::USAGE);
@@ -217,6 +222,21 @@ fn main() -> anyhow::Result<ExitCode> {
                 }
             };
             println!("{}", request.run()?);
+        }
+        #[cfg(target_os = "linux")]
+        Some("reply") => {
+            if args == ["--help"] || args == ["-h"] {
+                println!("{REPLY_USAGE}");
+            } else {
+                let request = match Reply::parse(&args) {
+                    Ok(request) => request,
+                    Err(err) => {
+                        eprintln!("wfc: {err}. {REPLY_USAGE}");
+                        return Ok(ExitCode::from(2));
+                    }
+                };
+                println!("{}", request.run()?);
+            }
         }
         Some(name @ ("ack" | "resolve")) => {
             let request = match Confirm::parse(name, &args) {

@@ -64,7 +64,9 @@ wfc close "$dispatch"
 
 关闭意图与新的 `done` 消息串行提交。首次回报按当前 dispatch、round 和 attempt 核对关闭记录。关闭待确认或已经确认时，同一键和报告可重取原消息号，新完成记录会被拒绝。待确认的派发始终列在 `status --active` 的 `dispatches` 中。已确认的任务结果（包括原失败退出码）继续显示，`closePending` 单独表示资源关闭进度。启动回执读取出错时，状态查询在 `launchDiagnostic` 中保留原因；已核实的关闭归档继续提供本轮结果和资源状态。对有根进程的绑定，归档须与当前绑定的根 PID 和创建标识一致，当前绑定可以记录更多后来发现的写者。归档身份异常时，`backendDiagnostic` 说明原因，资源关闭保持待确认。可信的启动回执仍能提供 worker 退出码。停机证明须为非空白文本，且绑定中已无任何写者。旧归档的 worker 结果损坏时，`closeWorkerDiagnostic` 保留原因，已核实的资源状态仍为已关闭。
 
-这组入口支持独立 Rust 状态目录里、本程序创建且未登记 controller owner 的第一轮派发。状态目录中出现 Python `router.db` 时，须先集成旧库和 owner 身份。受控服务联验可用 `python3 tests/herdr_public.py /path/to/herdr target/debug/wfc -v`。通过 `--herdr-backend` 向同一 `wfc` 的标准输入提供 `{"op":"submit","dispatch":"…","round":1,"attempt":"…","text":"…"}`，可验证投递认领与回执丢失后的处理。正式的 `reply`、跨轮复用、owner 接替与旧库身份迁移分别由对应工单集成。
+这组入口支持独立 Rust 状态目录里、本程序创建且未登记 controller owner 的第一轮派发。状态目录中出现 Python `router.db` 时，须先集成旧库和 owner 身份。受控服务联验可用 `python3 tests/herdr_public.py /path/to/herdr target/debug/wfc -v`。通过 `--herdr-backend` 向同一 `wfc` 的标准输入提供 `{"op":"submit","dispatch":"…","round":1,"attempt":"…","text":"…"}`，可验证投递认领与回执丢失后的处理。
+
+总控用 `wfc reply MESSAGE "回答"` 将回复送入原 worker 的 tmux 或 Herdr 会话。`MESSAGE` 是问题的数字编号。用 `wfc status --dispatch ID` 查看回复及其诊断。回复明确未送时可重试。输入可能已送达时，账本会保留回复占用，后续调用会拒绝再次发送。
 
 `--launch-config` 优先于 `WFC_LAUNCH_CONFIG`。启动参数依次为宿主的 `runtime` 数组、`command` 数组、wfc 为本次任务生成的 Codex 参数。路径含空格时直接写在同一个 JSON 字符串中。例如 npm 安装的 Codex 可以指定 Node 和脚本各自的绝对路径。
 

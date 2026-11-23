@@ -426,11 +426,39 @@ impl Handle {
         &mut self,
         text: &str,
         codex: bool,
+        save: impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<()> {
+        self.submit_input(text, codex, false, save)
+    }
+
+    pub fn submit_reply(
+        &mut self,
+        text: &str,
+        codex: bool,
+        save: impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<()> {
+        self.submit_input(text, codex, true, save)
+    }
+
+    fn submit_input(
+        &mut self,
+        text: &str,
+        codex: bool,
+        confirm_reply: bool,
         mut save: impl FnMut(&Self) -> std::io::Result<()>,
     ) -> Result<()> {
-        let before = self.read()?;
+        let before = self.read().map_err(|error| {
+            if confirm_reply {
+                error.before_effect()
+            } else {
+                error
+            }
+        })?;
         if screen::read_only(&before.text) {
             return Err(Failure::refused("worker input is paused"));
+        }
+        if codex && confirm_reply && screen::has_codex_draft(&before) {
+            return Err(Failure::unsent("Codex composer already contains a draft"));
         }
         self.send(
             "pane.send_input",
@@ -439,7 +467,8 @@ impl Handle {
             &mut save,
         )?;
         if codex {
-            screen::confirm_codex(self, text, &before, &mut save).map_err(Failure::after_effect)?;
+            screen::confirm_codex(self, text, &before, confirm_reply, &mut save)
+                .map_err(Failure::after_effect)?;
         }
         Ok(())
     }
