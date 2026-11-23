@@ -1,10 +1,14 @@
 //! Publish typed startup evidence. Child output and error strings are not forwarded.
+use anyhow::Result;
 use serde::Serialize;
+use serde_json::{json, Value};
 use std::io::ErrorKind;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
+use std::process::{Child, ExitStatus};
 use std::time::{Duration, Instant};
+
+const STARTUP_WINDOW: Duration = Duration::from_millis(300);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -80,6 +84,17 @@ impl Startup {
             ),
             _ => ("spawn_failed", "Worker could not start"),
         };
+        self.not_started(category, diagnostic);
+    }
+
+    pub(super) fn script_missing(&self) {
+        self.not_started(
+            "executable_missing",
+            "Configured worker script was not found",
+        );
+    }
+
+    fn not_started(&self, category: &'static str, diagnostic: &'static str) {
         self.publish(Failure {
             category,
             diagnostic,
@@ -92,12 +107,12 @@ impl Startup {
         });
     }
 
-    pub(crate) fn watch(&self, pid: u32) -> Running<'_> {
+    pub(crate) fn watch(&self, child: &Child) -> Running<'_> {
         Running {
             startup: self,
             since: Instant::now(),
-            pid,
-            process_start: wfc_herdr::Process::observe(pid)
+            pid: child.id(),
+            process_start: wfc_herdr::Process::observe_unreaped_child(child)
                 .ok()
                 .flatten()
                 .map(|p| p.creation),
@@ -118,6 +133,56 @@ impl Startup {
     }
 }
 
+// Started receipts can block on storage. Observe the exit independently and
+// finish the started write before the caller publishes terminal evidence.
+pub(crate) fn wait_host(
+    child: &mut Child,
+    save_started: impl FnOnce() -> Result<()> + Send,
+) -> Result<(ExitStatus, Instant, Result<()>)> {
+    let (status, observed, started) = std::thread::scope(|scope| {
+        let writer = std::thread::Builder::new().spawn_scoped(scope, save_started);
+        let status = child.wait();
+        let observed = Instant::now();
+        let started = match writer {
+            Ok(writer) => writer
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("host startup receipt writer failed"))),
+            Err(err) => Err(err.into()),
+        };
+        (status, observed, started)
+    });
+    Ok((status?, observed, started))
+}
+
+// A native zero exit is a startup fault only when the public host adapter
+// actually rejected confirmation and selected this terminal receipt.
+pub(super) fn unconfirmed_zero(state: &Path, row: &Value, launch_id: &str, receipt: &Value) {
+    let evidence = &receipt["startupZero"];
+    if receipt["category"] != "process_exited" || receipt["exitCode"] != 0 {
+        return;
+    }
+    let Some(((dispatch, attempt), pid)) =
+        row["dispatch"].as_str().zip(row["attempt"].as_str()).zip(
+            evidence["pid"]
+                .as_u64()
+                .and_then(|pid| u32::try_from(pid).ok())
+                .filter(|&pid| pid > 0),
+        )
+    else {
+        return;
+    };
+    Startup::new(state, dispatch, attempt, Some(launch_id)).publish(Failure {
+        category: "process_exited",
+        diagnostic: "Worker exited before host startup was confirmed",
+        exit_code: Some(0),
+        signal: None,
+        launch_id: Some(launch_id),
+        pid: Some(pid),
+        process_start: evidence["processStart"].as_str(),
+        requires_decision: true,
+    });
+}
+
 pub(crate) struct Running<'a> {
     startup: &'a Startup,
     since: Instant,
@@ -126,10 +191,28 @@ pub(crate) struct Running<'a> {
 }
 
 impl Running<'_> {
-    pub(crate) fn exited(self, status: ExitStatus) {
-        if status.success() || self.since.elapsed() > Duration::from_millis(300) {
-            return;
+    fn during_startup(&self, observed: Instant) -> bool {
+        observed.saturating_duration_since(self.since) <= STARTUP_WINDOW
+    }
+
+    pub(crate) fn exited(self, status: ExitStatus, observed: Instant) {
+        if !status.success() && self.during_startup(observed) {
+            self.publish_exit(status);
         }
+    }
+
+    pub(crate) fn host_exited(self, status: ExitStatus, observed: Instant) -> Option<Value> {
+        if !self.during_startup(observed) {
+            return None;
+        }
+        if status.success() {
+            return Some(json!({"pid":self.pid,"processStart":self.process_start}));
+        }
+        self.publish_exit(status);
+        None
+    }
+
+    fn publish_exit(&self, status: ExitStatus) {
         self.startup.publish(Failure {
             category: "process_exited",
             diagnostic: "Worker exited during startup",
@@ -146,7 +229,72 @@ impl Running<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, Value};
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn unreaped_exit_keeps_creation_identity_across_a_slow_started_receipt() -> Result<()> {
+        let state = std::env::temp_dir().join(format!("wfc-startup-{}", uuid::Uuid::new_v4()));
+        let dispatch = "d-aabbccdd";
+        let attempt = "a-123456789abc";
+        let result = (|| -> Result<()> {
+            let records = state.join("dispatches");
+            std::fs::create_dir_all(&records)?;
+            super::super::write_json(
+                &records.join(format!("{dispatch}.json")),
+                &json!({
+                    "dispatch":dispatch,"attempt":attempt,"round":1,"role":"fixture",
+                    "scope":"slow-started-receipt","cwd":state,"report":state.join("report"),
+                }),
+                None,
+            )?;
+
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", "read -r line; exit 23"])
+                .stdin(Stdio::piped())
+                .spawn()?;
+            let pid = child.id();
+            let live = wfc_herdr::Process::observe(pid);
+            drop(child.stdin.take());
+            // Wait for the terminal event without reaping or releasing the PID.
+            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            if unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            } == -1
+            {
+                let err = std::io::Error::last_os_error();
+                let _ = child.wait();
+                return Err(err.into());
+            }
+            let exited = wfc_herdr::Process::observe(pid);
+            let startup = Startup::new(&state, dispatch, attempt, Some("fixture-launch"));
+            let watching = startup.watch(&child);
+            let written = std::sync::OnceLock::new();
+            let (status, observed, started) = wait_host(&mut child, || {
+                std::thread::sleep(STARTUP_WINDOW + Duration::from_millis(25));
+                written.set(Instant::now()).unwrap();
+                Ok(())
+            })?;
+            started?;
+            let live = live?.expect("child was alive before stdin was closed");
+            assert_eq!(exited?, None);
+            assert_eq!(status.code(), Some(23));
+            assert!(observed < *written.get().unwrap());
+            assert!(watching.host_exited(status, observed).is_none());
+            let history = super::super::messages::history(&state, dispatch)?;
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0]["fault"]["exitCode"], 23);
+            assert_eq!(history[0]["fault"]["pid"], pid);
+            assert_eq!(history[0]["fault"]["processStart"], live.creation);
+            Ok(())
+        })();
+        let _ = std::fs::remove_dir_all(state);
+        result
+    }
 
     #[test]
     fn startup_publication_uses_the_current_attempt_and_one_durable_key() -> anyhow::Result<()> {
@@ -188,10 +336,34 @@ mod tests {
             super::super::write_json(&state.join("messages.json"), &json!(messages), None)?;
             Startup::new(&state, dispatch, "a-987654321abc", None)
                 .spawn_failed(ErrorKind::NotFound);
+            unconfirmed_zero(
+                &state,
+                &row,
+                "fixture-launch",
+                &json!({
+                    "category":"process_exited","exitCode":0,"startupZero":{"pid":1,"processStart":null},
+                }),
+            );
             let history = super::super::messages::history(&state, dispatch)?;
             assert_eq!(history.len(), 2);
             assert_eq!(history[1]["type"], "question");
             assert_eq!(history[1]["question"], "Can I proceed?");
+
+            row["round"] = json!(3);
+            row["attempt"] = json!("a-123abc789456");
+            super::super::write_json(&path, &row, None)?;
+            unconfirmed_zero(
+                &state,
+                &row,
+                "fixture-launch",
+                &json!({
+                    "category":"process_exited","exitCode":0,"startupZero":{"pid":1,"processStart":null},
+                }),
+            );
+            let history = super::super::messages::history(&state, dispatch)?;
+            assert_eq!(history.len(), 3);
+            assert_eq!(history[2]["fault"]["exitCode"], 0);
+            assert!(history[2]["fault"]["processStart"].is_null());
             Ok(())
         })();
         let _ = std::fs::remove_dir_all(state);

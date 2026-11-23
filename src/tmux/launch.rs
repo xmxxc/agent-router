@@ -714,27 +714,24 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
             return Ok(ExitCode::FAILURE);
         }
     };
-    let watching = startup.as_ref().map(|startup| startup.watch(child.id()));
+    let watching = startup.as_ref().map(|startup| startup.watch(&child));
     // Ctrl-C addresses the terminal foreground group. Let the worker handle it
     // and keep its receipt writer alive to record the actual exit.
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
     }
-    let started = super::binding::save(
-        &receipt,
-        &json!({"category":"started","pid":child.id(),"launchId":id}),
-    );
-    let status = child.wait()?;
-    if let Some(watching) = watching {
-        watching.exited(status);
-    }
+    let started_receipt = json!({"category":"started","pid":child.id(),"launchId":id});
+    let (status, observed, started) = crate::workflow::startup::wait_host(&mut child, || {
+        super::binding::save(&receipt, &started_receipt)
+    })?;
     let code = status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
-    super::binding::save(
-        &receipt,
-        &json!({"category":"process_exited","exitCode":code,"launchId":id}),
-    )?;
+    let mut terminal = json!({"category":"process_exited","exitCode":code,"launchId":id});
+    if let Some(zero) = watching.and_then(|watching| watching.host_exited(status, observed)) {
+        terminal["startupZero"] = zero;
+    }
+    super::binding::save(&receipt, &terminal)?;
     started?;
     Ok(ExitCode::from(code as u8))
 }

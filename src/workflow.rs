@@ -251,7 +251,20 @@ impl<'a> Dispatch<'a> {
                 record["executionId"] = record["attempt"].clone();
                 record["tmuxLaunchProtocol"] = json!(backend::LAUNCH_PROTOCOL);
             }
-            Some(host.prepare(&state, &mut record)?)
+            match host.prepare(&state, &mut record) {
+                Ok(launch) => Some(launch),
+                #[cfg(target_os = "linux")]
+                Err(err) if err.is::<host::MissingScript>() => {
+                    record["create"] = json!({"result":"definitely-not-sent","category":"configured_script_missing",
+                        "dispatch":dispatch,"attempt":attempt,"round":round});
+                    record["worker"] =
+                        json!({"state":"not_started","exit_code":null,"signal":null});
+                    write_json(&records.join(format!("{dispatch}.json")), &record, None)?;
+                    startup::Startup::new(&state, &dispatch, &attempt, None).script_missing();
+                    return Err(err);
+                }
+                Err(err) => return Err(err),
+            }
         } else {
             None
         };
@@ -289,6 +302,10 @@ impl<'a> Dispatch<'a> {
                     write_json(&published, &record, None).with_context(|| {
                         format!("could not publish launch evidence for {dispatch}; retaining its pending assignment")
                     })?;
+                    #[cfg(target_os = "linux")]
+                    if backend::publish_unconfirmed_zero(&state, &record).is_err() {
+                        eprintln!("wfc: could not verify early host exit");
+                    }
                     fs::remove_file(&pending)?;
                 }
                 ensure!(

@@ -271,16 +271,19 @@ fn supervise(args: &[OsString]) -> Result<()> {
             return Err(err).context("spawn worker");
         }
     };
-    let watching = startup.watch(child.id());
+    let watching = startup.watch(&child);
+    let root = child.id() as i32;
+    let observed_root = exit_pending(root).unwrap_or(false).then(Instant::now);
     let published = fs::rename(&pending, dir.join(format!("{id}.json")));
     if published.is_ok() {
         let _ = writeln!(io::stdout().lock(), "ready");
     }
     let result = watch_tree(
         &file,
-        child.id() as i32,
+        root,
         published.is_err(),
         published.is_ok().then_some(watching),
+        observed_root,
     )?;
     if let Err(err) = published {
         fs::remove_file(path)?;
@@ -296,21 +299,21 @@ fn watch_tree(
     root: i32,
     mut closing: bool,
     mut startup: Option<super::startup::Running<'_>>,
+    mut observed_root: Option<Instant>,
 ) -> Result<Value> {
     let mut root_exit = None;
     let mut killed_root = false;
-    loop {
+    'reap: loop {
         let mut status = 0;
         let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::__WALL) };
         if pid > 0 {
             if pid == root && root_exit.is_none() {
                 let exit = ExitStatus::from_raw(status);
+                let observed = observed_root.unwrap_or_else(Instant::now);
                 root_exit = Some(exit);
                 if let Some(startup) = startup.take() {
-                    let mut flag = [0];
-                    file.read_exact_at(&mut flag, 0)?;
-                    if !closing && flag == *b"0" {
-                        startup.exited(exit);
+                    if !close_killed_root(killed_root, exit) {
+                        startup.exited(exit, observed);
                     }
                 }
             }
@@ -353,6 +356,15 @@ fn watch_tree(
                 }
                 owned = true;
                 if closing {
+                    if pid == root && root_exit.is_none() {
+                        if killed_root {
+                            continue;
+                        }
+                        if exit_pending(root)? {
+                            observed_root.get_or_insert_with(Instant::now);
+                            continue 'reap;
+                        }
+                    }
                     if unsafe { libc::kill(pid, libc::SIGKILL) } == -1 {
                         let err = io::Error::last_os_error();
                         if err.raw_os_error() != Some(libc::ESRCH) {
@@ -370,10 +382,37 @@ fn watch_tree(
         std::thread::sleep(POLL);
     }
     let exit = root_exit.context("missing worker exit status")?;
-    let state = if killed_root && exit.signal() == Some(libc::SIGKILL) {
+    let state = if close_killed_root(killed_root, exit) {
         "cancelled"
     } else {
         "exited"
     };
     Ok(json!({"state":state,"exit_code":exit.code(),"signal":exit.signal()}))
+}
+
+fn close_killed_root(killed_root: bool, exit: ExitStatus) -> bool {
+    killed_root && exit.signal() == Some(libc::SIGKILL)
+}
+
+fn exit_pending(pid: i32) -> io::Result<bool> {
+    // A successful kill can also target an unreaped zombie. Check for a
+    // waitable natural exit before treating this as an active close.
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        if unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        } == 0
+        {
+            return Ok(unsafe { info.assume_init().si_pid() } == pid);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
 }

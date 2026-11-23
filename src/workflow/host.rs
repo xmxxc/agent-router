@@ -4,6 +4,7 @@ use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Map, Value};
 use std::{
     env, fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -108,6 +109,30 @@ fn argv(object: &Value, key: &str) -> Result<Vec<String>> {
         .collect()
 }
 
+#[derive(Debug)]
+pub(super) struct MissingScript;
+
+impl std::fmt::Display for MissingScript {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid launch config or missing configured script")
+    }
+}
+
+impl std::error::Error for MissingScript {}
+
+fn resolve_script(paths: impl IntoIterator<Item = PathBuf>) -> Result<PathBuf> {
+    let mut uncertain = false;
+    for path in paths {
+        match path.metadata() {
+            Ok(meta) if meta.is_file() => return Ok(path),
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => (),
+            _ => uncertain = true,
+        }
+    }
+    ensure!(!uncertain, "configured script could not be resolved");
+    Err(MissingScript.into())
+}
+
 fn configured(path: &Path, name: &str, cwd: &Path) -> Result<Launch> {
     let data: Value = serde_json::from_reader(fs::File::open(path)?)?;
     ensure!(
@@ -144,7 +169,7 @@ fn configured(path: &Path, name: &str, cwd: &Path) -> Result<Launch> {
     if !prefix.is_empty() {
         let path = Path::new(&command[0]);
         let resolved = if path.components().count() > 1 || path.is_absolute() {
-            cwd.join(path)
+            resolve_script([cwd.join(path)])?
         } else {
             let search = env
                 .get("PATH")
@@ -152,12 +177,8 @@ fn configured(path: &Path, name: &str, cwd: &Path) -> Result<Launch> {
                 .map(Into::into)
                 .or_else(|| std::env::var_os("PATH"))
                 .unwrap_or_default();
-            std::env::split_paths(&search)
-                .map(|p| cwd.join(p).join(path))
-                .find(|p| p.is_file())
-                .context("configured script is missing")?
+            resolve_script(std::env::split_paths(&search).map(|p| cwd.join(p).join(path)))?
         };
-        ensure!(resolved.is_file(), "configured script is missing");
         command[0] = resolved
             .to_str()
             .context("script path must be UTF-8")?
@@ -258,8 +279,12 @@ impl Options<'_> {
                 };
                 let path = path.canonicalize().context("invalid launch config path")?;
                 selected_config = Some(path.clone());
-                configured(&path, self.name, cwd).map_err(|_| {
-                    anyhow::anyhow!("invalid launch config or missing configured script")
+                configured(&path, self.name, cwd).map_err(|err| {
+                    if err.is::<MissingScript>() {
+                        err
+                    } else {
+                        anyhow::anyhow!("invalid launch config or missing configured script")
+                    }
                 })?
             }
             None => Launch {
