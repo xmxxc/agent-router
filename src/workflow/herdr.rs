@@ -304,7 +304,15 @@ pub(super) fn observe(state: &Path, row: &mut Value) -> Result<(Value, Value)> {
         let close_pending = unit.pending_close();
         *row = unit.row;
         row["closePending"] = json!(close_pending);
-        row["launch"] = backend::private_receipt(state, &row["create"])?;
+        row["launch"] = match backend::private_receipt(state, &row["create"]) {
+            Ok(launch) => launch,
+            Err(error) => {
+                row["launch"] = Value::Null;
+                row["launchDiagnostic"] = json!(format!("{error:#}"));
+                let (archived, inspection) = observed?;
+                return Ok((archived.ok_or(error)?, inspection));
+            }
+        };
         let (archived, inspection) = observed?;
         let worker = archived.unwrap_or_else(|| backend::worker(&row["launch"], &inspection));
         Ok((worker, inspection))
@@ -323,8 +331,9 @@ impl Assignment<'_> {
     }
 
     fn closed_worker(&self) -> Result<Option<Value>> {
-        if let Some(event) =
-            backend::last_herdr_close(&self.row).filter(|e| e["result"] == "completed")
+        if let Some(event) = backend::herdr_closes(&self.row)
+            .next_back()
+            .filter(|e| e["result"] == "completed")
         {
             backend::verify_herdr_close_target(&self.row, event)?;
             ensure!(

@@ -473,10 +473,8 @@ impl<'a> Done<'a> {
             let receipt =
                 inbox.validate_done(&assignment, &report, key.as_deref(), self.attempt)?;
             if receipt.is_none() && row["backend"] == "herdr" {
-                let close = super::backend::last_herdr_close(&row);
                 ensure!(
-                    !close.is_some_and(|e| super::backend::close_is_pending(e) || e["result"] == "completed")
-                        && super::backend::closed(&state, &row)?.is_none(),
+                    !super::backend::herdr_close_blocks_done(&state, &row)?,
                     "attempt {} is no longer accepted for {dispatch}; its execution resources are closing or closed",
                     assignment.worker.attempt
                 );

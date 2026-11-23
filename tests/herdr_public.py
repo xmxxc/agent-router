@@ -224,6 +224,12 @@ for line in sys.stdin:
                 _, error = callback.communicate(timeout=10)
                 self.assertEqual(callback.returncode, 1, error)
             self.assertEqual(self.status()['messages'], [message])
+        Path(self.h['receipt']).write_text('{')
+        archived = self.status()
+        self.assertEqual((archived['status'], archived['worker']['state'], archived['backendAlive']),
+                         ('completed', 'cancelled', False))
+        self.assertEqual(archived['messages'], [message])
+        self.assertTrue(archived['launchDiagnostic'])
         active = self.cli('status', '--active')
         self.assertEqual((active['dispatches'], active['reclaimable']), ([], []))
         self.assertEqual(len(calls), 1)
@@ -413,6 +419,62 @@ Path('done-received').write_bytes(reply)
         self.assertEqual(p.returncode, 1)
         self.assertIn(b'UTF-8', p.stderr)
         self.assertFalse(any(p.is_file() for p in state.rglob('*')))
+
+    def test_unreadable_launch_after_confirmed_close(self):
+        self.worker.write_text("from pathlib import Path\nimport time\nwhile not Path('exit-now').exists(): time.sleep(.02)\nraise SystemExit(17)")
+        self.dispatch()
+        (self.root/'exit-now').touch()
+        live.wait_for(lambda: self.status()['status'] == 'failed')
+        self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+        receipt = Path(self.h['receipt'])
+        # Invalid JSON exercises the read error even for a privileged test runner.
+        receipt.write_text('{')
+        view = self.status()
+        self.assertIsNone(view['launch'])
+        self.assertTrue(view['launchDiagnostic'])
+        self.assertEqual((view['status'], view['worker']['exit_code'], view['rounds'][0]['result']['exit_code']),
+                         ('failed', 17, 17))
+        self.assertEqual((view['backendResult'], view['backendAlive'], view['closePending']),
+                         ('completed', False, False))
+        # Neither a different close target nor absent close evidence certifies this execution.
+        path = Path(self.env['WFC_STATE'])/'dispatches'/(self.dispatch_id+'.json')
+        row = json.loads(path.read_bytes())
+        row['audit'][-1]['target']['nonce'] = 'other-execution'
+        for events in (row['audit'], []):
+            path.write_text(json.dumps(row | {'audit':events}))
+            view = self.status()
+            self.assertTrue(view['launchDiagnostic'])
+            self.assertEqual((view['status'], view['worker']['state'], view['backendAlive']),
+                             ('unknown', 'unknown', None))
+
+    def test_new_done_selects_only_its_execution_from_close_history(self):
+        self.dispatch()
+        self.submit('finish')
+        first, = live.wait_for(lambda: self.status()['messages'])
+        self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+        # Install an offline next-round assignment after a real first round.
+        path = Path(self.env['WFC_STATE'])/'dispatches'/(self.dispatch_id+'.json')
+        row = json.loads(path.read_bytes())
+        old, = row['audit']
+        report = self.root/'second.md'
+        report.write_text('second round')
+        row.update(round=2, attempt='a-0123456789ab', report=str(report), rounds=self.status()['rounds'])
+        row['backendHandle'].update(round=2, attempt=row['attempt'])
+        self.env.update(WFC_DISPATCH=self.dispatch_id, WFC_ROUND='2', WFC_ATTEMPT=row['attempt'])
+        args = ('done', '--report', report, '--attempt', row['attempt'], '--message-id', 'second-key')
+        current = old | {'dispatch':self.dispatch_id, 'round':2, 'attempt':row['attempt'], 'result':'uncertain'}
+        # Each unrelated event differs from the current identity in at least one field.
+        history = [old, current | {'dispatch':'d-other'}, current | {'round':1}, current | {'attempt':old['attempt']}]
+        path.write_text(json.dumps(row | {'audit':[current, *history]}))
+        self.cli(*args, error='closing or closed')
+        path.write_text(json.dumps(row | {'audit':history}))
+        accepted = self.cli(*args)
+        self.assertFalse(accepted['duplicate'])
+        repeated = self.cli(*args)
+        self.assertTrue(repeated['duplicate'])
+        self.assertEqual(repeated['messageId'], accepted['messageId'])
+        messages = self.status()['messages']
+        self.assertEqual([m['messageId'] for m in messages], [first['messageId'], accepted['messageId']])
 
     def test_worker_fails_before_close_with_surviving_writer(self):
         self.check_worker_exit_order(worker_first=True)

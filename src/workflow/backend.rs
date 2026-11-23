@@ -104,19 +104,36 @@ fn closed_path(state: &Path, row: &Value) -> Result<PathBuf> {
     )))
 }
 
-pub(super) fn last_herdr_close(row: &Value) -> Option<&Value> {
+pub(super) fn herdr_closes(row: &Value) -> impl DoubleEndedIterator<Item = &Value> {
     row["audit"]
-        .as_array()?
-        .iter()
-        .rfind(|event| event["operation"] == "close")
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|event| event["operation"] == "close")
 }
 
-pub(super) fn close_is_pending(event: &Value) -> bool {
+fn close_is_pending(event: &Value) -> bool {
     matches!(event["result"].as_str(), Some("pending" | "uncertain"))
 }
 
 pub(super) fn pending_herdr_close(row: &Value) -> Option<&Value> {
-    last_herdr_close(row).filter(|event| close_is_pending(event))
+    herdr_closes(row)
+        .next_back()
+        .filter(|event| close_is_pending(event))
+}
+
+fn same_execution(row: &Value, event: &Value) -> bool {
+    ["dispatch", "round", "attempt"]
+        .iter()
+        .all(|&k| event[k] == row[k])
+}
+
+pub(super) fn herdr_close_blocks_done(state: &Path, row: &Value) -> Result<bool> {
+    let latest = herdr_closes(row).rfind(|event| same_execution(row, event));
+    Ok(
+        latest.is_some_and(|e| close_is_pending(e) || e["result"] == "completed")
+            || closed(state, row)?.is_some(),
+    )
 }
 
 pub(super) fn verify_herdr_close_target(row: &Value, event: &Value) -> Result<()> {
@@ -136,9 +153,7 @@ pub(super) fn verify_herdr_close_target(row: &Value, event: &Value) -> Result<()
         ]
         .iter()
         .all(|&k| target[k] == current[k])
-            && ["dispatch", "round", "attempt"]
-                .iter()
-                .all(|&k| event[k] == row[k])
+            && same_execution(row, event)
             && target["writerProcesses"]
                 .as_array()
                 .zip(current["writerProcesses"].as_array())
