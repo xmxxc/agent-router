@@ -3,7 +3,7 @@ use super::{
     literal_question_argument, state_dir, valid_id, Assignment, Inbox, InputResult, Message,
     ReplyRecord, State,
 };
-use crate::workflow::{assignment, backend, controller, herdr, legacy_status_state};
+use crate::workflow::{assignment, backend, controller, herdr, legacy_view_state, StateView};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
@@ -61,7 +61,7 @@ impl<'a> Reply<'a> {
 
     pub fn run(self) -> Result<Value> {
         ensure!(
-            legacy_status_state(None)?.is_none(),
+            legacy_view_state(None, StateView::Status)?.is_none(),
             "reply requires the native Rust question ledger"
         );
         let state = state_dir()?;

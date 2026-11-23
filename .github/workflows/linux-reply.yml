@@ -1,7 +1,7 @@
 name: Linux reply, reclaim and controller receipts
 on:
   push:
-    branches: [rust-router/11-reply-r9-reclaim-combination]
+    branches: [rust-router/11-reply-r10-combination-compile]
   workflow_dispatch:
 
 permissions:

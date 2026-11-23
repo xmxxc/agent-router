@@ -294,9 +294,8 @@ impl Assignment<'_> {
                 h.submit(text, self.row["host"] == "codex", |h| self.checkpoint(h))
             }
             InputAction::Reply { text, .. } => {
-                h.submit_reply(text, self.row["host"].as_str().unwrap_or_default(), |h| {
-                    self.checkpoint(h)
-                })
+                let host = self.row["host"].as_str().unwrap_or_default().to_owned();
+                h.submit_reply(text, &host, |h| self.checkpoint(h))
             }
         };
         if !matches!(result,Err(e) if e.kind == FailureKind::Uncertain) {
