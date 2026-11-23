@@ -1,10 +1,10 @@
 //! Submit one batch to the explicitly selected OpenCode controller session.
 use super::Outcome;
 use anyhow::{ensure, Context, Result};
-use curl::easy::{Easy2, Handler, HttpVersion, List, NetRc};
+use curl::easy::{Easy, Easy2, Handler, HttpVersion, List, NetRc};
 use http::Uri;
 use serde_json::json;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv6Addr;
 use std::time::Duration;
 
 pub(super) struct Target<'a> {
@@ -34,49 +34,37 @@ impl Handler for ResponseHeaders {
     }
 }
 
-fn valid_host(host: &str) -> bool {
-    if let Some(literal) = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-    {
-        if let Some((address, zone)) = literal.split_once("%25") {
-            // libcurl's MAX_ZONEID_LEN includes the terminating NUL.
-            return (1..=15).contains(&zone.len())
-                && zone
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b))
-                && address.parse::<Ipv6Addr>().is_ok();
+fn valid_ipv6_host(host: &str) -> bool {
+    // libcurl runs urldecode_host before ipv6_parse. The binding uses the
+    // same decoder, with the control byte check applied here for host input.
+    let decoded;
+    let host = if host.contains('%') {
+        decoded = Easy::new().url_decode(host);
+        if decoded.iter().any(|&byte| byte < 0x20) {
+            return false;
         }
-        return literal.parse::<Ipv6Addr>().is_ok();
+        decoded.as_slice()
+    } else {
+        host.as_bytes()
+    };
+    let Some(literal) = host.strip_prefix(b"[").and_then(|h| h.strip_suffix(b"]")) else {
+        return false;
+    };
+    let mut parts = literal.splitn(2, |&byte| byte == b'%');
+    let address = parts.next().unwrap_or_default();
+    if let Some(zone) = parts.next() {
+        // libcurl stops at the first closing bracket. It skips a leading
+        // "25" when there is more zone data and then allows up to 15 bytes.
+        let zone = zone.split(|&byte| byte == b']').next().unwrap_or_default();
+        let zone = zone
+            .strip_prefix(b"25")
+            .filter(|rest| !rest.is_empty())
+            .unwrap_or(zone);
+        if !(1..=15).contains(&zone.len()) {
+            return false;
+        }
     }
-    if host.parse::<Ipv4Addr>().is_ok() {
-        return true;
-    }
-
-    let name = host.strip_suffix('.').unwrap_or(host);
-    let last_label = name.rsplit('.').next().unwrap_or_default();
-    // Keep dotted decimal as the only IPv4 syntax. libcurl also interprets
-    // names made entirely of decimal, octal or 0x-prefixed parts as addresses.
-    name.len() <= 253
-        && last_label.bytes().any(|b| b.is_ascii_alphabetic())
-        && !name.split('.').all(|label| {
-            label.bytes().all(|b| b.is_ascii_digit())
-                || label
-                    .strip_prefix("0x")
-                    .or_else(|| label.strip_prefix("0X"))
-                    .is_some_and(|hex| {
-                        !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())
-                    })
-        })
-        && name.split('.').all(|label| {
-            let bytes = label.as_bytes();
-            bytes.len() <= 63
-                && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
-                && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
-                && bytes
-                    .iter()
-                    .all(|&b| b.is_ascii_alphanumeric() || b == b'-')
-        })
+    std::str::from_utf8(address).is_ok_and(|address| address.parse::<Ipv6Addr>().is_ok())
 }
 
 impl<'a> Target<'a> {
@@ -94,10 +82,13 @@ impl<'a> Target<'a> {
         );
         let host = authority.host();
         // http::Uri checks the authority structure without parsing IP literals.
-        ensure!(
-            valid_host(host),
-            "--opencode-url must use bracketed IPv6, dotted decimal IPv4 or an ASCII DNS name"
-        );
+        ensure!(!host.is_empty(), "{invalid}");
+        if host.contains(['[', ']']) {
+            ensure!(
+                valid_ipv6_host(host),
+                "--opencode-url has an invalid bracketed IPv6 host"
+            );
+        }
         // Authority::port() returns None for both absent and malformed ports.
         // The host includes brackets for IPv6, so only its suffix can be a port.
         let suffix = &authority.as_str()[host.len()..];

@@ -216,10 +216,8 @@ class OpenCodeRelay(unittest.TestCase):
         receipt = self.publish("ours")
         cases = {
             "host": ("[1]:4096", "[::gg]:4096", "[::1::2]:4096", "[127.0.0.1]:4096",
-                     "[v1.foo]:4096", "[fe80::1%25]:4096", "[fe80::1%eth0]:4096",
-                     "[fe80::1%25abcdefghijklmnop]:4096", "127.0.0.999:4096",
-                     "127.1:4096", "0177.0.0.1:4096", "0x7f.0x1:4096", "-bad.test:4096",
-                     "bad..test:4096", "under_score.test:4096", f"{'a' * 64}.test:4096"),
+                     "[v1.foo]:4096", "host[1]:4096", "[fe80::1%]:4096", "[fe80::1%25]:4096",
+                     "[fe80::1%25abcdefghijklmnop]:4096", "[fe80::1%25eth%00]:4096"),
             "port": ("127.0.0.1:65536", "127.0.0.1:xyz", "127.0.0.1:+80",
                      "127.0.0.1:-1", "127.0.0.1:", "127.0.0.1:0", "[::1]:65536",
                      "[::1]junk:4096"),
@@ -241,18 +239,25 @@ class OpenCodeRelay(unittest.TestCase):
 
         # An empty scope exercises target acceptance without contacting these hosts.
         for url in ("http://127.0.0.1", "http://localhost", "https://controller-1.example.test.:443",
-                    "http://[::1]", "https://[2001:db8:0:1:2:3:4:5]:65535",
-                    "http://[::ffff:127.0.0.1]:4096", "http://[fe80::1%25abcdefghijklmno]:4096"):
+                    "http://controller.123:4096", "http://under_score.test:4096", "http://-bad.test:4096",
+                    "http://bad..test:4096", f"http://{'a' * 64}.test:4096", "http://127.0.0.999:4096",
+                    "http://127.1:4096", "http://0177.0.0.1:4096", "http://0x7f.0x1:4096", "http://[::1]",
+                    "https://[2001:db8:0:1:2:3:4:5]:65535", "http://[::ffff:127.0.0.1]:4096",
+                    "http://[fe80::1%eth0]:4096", "http://[fe80::1%25eth0]:4096",
+                    "http://[fe80::1%25abcdefghijklm%6e%6f]:4096", "http://[fe80::1%2525]:4096",
+                    "http://[fe80:%3a1]:4096"):
             with self.subTest(url=url):
                 self.cli("relay", *self.target(url), "--scope", "empty", "--for", ".05")
         self.assertEqual(self.posts, [])
-        self.send()
+        # libcurl also normalizes the legacy short IPv4 form to this loopback.
+        self.send(url=self.url.replace("127.0.0.1", "127.1", 1))
         post, = self.posts
         message, = self.batch(post)
         self.assertEqual((message["id"], message["messageId"], message["statusVersion"]),
                          (receipt["message"], receipt["messageId"], 2))
         ack = self.data("ack", receipt["messageId"])
-        self.assertEqual((ack["state"], ack["statusVersion"]), ("processed", 4))
+        self.assertEqual((ack["messageId"], ack["state"], ack["statusVersion"]),
+                         (receipt["messageId"], "processed", 4))
 
     def test_invalid_target_and_worker_callback_do_not_claim(self):
         receipt = self.publish("ours")
