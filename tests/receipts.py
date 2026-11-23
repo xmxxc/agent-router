@@ -148,6 +148,68 @@ class Receipts(unittest.TestCase):
             self.run_cli("ack", msg["messageId"], "--body", canonical)
         self.assertEqual([self.body(msg) for msg in self.history()], [canonical, canonical])
 
+    def test_original_body_after_unscoped_null_snapshot_rewrite(self):
+        path = self.state / "messages.json"
+        first, = json.loads(path.read_bytes())
+        row = {k: first[k] for k in ("id", "messageId", "dispatch", "role", "round",
+                                     "attempt", "report", "request_key")}
+        original = self.body(row)
+        row.update(received=True, head=None, dirty=None)
+        path.write_text(json.dumps([row]), encoding="utf-8")
+        expanded = self.body(self.history()[0])
+        for field, value in (("role", "different"), ("attempt", "wrong"), ("report", "elsewhere"),
+                             ("round", 2)):
+            wrong = self.body(dict(json.loads(original), **{field: value}))
+            self.run_cli("ack", self.mid, "--body", wrong, code=1)
+        self.run_cli("ack", self.mid, "--body", original + " ", code=1)
+        self.assertEqual(self.run_cli("ack", self.mid, "--body", original)["statusVersion"], 3)
+        for body in (original, expanded):
+            self.assertTrue(self.run_cli("ack", self.mid, "--body", body)["duplicate"])
+
+        # These rows can be distinguished from receipts rewritten from the
+        # original publisher. A saved digest always retains strict verification.
+        for protected in (dict(scope=self.id), dict(request_key=None), dict(dirty=False),
+                          dict(created_at="2026-01-01 12:00:00"), dict(head="a" * 40),
+                          dict(body_hash=hashlib.sha256(expanded.encode()).hexdigest()),
+                          dict(body_hash=hashlib.sha256(original.encode()).hexdigest())):
+            with self.subTest(protected=protected):
+                path.write_text(json.dumps([dict(row, **protected)]), encoding="utf-8")
+                self.run_cli("ack", self.mid, "--body", original, code=1)
+                self.assertEqual(self.history()[0]["state"], "received")
+
+    @unittest.skipUnless(sys.platform == "linux" and os.geteuid() != 0,
+                         "requires ordinary Linux directory permissions")
+    def test_confirmation_retries_sync_parent_after_rename(self):
+        path = self.state / "messages.json"
+        initial = path.read_bytes()
+        digest = json.loads(initial)[0]["body_hash"]
+        for operation in ("ack", "resolve"):
+            with self.subTest(operation=operation):
+                path.write_bytes(initial)
+                if operation == "ack":
+                    self.run_cli("wait", "--timeout", "0")
+                    args = ["ack", self.mid]
+                    expected = ("processed", 3)
+                else:
+                    rows = json.loads(initial)
+                    rows[0].update(state="unknown", statusVersion=8)
+                    path.write_text(json.dumps(rows), encoding="utf-8")
+                    args = ["resolve", self.mid, "--actor", "reviewer", "--reason", "verified",
+                            "--source", "operator", "--evidence", "delivery-47", "--body-hash", digest]
+                    expected = ("received", 9)
+                self.state.chmod(0o300)
+                try:
+                    self.run_cli(*args, code=1)
+                    after_rename = self.history()[0]
+                    self.assertEqual((after_rename["state"], after_rename["statusVersion"]), expected)
+                    self.run_cli(*args, code=1)
+                finally:
+                    self.state.chmod(0o700)
+                retry = self.run_cli(*args)
+                self.assertTrue(retry["duplicate"])
+                self.assertEqual(self.history()[0], after_rename)
+                self.assertEqual(retry.get("resolution"), after_rename.get("resolution"))
+
     def test_scoped_snapshot_survives_confirmation(self):
         # A revised #6 publisher can omit the request key and store null Git data.
         path = self.state / "messages.json"

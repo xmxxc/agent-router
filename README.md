@@ -53,7 +53,7 @@ wfc status --dispatch ID
 
 任务文件、工作目录和显式指定的程序路径都可以相对于调用方。程序也可使用 PATH 中的命令名。worker 以指定目录为当前目录，从 `WFC_TASK` 取得任务文件的绝对路径，并从 `WFC_ROLE`、`WFC_DISPATCH`、`WFC_ROUND`、`WFC_ATTEMPT` 和 `WFC_STATE` 取得本次派发上下文。派发在前台等待 worker 退出。worker 的标准输入和标准输出连接到空设备，诊断可写标准错误。worker 成功退出后，CLI 保存记录，标准输出返回一行 JSON，含 `dispatch`、`round`（首次为 1）、`attempt`、`role`、`task` 和 `cwd`。`status` 的 `dispatches` 数组列出已成功派发的记录，可用 `--dispatch` 按编号查询。启动失败、worker 返回非零或查询未知编号时，CLI 返回非零退出码并打印诊断。
 
-派发时用 `--report FILE` 绑定本轮报告路径。相对路径从派发命令所在目录解析，缺省使用 worker 工作目录下的 `report.md`。用 `--scope NAME` 把多项派发分到同一个总控组，省略时会生成独立的组名。worker 从 `WFC_REPORT` 和 `WFC_SCOPE` 读取这两项。报告父目录会在启动前创建。
+派发时用 `--report FILE` 绑定本轮报告路径。相对路径从派发命令所在目录解析，省略时使用 worker 工作目录下的 `report-<dispatch>.md`，每次派发各有一个文件。用 `--scope NAME` 把多项派发分到同一个总控组，省略时会生成独立的组名。worker 从 `WFC_REPORT` 和 `WFC_SCOPE` 读取这两项。报告父目录会在启动前创建。
 
 ```sh
 # worker 写好报告后提交，可用同一条命令安全重试
@@ -64,7 +64,7 @@ wfc wait --scope team-a --timeout 30
 
 `done` 核对 `WFC_DISPATCH`、已提供的轮次和 attempt，以及已写好的报告文件。提交其他文件会退出 1。首次提交记录派发工作目录的 Git 提交号 `head` 和有无未提交变更的 `dirty`（含未跟踪文件）。目录不在 Git 仓库中、Git 失败或单条命令超过 5 秒时，两项均为 null。
 
-显式传入 `--attempt ID` 时，默认重试键为 `done:<dispatch>:<attempt>`；也可自定 `--message-id KEY`。同一派发、同一键与相同报告重试，返回原数字编号 `message` 和稳定编号 `messageId`，标记 `duplicate: true`，保留该消息首次采集的 Git 快照。不同键分别创建消息。旧式调用可只设置 `WFC_DISPATCH`，同时省略两个选项会使每次调用各产生一条消息。跨轮复用报告路径或轮次历史不全时，应传入本轮的 `--attempt`。
+显式传入 `--attempt ID` 时，默认重试键为 `done:<dispatch>:<attempt>`；也可自定 `--message-id KEY`。同一派发、同一键与相同报告重试，返回原数字编号 `message` 和稳定编号 `messageId`，标记 `duplicate: true`，保留该消息首次采集的 Git 快照。不同键分别创建消息。旧式调用可只设置 `WFC_DISPATCH`，新派发同时省略两个选项时，每次调用各产生一条消息。升级前尚无报告绑定和 scope 的 R1 派发，worker 保留原启动环境并重试原命令时，会取回原编号和领取状态。跨轮复用报告路径或轮次历史不全时，应传入本轮的 `--attempt`。
 
 `wait` 默认等待 3600 秒，`--timeout` 接受小数秒，设为 0 可立即查询。它按提交顺序返回 `messages`，包含派发、轮次、attempt、角色、scope、报告路径、Git 快照、数字编号 `id` 和 `messageId`。可按 `--scope NAME`、`--dispatch ID` 或两者共同筛选。首次提交为 `unsent`（版本 1），领取为 `received`（版本 2）。消息在输出前标记为已收取，其他等待者可领取剩余消息。超时返回 `{"messages":[],"timedOut":true}`，退出码为 3。
 
@@ -78,6 +78,8 @@ wfc resolve MESSAGE --actor reviewer --reason "核对外部送达记录" \
 ```
 
 `--source` 默认为 `operator`。成功裁决后状态为 `received`，之后仍可单独 `ack`。同一声明可重试，改动证据或哈希会报冲突。`--body-hash` 是消息正文的 SHA-256。当前完成消息的正文字段为 `attempt`、`report`、`role`、`round`，带 `scope`、`head`、`dirty` 的快照还要保留这些字段及其原值。按键排序，以 UTF-8 编码 JSON，在冒号和逗号后各留一个空格，相当于 Python 的 `json.dumps(body, ensure_ascii=False, sort_keys=True).encode("utf-8")`。如需确认处理的是同一份正文，`ack --body BODY` 接受这段 JSON 原文。
+
+旧收件箱可能在消息已领取后才被补上两个值为 null 的 Git 字段。若旧记录带有请求键，缺少创建时间、显式 scope 和正文哈希，且两个 Git 字段均为 null，`ack --body` 也接受领取时的四字段原文。已保存哈希的消息始终同时核对该哈希和当前记录的正文。在 Unix 上，确认或裁决因目录同步失败而报错时，可重试同一命令；重试会补做同步，并保留已有版本与裁决证据。
 
 Rust 默认使用用户主目录下的 `.local/state/agent-router`，可用 `WFC_STATE` 指定独立状态目录。帮助、版本和内核入口都不会读写调度状态。与 Python 版并排使用时，把两份 `wfc` 放在不同目录，分别使用显式路径，并为每次调用指定各自的 `WFC_STATE`。
 

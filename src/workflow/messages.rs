@@ -4,7 +4,7 @@ mod receipt;
 pub use receipt::{Confirm, ACK_USAGE, RESOLVE_USAGE};
 use receipt::{Delivery, Resolution, State};
 
-use super::{git_snapshot::Snapshot, state_dir, valid_id};
+use super::{git_snapshot::Snapshot, resolve_report_path, state_dir, valid_id};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -150,16 +150,28 @@ fn body_hash(body: &str) -> String {
     format!("{:x}", Sha256::digest(body.as_bytes()))
 }
 
+fn canonical_body(body: Map<String, Value>) -> String {
+    // Python #40 uses sorted keys, UTF-8, and a space after each separator.
+    // All done payload fields are scalar. Map iterates in sorted key order.
+    let fields: Vec<_> = body
+        .into_iter()
+        .map(|(key, value)| format!("{}: {value}", json!(key)))
+        .collect();
+    format!("{{{}}}", fields.join(", "))
+}
+
 impl Completion {
-    // The immutable done payload. Wait, history and body verification all use
-    // these stored fields, including when the original report has disappeared.
-    fn body(&self) -> Map<String, Value> {
-        let mut body = Map::from_iter([
+    fn original_body(&self) -> Map<String, Value> {
+        Map::from_iter([
             ("attempt".into(), json!(self.worker.attempt)),
             ("report".into(), json!(self.report)),
             ("role".into(), json!(self.worker.role)),
             ("round".into(), json!(self.worker.round)),
-        ]);
+        ])
+    }
+
+    fn body(&self) -> Map<String, Value> {
+        let mut body = self.original_body();
         for key in ["head", "dirty"] {
             if let Some(value) = self.additional_fields.get(key) {
                 body.insert(key.into(), value.clone());
@@ -173,19 +185,8 @@ impl Completion {
         body
     }
 
-    fn canonical_body(&self) -> String {
-        // Python #40 uses sorted keys, UTF-8, and a space after each separator.
-        // All done payload fields are scalar. Map iterates in sorted key order.
-        let fields: Vec<_> = self
-            .body()
-            .into_iter()
-            .map(|(key, value)| format!("{}: {value}", json!(key)))
-            .collect();
-        format!("{{{}}}", fields.join(", "))
-    }
-
     fn computed_hash(&self) -> String {
-        body_hash(&self.canonical_body())
+        body_hash(&canonical_body(self.body()))
     }
 
     fn matches_hash(&self, hash: &str) -> bool {
@@ -193,6 +194,23 @@ impl Completion {
             .as_deref()
             .is_none_or(|stored| stored == hash)
             && self.computed_hash() == hash
+    }
+
+    fn matches_ack_body(&self, body: &str) -> bool {
+        if self.matches_hash(&body_hash(body)) {
+            return true;
+        }
+        // A pre-scope message could already have been received when a later
+        // publisher rewrote the inbox, adding the two null Git fields. That
+        // row is indistinguishable from one claimed after the rewrite. The
+        // original publisher always stored a request key and no timestamp.
+        self.body_hash.is_none()
+            && self.worker.scope.is_none()
+            && self.request_key.is_some()
+            && self.created_at.is_none()
+            && self.additional_fields.get("head") == Some(&Value::Null)
+            && self.additional_fields.get("dirty") == Some(&Value::Null)
+            && body == canonical_body(self.original_body())
     }
 
     fn receipt(&self, duplicate: bool) -> Value {
@@ -371,6 +389,10 @@ impl Inbox {
         writer.get_ref().sync_all()?;
         drop(writer);
         fs::rename(tmp, self.dir.join("messages.json"))?;
+        self.sync_directory()
+    }
+
+    fn sync_directory(&self) -> Result<()> {
         #[cfg(unix)]
         File::open(&self.dir)?.sync_all()?;
         Ok(())
@@ -414,8 +436,7 @@ impl<'a> Done<'a> {
     }
 
     pub fn run(self) -> Result<Value> {
-        let report = self
-            .report
+        let report = resolve_report_path(self.report)?
             .canonicalize()
             .with_context(|| format!("report not found: {}", self.report.display()))?;
         ensure!(report.is_file(), "report not found: {}", report.display());
@@ -424,25 +445,34 @@ impl<'a> Done<'a> {
         let dispatch = env::var("WFC_DISPATCH")
             .context("run done inside a dispatched worker (WFC_DISPATCH)")?;
         ensure!(valid_id(&dispatch), "invalid dispatch ID");
-        let key = self
-            .key
-            .map(str::to_owned)
-            .or_else(|| self.attempt.map(|id| format!("done:{dispatch}:{id}")));
         let check = || {
             let inbox = Inbox::open(&state)?;
             let assignment = Assignment::current(&state, &dispatch, self.attempt)?;
+            // R1 dispatches had neither field and derived the default key from
+            // the worker's launch environment. Assignment::current checked it.
+            let r1_worker = assignment.report.is_none()
+                && assignment.worker.scope.is_none()
+                && env::var_os("WFC_ROUND").is_some()
+                && env::var_os("WFC_ATTEMPT").is_some();
+            let keyed_attempt = self
+                .attempt
+                .or_else(|| r1_worker.then_some(assignment.worker.attempt.as_str()));
+            let key = self
+                .key
+                .map(str::to_owned)
+                .or_else(|| keyed_attempt.map(|id| format!("done:{dispatch}:{id}")));
             let receipt =
                 inbox.validate_done(&assignment, &report, key.as_deref(), self.attempt)?;
-            Ok::<_, anyhow::Error>((assignment, inbox, receipt))
+            Ok::<_, anyhow::Error>((assignment, inbox, receipt, key))
         };
-        let (initial, inbox, duplicate) = check()?;
+        let (initial, inbox, duplicate, _) = check()?;
         if let Some(receipt) = duplicate {
             return Ok(receipt);
         }
         // Git can block. Let unrelated callbacks and waits proceed while sampling.
         drop(inbox);
         let snapshot = Snapshot::read(&initial.cwd);
-        let (current, mut inbox, duplicate) = check()?;
+        let (current, mut inbox, duplicate, key) = check()?;
         ensure!(
             initial.worker.round == current.worker.round
                 && initial.worker.attempt == current.worker.attempt

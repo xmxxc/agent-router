@@ -1,6 +1,6 @@
 //! Receipt transitions and operator evidence. The caller holds the inbox lock
 //! from lookup until the updated receipt and its evidence are published.
-use super::{body_hash, options, Completion, Inbox};
+use super::{options, Completion, Inbox};
 use crate::workflow::state_dir;
 use anyhow::{bail, ensure, Context, Result};
 use chrono::Local;
@@ -161,7 +161,13 @@ impl<'a> Confirm<'a> {
             .with_context(|| format!("no controller message with id {}", self.id))?;
         let duplicate = self.action.apply(message)?;
         let receipt = message.receipt(duplicate);
-        if !duplicate {
+        if duplicate {
+            // The previous rename can be visible even if syncing its directory
+            // failed. Complete that durability step before acknowledging a retry.
+            inbox
+                .sync_directory()
+                .context("sync controller confirmation")?;
+        } else {
             inbox.save().context("save controller confirmation")?;
         }
         Ok(receipt)
@@ -175,7 +181,7 @@ impl Confirmation<'_> {
                 ensure!(message.delivery.delivered(), "ACK requires received");
                 if let Some(body) = body {
                     ensure!(
-                        message.matches_hash(&body_hash(body)),
+                        message.matches_ack_body(body),
                         "ACK conflicts with its body"
                     );
                 }
