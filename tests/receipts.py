@@ -253,6 +253,27 @@ class Receipts(unittest.TestCase):
         self.assertTrue(self.run_cli("ack", "m-first", "--body", original)["duplicate"])
         self.run_cli("ack", "m-second", "--body", original, code=1)
 
+    def test_legacy_body_depends_on_earlier_publications_across_dispatches(self):
+        path = self.state / "messages.json"
+        new, = json.loads(path.read_bytes())
+        early = {k: new[k] for k in LEGACY_FIELDS}
+        early.update(received=True, head=None, dirty=None)
+        marker = dict(early, dispatch="d-other", id=2, messageId="m-marker")
+        later = dict(early, dispatch="d-later", id=3, messageId="m-later")
+        short = self.body({k: later[k] for k in LEGACY_FIELDS})
+        for field, value in (("request_key", None), ("scope", "other"), ("head", "a" * 40),
+                             ("dirty", False), ("created_at", "2026-01-01 12:00:00")):
+            with self.subTest(field=field):
+                path.write_text(json.dumps([early, dict(marker, **{field: value}), later]))
+                self.run_cli("ack", self.mid, "--body", short)
+                before = path.read_bytes()
+                self.run_cli("ack", "m-later", "--body", short, code=1)
+                self.assertEqual(path.read_bytes(), before)
+                full = self.body(dict(later, scope=later["dispatch"]))
+                ack = self.run_cli("ack", "m-later", "--body", full)
+                self.assertEqual((ack["duplicate"], ack["statusVersion"]), (False, 3))
+                self.assertEqual(self.run_cli("ack", "m-later", "--body", full), dict(ack, duplicate=True))
+
 
 if __name__ == "__main__":
     unittest.main()
