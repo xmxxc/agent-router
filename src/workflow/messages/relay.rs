@@ -137,10 +137,16 @@ impl<'a> Relay<'a> {
         let mut diagnosed = HashSet::new();
         while !remaining().is_zero() {
             let order = transport_lock(&state, self.scope)?;
+            let recovery = if order.is_some() {
+                super::discover_startup_recovery(&state, None, self.scope)
+            } else {
+                Vec::new()
+            };
             let batch = match &order {
                 Some(_) => match Inbox::try_open(&state)? {
                     Some(mut inbox) => {
                         let verified = scope_assignments(&state, self.scope)?;
+                        inbox.recover_startups(recovery)?;
                         claim_batch(
                             &mut inbox,
                             self.scope,

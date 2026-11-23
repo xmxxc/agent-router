@@ -1,5 +1,7 @@
 """Public Linux startup failure reports, delivered through the existing inbox."""
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -12,6 +14,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+import uuid
 
 BINARY = Path(sys.argv.pop(1)).resolve()
 SECRET = "private-fixture-token"
@@ -316,14 +319,11 @@ class StartupFailure(unittest.TestCase):
         self.assertNotIn("startupFailure", row)
         self.assertFalse(self.cli("wait", "--scope", "host-zero-done", "--timeout", "0", code=3)["messages"])
 
-    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
-    def test_tmux_exit_follows_the_create_confirmation(self):
-        self.start_tmux()
+    def hold_tmux_create(self, gate):
         real_tmux = self.tmux[0]
         shim_dir = self.cwd / "bin"
-        shim_dir.mkdir()
+        shim_dir.mkdir(exist_ok=True)
         shim = shim_dir / "tmux"
-        gate = self.cwd / "pre-confirmation-exit"
         shim.write_text(f"#!{sys.executable}\n" + textwrap.dedent(f"""\
             import os
             from pathlib import Path
@@ -346,6 +346,13 @@ class StartupFailure(unittest.TestCase):
             sys.exit(0 if gate.exists() else 1)
         """))
         shim.chmod(0o700)
+        return shim_dir
+
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_tmux_exit_follows_the_create_confirmation(self):
+        self.start_tmux()
+        gate = self.cwd / "pre-confirmation-exit"
+        shim_dir = self.hold_tmux_create(gate)
         probe = textwrap.dedent("""\
             import json
             import os
@@ -429,6 +436,146 @@ class StartupFailure(unittest.TestCase):
         closed = self.cli("close", cancelled["dispatch"])
         self.assertEqual((closed["attempt"], closed["closeEffect"]), (cancelled["attempt"], "session_closed"))
         self.assertFalse(self.cli("wait", "--scope", "accepted-close", "--timeout", "0", code=3)["messages"])
+
+    @contextmanager
+    def staged_startup_exit(self, scope, *, done=False):
+        ready = self.cwd / f"{scope}-ready.json"
+        release = self.cwd / f"{scope}-release"
+        gate = self.cwd / f"{scope}-terminal"
+        shim_dir = self.hold_tmux_create(gate)
+        script = textwrap.dedent("""\
+            import json
+            import os
+            from pathlib import Path
+            import subprocess
+            import sys
+            import time
+
+            ready, release, terminal = map(Path, sys.argv[1:4])
+            if sys.argv[4] == "done":
+                subprocess.run([os.environ["WFC_BIN"], "done", "--report", os.environ["WFC_REPORT"],
+                                "--attempt", os.environ["WFC_ATTEMPT"]], check=True)
+            temporary = ready.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"dispatch": os.environ["WFC_DISPATCH"],
+                                            "attempt": os.environ["WFC_ATTEMPT"], "pid": os.getpid()}))
+            temporary.rename(ready)
+            deadline = time.monotonic() + 2
+            while not release.exists() and time.monotonic() < deadline:
+                time.sleep(.002)
+            if not release.exists():
+                raise SystemExit(125)
+            terminal.touch()
+            raise SystemExit(17)
+        """)
+        config = self.cwd / f"{scope}.json"
+        command = [sys.executable, "-c", script, str(ready), str(release), str(gate), "done" if done else "exit"]
+        config.write_text(json.dumps({"hosts": {"codex": {"command": command}}}))
+        args = [BINARY, "dispatch", "--task", "task", "--cwd", ".", "--report", "report", "--scope", scope,
+                "--role", "startup-check", "--host", "codex", "--launch-config", str(config)]
+        env = {**self.env, "PATH": f"{shim_dir}:{self.env['PATH']}"}
+        with subprocess.Popen(args, cwd=self.cwd, env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) as dispatch:
+            try:
+                self.until(ready.is_file, "await the real worker before releasing exit")
+                yield dispatch, release, json.loads(ready.read_text())
+            finally:
+                release.touch()
+                if dispatch.poll() is None:
+                    dispatch.kill()
+                dispatch.communicate(timeout=7)
+
+    def stop_after_startup_decision(self, scope, *, done=False):
+        with self.staged_startup_exit(scope, done=done) as (dispatch, release, child):
+            with (self.state / "messages.lock").open("a+b") as ledger:
+                fcntl.flock(ledger, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                release.touch()
+                final = self.state / "dispatches" / f"{child['dispatch']}.json"
+                self.until(final.is_file, "await durable create decision while notification is blocked")
+                row = json.loads(final.read_text())
+                self.assertEqual((row["create"]["result"], row["create"]["category"], row["create"]["exitCode"]),
+                                 ("uncertain", "process_exited", 17))
+                self.assertEqual((row["scope"], row["round"], row["attempt"]), (scope, 1, child["attempt"]))
+                self.assertIsNone(dispatch.poll())
+                dispatch.kill()
+                dispatch.communicate(timeout=7)
+                self.assertEqual(dispatch.returncode, -signal.SIGKILL)
+        return child, row
+
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_startup_notice_recovers_after_dispatch_interruption(self):
+        self.start_tmux()
+        scope = "interrupted-publish"
+        child, row = self.stop_after_startup_decision(scope)
+        ledger = self.state / "messages.json"
+        self.assertFalse(ledger.exists())
+        self.assertFalse(self.cli("wait", "--dispatch", child["dispatch"], "--scope", "wrong-scope", "--timeout", "0", code=3)["messages"])
+        self.assertFalse(ledger.exists())
+        args = [BINARY, "wait", "--scope", scope, "--timeout", "1.5"]
+        with ThreadPoolExecutor(max_workers=2) as waiters:
+            results = list(waiters.map(lambda _: subprocess.run(args, cwd=self.cwd, env=self.env,
+                                                                capture_output=True, text=True, timeout=6), range(2)))
+        self.assertEqual(sorted(result.returncode for result in results), [0, 3], results)
+        remaining = [m for result in results for m in json.loads(result.stdout)["messages"]]
+        message, = remaining
+        self.assertEqual((message["dispatch"], message["scope"], message["attempt"], message["round"]),
+                         (child["dispatch"], scope, child["attempt"], 1))
+        self.assertEqual((message["fault"]["exitCode"], message["fault"]["pid"], message["fault"]["launchId"]),
+                         (17, child["pid"], Path(row["create"]["receipt"]).stem))
+        self.check_ack(message)
+        self.assertEqual(len(json.loads(ledger.read_text())), 1)
+        print(json.dumps({"case": scope, "dispatch": child["dispatch"], "attempt": child["attempt"],
+                          "messageId": message["messageId"], "waitExitCodes": [0, 3], "ackVerified": True}), flush=True)
+
+        done_scope = "interrupted-with-done"
+        completed, _ = self.stop_after_startup_decision(done_scope, done=True)
+        done, = self.cli("wait", "--scope", done_scope, "--timeout", "0")["messages"]
+        self.assertEqual((done["type"], done["attempt"]), ("done", completed["attempt"]))
+        self.assertFalse(self.cli("wait", "--scope", done_scope, "--timeout", "0", code=3)["messages"])
+        row = self.cli("status", "--dispatch", completed["dispatch"])["dispatches"][0]
+        self.assertEqual([m["messageId"] for m in row["messages"]], [done["messageId"]])
+
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_startup_notice_recovers_after_ledger_write_failure(self):
+        self.start_tmux()
+        scope = "failed-notice-write"
+        with self.staged_startup_exit(scope) as (dispatch, release, child):
+            blocker = self.state / "messages.pending"
+            blocker.mkdir()
+            release.touch()
+            out, error = dispatch.communicate(timeout=7)
+            self.assertEqual((dispatch.returncode, out), (1, ""), error)
+            self.assertIn("could not publish confirmed startup failure", error)
+            self.assertFalse((self.state / "messages.json").exists())
+            blocker.rmdir()
+        ledger = self.state / "messages.json"
+        thread = str(uuid.uuid4())
+        sessions = self.cwd / ".codex/sessions/2026/01/01"
+        sessions.mkdir(parents=True)
+        (sessions / f"rollout-time-{thread}.jsonl").write_text(json.dumps({
+            "type": "session_meta", "payload": {"id": thread, "source": "cli"},
+        }) + "\n")
+        queue = self.cwd / "bin/codex"
+        queue.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""\
+            import json
+            import sys
+            with open("queue-calls", "a") as log:
+                log.write(json.dumps(sys.argv[1:]) + "\\n")
+        """))
+        queue.chmod(0o700)
+        self.cli("relay", "--scope", scope, "--codex", "--for", "1.5",
+                 extra={"CODEX_THREAD_ID": thread, "PATH": f"{queue.parent}:{self.env['PATH']}"})
+        call, = [json.loads(line) for line in (self.cwd / "queue-calls").read_text().splitlines()]
+        prefix = "[router] Messages for the controller: "
+        self.assertTrue(call[4].startswith(prefix))
+        message, = json.loads(call[4][len(prefix):])["messages"]
+        self.assertEqual((message["scope"], message["attempt"], message["fault"]["exitCode"]), (scope, child["attempt"], 17))
+        ack = self.cli("ack", message["messageId"])
+        self.assertEqual((ack["state"], ack["statusVersion"]), ("processed", 4))
+        self.assertTrue(self.cli("ack", message["messageId"])["duplicate"])
+        self.assertFalse(self.cli("wait", "--scope", scope, "--timeout", "0", code=3)["messages"])
+        self.assertEqual(len(json.loads(ledger.read_text())), 1)
+        print(json.dumps({"case": scope, "dispatch": child["dispatch"], "attempt": child["attempt"],
+                          "messageId": message["messageId"], "queueCalls": 1, "ackVerified": True}), flush=True)
 
     @contextmanager
     def read_only_history(self, history):

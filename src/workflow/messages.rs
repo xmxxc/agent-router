@@ -431,6 +431,74 @@ impl Inbox {
         Ok(batch)
     }
 
+    #[cfg(target_os = "linux")]
+    fn append_startup_failure(
+        &mut self,
+        assignment: Assignment,
+        host: &Value,
+        failure: &super::startup::Failure<'_>,
+    ) -> bool {
+        let worker = assignment.worker;
+        let key = format!(
+            "startup:{}:{}:{}",
+            worker.dispatch, worker.round, worker.attempt
+        );
+        if self.messages.iter().any(|m| {
+            m.worker.dispatch == worker.dispatch
+                && m.worker.attempt == worker.attempt
+                && m.worker.round == worker.round
+                && (m.request_key.as_deref() == Some(&key)
+                    || m.additional_fields
+                        .get("kind")
+                        .is_some_and(|kind| kind == "startup_failure")
+                    || matches!(m.kind(), "done" | "question"))
+        }) {
+            return false;
+        }
+        let mut message = Message {
+            message_type: Some(failure.message_type().into()),
+            id: self.messages.len() as u64 + 1,
+            message_id: format!("m-{}", Uuid::new_v4().simple()),
+            worker,
+            report: assignment.report,
+            request_key: Some(key),
+            body_hash: None,
+            delivery: Delivery::unsent(),
+            resolution: None,
+            created_at: Some(receipt::timestamp()),
+            additional_fields: Map::from_iter([
+                ("kind".into(), json!("startup_failure")),
+                ("host".into(), host.clone()),
+                ("message".into(), json!(failure.diagnostic())),
+                ("fault".into(), json!(failure)),
+            ]),
+        };
+        message.body_hash = Some(message.computed_hash());
+        self.messages.push(message);
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recover_startups(&mut self, candidates: Vec<RecoverableStartup>) -> Result<()> {
+        let mut changed = false;
+        for candidate in candidates {
+            if !candidate.current() {
+                continue;
+            }
+            let launch = candidate.receipt["launchId"]
+                .as_str()
+                .context("missing launch ID")?;
+            if let Ok(Some(failure)) = super::startup::tmux_failure(launch, &candidate.receipt) {
+                changed |=
+                    self.append_startup_failure(candidate.assignment, &candidate.host, &failure);
+            }
+        }
+        if changed {
+            self.save().context("recover confirmed startup failure")?;
+        }
+        Ok(())
+    }
+
     fn validate_done(
         &self,
         assignment: &Assignment,
@@ -527,6 +595,150 @@ impl Inbox {
 }
 
 #[cfg(target_os = "linux")]
+struct RecoverableStartup {
+    path: PathBuf,
+    stamp: fs::Metadata,
+    _file: File,
+    assignment: Assignment,
+    host: Value,
+    receipt: Value,
+}
+
+#[cfg(target_os = "linux")]
+impl RecoverableStartup {
+    fn current(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(&self.path).is_ok_and(|current| {
+            current.is_file()
+                && current.dev() == self.stamp.dev()
+                && current.ino() == self.stamp.ino()
+                && current.ctime() == self.stamp.ctime()
+                && current.ctime_nsec() == self.stamp.ctime_nsec()
+                && current.len() == self.stamp.len()
+        })
+    }
+}
+
+// Read only published assignments and their verified terminal receipts. The
+// file pins the read generation; the locked publisher only rechecks metadata.
+#[cfg(target_os = "linux")]
+fn discover_startup_recovery(
+    state: &Path,
+    dispatch: Option<&str>,
+    scope: Option<&str>,
+) -> Vec<RecoverableStartup> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = state.join("dispatches");
+    let ids = dispatch.map_or_else(
+        || super::assignment::ids(&dir).unwrap_or_default(),
+        |id| [id.to_owned()].into(),
+    );
+    ids.into_iter()
+        .filter_map(|id| {
+            let path = dir.join(format!("{id}.json"));
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&path)
+                .ok()?;
+            let stamp = file.metadata().ok()?;
+            if !stamp.is_file() {
+                return None;
+            }
+            let row = super::decode_record(file.try_clone().ok()?, &path).ok()?;
+            if !super::assignment::identified(&row)
+                || row["createPending"] == true
+                || !row["publicationDiagnostic"].is_null()
+                || !row["controllerOwner"].is_null()
+                || !row["scope"].as_str().is_some_and(|bound| {
+                    !bound.is_empty() && scope.is_none_or(|scope| scope == bound)
+                })
+            {
+                return None;
+            }
+            let receipt = super::backend::verified_unconfirmed_tmux_receipt(state, &row).ok()??;
+            Some(RecoverableStartup {
+                path,
+                stamp,
+                _file: file,
+                assignment: Assignment::deserialize(&row).ok()?,
+                host: row["host"].clone(),
+                receipt,
+            })
+        })
+        .collect()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod startup_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn startup_recovery_rejects_replaced_assignment_and_preserves_existing_question() -> Result<()>
+    {
+        let state = env::temp_dir().join(format!("wfc-startup-recovery-{}", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let dispatch = "d-aabbccdd";
+            let round = 1;
+            let attempt = "a-123456789abc";
+            let launch = "0123456789abcdef0123456789abcdef";
+            let scope = "original-scope";
+            fs::create_dir_all(state.join("launches"))?;
+            fs::create_dir_all(state.join("dispatches"))?;
+            let receipt = state
+                .canonicalize()?
+                .join("launches")
+                .join(format!("{launch}.json"));
+            let path = state.join("dispatches").join(format!("{dispatch}.json"));
+            super::super::write_json(
+                &receipt,
+                &json!({"category":"process_exited","exitCode":17,"launchId":launch,
+                "startupExit":{"exitCode":17,"signal":null,"pid":123,"processStart":null}}),
+                None,
+            )?;
+            let row = json!({"dispatch":dispatch,"round":round,"attempt":attempt,"scope":scope,
+                "executionId":attempt,"role":"worker","cwd":state,"report":state.join("report"),
+                "backend":"tmux","host":"codex","create":{"result":"uncertain","category":"process_exited",
+                    "dispatch":dispatch,"round":round,"attempt":attempt,"exitCode":17,"receipt":receipt}});
+            super::super::write_json(&path, &row, None)?;
+            assert!(
+                discover_startup_recovery(&state, Some(dispatch), Some("wrong-scope")).is_empty()
+            );
+            let lost = discover_startup_recovery(&state, Some(dispatch), Some(scope));
+            assert_eq!(lost.len(), 1);
+            let mut replaced = row.clone();
+            replaced["attempt"] = json!("a-aaaaaaaaaaaa");
+            super::super::write_json(&path, &replaced, None)?;
+            let mut inbox = Inbox::open(&state)?;
+            inbox.recover_startups(lost)?;
+            assert!(inbox.messages.is_empty());
+            drop(inbox);
+
+            super::super::write_json(&path, &row, None)?;
+            super::super::write_json(
+                &state.join("messages.json"),
+                &json!([{
+                    "id":1,"messageId":"m-question","dispatch":dispatch,"round":round,"attempt":attempt,
+                    "scope":scope,"role":"worker","question_payload":{"text":"Continue?","options":[]},
+                    "state":"received","statusVersion":2,
+                }]),
+                None,
+            )?;
+            let recovered = discover_startup_recovery(&state, None, Some(scope));
+            let mut inbox = Inbox::open(&state)?;
+            inbox.recover_startups(recovered)?;
+            assert_eq!(inbox.messages.len(), 1);
+            assert_eq!(inbox.messages[0].message_id, "m-question");
+            assert_eq!(inbox.messages[0].view()["type"], "question");
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(state);
+        result
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn publish_startup_failure(
     state: &Path,
     dispatch: &str,
@@ -542,45 +754,16 @@ pub(super) fn publish_startup_failure(
     let (file, path) = super::assignment::open_assignment(&dir, dispatch)?;
     let row = super::decode_record(file, &path)?;
     let assignment = Assignment::deserialize(&row)?;
-    let worker = assignment.worker;
     ensure!(
-        worker.attempt == attempt && worker.round > 0 && assignment.controller_owner.is_none(),
+        assignment.worker.attempt == attempt
+            && assignment.worker.round > 0
+            && assignment.controller_owner.is_none(),
         "startup failure does not match the current assignment"
     );
-    let key = format!("startup:{dispatch}:{}:{attempt}", worker.round);
-    if inbox.messages.iter().any(|m| {
-        m.worker.dispatch == worker.dispatch
-            && m.worker.attempt == worker.attempt
-            && m.worker.round == worker.round
-            && (m.request_key.as_deref() == Some(&key)
-                || m.additional_fields
-                    .get("kind")
-                    .is_some_and(|kind| kind == "startup_failure")
-                || matches!(m.kind(), "done" | "question"))
-    }) {
-        return Ok(());
+    if inbox.append_startup_failure(assignment, &row["host"], failure) {
+        inbox.save().context("publish startup failure")?;
     }
-    let mut message = Message {
-        message_type: Some(failure.message_type().into()),
-        id: inbox.messages.len() as u64 + 1,
-        message_id: format!("m-{}", Uuid::new_v4().simple()),
-        worker,
-        report: assignment.report,
-        request_key: Some(key),
-        body_hash: None,
-        delivery: Delivery::unsent(),
-        resolution: None,
-        created_at: Some(receipt::timestamp()),
-        additional_fields: Map::from_iter([
-            ("kind".into(), json!("startup_failure")),
-            ("host".into(), row["host"].clone()),
-            ("message".into(), json!(failure.diagnostic())),
-            ("fault".into(), json!(failure)),
-        ]),
-    };
-    message.body_hash = Some(message.computed_hash());
-    inbox.messages.push(message);
-    inbox.save().context("publish startup failure")
+    Ok(())
 }
 
 // Writers publish complete snapshots by rename. A status reader can open
@@ -726,8 +909,14 @@ impl<'a> Wait<'a> {
         let state = state_dir()?;
         let start = Instant::now();
         loop {
+            #[cfg(target_os = "linux")]
+            let recovery = discover_startup_recovery(&state, self.dispatch, self.scope);
             let batch = match Inbox::try_open(&state)? {
-                Some(mut inbox) => inbox.claim(self.dispatch, self.scope, State::Received)?,
+                Some(mut inbox) => {
+                    #[cfg(target_os = "linux")]
+                    inbox.recover_startups(recovery)?;
+                    inbox.claim(self.dispatch, self.scope, State::Received)?
+                }
                 None => Vec::new(),
             };
             let remaining = self.timeout.saturating_sub(start.elapsed());
