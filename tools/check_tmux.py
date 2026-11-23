@@ -7,6 +7,7 @@ import pty
 import select
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -729,12 +730,28 @@ os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
             self.assertEqual(self.call("create", **self.launch)["result"], "uncertain")
         finally:
             os.rename(parked, self.socket)
+        endpoint = Path(self.socket)
+        original_socket = endpoint.lstat()
         self.stop_server()
+        try:
+            leftover_socket = endpoint.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            # Some tmux servers leave the socket entry behind after exiting.
+            self.assertTrue(stat.S_ISSOCK(leftover_socket.st_mode))
+            self.assertTrue(os.path.samestat(original_socket, leftover_socket))
+            rows = Path("/proc/net/unix").read_bytes().split(b"\n")
+            address = os.fsencode(self.socket)
+            self.assertFalse(any(row.split(maxsplit=7)[7:] == [address] for row in rows))
+            self.assertEqual(self.call("inspect", legacyRecovery=recovery)["result"], "uncertain")
+            endpoint.unlink()
         self.assertEqual(self.call("inspect")["result"], "uncertain")
         for field in ("pidNamespace", "networkNamespace", "userNamespace", "effectiveUid"):
             wrong_scope = {**recovery, field: recovery[field] + 1}
             self.assertEqual(self.call("inspect", legacyRecovery=wrong_scope)["result"], "uncertain")
-        self.assertFalse(self.call("inspect", legacyRecovery=recovery)["alive"])
+        restored = self.call("inspect", legacyRecovery=recovery)
+        self.assertEqual((restored.get("result"), restored.get("alive")), ("accepted", False), restored)
 
         other_id = "bf" * 16
         pointer.write_text(json.dumps({"Registered": {"id": other_id, "execution": "A"}}))
