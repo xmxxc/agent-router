@@ -8,19 +8,20 @@ permissions:
 
 jobs:
   linux-startup-failure:
-    name: '#13 hosted tmux startup failure rerun'
+    name: '#13 hosted tmux process creation identity'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     defaults:
       run:
         shell: bash
     env:
-      PRODUCT_SHA: 4d85a909c6e36319519b243c830ca28fe6f14779
-      PRODUCT_TREE: 64933648d9d4c842c316796ffc489e38a35bee2a
+      PRODUCT_SHA: 905190d1b50f23ff47a3e3e0f66550640ac65e8c
+      PRODUCT_TREE: ba52ae46da4a850a6b1652c411c6b2b7787544ae
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TARGET: x86_64-unknown-linux-gnu
       TEST_GROUP: hosted-tmux
       BASELINE_RUN: '45219721058'
+      PREVIOUS_HOSTED_RUN: '45222227720'
       CARGO_BUILD_JOBS: '2'
       PYTHONUTF8: '1'
       PYTHONDONTWRITEBYTECODE: '1'
@@ -29,9 +30,9 @@ jobs:
       - name: Record workflow run
         run: |
           mkdir -p "$EVIDENCE"
-          printf 'workflow=%s\nrun=%s\nattempt=%s\nexpectedProduct=%s\nexpectedTree=%s\ntestGroup=%s\nbaselineRun=%s\n' \
-            "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PRODUCT_SHA" "$PRODUCT_TREE" \
-            "$TEST_GROUP" "$BASELINE_RUN" |
+          printf '%s\n' "workflow=$GITHUB_SHA" "run=$GITHUB_RUN_ID" "attempt=$GITHUB_RUN_ATTEMPT" \
+            "expectedProduct=$PRODUCT_SHA" "expectedTree=$PRODUCT_TREE" "testGroup=$TEST_GROUP" \
+            "baselineRun=$BASELINE_RUN" "previousHostedRun=$PREVIOUS_HOSTED_RUN" |
             tee "$EVIDENCE/run.log"
       - name: Check out the CI scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -128,7 +129,7 @@ jobs:
             [[ "$version" == *"(Rust, $TARGET, release, build $PRODUCT_SHA)" ]]
             sha256sum "$binary"
           } 2>&1 | tee "$EVIDENCE/build.log"
-      - name: Run the hosted tmux startup failure test
+      - name: Verify hosted tmux process creation identity
         working-directory: product
         env:
           WFC_BUILD_ID: ${{ env.PRODUCT_SHA }}
@@ -143,7 +144,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: linux-startup-failure-${{ env.TEST_GROUP }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: linux-startup-failure-${{ env.TEST_GROUP }}-process-start-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14
