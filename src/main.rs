@@ -109,6 +109,10 @@ fn run() -> anyhow::Result<ExitCode> {
             }
         }
         #[cfg(target_os = "linux")]
+        Some("--claude-session-start") if args.is_empty() => {
+            workflow::host::claude_session_start()?
+        }
+        #[cfg(target_os = "linux")]
         Some("--herdr-backend") if args.is_empty() => {
             let request = serde_json::from_reader(std::io::stdin().lock())?;
             let reply = workflow::herdr::submit(request)?;
