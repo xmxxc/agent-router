@@ -10,11 +10,27 @@ pub use preview::{can_preview_router_db, reclaim_preview, status, verify_router_
 
 use anyhow::{ensure, Context, Result};
 use rusqlite::{Connection, OpenFlags};
+#[cfg(unix)]
+use std::fmt;
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
     time::Duration,
 };
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct UnknownHomeAccount(String);
+
+#[cfg(unix)]
+impl fmt::Display for UnknownHomeAccount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "cannot determine home directory for {}", self.0)
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for UnknownHomeAccount {}
 
 /// Resolve links in the existing prefix without creating a missing state directory.
 fn resolve(path: &Path) -> Result<PathBuf> {
@@ -69,7 +85,7 @@ fn expand_home(path: PathBuf) -> Result<PathBuf> {
             let why = || format!("cannot determine home directory for {name}");
             nix::unistd::User::from_name(&name[1..])
                 .with_context(why)?
-                .with_context(why)?
+                .ok_or_else(|| UnknownHomeAccount(name.to_owned()))?
                 .dir
         }
         #[cfg(not(unix))]

@@ -168,7 +168,7 @@ impl<'a> Dispatch<'a> {
         let task = self.task.canonicalize().context("resolve task file")?;
         ensure!(task.is_file(), "--task must name a file");
 
-        let state = state_dir()?;
+        let state = writable_state_dir()?;
         let records = state.join("dispatches");
         let dispatch = format!("d-{}", Uuid::new_v4().simple());
         let attempt = format!("a-{}", Uuid::new_v4().simple());
@@ -489,6 +489,72 @@ pub(crate) fn state_dir() -> Result<PathBuf> {
     Ok(std::path::absolute(root)?)
 }
 
+pub(crate) fn writable_state_dir() -> Result<PathBuf> {
+    let state = state_dir();
+    if let Ok(path) = &state {
+        ensure_state_writable(path)?;
+    }
+    #[cfg(target_os = "linux")]
+    if env::var_os("WFC_STATE").is_some_and(|value| value.is_empty()) {
+        // An empty override selects the legacy default for reads.
+        check_legacy_state_path(None)?;
+    }
+    state
+}
+
+pub(crate) fn ensure_state_writable(state: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        ensure_no_legacy_db(state)?;
+        check_legacy_state_path(Some(state))?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = state;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const LEGACY_WRITE_GUIDANCE: &str =
+    "Stop legacy writers and import into a new isolated WFC_STATE before writing with Rust.";
+
+#[cfg(target_os = "linux")]
+fn check_legacy_state_path(native: Option<&Path>) -> Result<()> {
+    match wfc_legacy_state::state_dir() {
+        Ok(legacy) if Some(legacy.as_path()) != native => ensure_no_legacy_db(&legacy),
+        Ok(_) => Ok(()),
+        Err(error) if error.is::<wfc_legacy_state::UnknownHomeAccount>() => Ok(()),
+        Err(error) => Err(error).context(format!(
+            "legacy state write blocked while resolving the Python state path. {LEGACY_WRITE_GUIDANCE}"
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_no_legacy_db(state: &Path) -> Result<()> {
+    // An entry or recovery sidecar is sufficient. Opening SQLite to establish
+    // its type or contents can require recovery or create sidecars.
+    for name in [
+        "router.db",
+        "router.db-wal",
+        "router.db-shm",
+        "router.db-journal",
+    ] {
+        let path = state.join(name);
+        let blocked = || {
+            format!(
+                "legacy state write blocked at {}. {LEGACY_WRITE_GUIDANCE}",
+                path.display()
+            )
+        };
+        match fs::symlink_metadata(&path) {
+            Ok(_) => anyhow::bail!("{}", blocked()),
+            Err(error) if error.kind() == ErrorKind::NotFound => (),
+            Err(error) => return Err(error).with_context(blocked),
+        }
+    }
+    Ok(())
+}
+
 fn valid_id(id: &str) -> bool {
     valid_identity(id, "d-")
 }
@@ -606,18 +672,17 @@ fn native_ledger_exists(path: &Path, view: StateView, no_legacy: bool) -> Result
 }
 
 #[cfg(target_os = "linux")]
-fn verified_legacy_path(state: &Path) -> Result<bool> {
-    let path = state.join("router.db");
-    let Some(metadata) = ledger_metadata(&path, StateView::ReclaimConfirm)? else {
-        return Ok(false);
-    };
-    ensure!(
-        metadata.is_file(),
-        "{} is not a regular file",
-        path.display()
-    );
-    wfc_legacy_state::verify_router_db(state)?;
-    Ok(true)
+fn missing_named_home(configured: Option<&OsStr>, error: &anyhow::Error) -> bool {
+    let named_home = configured.is_some_and(|path| {
+        Path::new(path)
+            .components()
+            .find(|part| *part != Component::CurDir)
+            .is_some_and(|part| {
+                matches!(part, Component::Normal(name)
+                if name != "~" && name.as_encoded_bytes().starts_with(b"~"))
+            })
+    });
+    named_home && !error.is::<std::io::Error>() && error.chain().nth(1).is_none()
 }
 
 #[cfg(target_os = "linux")]
@@ -628,18 +693,8 @@ fn legacy_view_state(id: Option<&OsStr>, view: StateView) -> Result<Option<PathB
     }
     let legacy = wfc_legacy_state::state_dir().and_then(|state| {
         let database = state.join("router.db");
-        let exists = if view == StateView::ReclaimConfirm {
-            verified_legacy_path(&state)?
-        } else {
-            database.try_exists()?
-        };
-        Ok(exists.then_some(state))
+        Ok(database.try_exists()?.then_some(state))
     });
-    // A native assignment does not resolve an ambiguous legacy path.
-    let legacy = match legacy {
-        Err(error) if view == StateView::ReclaimConfirm => return Err(error),
-        legacy => legacy,
-    };
     let no_legacy = matches!(legacy, Ok(None));
     if no_legacy && view == StateView::Status {
         return Ok(None);
@@ -679,21 +734,8 @@ fn legacy_view_state(id: Option<&OsStr>, view: StateView) -> Result<Option<PathB
     }
     // ~account/dir is also a valid literal Rust path. A missing account is
     // reported without a system error by legacy discovery.
-    let named_home = configured.as_deref().is_some_and(|path| {
-        Path::new(path)
-            .components()
-            .find(|part| *part != Component::CurDir)
-            .is_some_and(|part| {
-                matches!(part, Component::Normal(name)
-                if name != "~" && name.as_encoded_bytes().starts_with(b"~"))
-            })
-    });
     match legacy {
-        Err(error)
-            if named_home && !error.is::<std::io::Error>() && error.chain().nth(1).is_none() =>
-        {
-            Ok(None)
-        }
+        Err(error) if missing_named_home(configured.as_deref(), &error) => Ok(None),
         result => result,
     }
 }
@@ -806,8 +848,12 @@ fn status_with_history(
     let mut undelivered = Vec::new();
     let mut reclaimable = Vec::new();
     let owners = controller::Owners::read(&state)?;
+    #[cfg(target_os = "linux")]
+    let read_only = ensure_state_writable(&state).is_err();
+    #[cfg(not(target_os = "linux"))]
+    let read_only = false;
     for record in &mut dispatches {
-        observe_dispatch(&state, &dir, record, false)?;
+        observe_dispatch(&state, &dir, record, read_only)?;
         record
             .as_object_mut()
             .unwrap()

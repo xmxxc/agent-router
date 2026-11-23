@@ -1,8 +1,8 @@
 //! R1 Herdr assignments. A stable lock covers inspection, input claims, close
 //! and reconciliation while atomic replacements publish complete record generations.
 use super::{
-    backend, controller, host, read_record, record_scope, state_dir, valid_id, valid_identity,
-    write_json,
+    backend, controller, ensure_no_legacy_db, host, read_record, record_scope, valid_id,
+    valid_identity, writable_state_dir, write_json,
 };
 use crate::host_launch;
 use anyhow::{ensure, Context, Result};
@@ -18,14 +18,6 @@ use std::time::{Duration, Instant};
 use wfc_herdr::{FailureKind, Handle, Launch, Mapping, Process};
 
 pub const USAGE: &str = "wfc herdr-reconcile DISPATCH --pane P --terminal T --actor NAME --evidence TEXT [--workspace W] [--old-writer-evidence TEXT] [--owner-token TOKEN]";
-
-fn native_state(state: &Path) -> Result<()> {
-    ensure!(
-        !state.join("router.db").try_exists()?,
-        "legacy router database requires owner and assignment migration"
-    );
-    Ok(())
-}
 
 fn launch_receipt(state: &Path, create: &Value) -> Result<Value> {
     let launch = backend::herdr_receipt(state, create)?;
@@ -52,7 +44,7 @@ struct Assignment<'a> {
 impl<'a> Assignment<'a> {
     fn lock_unowned(state: &'a Path, id: &str, operation: &str) -> Result<(Self, File)> {
         ensure!(valid_id(id), "invalid dispatch ID");
-        native_state(state)?;
+        ensure_no_legacy_db(state)?;
         let row = read_record(&state.join("dispatches").join(format!("{id}.json")))?;
         let scope = record_scope(&row).context("invalid dispatch scope")?;
         let authorize = || controller::Owners::read(state)?.require(scope, None, operation);
@@ -69,7 +61,7 @@ impl<'a> Assignment<'a> {
 
     fn lock(state: &'a Path, id: &str, new: Option<Value>) -> Result<Self> {
         ensure!(valid_id(id), "invalid dispatch ID");
-        native_state(state)?;
+        ensure_no_legacy_db(state)?;
         let path = state.join("dispatches").join(format!("{id}.json"));
         let lock_path = path.with_extension("herdr-lock");
         let lock = if new.is_some() {
@@ -127,7 +119,7 @@ impl<'a> Assignment<'a> {
     }
 
     fn current(&self) -> Result<()> {
-        native_state(self.state)?;
+        ensure_no_legacy_db(self.state)?;
         ensure!(
             read_record(&self.path)? == self.row,
             "Herdr assignment changed during operation"
@@ -577,7 +569,7 @@ pub struct Input {
 pub fn submit(input: Input) -> Result<Value> {
     ensure!(input.op == "submit", "unsupported Herdr operation");
     controller::require_controller("submit")?;
-    let state = state_dir()?;
+    let state = writable_state_dir()?;
     let (mut unit, _scope) = Assignment::lock_unowned(&state, &input.dispatch, "submit")?;
     ensure!(
         unit.row["round"] == input.round && unit.row["attempt"] == input.attempt,
@@ -667,7 +659,7 @@ impl Reconcile {
             !self.owner_token,
             "controller owner authorization is unavailable"
         );
-        let state = state_dir()?;
+        let state = writable_state_dir()?;
         let (mut unit, _scope) =
             Assignment::lock_unowned(&state, &self.dispatch, "herdr-reconcile")?;
         ensure!(

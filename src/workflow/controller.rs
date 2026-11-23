@@ -3,7 +3,7 @@
 //! Serialize lease changes and ledger claims under messages.lock. A scoped
 //! relay holds its scope lock from claim through external I/O and settlement,
 //! releasing messages.lock while delivery is in flight.
-use super::{host, messages, state_dir, write_json};
+use super::{ensure_state_writable, host, messages, writable_state_dir, write_json};
 use anyhow::{ensure, Context, Result};
 use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
@@ -202,6 +202,7 @@ fn scope_lock_file(state: &Path, scope: &str) -> Result<File> {
 
 #[cfg(target_os = "linux")]
 pub(super) fn try_scope_lock(state: &Path, scope: &str) -> Result<Option<File>> {
+    ensure_state_writable(state)?;
     let lock = scope_lock_file(state, scope)?;
     try_lock(&lock).map(|locked| locked.then_some(lock))
 }
@@ -215,6 +216,7 @@ fn try_lock(file: &File) -> Result<bool> {
 }
 
 pub(super) fn lock_scope(state: &Path, scope: &str) -> Result<File> {
+    ensure_state_writable(state)?;
     fs::create_dir_all(state)?;
     let lock = scope_lock_file(state, scope)?;
     let start = Instant::now();
@@ -228,6 +230,7 @@ pub(super) fn lock_scope(state: &Path, scope: &str) -> Result<File> {
         }
         std::thread::sleep(remaining.min(Duration::from_millis(50)));
     }
+    ensure_state_writable(state)?;
     Ok(lock)
 }
 
@@ -267,7 +270,7 @@ impl<'a> Owner<'a> {
     }
 
     pub fn run(self) -> Result<Value> {
-        let state = state_dir()?;
+        let state = writable_state_dir()?;
         let _scope_lock = lock_scope(&state, &self.scope)?;
         let _ledger_lock = messages::lock_for_publish(&state)?;
         let mut owners = Owners::read(&state)?;

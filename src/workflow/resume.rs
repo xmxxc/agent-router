@@ -44,7 +44,7 @@ impl<'a> Resume<'a> {
 
     pub fn run(self) -> Result<Value> {
         controller::require_controller("resume")?;
-        let state = super::state_dir()?;
+        let state = super::writable_state_dir()?;
         let dir = state.join("dispatches");
         let read = || {
             assignment::public_record(&dir, self.dispatch)?

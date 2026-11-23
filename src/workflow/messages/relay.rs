@@ -6,8 +6,10 @@ pub(crate) mod queue_owner;
 mod registration;
 pub use registration::waiters;
 
-use super::{spaced_json, state_dir, Inbox, State};
-use crate::workflow::{controller, read_record, valid_id, worker_owner};
+use super::{spaced_json, Inbox, State};
+use crate::workflow::{
+    controller, ensure_state_writable, read_record, valid_id, worker_owner, writable_state_dir,
+};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
@@ -116,14 +118,17 @@ impl<'a> Relay<'a> {
     }
 
     pub fn run(self) -> Result<()> {
-        let state = state_dir()?;
+        let state = writable_state_dir()?;
         let token = controller::token(self.owner_token);
-        let preflight =
-            || controller::Owners::read(&state)?.preflight(self.scope, token.as_deref(), "relay");
+        let preflight = || {
+            ensure_state_writable(&state)?;
+            controller::Owners::read(&state)?.preflight(self.scope, token.as_deref(), "relay")
+        };
         preflight()?;
         scope_assignments(&state, self.scope)?;
         let target = self.target.resolve()?;
         let timeout = seconds(&env::var("WFC_QUEUE_TIMEOUT").unwrap_or_else(|_| "60".into()))?;
+        ensure_state_writable(&state)?;
         if self.detach {
             fs::create_dir_all(&state)?;
             let log = state.join("relay.log");
@@ -205,6 +210,7 @@ impl<'a> Relay<'a> {
                 None => None,
             };
             if let Some((batch, text)) = batch {
+                ensure_state_writable(&state)?;
                 let limit = remaining().min(timeout);
                 let outcome = match &target {
                     Target::Codex(thread) => {

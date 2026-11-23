@@ -6,7 +6,10 @@ pub mod relay;
 pub use receipt::{Confirm, ACK_USAGE, RESOLVE_USAGE};
 use receipt::{Delivery, Resolution, State};
 
-use super::{controller, git_snapshot::Snapshot, resolve_report_path, state_dir, valid_id};
+use super::{
+    controller, ensure_state_writable, git_snapshot::Snapshot, resolve_report_path, valid_id,
+    writable_state_dir,
+};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -531,6 +534,7 @@ struct Inbox {
 }
 
 fn lock_file(dir: &Path) -> Result<File> {
+    ensure_state_writable(dir)?;
     fs::create_dir_all(dir).context("create message directory")?;
     let path = dir.join("messages.lock");
     let mut options = private_file();
@@ -565,6 +569,7 @@ fn lock_file(dir: &Path) -> Result<File> {
 pub(super) fn lock_for_publish(dir: &Path) -> Result<File> {
     let lock = lock_file(dir)?;
     lock.lock().context("lock controller messages")?;
+    ensure_state_writable(dir)?;
     Ok(lock)
 }
 
@@ -716,6 +721,7 @@ impl Inbox {
             Err(TryLockError::WouldBlock) => return Ok(None),
             Err(TryLockError::Error(e)) => return Err(e).context("lock controller messages"),
         }
+        ensure_state_writable(state)?;
         Ok(Some(Self::read_locked(state, lock)?))
     }
 
@@ -915,6 +921,7 @@ impl Inbox {
         &self,
         write_contents: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
     ) -> Result<()> {
+        ensure_state_writable(&self.dir)?;
         let tmp = self.dir.join("messages.pending");
         let file = Self::open_pending(&tmp)?;
         let mut writer = BufWriter::new(file);
@@ -1058,7 +1065,7 @@ impl<'a> Done<'a> {
             .with_context(|| format!("report not found: {}", self.report.display()))?;
         ensure!(report.is_file(), "report not found: {}", report.display());
         ensure!(report.to_str().is_some(), "report path must be UTF-8");
-        let state = state_dir()?;
+        let state = writable_state_dir()?;
         let dispatch = env::var("WFC_DISPATCH")
             .context("run done inside a dispatched worker (WFC_DISPATCH)")?;
         ensure!(valid_id(&dispatch), "invalid dispatch ID");
@@ -1156,7 +1163,7 @@ impl<'a> Ask<'a> {
     }
 
     pub fn run(self) -> Result<Value> {
-        let state = state_dir()?;
+        let state = writable_state_dir()?;
         let dispatch = env::var("WFC_DISPATCH")
             .context("run ask inside a dispatched worker (WFC_DISPATCH)")?;
         ensure!(valid_id(&dispatch), "invalid dispatch ID");
@@ -1302,7 +1309,7 @@ impl<'a> Wait<'a> {
     }
 
     pub fn run(self) -> Result<Vec<Value>> {
-        let state = state_dir()?;
+        let state = writable_state_dir()?;
         let token = controller::token(self.owner_token);
         let start = Instant::now();
         loop {
