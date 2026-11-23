@@ -325,7 +325,7 @@ impl Inbox {
                 );
                 resolved.push((worker.dispatch.clone(), candidate.stamps));
                 if published.insert(key) {
-                    self.push_startup_failure(candidate.assignment, &candidate.host, &failure);
+                    self.push_startup_failure(candidate.assignment, &candidate.host, &failure)?;
                 }
             } else {
                 resolved.push((worker.dispatch.clone(), candidate.stamps));

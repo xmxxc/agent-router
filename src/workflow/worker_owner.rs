@@ -1,5 +1,8 @@
 //! One detached wfc owns and reaps one Linux worker tree.
-use super::{controller, messages, read_record, record_scope, state_dir, valid_id, valid_identity};
+use super::{
+    controller, ensure_state_writable, messages, read_record, record_scope, state_dir, valid_id,
+    valid_identity, writable_state_dir,
+};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -160,7 +163,7 @@ pub fn parse_close(args: &[OsString]) -> Result<(&str, Option<&str>)> {
 
 pub fn close(id: &str, explicit_token: Option<&str>) -> Result<Value> {
     ensure!(valid_id(id), "invalid dispatch ID");
-    let state = state_dir()?;
+    let state = writable_state_dir()?;
     let dir = state.join("dispatches");
     let record = super::assignment::public_record(&dir, id)?
         .with_context(|| format!("unknown dispatch {id}"))?;
@@ -200,6 +203,7 @@ pub fn close(id: &str, explicit_token: Option<&str>) -> Result<Value> {
 }
 
 pub(super) fn validate_close(record: &Value) -> Result<()> {
+    ensure!(record["legacyArchived"] != true, "offline legacy assignment has no close target");
     ensure!(
         record["publicationDiagnostic"].is_null(),
         "close uncertain: {}",
@@ -233,6 +237,7 @@ pub(super) fn require_resolved_resume(record: &Value) -> Result<()> {
 
 // The caller holds the authorized scope lock for this assignment.
 pub(super) fn close_locked(state: &Path, selected: &Value) -> Result<Value> {
+    ensure_state_writable(state)?;
     let id = selected["dispatch"].as_str().context("missing dispatch")?;
     let dir = state.join("dispatches");
     let current = super::assignment::public_record(&dir, id)?

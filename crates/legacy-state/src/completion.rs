@@ -116,6 +116,26 @@ pub(super) fn legacy_result(body: &Value) -> bool {
         })
 }
 
+/// A later pre-attempt receipt did not rewrite the earlier snapshot evidence.
+pub fn keeps_earlier_done(previous: &Value, next: &Value, round: i64, attempt: &str) -> bool {
+    legacy_result(next)
+        && (legacy_result(previous)
+            || (previous["round"].as_i64() == Some(round)
+                && previous["attempt"].as_str() == Some(attempt)))
+}
+
+/// Compare the fields present in both JSON objects without replacing evidence.
+pub fn check_final_done_result(stored: &str, receipt: &str) -> Result<()> {
+    let difference = differing_fields(stored, receipt)?;
+    ensure!(
+        difference.is_none_or(|(fields, evidence)| fields
+            .iter()
+            .all(|(key, value)| evidence.get(key).is_none_or(|other| other == value))),
+        "conflicting stored result and final done receipt"
+    );
+    Ok(())
+}
+
 struct Snapshot {
     rowid: i64,
     round: i64,
@@ -203,11 +223,7 @@ impl Snapshot {
         if let Some(previous) = &self.receipt {
             // Python upgrades pre-attempt messages with ORDER BY id LIMIT 1.
             // Later unqualified submissions never rewrote that snapshot.
-            if legacy_result(&body)
-                && (legacy_result(&previous.body)
-                    || (previous.body["round"].as_i64() == Some(self.round)
-                        && previous.body["attempt"].as_str() == Some(self.attempt.as_str())))
-            {
+            if keeps_earlier_done(&previous.body, &body, self.round, &self.attempt) {
                 return Ok(());
             }
             // Modern Python appends each fresh completion, then rewrites this one snapshot
@@ -441,13 +457,7 @@ impl Snapshot {
                 );
             }
             if let Some(original) = self.result.as_deref() {
-                let difference = differing_fields(original, &receipt.raw)?;
-                ensure!(
-                    difference.is_none_or(|(fields, evidence)| fields
-                        .iter()
-                        .all(|(k, v)| evidence.get(k).is_none_or(|other| other == v))),
-                    "conflicting stored result and final done receipt"
-                );
+                check_final_done_result(original, &receipt.raw)?;
             }
         } else if !completed && !self.running_completion(db, dispatch, stored.as_ref())? {
             return Ok(None);

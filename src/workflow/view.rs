@@ -84,7 +84,12 @@ pub fn merged_history(row: &Value, ledger: Vec<Value>) -> Result<Vec<Value>> {
         }
         history.push(message);
     }
-    history.sort_by_key(|m| m["round"].as_u64().unwrap_or(0));
+    if row["legacyArchived"] == true {
+        // The two parts of the import share the original SQLite ID order.
+        history.sort_by_key(|m| m["id"].as_u64().unwrap_or(0));
+    } else {
+        history.sort_by_key(|m| m["round"].as_u64().unwrap_or(0));
+    }
     Ok(history)
 }
 
@@ -237,13 +242,22 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
     } else {
         status
     });
-    if let Some(event) = history.iter().rev().find(|m| {
-        m["type"] == "reclaimed"
-            && m["to"] == "worker"
-            && m["dispatch"] == row["dispatch"]
-            && m["round"] == row["round"]
-            && m["attempt"] == row["attempt"]
-    }) {
+    let reclaimed = if row["legacyArchived"] == true {
+        // The Python writer's reclaim receipt is dispatch-level. A later
+        // resume ends that resource state without changing the old receipt.
+        history.iter().rev().find(|m| {
+            m["recipient"] == "worker" && matches!(m["type"].as_str(), Some("reclaimed" | "resumed"))
+        }).filter(|m| m["type"] == "reclaimed")
+    } else {
+        history.iter().rev().find(|m| {
+            m["type"] == "reclaimed"
+                && m["to"] == "worker"
+                && m["dispatch"] == row["dispatch"]
+                && m["round"] == row["round"]
+                && m["attempt"] == row["attempt"]
+        })
+    };
+    if let Some(event) = reclaimed {
         row["reclaimed"] = event["at"].clone();
         row["status"] = json!("reclaimed");
         row["lifecycle"] = json!("reclaimed");
