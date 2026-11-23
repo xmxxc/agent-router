@@ -94,6 +94,8 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
     let prior_exit: Option<Value> = None;
     let unresolved_worker =
         (pending_close || row["closeWorkerDiagnostic"].is_string()) && prior_exit.is_none();
+    let interrupted =
+        super::assignment::interrupt_fence(row).is_some() && row["resourceCleanup"] != "confirmed";
     if let Some(exit) = prior_exit {
         row["worker"] = exit;
     }
@@ -141,7 +143,7 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
             let unconfirmed_create =
                 row["backend"] == "herdr" && row["create"]["result"] != "accepted";
             let state = match row["worker"]["state"].as_str() {
-                _ if unresolved_worker => "unknown",
+                _ if unresolved_worker || interrupted => "unknown",
                 _ if unconfirmed_create && row["worker"]["state"] != "cancelled" => {
                     round["result"] = row["create"].clone();
                     "unknown"

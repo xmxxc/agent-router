@@ -21,6 +21,8 @@ mod backend;
 #[cfg(target_os = "linux")]
 pub mod herdr;
 pub mod host;
+#[cfg(target_os = "linux")]
+pub mod interrupt;
 mod view;
 
 pub const DISPATCH_USAGE: &str =

@@ -167,6 +167,15 @@ fn existing(state: &Path, row: &Value, op: &str) -> Result<Value> {
     call(state, row, request)
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn interrupt(state: &Path, row: &Value, launch: &str) -> Result<Value> {
+    call(
+        state,
+        row,
+        json!({"op":"interrupt","executionId":row["executionId"],"launchId":launch}),
+    )
+}
+
 fn receipt_id(row: &Value) -> Result<Option<&str>> {
     let create = &row["create"];
     if !create.is_null() {

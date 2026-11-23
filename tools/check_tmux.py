@@ -2248,6 +2248,175 @@ time.sleep(45)
                 owner = self.call("inspect", dispatch=other["dispatch"], executionId=other["attempt"])
                 self.assertTrue(owner["alive"] and owner["owned"] and owner["workerBound"], owner)
 
+    def public_interrupt_fixture(self):
+        worker = self.work / "interrupt-worker.py"
+        worker.write_text(r"""import json, os, time, tty
+from pathlib import Path
+
+tty.setraw(0)
+data = {key: os.environ[key] for key in ("WFC_DISPATCH", "WFC_ROUND", "WFC_ATTEMPT",
+                                        "WFC_WORKER_CALLBACK", "WFC_REPORT")}
+assert "WFC_OWNER_TOKEN" not in os.environ and "WFC_CONTROLLER_TOKEN" not in os.environ
+attempt = data["WFC_ATTEMPT"]
+temp = Path(attempt + ".tmp")
+temp.write_text(json.dumps(data))
+temp.rename(attempt + ".ready")
+with open(attempt + ".keys", "wb", buffering=0) as keys:
+    while byte := os.read(0, 1):
+        keys.write(byte)
+""")
+        config = self.work / "interrupt-launch.json"
+        config.write_text(json.dumps({"hosts": {"codex": {"command": [sys.executable, str(worker)]}}}))
+        (self.work / "task").write_text("interrupt this controlled worker")
+        env = {**self.env, "WFC_STATE": str(self.state)}
+        env.pop("WFC_OWNER_TOKEN", None)
+
+        def cli(*args, code=0, **overrides):
+            proc = subprocess.run([WFC, *args], cwd=self.work, env={**env, **overrides},
+                                  capture_output=True, text=True, timeout=15)
+            self.assertEqual(proc.returncode, code, (args, proc.stdout, proc.stderr))
+            if code:
+                self.assertFalse(proc.stdout)
+                return proc.stderr
+            return json.loads(proc.stdout)
+
+        def dispatch(name, **credentials):
+            record = cli("dispatch", "--host", "codex", "--scope", name, "--cwd", ".",
+                         "--task", "task", "--report", name + ".md",
+                         "--launch-config", str(config), **credentials)
+            ready = self.work / (record["attempt"] + ".ready")
+            keys = self.work / (record["attempt"] + ".keys")
+            self.wait_interrupt_fixture(lambda: ready.exists() and keys.exists())
+            return record, json.loads(ready.read_text()), keys
+
+        shim = self.work / "tmux"
+        shim.write_text(f"""#!{sys.executable}
+import os, subprocess, sys, time
+from pathlib import Path
+
+args = sys.argv[1:]
+real = {TMUX!r}
+work = Path({str(self.work)!r})
+mode = os.environ.get("INTERRUPT_TEST_MODE")
+if mode and "if-shell" in args and any("send-keys -t " in a and " C-c" in a for a in args):
+    if mode == "hold":
+        (work / "at-interrupt-key").touch()
+        deadline = time.monotonic() + 12
+        while not (work / "allow-interrupt-key").exists():
+            if time.monotonic() >= deadline:
+                sys.exit(2)
+            time.sleep(.02)
+    elif mode == "lose-response":
+        result = subprocess.run([real, *args], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, close_fds=False)
+        if result.returncode == 0:
+            (work / "real-key-command-succeeded").touch()
+        sys.exit(1)
+os.execv(real, [real, *args])
+""")
+        shim.chmod(0o700)
+        return cli, dispatch, env
+
+    def wait_interrupt_fixture(self, ready):
+        deadline = time.monotonic() + 6
+        while not ready():
+            self.assertLess(time.monotonic(), deadline, "interrupt fixture did not reach its boundary")
+            time.sleep(.025)
+
+    def test_public_interrupt_fences_before_tmux_key(self):
+        cli, dispatch, env = self.public_interrupt_fixture()
+        owner = cli("acquire", "--scope", "managed-interrupt", "--owner", "A")["token"]
+        credentials = {"WFC_OWNER_TOKEN": owner}
+        target, callback, keys = dispatch("managed-interrupt", **credentials)
+        neighbor, _, other_keys = dispatch("neighbor-interrupt")
+        identity = target["dispatch"], target["attempt"]
+        pane = self.active_pane(identity[0])
+        self.assertEqual(json.loads(cli("interrupt", identity[0], code=1))["error"], "stale_controller_owner")
+        self.assertEqual(json.loads(cli(
+            "interrupt", identity[0], code=1, **credentials,
+            WFC_WORKER_CALLBACK=callback["WFC_WORKER_CALLBACK"],
+        ))["error"], "worker_callback_only")
+
+        bad_target = self.call("interrupt", dispatch=identity[0], executionId=identity[1],
+                               launchId="f" * 32)
+        self.assertEqual(bad_target["result"], "refused")
+        self.assertEqual(keys.read_bytes(), b"")
+
+        path = self.state / "dispatches" / f"{identity[0]}.json"
+        Path(callback["WFC_REPORT"]).write_text("old writer's report")
+        launch = {**env, **credentials, "INTERRUPT_TEST_MODE": "hold",
+                  "PATH": str(self.work) + ":" + env["PATH"]}
+        with subprocess.Popen([WFC, "interrupt", identity[0]], cwd=self.work, env=launch,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            try:
+                self.wait_interrupt_fixture(lambda: (self.work / "at-interrupt-key").exists())
+                saved = json.loads(path.read_text())
+                audit, = saved["audit"]
+                self.assertEqual((audit["result"], audit["ownerGeneration"], audit["scopeFence"]),
+                                 ("pending", 1, True))
+                self.assertEqual((audit["round"], audit["attempt"], audit["target"]["executionId"]),
+                                 (1, identity[1], identity[1]))
+                self.assertEqual(audit["target"]["receipt"], target["create"]["receipt"])
+                self.assertEqual(saved["rounds"][0]["state"], "unknown")
+                self.assertEqual(keys.read_bytes(), b"")
+                callback_env = {key: value for key, value in callback.items() if key != "WFC_REPORT"}
+                self.assertIn("execution was interrupted", cli(
+                    "ask", "late", "--attempt", identity[1], code=1, **callback_env))
+                self.assertIn("execution was interrupted", cli(
+                    "done", "--report", callback["WFC_REPORT"], "--attempt", identity[1],
+                    code=1, **callback_env))
+            finally:
+                (self.work / "allow-interrupt-key").touch()
+                out, err = process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 0, (out, err))
+        result = json.loads(out)
+        self.assertEqual((result["result"], result["audit"], result["attempt"]), ("accepted", 1, identity[1]))
+        self.wait_interrupt_fixture(lambda: keys.read_bytes() == b"\x03")
+        status = cli("status", "--dispatch", identity[0])["dispatches"][0]
+        self.assertEqual((status["status"], status["rounds"][0]["state"], status["backendAlive"]),
+                         ("unknown", "unknown", True))
+        self.assertEqual((status["audit"][0]["result"], status["messages"]), ("accepted", []))
+        self.assertEqual(self.active_pane(identity[0]), pane)
+        repeat = json.loads(cli("interrupt", identity[0], code=1, **credentials))
+        self.assertEqual((repeat["error"], repeat["audit"]), ("lifecycle_reconcile_required", 1))
+        self.assertEqual(keys.read_bytes(), b"\x03")
+        self.assertEqual(other_keys.read_bytes(), b"")
+        closed = cli("close", identity[0], **credentials)
+        self.assertEqual((closed["result"], closed["resourceCleanup"]), ("completed", "confirmed"))
+        self.assertTrue(cli("status", "--dispatch", neighbor["dispatch"])["dispatches"][0]["backendAlive"])
+
+    def test_public_interrupt_lost_confirmation_keeps_fence_and_refuses_foreign_writer(self):
+        cli, dispatch, env = self.public_interrupt_fixture()
+        target, _, keys = dispatch("unclaimed-interrupt")
+        foreign, _, foreign_keys = dispatch("foreign-interrupt")
+        foreign_session = f"=wfc-{foreign['dispatch']}"
+        subprocess.run(self.tmux + ["set-environment", "-t", foreign_session, "WFC_STATE", str(self.other)],
+                       env=self.env, check=True)
+        error = cli("interrupt", foreign["dispatch"], code=1)
+        self.assertIn("live original tmux writer", error)
+        foreign_record = self.state / "dispatches" / (foreign["dispatch"] + ".json")
+        self.assertFalse(json.loads(foreign_record.read_text()).get("audit"))
+        subprocess.run(self.tmux + ["has-session", "-t", foreign_session], env=self.env, check=True)
+        self.assertEqual(foreign_keys.read_bytes(), b"")
+
+        identity = target["dispatch"], target["attempt"]
+        result = cli("interrupt", identity[0], INTERRUPT_TEST_MODE="lose-response",
+                     PATH=str(self.work) + ":" + env["PATH"])
+        self.assertTrue((self.work / "real-key-command-succeeded").exists())
+        self.assertEqual((result["result"], result["audit"], result["attempt"]), ("uncertain", 1, identity[1]))
+        self.wait_interrupt_fixture(lambda: keys.read_bytes() == b"\x03")
+        repeated = json.loads(cli("interrupt", identity[0], code=1))
+        self.assertEqual((repeated["error"], repeated["result"], repeated["audit"]),
+                         ("lifecycle_reconcile_required", "uncertain", 1))
+        status = cli("status", "--dispatch", identity[0])["dispatches"][0]
+        self.assertEqual((status["status"], status["backendAlive"]), ("unknown", True))
+        audit, = status["audit"]
+        self.assertEqual((audit["scopeFence"], audit["ownerGeneration"], audit["result"]),
+                         (True, None, "uncertain"))
+        self.assertEqual(keys.read_bytes(), b"\x03")
+        self.assertEqual(foreign_keys.read_bytes(), b"")
+        subprocess.run(self.tmux + ["has-session", "-t", foreign_session], env=self.env, check=True)
+
     def test_lifecycle(self):
         # Keep the worker alive across Ctrl-C so close tests the active-session path.
         argv = ["/bin/sh", "-c", "trap '' INT; exec /bin/cat"]

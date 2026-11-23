@@ -19,6 +19,7 @@ const RESERVED_COMMANDS: &[&str] = &[
     "continue",
     "nudge",
     "resume",
+    "handoff",
     #[cfg(not(target_os = "linux"))]
     "reclaim",
     #[cfg(not(target_os = "linux"))]
@@ -65,6 +66,8 @@ fn run() -> anyhow::Result<ExitCode> {
             println!("{RECLAIM_USAGE}");
             #[cfg(target_os = "linux")]
             println!("{}", workflow::worker_owner::CLOSE_USAGE);
+            #[cfg(target_os = "linux")]
+            println!("{}", workflow::interrupt::USAGE);
             #[cfg(target_os = "linux")]
             println!("{}", workflow::herdr::USAGE);
             println!("{DONE_USAGE}");
@@ -168,6 +171,23 @@ fn run() -> anyhow::Result<ExitCode> {
         }
         #[cfg(target_os = "linux")]
         Some("--worker-owner") => workflow::worker_owner::run(&args)?,
+        #[cfg(target_os = "linux")]
+        Some("interrupt") => {
+            use workflow::interrupt::{Interrupt, USAGE};
+            if args == ["--help"] || args == ["-h"] {
+                println!("{USAGE}");
+            } else {
+                let request = match Interrupt::parse(&args) {
+                    Ok(request) => request,
+                    Err(err) => {
+                        eprintln!("wfc: {err}. {USAGE}");
+                        return Ok(ExitCode::from(2));
+                    }
+                };
+                controller::require_controller("interrupt")?;
+                println!("{}", request.run()?);
+            }
+        }
         #[cfg(target_os = "linux")]
         Some("close") => {
             use workflow::worker_owner::{close, parse_close, CLOSE_USAGE};

@@ -46,7 +46,10 @@ enum Operation {
         text: String,
         host: Option<String>,
     },
-    Interrupt,
+    Interrupt {
+        #[serde(rename = "launchId")]
+        launch_id: Option<String>,
+    },
     Resume {
         #[serde(flatten)]
         launch: launch::Launch,
@@ -507,7 +510,7 @@ impl Tmux<'_> {
                     Operation::Resume { .. } | Operation::Create(_) if matches!(self.claim()?, Some(binding::Claim::Released(Some(last))) if last == id) => {
                         ()
                     }
-                    Operation::Submit { .. } | Operation::Interrupt => {
+                    Operation::Submit { .. } | Operation::Interrupt { .. } => {
                         return Ok(
                             json!({"result":"definitely-not-sent","category":"input_not_delivered","diagnostic":"execution has already closed"}),
                         )
@@ -523,7 +526,7 @@ impl Tmux<'_> {
                 let t = self.owned()?;
                 Ok(json!({"result":"accepted","screen":self.capture(&t,&t.pane)?}))
             }
-            Operation::Interrupt => {
+            Operation::Interrupt { .. } => {
                 let target = self.input_target()?;
                 self.worker_command(
                     &target,
@@ -924,6 +927,18 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
             || (matches!(request.op, Operation::Inspect) && !request.fresh_dispatch),
         "legacyRecovery requires ordinary inspect"
     );
+    let interrupt_launch = match &request.op {
+        Operation::Interrupt {
+            launch_id: Some(id),
+        } => {
+            ensure!(
+                request.execution_id.is_some() && binding::valid_launch_id(id),
+                "interrupt launch requires a native execution and valid launch ID"
+            );
+            Some(id.as_str())
+        }
+        _ => None,
+    };
     let native_id;
     let mut backend = Tmux {
         state: &state,
@@ -939,7 +954,10 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
             .execution_id
             .as_deref()
             .filter(|_| request.close_operation_id.is_some()),
-        input_request: matches!(request.op, Operation::Submit { .. } | Operation::Interrupt),
+        input_request: matches!(
+            request.op,
+            Operation::Submit { .. } | Operation::Interrupt { .. }
+        ),
         session: format!("wfc-{}", request.dispatch),
         socket: env::var_os("WFC_TMUX_SOCKET")
             .map(std::path::absolute)
@@ -955,6 +973,12 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
             Ok(id) => id,
             Err(e) => return Ok(e),
         };
+        if interrupt_launch.is_some_and(|expected| expected != native_id.as_str()) {
+            return Ok(failure(
+                "refused",
+                "interrupt launch no longer matches the verified worker",
+            ));
+        }
         backend.legacy_execution_id = Some(&native_id);
     }
     let mut result = backend
