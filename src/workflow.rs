@@ -177,6 +177,7 @@ impl<'a> Dispatch<'a> {
         let authorize =
             || controller::Owners::read(&state)?.require(&scope, token.as_deref(), "dispatch");
         authorize()?;
+        fs::create_dir_all(&records).context("create dispatch state directory")?;
         let default_report = cwd.join(format!("report-{dispatch}.md"));
         let report = report_destination(self.report.unwrap_or(&default_report))?;
         let report_dir = report
@@ -262,7 +263,6 @@ impl<'a> Dispatch<'a> {
                     .env
                     .insert(controller::WORKER_CALLBACK.into(), json!(secret));
             }
-            fs::create_dir_all(&records).context("create dispatch state directory")?;
             (assignment::reserve(&records, &dispatch, &record)?, callback)
         };
         let mut preserve_binding = false;
