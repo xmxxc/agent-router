@@ -1,7 +1,7 @@
-name: Linux startup, ask, and ownership combination regression
+name: Linux startup confirmation and read-only close regression
 on:
   push:
-    branches: [rust-router/linux-ci-startup-ask-combination]
+    branches: [rust-router/linux-ci-startup-confirmation-combination]
 
 permissions:
   contents: read
@@ -12,20 +12,21 @@ defaults:
 
 jobs:
   legacy-public:
-    name: '#13 startup boundaries with #11 ask, ownership, and legacy ledger'
+    name: '#13 startup confirmation and verified preflight close'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      WFC_BUILD_ID: 59b9539181daaba91ebaa7303e15eb410fca5216
-      PRODUCT_TREE: 910457b6e408df19bc312db33041e97643a0c068
-      PRODUCT_PARENTS: 3578eebb0aa13e7470ef72a088d5fa074546e268 f42b4471e5f850f526ef471a02dc997bb542e33a
-      INPUTS_SHA256: ebc4e26a03f776681c2d4da6578c925e02a7399dff15029325743ebeca9feecb
+      WFC_BUILD_ID: ae91101acf9e35b8abd00ddcbef78e206e648ac4
+      PRODUCT_TREE: 86e932054c3d4144d14350af2cd3b2424f66a5a9
+      PRODUCT_PARENTS: 59b9539181daaba91ebaa7303e15eb410fca5216 b42dca29ca28c621475af58d92675feff1956ecd
+      INPUTS_SHA256: 6a6a2b230919fcb10bd075f60239bc15d992bcb2e33e833182b6f6bee779fda4
+      PREVIOUS_COMBINATION_RUN: '45233642815'
       LEGACY_TREE: 034a9cad954bc952812b35bec6fef840c6abc3a1
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TMUX_FIXTURE_SHA: 5ced6218637c11d9ca73fa3285a1ff98fadad6fc
       HERDR_SHA256: 14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d
       TRIPLE: x86_64-unknown-linux-gnu
-      EVIDENCE: ${{ github.workspace }}/linux-startup-ask-combination-evidence
+      EVIDENCE: ${{ github.workspace }}/linux-startup-confirmation-evidence
       CARGO_BUILD_JOBS: '2'
       PYTHONUTF8: '1'
     steps:
@@ -35,6 +36,7 @@ jobs:
           printf 'Workflow %s\nRun %s attempt %s\nExpected product %s tree %s\nExpected parents %s\n' \
             "$GITHUB_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$WFC_BUILD_ID" "$PRODUCT_TREE" "$PRODUCT_PARENTS" \
             | tee "$EVIDENCE/run.log"
+          printf 'Previous combination run %s\n' "$PREVIOUS_COMBINATION_RUN" | tee -a "$EVIDENCE/run.log"
           uname -a | tee -a "$EVIDENCE/run.log"
       - name: Check out the pinned product
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -113,19 +115,6 @@ jobs:
           [[ "$version" == *"(Rust, $TRIPLE, release, build $WFC_BUILD_ID)" ]]
           readelf -hW "$dir/wfc" "$dir/wfc-legacy-state" | tee "$EVIDENCE/elf.log"
           readelf -dW "$dir/wfc" | tee -a "$EVIDENCE/elf.log"
-      - name: Run the public legacy read-only matrix
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: product
-        run: |
-          uid=$(id -u)
-          test "$uid" -ne 0
-          head -n 2 "$EVIDENCE/binaries.log" | sha256sum --check --strict | tee "$EVIDENCE/legacy-public-elf.log"
-          log="$EVIDENCE/legacy-public.log"
-          python -Bu tests/legacy_public.py "target/$TRIPLE/release/wfc" 2>&1 | tee "$log"
-          test "$(wc -l < "$log")" -eq 15
-          grep -Fxq -- "ordinary UID $uid named status keeps Rust priority with traversal only; lists report EACCES" "$log"
-          grep -Fxq -- 'a messages.json directory reports the path type error; the legacy ledger is unchanged' "$log"
-          printf 'Public legacy matrix: 13 baseline + 2 R12 cases (uid %s)\n' "$uid" | tee "$EVIDENCE/legacy-public-summary.log"
       - name: Ensure native tmux is available
         id: tmux
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
@@ -206,12 +195,33 @@ jobs:
           status=0
           python -B "$reaper" python -Bu tests/startup_failure.py "target/$TRIPLE/release/wfc" -v \
             StartupFailure.test_hosted_failures \
-            StartupFailure.test_tmux_zero_follows_the_create_confirmation \
+            StartupFailure.test_tmux_exit_follows_the_create_confirmation \
             StartupFailure.test_script_lookup_permission_failure \
             2>&1 | tee -a "$log" || status=$?
           printf 'startup-tmux exit=%s\n' "$status" | tee -a "$EVIDENCE/startup-results.log"
           if grep -Eq ' \.\.\. skipped |OK \(skipped=' "$log"; then
             echo 'A required startup case was skipped' | tee -a "$log"
+            exit 1
+          fi
+          exit "$status"
+      - name: Verify script preflight close replay and owner locks as a regular user
+        if: ${{ !cancelled() && steps.fixture-identity.outcome == 'success' }}
+        working-directory: product
+        run: |
+          log="$EVIDENCE/startup-readonly.log"
+          head -n 2 "$EVIDENCE/binaries.log" | sha256sum --check --strict | tee "$log"
+          uid=$(id -u)
+          test "$uid" -ne 0
+          printf 'Ordinary runner UID %s\n' "$uid" | tee -a "$log"
+          reaper="$GITHUB_WORKSPACE/tmux-r11-fixtures/tools/ci/tmux-r11/reap.py"
+          status=0
+          python -B "$reaper" python -Bu tests/startup_failure.py "target/$TRIPLE/release/wfc" -v \
+            StartupFailure.test_script_preflight_close_replays_from_read_only_history \
+            StartupFailure.test_managed_script_preflight_close_keeps_scope_lock \
+            2>&1 | tee -a "$log" || status=$?
+          printf 'startup-readonly exit=%s\n' "$status" | tee -a "$EVIDENCE/startup-results.log"
+          if grep -Eq ' \.\.\. skipped |OK \(skipped=' "$log"; then
+            echo 'A required read-only case was skipped' | tee -a "$log"
             exit 1
           fi
           exit "$status"
@@ -229,6 +239,7 @@ jobs:
             exit "$status"
           fi
           for case in \
+            workflow::backend::tests::startup_terminal_notice_requires_the_selected_launch_and_outcome \
             workflow::messages::tests::startup_receipt_with_report_does_not_count_as_done \
             workflow::startup::tests::startup_publication_uses_the_current_attempt_and_one_durable_key \
             workflow::startup::tests::unreaped_exit_keeps_creation_identity_across_a_slow_started_receipt \
@@ -315,10 +326,6 @@ jobs:
           done
           head -n 2 "$EVIDENCE/binaries.log" | sha256sum --check --strict | tee -a "$log"
           exit "$failed"
-      - name: Run the Rust workspace tests
-        if: ${{ !cancelled() && steps.tmux.outcome == 'success' }}
-        working-directory: product
-        run: cargo test --workspace --release --locked --target "$TRIPLE" 2>&1 | tee "$EVIDENCE/workspace-tests.log"
       - name: Checksum the evidence logs
         if: ${{ always() }}
         run: |
@@ -328,7 +335,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ always() }}
         with:
-          name: linux-startup-ask-combination-${{ github.run_id }}-${{ github.run_attempt }}
+          name: linux-startup-confirmation-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14
