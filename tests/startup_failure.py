@@ -132,7 +132,8 @@ class StartupFailure(unittest.TestCase):
                 self.assertEqual(message["fault"]["category"], "executable_missing")
                 self.assertRegex(message["fault"]["launchId"], r"^[a-f0-9]{32}$")
                 self.check_ack(message)
-        self.deploy("host-exits", [sys.executable, "-c", f"print('{SECRET}', file=sys.stderr); sys.exit(23)"],
+        self.deploy("host-exits", [sys.executable, "-c",
+                                  f"import sys; print('{SECRET}', file=sys.stderr); sys.exit(23)"],
                     host="codex", code=1)
         message = self.wait("host-exits")
         self.assertEqual((message["type"], message["fault"]["exitCode"]), ("exited", 23))
