@@ -43,7 +43,7 @@ def collect(prepared, target, out):
         name, version = package['name'], package['version']
         source = Path(package['manifest_path']).parent
         dest = out / 'cargo' / f'{name}-{version}'
-        if source == prepared:
+        if source in (prepared, prepared / 'crates/herdr'):
             dest.mkdir(parents=True)
             shutil.copyfile(prepared / 'LICENSE-WFC', dest / 'LICENSE-WFC')
             files = ['LICENSE-WFC']
