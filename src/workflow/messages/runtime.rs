@@ -221,13 +221,15 @@ impl Monitor {
     ) -> (Option<Watch>, Vec<Notice>) {
         let episode: Vec<_> = current_messages(row, history)
             .rev()
-            .filter(|m| m["kind"] == OBSERVATION)
-            .take_while(|m| m["fault"]["category"] != "recovered")
+            .filter(|m| m["kind"] == OBSERVATION && !is_read_event(m))
+            .take_while(|m| m["fault"]["evidence"] != "changed_activity")
             .collect();
         let seen = |n: &Notice| episode.iter().any(|m| same_fault(m, n));
         let fault_open = episode
             .iter()
             .any(|m| m["fault"]["evidence"] != "turn_deadline");
+        let was_unreadable = read_event(row, history)
+            .is_some_and(|m| m["fault"]["evidence"] == "backend_unavailable");
         let Sample::Screen {
             fingerprint,
             salt,
@@ -238,7 +240,7 @@ impl Monitor {
             let notice = Notice::Unavailable;
             return (
                 None,
-                (previous.is_some() && !seen(&notice))
+                (previous.is_some() && !was_unreadable)
                     .then_some(notice)
                     .into_iter()
                     .collect(),
@@ -246,8 +248,7 @@ impl Monitor {
         };
         let paused = current_messages(row, history).any(|m| m["type"] == "question");
         let changed = previous.is_none_or(|w| w.fingerprint != fingerprint);
-        let read_restored = !paused && fault.is_none() && seen(&Notice::Unavailable);
-        let reset = changed || read_restored || previous.is_some_and(|w| w.paused != paused);
+        let reset = changed || was_unreadable || previous.is_some_and(|w| w.paused != paused);
         let since = if reset {
             now
         } else {
@@ -263,11 +264,18 @@ impl Monitor {
         } else if !paused {
             if changed && nonblank && previous.is_some() && fault_open {
                 notices.push(Notice::Recovered);
-            } else if read_restored {
-                notices.push(Notice::ReadRestored);
-            } else if !fault_open && !self.stall.is_zero() && idle >= self.stall.as_secs_f64() {
+            } else if !was_unreadable
+                && !fault_open
+                && !self.stall.is_zero()
+                && idle >= self.stall.as_secs_f64()
+            {
                 notices.push(Notice::Stalled(idle as u64));
             }
+        }
+        if was_unreadable {
+            // A successful capture ends the read interruption on its own.
+            // The screen fault and the pending answer have independent histories.
+            notices.push(Notice::ReadRestored);
         }
         // A changing quota/error banner does not suspend the total timer.
         let deadline = Notice::Deadline(total as u64);
@@ -406,6 +414,34 @@ fn finished(row: &Value, history: &[Value]) -> bool {
         || current_messages(row, history).any(|m| m["kind"] == "startup_failure")
 }
 
+fn is_read_event(message: &Value) -> bool {
+    matches!(
+        message["fault"]["evidence"].as_str(),
+        Some("backend_unavailable" | "read_restored")
+    )
+}
+
+fn read_event<'a>(row: &Value, history: &'a [Value]) -> Option<&'a Value> {
+    // Earlier versions could use changed_activity alone when one capture
+    // both restored reading and provided new content.
+    let mut old_activity_restore = false;
+    for m in history.iter().rev().filter(|m| {
+        m["dispatch"] == row["dispatch"]
+            && m["round"] == row["round"]
+            && m["attempt"] == row["attempt"]
+            && row_scope(m) == row_scope(row)
+            && m["kind"] == OBSERVATION
+    }) {
+        match m["fault"]["evidence"].as_str() {
+            Some("read_restored") => return Some(m),
+            Some("backend_unavailable") => return (!old_activity_restore).then_some(m),
+            Some("changed_activity") => old_activity_restore = true,
+            _ => (),
+        }
+    }
+    None
+}
+
 fn same_fault(message: &Value, notice: &Notice) -> bool {
     message["kind"] == OBSERVATION
         && message["fault"]["category"] == notice.category()
@@ -474,15 +510,22 @@ fn classify(host: &str, screen: &str) -> Option<Notice> {
         let line = line.trim();
         // Codex uses this marker for assistant output. A bare footer, timer or
         // redraw underneath an older fault is not a new assistant response.
-        let assistant_output = host == "codex"
-            && line.strip_prefix("• ").is_some_and(|text| {
-                text.ends_with(['.', '!', '?']) && text.chars().any(char::is_alphabetic)
-            });
+        let assistant_marker = host == "codex" && line.starts_with("• ");
         let line = line
             .strip_prefix(['•', '■'])
             .unwrap_or(line)
             .trim_start()
             .to_ascii_lowercase();
+        let assistant_output = assistant_marker
+            && line.chars().next().is_some_and(char::is_alphabetic)
+            && ![
+                "elapsed:",
+                "time elapsed:",
+                "this conversation is read-only or unavailable;",
+            ]
+            .iter()
+            .any(|&prefix| line.starts_with(prefix))
+            && !line.contains("esc to interrupt");
         let prefix = |choices: &[&str]| {
             choices.iter().any(|choice| {
                 line.strip_prefix(choice).is_some_and(|rest| {
@@ -642,6 +685,8 @@ pub(in crate::workflow) fn project(row: &mut Value, history: &[Value]) {
         return;
     }
     let pending = current().any(|m| m["type"] == "question");
+    let last_read = read_event(row, history);
+    let unreadable = last_read.is_some_and(|m| m["fault"]["evidence"] == "backend_unavailable");
     let latest = if pending {
         current()
             .rev()
@@ -650,13 +695,13 @@ pub(in crate::workflow) fn project(row: &mut Value, history: &[Value]) {
                 m["kind"] == OBSERVATION
                     && matches!(
                         m["fault"]["evidence"].as_str(),
-                        Some("screen_notice" | "backend_unavailable" | "verified_exit")
+                        Some("screen_notice" | "verified_exit")
                     )
             })
     } else {
-        current().rfind(|m| m["kind"] == OBSERVATION)
+        current().rfind(|m| m["kind"] == OBSERVATION && !is_read_event(m))
     };
-    if let Some(latest) = latest {
+    if let Some(latest) = latest.filter(|m| !unreadable || m["type"] != "recovered") {
         let state = match latest["fault"]["category"].as_str() {
             Some("recovered") => "active",
             Some("permission_required") => "awaiting_permission",
@@ -672,5 +717,17 @@ pub(in crate::workflow) fn project(row: &mut Value, history: &[Value]) {
         }
     } else if pending {
         row["hostActivity"] = json!({"state":"awaiting_answer"});
+    } else if unreadable {
+        row["hostActivity"] =
+            json!({"state":"disconnected","fault":last_read.map(|m| &m["fault"])});
+    } else if last_read.is_some() {
+        row["hostActivity"] = json!({"state":"readable"});
+    }
+    if last_read.is_some() {
+        row["hostActivity"]["readState"] = json!(if unreadable {
+            "unavailable"
+        } else {
+            "readable"
+        });
     }
 }

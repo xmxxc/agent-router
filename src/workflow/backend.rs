@@ -169,9 +169,13 @@ fn existing(state: &Path, row: &Value, op: &str) -> Result<Value> {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn runtime_screen(state: &Path, row: &mut Value) -> Result<Option<String>> {
+pub(super) fn runtime_screen(
+    state: &Path,
+    row: &mut Value,
+    progress: &mut dyn FnMut(bool),
+) -> Result<Option<String>> {
     if row["backend"] == "herdr" {
-        return super::herdr::runtime_screen(state, row);
+        return super::herdr::runtime_screen(state, row, progress);
     }
     if runtime_closing(state, row)? {
         return Ok(None);

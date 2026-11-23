@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -91,6 +91,20 @@ impl<'a> Assignment<'a> {
             File::open(lock_path).context("missing native Herdr assignment lock")?
         };
         lock.lock()?;
+        Self::locked(state, path, lock, new)
+    }
+
+    fn try_runtime(state: &'a Path, id: &str) -> Result<Option<Self>> {
+        let path = assignment_path(state, id)?;
+        let lock = File::open(path.with_extension("herdr-lock"))?;
+        match lock.try_lock() {
+            Ok(()) => Self::locked(state, path, lock, None).map(Some),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(e)) => Err(e.into()),
+        }
+    }
+
+    fn locked(state: &'a Path, path: PathBuf, lock: File, new: Option<Value>) -> Result<Self> {
         let row = match new {
             Some(row) => {
                 ensure!(!path.try_exists()?, "dispatch already published");
@@ -347,15 +361,25 @@ pub(super) fn runtime_closing(state: &Path, row: &Value) -> Result<bool> {
     Ok(false)
 }
 
-pub(super) fn runtime_screen(state: &Path, row: &mut Value) -> Result<Option<String>> {
+pub(super) fn runtime_screen(
+    state: &Path,
+    row: &mut Value,
+    progress: &mut dyn FnMut(bool),
+) -> Result<Option<String>> {
     let id = row["dispatch"].as_str().context("missing dispatch")?;
-    let mut unit = Assignment::lock(state, id, None)?;
+    let Some(mut unit) = Assignment::try_runtime(state, id)? else {
+        return Ok(None);
+    };
     if unit.row != *row || runtime_closing(state, &unit.row)? {
         return Ok(None);
     }
     let inspection = unit.inspect()?;
     let screen = if inspection["result"] == "accepted" && inspection["alive"] == true {
-        unit.handle()?.read().ok().map(|screen| screen.text)
+        match unit.handle()?.read_with_progress(Some(progress)) {
+            Ok(screen) => Some(screen.text),
+            Err(e) if e.kind == FailureKind::Uncertain => None,
+            Err(e) => return Err(e.into()),
+        }
     } else {
         None
     };

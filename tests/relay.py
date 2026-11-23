@@ -222,7 +222,7 @@ sys.exit(child.wait())
                           "allProbeClientsStopped": True}), flush=True)
 
     @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
-    def test_runtime_probe_timeout_and_abandoned_relay(self):
+    def test_unverified_tmux_timeout_and_abandoned_relay(self):
         self.start_private_tmux()
         config = self.root / "launch.json"
         fixture = "import time; print('Ready.', flush=True); time.sleep(60)"
@@ -238,14 +238,9 @@ sys.exit(child.wait())
         self.assertFalse(self.data(*wait, "--timeout", ".55", code=3)["messages"])
         self.assertTrue(probes(), "the clipped invocation reached the slow client")
 
-        [failure] = self.data(*wait, "--timeout", "3")["messages"]
-        self.assertEqual((failure["type"], failure["fault"]["category"], failure["fault"]["evidence"]),
-                         ("unknown", "protocol_disconnected", "backend_unavailable"))
-        for key in ("scope", "round", "attempt", "dispatch"):
-            self.assertEqual(failure[key], job[key])
-        ack = self.data("ack", failure["messageId"])
-        self.assertEqual((ack["state"], ack["statusVersion"]), ("processed", 3))
-        self.assertFalse(self.data(*wait, "--timeout", "1.45", code=3)["messages"])
+        before = len(probes())
+        self.assertFalse(self.data(*wait, "--timeout", "1.55", code=3)["messages"])
+        self.assertGreater(len(probes()), before, "the complete attempt reached the shim")
         other = self.publish("ours")
         [answer] = self.data("wait", "--scope", "ours", "--timeout", "0")["messages"]
         self.assertEqual(answer["messageId"], other["messageId"])
@@ -268,16 +263,12 @@ sys.exit(child.wait())
         self.assertFalse(self.calls(), "cancellation did not send a new queue message")
 
         slow.unlink()
-        [recovery] = self.data(*wait, "--timeout", "3")["messages"]
-        self.assertEqual((recovery["type"], recovery["fault"]["evidence"]), ("recovered", "read_restored"))
-        self.assertFalse(self.data(*wait, "--timeout", ".55", code=3)["messages"])
-        self.assertTrue(self.data("ack", failure["messageId"])["duplicate"])
+        self.assertFalse(self.data(*wait, "--timeout", ".65", code=3)["messages"])
         status, = self.data("status", "--dispatch", job["dispatch"])["dispatches"]
-        self.assertEqual([m["messageId"] for m in status["messages"] if m["kind"] == "host_runtime"],
-                         [failure["messageId"], recovery["messageId"]])
+        self.assertFalse(status["messages"])
         self.assertEqual(self.data("close", job["dispatch"])["result"], "completed")
         print(json.dumps({"case": "abandoned-relay", "scope": job["scope"], "attempt": job["attempt"],
-                          "failure": failure["messageId"], "ack": ack, "recovery": recovery["messageId"],
+                          "unverifiedTimeoutSilent": True,
                           "otherReceipt": answer["messageId"], "slowClient": shim.pid,
                           "slowClientStart": shim.started, "descendant": descendant.pid,
                           "descendantStart": descendant.started, **cleanup}), flush=True)

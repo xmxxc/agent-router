@@ -114,7 +114,7 @@ impl Session {
             service,
             deadline,
         };
-        let pong = rpc.exchange(socket, "ping", json!({}))?;
+        let pong = rpc.exchange(socket, "ping", json!({}), None)?;
         if pong["version"] != "0.9.5" || pong["protocol"] != 22 {
             return Err(Failure::refused(
                 "Herdr requires version 0.9.5 / protocol 22",
@@ -132,6 +132,15 @@ impl Session {
     }
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
+        self.call_tracked(method, params, None)
+    }
+
+    pub(super) fn call_tracked(
+        &self,
+        method: &str,
+        params: Value,
+        progress: Option<&mut dyn FnMut(bool)>,
+    ) -> Result<Value> {
         let before_send = |e: Failure| {
             if method == "pane.close" {
                 e.before_effect()
@@ -145,10 +154,16 @@ impl Session {
                 "Herdr service identity changed",
             )));
         }
-        self.exchange(socket, method, params)
+        self.exchange(socket, method, params, progress)
     }
 
-    fn exchange(&self, mut socket: UnixStream, method: &str, params: Value) -> Result<Value> {
+    fn exchange(
+        &self,
+        mut socket: UnixStream,
+        method: &str,
+        params: Value,
+        progress: Option<&mut dyn FnMut(bool)>,
+    ) -> Result<Value> {
         let id = Uuid::new_v4().simple().to_string();
         let mut frame =
             serde_json::to_vec(&json!({"id":id, "method":method, "params":params})).unwrap();
@@ -179,6 +194,18 @@ impl Session {
             }
             bytes = &bytes[n..];
         }
+        // A fully written, peer-checked frame is distinct from waiting on a
+        // local lock, opening a socket, or checking the pane binding.
+        struct InFlight<'a>(&'a mut dyn FnMut(bool));
+        impl Drop for InFlight<'_> {
+            fn drop(&mut self) {
+                (self.0)(false);
+            }
+        }
+        let _pending = progress.map(|progress| {
+            progress(true);
+            InFlight(progress)
+        });
         frame.clear();
         let mut chunk = [0; 8192];
         loop {

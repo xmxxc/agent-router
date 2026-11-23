@@ -684,5 +684,71 @@ class StartupFailure(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
 
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_codex_unicode_appended_activity(self):
+        self.start_tmux()
+        commands = self.cwd / "screen.json"
+        lines = [f"Quota exceeded: {SECRET}"]
+        commands.write_text(json.dumps(lines))
+        fixture = textwrap.dedent("""
+            import json
+            import time
+            from pathlib import Path
+            count = 0
+            while True:
+                lines = json.loads(Path("screen.json").read_text())
+                for line in lines[count:]:
+                    print(line, flush=True)
+                count = len(lines)
+                time.sleep(.025)
+            """)
+        job = self.deploy("unicode-codex", [sys.executable, "-c", fixture], host="codex")
+        wait = ("wait", "--scope", job["scope"], "--dispatch", job["dispatch"], "--stall-after", "0")
+        extra = {"WFC_MAX_TURN_SECONDS": "0"}
+
+        def append(line):
+            lines.append(line)
+            tmp = commands.with_suffix(".tmp")
+            tmp.write_text(json.dumps(lines))
+            tmp.replace(commands)
+
+        def observe(category, evidence):
+            notice, = self.cli(*wait, "--timeout", "3", extra=extra)["messages"]
+            self.assertEqual((notice["fault"]["category"], notice["fault"]["evidence"]),
+                             (category, evidence))
+            self.assertEqual((notice["attempt"], notice["scope"]), (job["attempt"], job["scope"]))
+            self.assertNotIn(SECRET, json.dumps(notice))
+            self.assertEqual(self.cli("ack", notice["messageId"])["state"], "processed")
+            return notice["messageId"]
+
+        def quiet():
+            self.assertFalse(self.cli(*wait, "--timeout", "1.3", code=3, extra=extra)["messages"])
+
+        first = observe("quota", "screen_notice")
+        append("Elapsed: 2s")
+        quiet()
+        append("• Time elapsed: 3 seconds")
+        quiet()
+        append("• 4s")
+        quiet()
+        append("普通尾注只是界面文本")
+        quiet()
+        append("• 已拿到结果。")
+        with_punctuation = observe("recovered", "changed_activity")
+        quiet()
+        append("Quota exceeded")
+        second = observe("quota", "screen_notice")
+        self.assertNotEqual(first, second)
+        append("• 已生成下一批结果")
+        without_punctuation = observe("recovered", "changed_activity")
+        quiet()
+        self.assertNotEqual(with_punctuation, without_punctuation)
+        self.assertEqual(self.cli("close", job["dispatch"])["result"], "completed")
+        print(json.dumps({"case": "codex-unicode-appended-activity", "scope": job["scope"],
+                          "attempt": job["attempt"], "quotaReceipts": [first, second],
+                          "recoveryReceipts": [with_punctuation, without_punctuation],
+                          "ordinaryFootersSilent": True}), flush=True)
+
+
 if __name__ == "__main__":
     unittest.main()

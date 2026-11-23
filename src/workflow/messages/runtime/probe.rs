@@ -11,8 +11,8 @@ use std::{
     env,
     ffi::OsString,
     fs::File,
-    io::{self, Read, Seek},
-    os::fd::FromRawFd,
+    io::{self, Read, Seek, Write},
+    os::fd::{AsRawFd, FromRawFd},
     path::Path,
     process::{Child, Command, ExitCode, Stdio},
     task::Poll,
@@ -22,6 +22,8 @@ use std::{
 const MAX_PROBE: Duration = Duration::from_secs(1);
 const READ_TIMEOUT: u8 = 3; // private supervisor outcome
 const CANCELLED: u8 = 4;
+const REQUEST_SENT: u8 = 0x1e;
+const REQUEST_ENDED: u8 = 0x1f;
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Observation {
@@ -165,10 +167,16 @@ pub(crate) fn run_runtime_owner(args: &[OsString]) -> Result<ExitCode> {
         return Ok(ExitCode::from(CANCELLED)); // no backend read was started
     }
     become_subreaper().context("configure observation supervisor")?;
+    let (mut witness, marker) = io::pipe()?;
+    // SAFETY: this descriptor is the supervisor's read end of its private pipe.
+    if unsafe { libc::fcntl(witness.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error().into());
+    }
     let mut cmd = Command::new(env::current_exe()?);
     cmd.arg("--observe-host-runtime")
         .args(&args[2..])
-        .stdin(Stdio::null());
+        .stdin(Stdio::null())
+        .stderr(Stdio::from(marker));
     new_session(&mut cmd);
     // The in-group guard pins the target even if the supervisor itself dies.
     let _lifetime = guard_group(&mut cmd)?;
@@ -186,7 +194,15 @@ pub(crate) fn run_runtime_owner(args: &[OsString]) -> Result<ExitCode> {
             }
             let remaining = deadline.saturating_sub(monotonic_ns()?);
             if remaining == 0 {
-                return Ok(READ_TIMEOUT);
+                // Exactly one outstanding request marker is sufficient. No
+                // marker, an ended exchange, or stderr diagnostics are silent.
+                let mut marks = [0; 3];
+                return Ok(match witness.read(&mut marks) {
+                    Ok(1) if marks[0] == REQUEST_SENT => READ_TIMEOUT,
+                    Ok(_) => CANCELLED,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => CANCELLED,
+                    Err(e) => return Err(e),
+                });
             }
             let sleep_ms = remaining.div_ceil(1_000_000).min(10) as i32;
             if cancelled(parent, sleep_ms)? {
@@ -222,9 +238,19 @@ pub(crate) fn run_runtime_probe(args: &[OsString]) -> Result<()> {
     if binding(&row) != expected {
         return Ok(());
     }
+    let mut sent = false;
+    let mut progress = |in_flight| {
+        sent |= in_flight;
+        let byte = if in_flight {
+            REQUEST_SENT
+        } else {
+            REQUEST_ENDED
+        };
+        let _ = io::stderr().lock().write_all(&[byte]);
+    };
     let sample = if backend::runtime_exit(&state, &row)?.is_some() {
         Sample::Unavailable // the publisher takes the same bound local terminal evidence
-    } else if let Some(screen) = backend::runtime_screen(&state, &mut row)? {
+    } else if let Some(screen) = backend::runtime_screen(&state, &mut row, &mut progress)? {
         let start = screen.ceil_char_boundary(screen.len().saturating_sub(4096));
         let tail = screen[start..].trim();
         Sample::Screen {
@@ -233,8 +259,12 @@ pub(crate) fn run_runtime_probe(args: &[OsString]) -> Result<()> {
             nonblank: !tail.is_empty(),
             salt: salt.to_owned(),
         }
-    } else {
+    } else if sent {
         Sample::Unavailable
+    } else {
+        // Tmux clients and preflight RPCs do not establish that the bound
+        // screen request reached its peer. Local contention is also silent.
+        return Ok(());
     };
     serde_json::to_writer(
         io::stdout().lock(),

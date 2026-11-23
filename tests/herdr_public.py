@@ -179,6 +179,145 @@ for line in sys.stdin:
                               "dispatch": self.dispatch_id, "attempt": self.row["attempt"],
                               "pane": self.h["pane"], "closeAfterDeadline": "completed"}), flush=True)
 
+    def test_runtime_read_evidence_and_independent_recovery(self):
+        hold = threading.Event()
+        entered = threading.Event()
+        release = threading.Event()
+        returned = threading.Event()
+        requests = []
+        methods = []
+        secret = "private-herdr-transport-token"
+        screen = self.root / "screen"
+        screen.write_text("Ready.")
+        self.worker.write_text(r"""
+import time
+from pathlib import Path
+last = None
+while True:
+    text = Path("screen").read_text()
+    if text != last:
+        print("\x1b[2J\x1b[H" + text, flush=True)
+        last = text
+    time.sleep(.025)
+""")
+        self.env["WFC_MAX_TURN_SECONDS"] = "0"
+
+        def observe_read(req, reply):
+            methods.append(req["method"])
+            if req["method"] == "pane.read":
+                requests.append((req["id"], req["params"]["pane_id"]))
+                if hold.is_set():
+                    entered.set()
+                    release.wait(5)
+                    returned.set()
+                    return None
+            return reply
+
+        def run_wait(timeout, quiet=False):
+            args = ("wait", "--scope", self.row["scope"], "--dispatch", self.dispatch_id,
+                    "--stall-after", "0", "--timeout", timeout)
+            result = self.cli(*args, error='"timedOut":true' if quiet else None)
+            return json.loads(result)["messages"] if quiet else result["messages"]
+
+        def slow_wait(timeout, quiet=False):
+            start = len(requests)
+            entered.clear()
+            release.clear()
+            returned.clear()
+            hold.set()
+            try:
+                messages = run_wait(timeout, quiet)
+                self.assertTrue(entered.is_set(), "the bound pane.read was sent")
+                self.assertEqual(len(requests), start + 1)
+                self.assertEqual(requests[-1][1], self.h["pane"])
+                return messages
+            finally:
+                hold.clear()
+                release.set()
+                if entered.is_set():
+                    self.assertTrue(returned.wait(2))
+
+        def show(text):
+            tmp = screen.with_suffix(".tmp")
+            tmp.write_text(text)
+            tmp.replace(screen)
+            live.wait_for(lambda: text in self.service.api("pane.read", pane_id=self.h["pane"],
+                source="recent", format="text", strip_ansi=True, lines=10)["read"]["text"])
+
+        def ack(notice):
+            for key in ("scope", "dispatch", "round", "attempt"):
+                self.assertEqual(notice[key], self.row[key])
+            first = self.cli("ack", notice["messageId"])
+            self.assertEqual((first["state"], first["statusVersion"]), ("processed", 3))
+            self.assertTrue(self.cli("ack", notice["messageId"])["duplicate"])
+
+        def verify(notices, expected):
+            self.assertEqual([m["fault"]["evidence"] for m in notices], expected)
+            self.assertNotIn(secret, json.dumps(notices))
+            for message in notices:
+                ack(message)
+
+        with self.service.fault_proxy(observe_read) as endpoint:
+            self.dispatch(endpoint=endpoint)
+            self.assertFalse(run_wait("1.4", quiet=True))
+            self.assertTrue(requests, "the original bound pane was read successfully")
+            state = Path(self.env["WFC_STATE"])
+            watch = state / "dispatches" / f"{self.dispatch_id}.host-watch"
+            self.assertTrue(json.loads(watch.read_text())["execution"])
+            lockfile = state / "dispatches" / f"{self.dispatch_id}.herdr-lock"
+            start = len(requests)
+            rpc_count = len(methods)
+            with lockfile.open("rb") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                self.assertFalse(run_wait("1.4", quiet=True))
+                self.assertEqual(len(methods), rpc_count)
+                self.assertEqual(len(requests), start)
+            self.assertFalse(run_wait(".55", quiet=True))
+            self.assertGreater(len(requests), start)
+            self.assertFalse(slow_wait(".65", quiet=True))
+            first = slow_wait("3")
+            verify(first, ["backend_unavailable"])
+            self.assertFalse(slow_wait("1.4", quiet=True))
+
+            show(f"Quota exceeded: {secret}")
+            quota_restored = run_wait("3")
+            verify(quota_restored, ["screen_notice", "read_restored"])
+            quota = self.status()["hostActivity"]
+            self.assertEqual((quota["state"], quota["fault"]["category"], quota["readState"]),
+                             ("blocked", "quota", "readable"))
+            again = slow_wait("3")
+            verify(again, ["backend_unavailable"])
+            self.assertNotEqual(first[0]["messageId"], again[0]["messageId"])
+            self.assertEqual(len({req_id for req_id, _ in requests}), len(requests))
+            self.assertEqual(self.status()["hostActivity"]["readState"], "unavailable")
+
+            ledger = state / "messages.json"
+            messages = json.loads(ledger.read_text())
+            question = {key: self.row[key] for key in ("dispatch", "scope", "round", "attempt", "role")}
+            messages.append(dict(question, type="question", id=len(messages) + 1, messageId="m-test-question",
+                                 state="processed", statusVersion=3,
+                                 question_payload={"text": "private pending answer", "options": []}))
+            pending = ledger.with_suffix(".tmp")
+            pending.write_text(json.dumps(messages))
+            pending.replace(ledger)
+            show(f"Approval required: {secret}")
+            permission_restored = run_wait("3")
+            verify(permission_restored, ["screen_notice", "read_restored"])
+            activity = self.status()["hostActivity"]
+            self.assertEqual((activity["state"], activity["fault"]["category"], activity["readState"],
+                              activity["awaitingAnswer"]),
+                             ("awaiting_permission", "permission_required", "readable", True))
+            self.assertFalse(run_wait(".55", quiet=True))
+            self.assertNotIn(secret, ledger.read_text())
+            self.assertEqual(self.cli("close", self.dispatch_id)["result"], "completed")
+            print(json.dumps({"case": "herdr-transport-classification", "dispatch": self.dispatch_id,
+                              "attempt": self.row["attempt"], "pane": self.h["pane"],
+                              "busyIssuedNoRequest": True, "clippedReadSilent": True,
+                              "slowReadReceipts": [first[0]["messageId"], again[0]["messageId"]],
+                              "quotaRestored": quota_restored[-1]["messageId"],
+                              "permissionRestored": permission_restored[-1]["messageId"],
+                              "pendingAnswerPreserved": True, "close": "completed"}), flush=True)
+
     def test_abandoned_runtime_wait_reaps_the_probe_and_releases_herdr_lock(self):
         entered = threading.Event()
         release = threading.Event()
