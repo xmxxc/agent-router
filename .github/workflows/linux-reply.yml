@@ -1,7 +1,7 @@
 name: Linux reply boundaries and controller takeover
 on:
   push:
-    branches: [rust-router/11-reply-r7-combination]
+    branches: [rust-router/11-reply-r8-combination]
   workflow_dispatch:
 
 permissions:
@@ -110,9 +110,12 @@ jobs:
             PublicLifecycle.test_public_reply_distinguishes_authored_herdr_text_from_dim_placeholder \
             PublicLifecycle.test_public_reply_requires_a_writable_herdr_chat_prompt \
             PublicLifecycle.test_public_reply_retains_claim_when_herdr_empty_composer_cannot_be_confirmed \
+            PublicLifecycle.test_public_reply_uses_upstream_codex_footer_and_protects_attachments \
+            PublicLifecycle.test_public_reply_only_retries_enter_for_the_exact_visible_codex_line \
+            PublicLifecycle.test_public_reply_uses_native_opencode_and_claude_composer_shapes \
             PublicLifecycle.test_managed_herdr_reply_rechecks_owner_while_waiting \
             2>&1 | tee "$EVIDENCE/herdr-public.log"
-      - name: Verify tmux takeover during a queued reply
+      - name: Verify tmux reply text and controller takeover
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: product
         run: |
@@ -122,6 +125,8 @@ jobs:
           fi
           tmux -V | tee "$EVIDENCE/tmux.log"
           python -Bu tools/check_tmux.py target/release/wfc -v \
+            Backend.test_public_reply_once_and_original_done \
+            Backend.test_public_reply_preserves_tmux_draft_with_changed_whitespace \
             Backend.test_managed_tmux_reply_rechecks_owner_while_waiting \
             2>&1 | tee -a "$EVIDENCE/tmux.log"
       - name: Checksum evidence

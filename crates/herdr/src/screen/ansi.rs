@@ -4,6 +4,7 @@
 #[derive(Default)]
 struct Style {
     background: bool,
+    foreground: bool,
     bold: bool,
     dim: bool,
     reverse: bool,
@@ -30,6 +31,7 @@ impl Style {
                 return None;
             }
             self.background |= code == "48";
+            self.foreground |= code == "38";
             return Some(());
         }
 
@@ -50,6 +52,8 @@ impl Style {
 pub(super) struct Row {
     pub text: String,
     pub active_prompt: bool,
+    pub visible_claude_prompt: bool,
+    pub visible_foreground: bool,
     pub prompt_background: bool,
     pub has_nondefault_background: bool,
     pub has_nonplaceholder_body: bool,
@@ -77,7 +81,11 @@ pub(super) fn rows(input: &str) -> Option<Vec<Row>> {
                     row.active_prompt = style.bold && !style.dim && !style.reverse && !style.hidden;
                     row.prompt_background = style.background && !style.reverse && !style.hidden;
                 }
+                if row.text.is_empty() && text.starts_with('❯') {
+                    row.visible_claude_prompt = !style.dim && !style.reverse && !style.hidden;
+                }
                 if text.chars().any(|c| c != ' ') {
+                    row.visible_foreground |= style.foreground && !style.reverse && !style.hidden;
                     row.has_nondefault_background |=
                         style.background || style.reverse || style.hidden;
                 }

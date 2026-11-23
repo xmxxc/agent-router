@@ -49,6 +49,7 @@ fn notices(screen: &str) -> Notices {
 struct Draft {
     text: String,
     scrolled: bool,
+    single_line: Option<String>,
 }
 
 impl Draft {
@@ -58,7 +59,11 @@ impl Draft {
 }
 
 fn codex_draft(screen: &str) -> Option<Draft> {
-    let lines: Vec<_> = screen.trim_end().lines().map(str::trim_end).collect();
+    let lines: Vec<_> = screen
+        .trim_end()
+        .lines()
+        .map(|line| line.trim_end_matches(' '))
+        .collect();
     let start = lines
         .iter()
         .rposition(|s| *s == "›" || s.starts_with("› "))?;
@@ -98,7 +103,15 @@ fn codex_draft(screen: &str) -> Option<Draft> {
         }
         text.push_str(line.trim());
     }
-    Some(Draft { text, scrolled })
+    let single_line = match &lines[start..end] {
+        [line] if !scrolled => line.strip_prefix("› ").map(str::to_owned),
+        _ => None,
+    };
+    Some(Draft {
+        text,
+        scrolled,
+        single_line,
+    })
 }
 
 fn matches_input(draft: &Draft, text: &str) -> bool {
@@ -250,13 +263,11 @@ impl Tmux<'_> {
                 if draft.as_ref().is_some_and(Draft::empty) {
                     break;
                 }
-                if !draft.as_ref().is_some_and(|d| {
-                    !d.scrolled
-                        && d.text
-                            .chars()
-                            .filter(|c| !c.is_whitespace())
-                            .eq(text.chars().filter(|c| !c.is_whitespace()))
-                }) {
+                if !draft
+                    .as_ref()
+                    .and_then(|d| d.single_line.as_deref())
+                    .is_some_and(|shown| wfc_herdr::matches_single_line_draft(shown, text))
+                {
                     return Err(uncertain("Codex composer did not confirm the reply"));
                 }
             } else if !draft.as_ref().is_some_and(|d| matches_input(d, text)) {

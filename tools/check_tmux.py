@@ -86,6 +86,8 @@ def composer(mode, logfile, reply_worker=False):
                         draft = b""
                 elif mode == "change":
                     draft = b"someone else's draft"
+                elif mode == "changed-reply":
+                    draft = draft.replace(b": a b", b": ab")
                 elif mode == "scroll":
                     draft = "visible slice ↑".encode()
                 elif mode != "always-drop" and (mode != "drop" or enters > 1):
@@ -538,6 +540,17 @@ os.execv(argv[0], argv)
         reply, = self.reply_attempts()
         self.assertEqual(reply["inputResult"], "uncertain")
         self.assert_reply_bytes(f"[router] Answer to question {self.number}: visible slice of the draft\r".encode())
+        self.assertFalse((self.work / "accepted").exists())
+
+    def test_public_reply_preserves_tmux_draft_with_changed_whitespace(self):
+        self.setup_reply("changed-reply")
+        self.assertIn("composer did not confirm",
+                      self.reply_cli("reply", self.number, "a b", expected=1))
+        self.assertIn(": ab", self.reply_screen())
+        self.assertIn("already answered", self.reply_cli("reply", self.number, "again", expected=1))
+        reply, = self.reply_attempts()
+        self.assertEqual(reply["inputResult"], "uncertain")
+        self.assert_reply_bytes(f"[router] Answer to question {self.number}: a b\r".encode())
         self.assertFalse((self.work / "accepted").exists())
 
     def test_public_reply_rechecks_after_waiting_for_input_lock(self):

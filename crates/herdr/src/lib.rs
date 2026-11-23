@@ -16,6 +16,11 @@ use uuid::Uuid;
 
 pub type Result<T> = std::result::Result<T, Failure>;
 
+/// PTY redraws do not distinguish layout wrapping from a draft newline.
+pub fn matches_single_line_draft(shown: &str, sent: &str) -> bool {
+    !shown.is_empty() && shown == sent && !shown.chars().any(char::is_control)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FailureKind {
@@ -445,60 +450,43 @@ impl Handle {
         &mut self,
         text: &str,
         codex: bool,
-        save: impl FnMut(&Self) -> std::io::Result<()>,
+        mut save: impl FnMut(&Self) -> std::io::Result<()>,
     ) -> Result<()> {
-        self.submit_input(text, codex, false, save)
+        let before = self.read()?;
+        if screen::read_only(&before.text) {
+            return Err(Failure::refused("worker input is paused"));
+        }
+        self.send(
+            "pane.send_input",
+            json!({"pane_id":self.pane,"text":text,"keys":["Enter"]}),
+            true,
+            &mut save,
+        )?;
+        if codex {
+            screen::confirm_codex(self, text, &before, &mut save).map_err(Failure::after_effect)?;
+        }
+        Ok(())
     }
 
     pub fn submit_reply(
         &mut self,
         text: &str,
-        codex: bool,
-        save: impl FnMut(&Self) -> std::io::Result<()>,
-    ) -> Result<()> {
-        if !codex {
-            return Err(Failure::unsent(
-                "a writable chat composer could not be verified for this Herdr host",
-            ));
-        }
-        self.submit_input(text, codex, true, save)
-    }
-
-    fn submit_input(
-        &mut self,
-        text: &str,
-        codex: bool,
-        confirm_reply: bool,
+        host: &str,
         mut save: impl FnMut(&Self) -> std::io::Result<()>,
     ) -> Result<()> {
-        let before_input = |error: Failure| {
-            if confirm_reply {
-                error.before_effect()
-            } else {
-                error
-            }
-        };
-        let before = self.read().map_err(before_input)?;
+        let before = self.read().map_err(Failure::before_effect)?;
         if screen::read_only(&before.text) {
             return Err(Failure::refused("worker input is paused"));
         }
-        if codex && confirm_reply {
-            screen::require_empty_reply_box(self, &before).map_err(before_input)?;
-        }
+        screen::require_empty_reply_box(self, &before, host).map_err(Failure::before_effect)?;
         // Preparation performs only observation and local checkpoints. An
         // incomplete response to the subsequent input call may be post-effect.
-        let rpc = self.prepare_send(true, &mut save).map_err(before_input)?;
+        let rpc = self
+            .prepare_send(true, &mut save)
+            .map_err(Failure::before_effect)?;
         let params = json!({"pane_id":self.pane,"text":text,"keys":["Enter"]});
-        if confirm_reply {
-            rpc.send_reply(params)?;
-        } else {
-            rpc.call("pane.send_input", params)?;
-        }
-        if codex {
-            screen::confirm_codex(self, text, &before, confirm_reply, &mut save)
-                .map_err(Failure::after_effect)?;
-        }
-        Ok(())
+        rpc.send_reply(params)?;
+        screen::confirm_reply(self, text, &before, host, &mut save).map_err(Failure::after_effect)
     }
 
     /// Close only the bound pane. Persist all observed writers before closing,
