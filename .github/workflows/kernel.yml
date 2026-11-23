@@ -14,7 +14,7 @@ jobs:
     name: ${{ matrix.platform }}
     strategy:
       fail-fast: false
-      matrix:
+      matrix: &platforms
         include:
           - platform: windows-x64
             runner: windows-2022
@@ -116,3 +116,61 @@ jobs:
           done
           cat dist/*.sha256 > dist/SHA256SUMS
           gh release create "$TAG" dist/*.zip dist/*.tar.gz dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease --latest=false --title "$TAG" --notes "Linux x64 and Windows x64 test binaries for commit $GITHUB_SHA."
+
+  verify-download:
+    name: Verify published ${{ matrix.platform }}
+    needs: prerelease
+    strategy:
+      fail-fast: false
+      matrix: *platforms
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      TRIPLE: ${{ matrix.triple }}
+      EXE: ${{ matrix.exe }}
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - name: Download public release assets and independent file metadata
+        run: |
+          mkdir downloads
+          cd downloads
+          tag=$(jq -nrj --arg tag "$GITHUB_REF_NAME" '$tag | @uri')
+          curl --fail --silent --show-error --location --retry 3 \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$tag" -o release.json
+          archive="wfc-$PLATFORM-$GITHUB_SHA"
+          if [[ "$RUNNER_OS" == Windows ]]; then archive+=.zip; else archive+=.tar.gz; fi
+          release_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$tag"
+          for name in "$archive" SHA256SUMS; do
+            curl --fail --silent --show-error --location --retry 3 "$release_url/$name" -o "$name"
+          done
+      - name: Verify downloaded bytes, build identity and bundled notices
+        run: python tools/verify_candidate.py downloads "$GITHUB_REF_NAME" "$GITHUB_SHA" "$PLATFORM" "published candidate"
+      - name: Run the downloaded CLI and exercise its native terminal
+        run: |
+          bin="./published candidate/$EXE"
+          version=$("$bin" --version)
+          echo "$version"
+          [[ "$version" == *"(Rust, $TRIPLE, release, build $GITHUB_SHA)" ]]
+          python tools/smoke.py "$bin" --kernel
+      - name: Fetch pinned Python compatibility tests
+        if: runner.os == 'Windows'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: xmxxc/workflow-core
+          ref: 3c06c0905faaf9e61de49404c33e70720409607f
+          path: integration-workflow-core
+          persist-credentials: false
+      - name: Run the downloaded Windows companion through Python
+        if: runner.os == 'Windows'
+        timeout-minutes: 8
+        run: python tools/check_wfc.py integration-workflow-core "published candidate/wfc-kernel.exe"
