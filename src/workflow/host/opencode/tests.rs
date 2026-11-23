@@ -498,11 +498,12 @@ fn private_launch_and_adoption_identity_are_bound() {
         b"external fixture must never be opened"
     );
     fixture.assert_rejected(&old, "missing private OpenCode opening evidence");
-    let mut legacy = old.clone();
-    legacy["opencodeOpening"] = json!({"attempt":ATTEMPT,"database":shared,"briefSha256":"old"});
-    legacy["hostSession"] = json!("ses_original");
-    legacy["opencodeSession"] = json!({"firstMessage":"msg_first","project":"project"});
-    fixture.assert_rejected(&legacy, "missing private OpenCode opening evidence");
+    let mut legacy_record = old.clone();
+    legacy_record["opencodeOpening"] =
+        json!({"attempt":ATTEMPT,"database":shared,"briefSha256":"old"});
+    legacy_record["hostSession"] = json!("ses_original");
+    legacy_record["opencodeSession"] = json!({"firstMessage":"msg_first","project":"project"});
+    fixture.assert_rejected(&legacy_record, "missing private OpenCode opening evidence");
 
     fixture.configure(
         json!({"WFC_OPENCODE_ISOLATED_STORE":"1","OPENCODE_DB":shared,"WFC_OPENCODE_DB":""}),
