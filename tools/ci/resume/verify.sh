@@ -15,6 +15,8 @@ case "$group" in
             Backend.test_read_only_unowned_close_replays_confirmed_archive
             Backend.test_public_interrupt_preflight_zero_send_allows_takeover
             Backend.test_public_interrupt_blocks_owner_change_after_backend_dies_with_queued_key
+            Backend.test_public_interrupt_native_lock_error_allows_original_close
+            Backend.test_public_interrupt_lost_preflight_reply_remains_unresolved
         )
         ;;
     public-herdr-close)
