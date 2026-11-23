@@ -18,7 +18,7 @@ import unittest
 def composer(mode, logfile, reply_worker=False):
     """Controlled terminal host: log actual input bytes and optionally drop Enter."""
     tty.setraw(0)
-    draft = b""
+    draft = "original draft ↑".encode() if mode == "existing-scroll" else b""
     enters = 0
     banner = "This chat uses A, but Codex now uses B, so this chat is read-only."
     refused = "This conversation is read-only or unavailable; no operation was sent."
@@ -43,6 +43,10 @@ def composer(mode, logfile, reply_worker=False):
         draw()
         while True:
             if reply_worker:
+                if mode == "existing-scroll" and Path("clear-draft").exists():
+                    Path("clear-draft").unlink()
+                    draft = b""
+                    draw()
                 if notice == banner and Path("enable-input").exists():
                     notice = ""
                     draw()

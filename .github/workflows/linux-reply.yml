@@ -1,7 +1,7 @@
 name: Linux worker replies
 on:
   push:
-    branches: [rust-router/11-reply]
+    branches: [rust-router/11-reply, rust-router/11-reply-r2]
   workflow_dispatch:
 
 permissions:
@@ -121,6 +121,9 @@ jobs:
             PublicLifecycle.test_claim_survives_lost_ack_and_reconcile \
             PublicLifecycle.test_public_reply_on_bound_herdr_pane \
             PublicLifecycle.test_public_reply_retains_claim_after_herdr_delivers_without_receipt \
+            PublicLifecycle.test_public_reply_releases_claim_after_herdr_preflight_read_fails \
+            PublicLifecycle.test_public_reply_preserves_existing_scrolled_herdr_draft \
+            PublicLifecycle.test_public_reply_keeps_claim_when_herdr_draft_reappears \
             2>&1 | tee "$EVIDENCE/herdr-public.log"
       - name: Checksum evidence
         if: always()
