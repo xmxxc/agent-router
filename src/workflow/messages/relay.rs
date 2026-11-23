@@ -334,8 +334,7 @@ fn claim_batch(
     let mut messages = Vec::new();
     let mut text = String::from(PREFIX);
     for m in &mut inbox.messages {
-        if !m.is_controller_message()
-            || m.delivery.state != State::Unsent
+        if !m.claimable()
             || scope.is_some_and(|s| s != m.worker.scope())
         {
             continue;

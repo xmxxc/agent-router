@@ -63,6 +63,8 @@ fn run() -> anyhow::Result<ExitCode> {
             #[cfg(target_os = "linux")]
             println!("{}", workflow::reclaim::USAGE);
             #[cfg(target_os = "linux")]
+            println!("{}", workflow::legacy_import::USAGE);
+            #[cfg(target_os = "linux")]
             println!("{}", workflow::worker_owner::CLOSE_USAGE);
             #[cfg(target_os = "linux")]
             println!("{}", workflow::herdr::USAGE);
@@ -266,6 +268,15 @@ fn run() -> anyhow::Result<ExitCode> {
             };
             controller::require_controller("status")?;
             println!("{}", workflow::status(id, active)?);
+        }
+        #[cfg(target_os = "linux")]
+        Some("migrate-legacy") => {
+            if args == ["--help"] || args == ["-h"] {
+                println!("{}", workflow::legacy_import::USAGE);
+            } else {
+                controller::require_controller("migrate-legacy")?;
+                println!("{}", workflow::legacy_import::run(&args)?);
+            }
         }
         #[cfg(target_os = "linux")]
         Some("reclaim") => {

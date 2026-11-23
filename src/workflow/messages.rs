@@ -206,6 +206,7 @@ impl Assignment {
             row["createPending"] = json!(true);
         }
         let assignment = Self::deserialize(&row).context("read worker assignment identity")?;
+        ensure!(row["legacyArchived"] != true, "offline legacy assignment has no writable worker");
         let worker = &assignment.worker;
         ensure!(
             assignment.controller_owner.is_none(),
@@ -254,6 +255,8 @@ struct Message {
     request_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     body_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_body: Option<String>,
     #[serde(flatten)]
     delivery: Delivery,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -362,6 +365,7 @@ impl Message {
             question_payload: None,
             request_key,
             body_hash: None,
+            legacy_body: None,
             delivery: Delivery::unsent(),
             resolution: None,
             created_at: Some(receipt::timestamp()),
@@ -394,6 +398,11 @@ impl Message {
     }
 
     fn valid_payload(&self) -> bool {
+        if let Some(raw) = &self.legacy_body {
+            if self.body_hash.as_deref() != Some(body_hash(raw).as_str()) {
+                return false;
+            }
+        }
         match self.kind() {
             MessageKind::Done => self.report.is_some(),
             MessageKind::Question => self.report.is_none(),
@@ -428,7 +437,14 @@ impl Message {
     }
 
     fn computed_hash(&self) -> String {
+        if let Some(raw) = &self.legacy_body {
+            return body_hash(raw);
+        }
         body_hash(&canonical_body(self.body()))
+    }
+
+    fn claimable(&self) -> bool {
+        self.is_controller_message() && self.delivery.state == State::Unsent && self.legacy_body.is_none()
     }
 
     fn matches_hash(&self, hash: &str) -> bool {
@@ -506,6 +522,19 @@ impl Message {
                 view.insert("tmux".into(), tmux.clone());
             }
         }
+        if let Some(raw) = &self.legacy_body {
+            view.insert("body".into(), json!(raw));
+            view.insert("bodyHash".into(), json!(self.body_hash));
+            view.insert("at".into(), json!(self.created_at));
+            view.insert("to".into(), json!("controller"));
+            view.insert("delivered".into(), json!(self.delivery.delivered()));
+            if let Some(resolution) = &self.resolution {
+                view.insert("resolution".into(), json!(resolution));
+            }
+            if self.delivery.state == State::Unsent {
+                view.insert("legacyDeliveryHeld".into(), json!(true));
+            }
+        }
         Value::Object(view)
     }
 
@@ -531,6 +560,14 @@ struct Inbox {
     messages: Vec<Message>,
     // The lock lives on a stable file because save replaces the data file.
     _lock: File,
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn stage_legacy_messages(state: &Path, rows: &[Value]) -> Result<()> {
+    let messages = rows.iter().cloned().map(serde_json::from_value::<Message>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    ensure!(messages.iter().all(Message::valid_payload), "invalid staged legacy receipt");
+    super::write_json(&state.join("messages.json"), &serde_json::to_value(messages)?, None)
 }
 
 fn lock_file(dir: &Path) -> Result<File> {
@@ -672,6 +709,15 @@ fn check_snapshot_size(size: usize) -> Result<()> {
 }
 
 impl Inbox {
+    fn next_id(&self) -> Result<u64> {
+        #[cfg(target_os = "linux")]
+        let high_water = super::legacy_import::high_water(&self.dir)?;
+        #[cfg(not(target_os = "linux"))]
+        let high_water = 0;
+        self.messages.iter().map(|message| message.id).max().unwrap_or(0)
+            .max(high_water).checked_add(1).context("message ID exhausted")
+    }
+
     fn snapshot(dir: &Path) -> Result<Vec<Message>> {
         let path = dir.join("messages.json");
         match File::open(&path) {
@@ -735,8 +781,7 @@ impl Inbox {
             .messages
             .iter_mut()
             .filter(|m| {
-                m.is_controller_message()
-                    && m.delivery.state == State::Unsent
+                m.claimable()
                     && dispatch.is_none_or(|id| id == m.worker.dispatch)
                     && scope.is_none_or(|scope| scope == m.worker.scope())
             })
@@ -986,7 +1031,7 @@ impl Reclaimed {
         // The lock is released before the caller enters the backend.
         let mut inbox = Inbox::open(state)?;
         check_ledger_replacement(state)?;
-        self.append(&mut inbox);
+        self.append(&mut inbox)?;
         let bytes = serde_json::to_vec(&inbox.messages)?;
         check_snapshot_size(bytes.len())?;
         let pending = inbox.dir.join("messages.pending");
@@ -1006,7 +1051,7 @@ impl Reclaimed {
 
     pub(super) fn publish(self, state: &Path) -> Result<u64> {
         let mut inbox = Inbox::open(state)?;
-        let id = self.append(&mut inbox);
+        let id = self.append(&mut inbox)?;
         let bytes = serde_json::to_vec(&inbox.messages)?;
         check_snapshot_size(bytes.len())?;
         inbox
@@ -1015,8 +1060,8 @@ impl Reclaimed {
         Ok(id)
     }
 
-    fn append(&self, inbox: &mut Inbox) -> u64 {
-        let id = inbox.messages.len() as u64 + 1;
+    fn append(&self, inbox: &mut Inbox) -> Result<u64> {
+        let id = inbox.next_id()?;
         inbox.messages.push(Message {
             id,
             message_id: self.message_id.clone(),
@@ -1025,6 +1070,7 @@ impl Reclaimed {
             question_payload: None,
             request_key: None,
             body_hash: None,
+            legacy_body: None,
             delivery: Delivery::unsent(),
             resolution: None,
             created_at: Some(receipt::timestamp()),
@@ -1033,7 +1079,7 @@ impl Reclaimed {
                 ("tmux".into(), self.tmux.clone()),
             ]),
         });
-        id
+        Ok(id)
     }
 }
 
@@ -1116,7 +1162,7 @@ impl<'a> Done<'a> {
         if let Some(receipt) = duplicate {
             return Ok(receipt);
         }
-        let mut message = Message::new(inbox.messages.len() as u64 + 1, current.worker, key);
+        let mut message = Message::new(inbox.next_id()?, current.worker, key);
         message.report = Some(report);
         message.additional_fields = Map::from_iter([
             ("head".into(), json!(snapshot.head)),
@@ -1271,7 +1317,7 @@ impl<'a> Ask<'a> {
             !blocked?,
             "attempt is no longer accepted for {dispatch}; its round is not running"
         );
-        let mut message = Message::new(inbox.messages.len() as u64 + 1, assignment.worker, key);
+        let mut message = Message::new(inbox.next_id()?, assignment.worker, key);
         message.question_payload = Some(payload);
         let mut receipt = inbox.publish(message).context("publish question")?;
         receipt["next"] = json!("End your turn now; the answer arrives as your next message.");

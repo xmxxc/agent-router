@@ -310,6 +310,11 @@ fn confirm(
     token: Option<&str>,
     named: bool,
 ) -> Result<Value> {
+    if selected["legacyArchived"] == true {
+        let mut item = session(selected);
+        gone(&mut item);
+        return Ok(item);
+    }
     let _lock = controller::lock_scope(state, scope)?;
     authorize(state, scope, token)?;
     let id = selected["dispatch"].as_str().context("missing dispatch")?;

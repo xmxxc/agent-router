@@ -15,7 +15,7 @@ const MESSAGE: &str = "SELECT id,coalesce(nullif(message_uid,''),cast(id AS text
     coalesce(nullif(status_version,0),1) AS statusVersion,body_hash AS bodyHash,body,delivered,
     resolver_actor,resolution_source,resolution_reason,resolution_evidence,datetime(epoch_second(resolved_at),'unixepoch','localtime') AS resolved_at FROM message";
 
-fn rows(db: &Connection, sql: &str, params: impl Params) -> Result<Vec<Value>> {
+pub(super) fn rows(db: &Connection, sql: &str, params: impl Params) -> Result<Vec<Value>> {
     let mut stmt = db.prepare(sql)?;
     let mut cursor = stmt.query(params)?;
     let mut items = vec![];

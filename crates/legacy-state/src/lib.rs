@@ -1,11 +1,13 @@
 //! Offline access to workflow-core's Python router.db. See the crate README for cutover.
 mod completion;
+mod import;
 mod migrate;
 mod preview;
 mod recovery;
 mod schema;
 
 pub use migrate::open_offline_copy;
+pub use import::{import_scratch, stopped_ledger};
 pub use preview::{can_preview_router_db, reclaim_preview, status, verify_router_db};
 
 use anyhow::{ensure, Context, Result};

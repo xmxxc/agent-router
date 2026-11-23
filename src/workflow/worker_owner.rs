@@ -203,6 +203,7 @@ pub fn close(id: &str, explicit_token: Option<&str>) -> Result<Value> {
 }
 
 pub(super) fn validate_close(record: &Value) -> Result<()> {
+    ensure!(record["legacyArchived"] != true, "offline legacy assignment has no close target");
     ensure!(
         record["publicationDiagnostic"].is_null(),
         "close uncertain: {}",

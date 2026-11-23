@@ -51,6 +51,7 @@ impl<'a> Resume<'a> {
                 .with_context(|| format!("unknown native dispatch {}", self.dispatch))
         };
         let initial = read()?;
+        ensure!(initial["legacyArchived"] != true, "offline legacy assignment has no resumable worker");
         let scope = super::record_scope(&initial).context("invalid dispatch scope")?;
         let token = controller::token(self.owner_token);
         let authorize = || -> Result<Value> {

@@ -22,6 +22,8 @@ mod backend;
 pub mod herdr;
 pub mod host;
 #[cfg(target_os = "linux")]
+pub mod legacy_import;
+#[cfg(target_os = "linux")]
 pub mod reclaim;
 #[cfg(target_os = "linux")]
 pub mod resume;
@@ -507,6 +509,7 @@ pub(crate) fn ensure_state_writable(state: &Path) -> Result<()> {
     {
         ensure_no_legacy_db(state)?;
         check_legacy_state_path(Some(state))?;
+        legacy_import::published(state)?;
     }
     #[cfg(not(target_os = "linux"))]
     let _ = state;
