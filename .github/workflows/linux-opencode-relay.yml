@@ -1,7 +1,7 @@
 name: Linux bounded startup recovery and OpenCode integration
 on:
   push:
-    branches: [rust-router/linux-ci-startup-bounded-combination]
+    branches: [rust-router/linux-ci-startup-bounded-compile-fix]
 
 permissions:
   contents: read
@@ -14,10 +14,10 @@ jobs:
       run:
         shell: bash
     env:
-      PRODUCT_SHA: 2a27278b80b858605471c56fb9934cf2a03980cf
-      PRODUCT_TREE: 4549f75eac8620e776e9ebdc60de3a882225a3cd
-      PRODUCT_PARENTS: 'fdfcaec8adebaadd5046ce66603a23849d6e277e 87a3de3c446c80f60b95681926e82b446d2b4779'
-      INPUTS_SHA256: 32ba1383ade5b620f8945ac7775fbf4ab77d352adb7b41036f0ba7eaea30bdfc
+      PRODUCT_SHA: 89d85f240d0bff674ae7d8ee55279da86d505c8c
+      PRODUCT_TREE: 6d1d81ce5c5949bf2254b0d3f266a182ce65c624
+      PRODUCT_PARENTS: '2a27278b80b858605471c56fb9934cf2a03980cf e65856c8216d3c19288689c3736ed6da324f3ef2'
+      INPUTS_SHA256: dcdc3eca745f1daed1e0db371c43e277dfe9bd9e0145eaf9f60de8d3c9c0bae1
       LOCK_SHA256: 759d7553d4023d05406dfaa81984fe2819ee88ceb982b35468dd2f78ce748709
       PRIOR_STARTUP_RUN: '45242439722'
       PRIOR_OPENCODE_RUN: '45240722301'
