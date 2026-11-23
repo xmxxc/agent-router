@@ -35,11 +35,12 @@ run_group() {
 
 case "${1:-}" in
     combination)
-        run_group runtime-tmux 6 python3 -Bu tests/relay.py "$binary" -v \
+        run_group runtime-tmux 7 python3 -Bu tests/relay.py "$binary" -v \
             Relay.test_tmux_bound_absence_is_reported_and_recovers \
             Relay.test_unverified_tmux_timeout_and_abandoned_relay \
             Relay.test_codex_unicode_appended_activity \
             Relay.test_runtime_scope_takeover_fences_the_inflight_read \
+            Relay.test_runtime_reply_fences_an_already_captured_fault \
             Relay.test_runtime_notice_through_the_private_queue \
             Relay.test_timer_redraw_does_not_delay_stall
         # Import the fixture so unittest receives the method selectors.

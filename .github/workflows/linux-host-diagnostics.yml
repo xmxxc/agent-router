@@ -1,7 +1,7 @@
 name: Linux host diagnostics
 on:
   push:
-    branches: [rust-router/13-host-diagnostics-r13-startup-ci]
+    branches: [rust-router/13-host-diagnostics-r14-observation-ci]
 
 permissions:
   contents: read
@@ -15,10 +15,10 @@ jobs:
       run:
         shell: bash
     env:
-      PRODUCT_SHA: d44a91bdb71411d80c84bb770cdbf7c377b8298d
-      PRODUCT_TREE: b2fb7b2cfd34a42152e248252253d46c79c6b647
-      PRODUCT_PARENTS: 'fe94e3afe1103ff4c48e20e7a5d644317fccd90d 5c0a0e6cdf68258333944312414548733d6427ad'
-      REFERENCE_RUNS: '45246627284/2 45250815210/1'
+      PRODUCT_SHA: 1df370049f8f2e5b885a040caec76fc732abce23
+      PRODUCT_TREE: 8fe75f79823e93716c19dfb20c4a67f297e961cb
+      PRODUCT_PARENTS: 'd44a91bdb71411d80c84bb770cdbf7c377b8298d'
+      REFERENCE_RUNS: '45273383152/1 45246627284/2 45250815210/1'
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TARGET: x86_64-unknown-linux-gnu
       HERDR_RELEASE_URL: https://github.com/herdrdev/herdr/releases/download/v0.9.5/herdr-linux-x86_64
@@ -41,7 +41,7 @@ jobs:
           ref: ${{ github.sha }}
           path: ci
           persist-credentials: false
-      - name: Check out the frozen first-parent combination
+      - name: Check out the frozen observation candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.PRODUCT_SHA }}
@@ -70,7 +70,7 @@ jobs:
             git -C ../native-input show -s --format='native-input=%H tree=%T'
             printf '%s  %s\n' 17e88863f3600672ab49182f217281b6fc4d3c762bde361935e436a95214d05c \
               ../native-input/vendor/zlib-1.3.1.tar.gz | sha256sum --check --strict
-            printf '%s  %s\n' 9145088c71a4ff2d3e50d9bd3d881c61038527cd28033e8bbaff267b95e769f0 vendor/INPUTS.sha256 | sha256sum --check --strict
+            printf '%s  %s\n' 2b5cebc81ad872b1cfd6795be449b86f05ca6c9990ba6aeffa2fbf43de5649f6 vendor/INPUTS.sha256 | sha256sum --check --strict
             sha256sum vendor/INPUTS.sha256
             sha256sum --check --strict vendor/INPUTS.sha256
           } 2>&1 | tee "$EVIDENCE/sources.log"
@@ -136,7 +136,7 @@ jobs:
             sha256sum "$binary"
             readelf -hW "$binary"
           } 2>&1 | tee "$EVIDENCE/build.log"
-      - name: Verify tmux observation, current scope, reclaim and both targets
+      - name: Verify tmux observation, reply fencing, reclaim and both targets
         working-directory: product
         env:
           WFC_BUILD_ID: ${{ env.PRODUCT_SHA }}
