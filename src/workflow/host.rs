@@ -240,6 +240,26 @@ impl Options<'_> {
         record: &mut Value,
         resume: Option<&str>,
     ) -> Result<Launch> {
+        self.prepare_launch(state, record, resume, resume.is_some())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn prepare_handoff(&self, state: &Path, record: &mut Value) -> Result<Launch> {
+        self.prepare_launch(
+            state,
+            record,
+            Some("[router] This task has been handed off to a new host"),
+            false,
+        )
+    }
+
+    fn prepare_launch(
+        &self,
+        state: &Path,
+        record: &mut Value,
+        opening: Option<&str>,
+        resume: bool,
+    ) -> Result<Launch> {
         let cwd = PathBuf::from(record["cwd"].as_str().context("missing cwd")?);
         let report = Path::new(record["report"].as_str().context("missing report")?);
         let mut writable = vec![
@@ -249,7 +269,7 @@ impl Options<'_> {
                 .context("missing report directory")?
                 .to_owned(),
         ];
-        let mut brief = worker_brief(record, resume.unwrap_or(FIRST_BRIEF))?;
+        let mut brief = worker_brief(record, opening.unwrap_or(FIRST_BRIEF))?;
         if self.name == "opencode" && self.backend == "herdr" {
             brief.push_str(&format!(
                 " Current attempt {}.",
@@ -257,7 +277,7 @@ impl Options<'_> {
             ));
         }
         let path = self.config.map(PathBuf::from).or_else(|| {
-            if resume.is_some() {
+            if opening.is_some() {
                 return None;
             }
             env::var_os("WFC_LAUNCH_CONFIG")
@@ -288,7 +308,7 @@ impl Options<'_> {
         let mut ignored = Vec::new();
         match self.name {
             "codex" => {
-                if resume.is_some() {
+                if resume {
                     a.push("resume".into());
                 }
                 a.extend(
@@ -389,14 +409,14 @@ impl Options<'_> {
             match codex_home(&cwd, &launch.env) {
                 Ok(home) => {
                     record["codexHome"] = json!(home);
-                    if resume.is_some() {
+                    if resume {
                         launch.env.insert("CODEX_HOME".into(), json!(home));
                     }
                 }
-                Err(error) if resume.is_some() => return Err(error),
+                Err(error) if resume => return Err(error),
                 Err(_) => {}
             }
-            if resume.is_none() {
+            if !resume {
                 record["codexBriefHash"] = json!(super::messages::body_hash(
                     launch.argv.last().context("missing Codex brief")?
                 ));
@@ -410,7 +430,10 @@ impl Options<'_> {
         }
         launch.env.insert(
             "WFC_ROUND".into(),
-            json!(record["round"].as_u64().context("missing round")?.to_string()),
+            json!(record["round"]
+                .as_u64()
+                .context("missing round")?
+                .to_string()),
         );
         launch.env.insert("WFC_STATE".into(), json!(state));
         launch

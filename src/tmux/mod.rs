@@ -21,6 +21,8 @@ pub struct Request {
     execution_id: Option<String>,
     #[serde(rename = "closeOperationId")]
     close_operation_id: Option<String>,
+    #[serde(rename = "handoffAudit")]
+    handoff_audit: Option<usize>,
     #[serde(rename = "legacyExecutionId")]
     legacy_execution_id: Option<String>,
     #[serde(rename = "legacyWorkerPane")]
@@ -79,6 +81,7 @@ struct Tmux<'a> {
     input_request: bool,
     new_execution_id: Option<&'a str>,
     close_operation_id: Option<&'a str>,
+    handoff_audit: Option<usize>,
     close_execution: Option<&'a str>,
     state: &'a Path,
     dispatch: &'a str,
@@ -863,6 +866,7 @@ pub(crate) fn attach(state: &Path, dispatch: &str, socket: &Path, token: &str) -
         input_request: false,
         new_execution_id: None,
         close_operation_id: None,
+        handoff_audit: None,
         close_execution: None,
         session: format!("wfc-{dispatch}"),
         socket: Some(socket.to_owned()),
@@ -989,6 +993,7 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
         legacy_recovery: request.legacy_recovery.as_ref(),
         new_execution_id: request.execution_id.as_deref().filter(|_| launching),
         close_operation_id: request.close_operation_id.as_deref(),
+        handoff_audit: request.handoff_audit,
         close_execution: request
             .execution_id
             .as_deref()
@@ -1003,6 +1008,21 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
         Ok(lock) => lock,
         Err(result) => return Ok(result),
     };
+    if let Some(audit) = request.handoff_audit {
+        ensure!(
+            matches!(&request.op, Operation::Create(_)) && !request.fresh_dispatch,
+            "handoff audit requires a replacement create"
+        );
+        let attempt = request
+            .execution_id
+            .as_deref()
+            .context("missing handoff execution")?;
+        if let Err(error) =
+            crate::workflow::handoff::require_launch(&state, &request.dispatch, attempt, audit)
+        {
+            return Ok(failure("definitely-not-sent", &format!("{error:#}")));
+        }
+    }
     let inspect = matches!(request.op, Operation::Inspect);
     if let Some(execution) = request.execution_id.as_deref().filter(|_| !launching) {
         native_id = match backend.registered_launch(execution) {

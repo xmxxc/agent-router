@@ -70,11 +70,26 @@ pub(super) fn unresolved_resume(row: &Value) -> Option<&Value> {
         .filter(|event| matches!(event["result"].as_str(), Some("pending" | "uncertain")))
 }
 
+pub(super) fn unresolved_handoff(row: &Value) -> Option<&Value> {
+    row["audit"].as_array()?.iter().rev().find(|event| {
+        event["operation"] == "handoff"
+            && event["dispatch"] == row["dispatch"]
+            && (event["fromAttempt"] == row["attempt"] || event["toAttempt"] == row["attempt"])
+            && matches!(event["result"].as_str(), Some("pending" | "uncertain"))
+    })
+}
+
+pub(super) fn handoff_blocks_old_writer(row: &Value) -> bool {
+    unresolved_handoff(row).is_some_and(|event| event["fromAttempt"] == row["attempt"])
+}
+
 #[cfg(target_os = "linux")]
 pub(super) fn unresolved_lifecycle(row: &Value) -> Option<&Value> {
-    row["audit"].as_array()?.iter().rev().find(|event| {
-        matches!(event["result"].as_str(), Some("pending" | "uncertain"))
-    })
+    row["audit"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|event| matches!(event["result"].as_str(), Some("pending" | "uncertain")))
 }
 
 pub(super) fn public_record(dir: &Path, id: &str) -> Result<Option<Value>> {

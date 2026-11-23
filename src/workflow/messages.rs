@@ -866,9 +866,10 @@ impl Inbox {
                         && r["report"].as_str().map(Path::new) == Some(report)
                 });
             ensure!(
-                !reused_report && !history().any(|m| (m.worker.round != worker.round
-                    || m.worker.attempt != worker.attempt)
-                    && m.report.as_deref() == Some(report)),
+                !reused_report
+                    && !history().any(|m| (m.worker.round != worker.round
+                        || m.worker.attempt != worker.attempt)
+                        && m.report.as_deref() == Some(report)),
                 "ambiguous report for {}; supply --attempt",
                 worker.dispatch
             );
@@ -932,7 +933,8 @@ impl Inbox {
         });
         let pending_resume = attempt.is_some()
             && controller::worker_callback().is_some()
-            && super::assignment::resume_audit(row).is_some_and(|event| event["result"] == "pending");
+            && super::assignment::resume_audit(row)
+                .is_some_and(|event| event["result"] == "pending");
         ensure!(
             !confirmed_done
                 && (pending_resume
@@ -1163,6 +1165,10 @@ impl<'a> Done<'a> {
                 .or_else(|| keyed_attempt.map(|id| format!("done:{dispatch}:{id}")));
             let receipt =
                 inbox.validate_done(&assignment, &row, &report, key.as_deref(), self.attempt)?;
+            ensure!(
+                receipt.is_some() || !super::assignment::handoff_blocks_old_writer(&row),
+                "attempt is no longer accepted for {dispatch}; handoff is closing the old execution"
+            );
             if receipt.is_none() && row["backend"] == "herdr" {
                 ensure!(
                     !super::backend::herdr_close_blocks_callback(&state, &row)?,
@@ -1286,6 +1292,10 @@ impl<'a> Ask<'a> {
                 inbox.sync_directory().context("sync question receipt")?;
                 Some(prior.receipt(true))
             } else {
+                ensure!(
+                    !super::assignment::handoff_blocks_old_writer(&row),
+                    "attempt is no longer accepted for {dispatch}; handoff is closing the old execution"
+                );
                 inbox.require_question_round(&assignment, &row, attempt)?;
                 // The Herdr close intent is saved under the inbox lock.
                 if row["backend"] == "herdr" {

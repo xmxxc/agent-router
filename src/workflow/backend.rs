@@ -107,6 +107,21 @@ pub fn create(state: &Path, row: &Value, launch: Launch) -> Result<Value> {
 }
 
 #[cfg(target_os = "linux")]
+pub(super) fn create_for_handoff(
+    state: &Path,
+    row: &Value,
+    audit: usize,
+    launch: Launch,
+) -> Result<Value> {
+    call(
+        state,
+        row,
+        json!({"op":"create","executionId":row["executionId"],"handoffAudit":audit,
+            "cwd":row["cwd"],"label":row["label"],"argv":launch.argv,"env":launch.env}),
+    )
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn resume(state: &Path, row: &Value, launch: Launch) -> Result<Value> {
     call(
         state,
@@ -232,7 +247,7 @@ fn existing_request(state: &Path, row: &Value, mut request: Value) -> Result<Val
     call(state, row, request)
 }
 
-fn receipt_id(row: &Value) -> Result<Option<&str>> {
+pub(super) fn receipt_id(row: &Value) -> Result<Option<&str>> {
     let create = &row["create"];
     if !create.is_null() {
         // R2 only created first-round assignments and stored the reply inline.
@@ -339,6 +354,50 @@ fn private_receipt(state: &Path, launch: Option<&str>) -> Result<Value> {
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(Value::Null),
         Err(e) => Err(e).context("open host launch receipt"),
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn handoff_writer(state: &Path, row: &Value) -> Result<Option<wfc_herdr::Process>> {
+    let launch = receipt_id(row)?.context("missing original launch receipt")?;
+    let known = state
+        .canonicalize()?
+        .join("launches")
+        .join(format!("{launch}.json"));
+    ensure!(
+        row["create"]["receipt"].as_str().map(Path::new) == Some(known.as_path()),
+        "unexpected original launch receipt path"
+    );
+    let receipt = private_receipt(state, Some(launch))?;
+    ensure!(
+        receipt["launchId"] == launch && receipt["treeTracked"] == true,
+        "unverified original worker tree; handoff requires a tracked native launch"
+    );
+    if exited(&receipt).is_some() {
+        return Ok(None);
+    }
+    let pid = receipt["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0 && receipt["category"] == "started")
+        .context("missing original writer process")?;
+    Ok(wfc_herdr::Process::observe(pid)?)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn handoff_tree_stopped(state: &Path, row: &Value) -> Result<Option<Value>> {
+    let launch = receipt_id(row)?.context("missing original launch receipt")?;
+    let path = state.join("launches").join(format!("{launch}.stopped"));
+    let Some(evidence) = super::handoff::read_order(&path)? else {
+        return Ok(None);
+    };
+    Ok((evidence["writerTreeStopped"] == true
+        && evidence["launchId"] == launch
+        && evidence["dispatch"] == row["dispatch"]
+        && evidence["attempt"] == row["attempt"]
+        && row["round"]
+            .as_u64()
+            .is_some_and(|round| evidence["round"] == round.to_string()))
+    .then_some(evidence))
 }
 
 fn closed_path(state: &Path, row: &Value) -> Result<PathBuf> {
