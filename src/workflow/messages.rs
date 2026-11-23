@@ -6,7 +6,7 @@ pub mod relay;
 pub use receipt::{Confirm, ACK_USAGE, RESOLVE_USAGE};
 use receipt::{Delivery, Resolution, State};
 
-use super::{git_snapshot::Snapshot, resolve_report_path, state_dir, valid_id};
+use super::{controller, git_snapshot::Snapshot, resolve_report_path, state_dir, valid_id};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -19,10 +19,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub const DONE_USAGE: &str = "wfc done --report FILE [--attempt ID] [--message-id KEY]";
-pub const WAIT_USAGE: &str = "wfc wait [--timeout SECONDS] [--scope NAME] [--dispatch ID]";
+pub const DONE_USAGE: &str =
+    "wfc done --report FILE [--attempt ID] [--message-id KEY] [--owner-token TOKEN]";
+pub const WAIT_USAGE: &str =
+    "wfc wait [--timeout SECONDS] [--scope NAME] [--dispatch ID] [--owner-token TOKEN]";
 
-fn options<'a, const N: usize>(
+pub(super) fn options<'a, const N: usize>(
     args: &'a [OsString],
     names: [&str; N],
     mut positional: Option<&mut Option<&'a str>>,
@@ -49,9 +51,13 @@ fn options<'a, const N: usize>(
             .context("option requires a value")?
             .to_str()
             .context("expected UTF-8 option value")?;
-        ensure!(!value.is_empty() || flag == "--body", "empty option value");
         ensure!(
-            positional.is_none() || !value.starts_with("--"),
+            !value.is_empty() || matches!(flag, "--body" | "--token" | "--owner-token" | "--owner"),
+            "empty option value"
+        );
+        ensure!(
+            !value.starts_with("--")
+                || (positional.is_none() && matches!(flag, "--report" | "--message-id")),
             "option requires a value"
         );
         ensure!(
@@ -87,6 +93,8 @@ struct Assignment {
     cwd: PathBuf,
     #[serde(rename = "controllerOwner")]
     controller_owner: Option<Value>,
+    #[serde(rename = "workerCallbackHash")]
+    callback_hash: Option<String>,
 }
 
 impl Assignment {
@@ -124,6 +132,20 @@ impl Assignment {
         );
         Ok(assignment)
     }
+
+    // Call with the ledger lock held while checking the current assignment.
+    fn authorize_done(&self, state: &Path, token: Option<&str>) -> Result<()> {
+        if let Some(secret) = controller::worker_callback() {
+            if secret.to_str().is_some_and(|secret| {
+                self.callback_hash.as_deref() == Some(body_hash(secret).as_str())
+            }) {
+                return Ok(());
+            }
+            return Err(controller::invalid_worker_callback("done").into());
+        }
+        controller::Owners::read(state)?.require(self.worker.scope(), token, "done")?;
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -148,7 +170,7 @@ struct Completion {
     additional_fields: Map<String, Value>,
 }
 
-fn body_hash(body: &str) -> String {
+pub(super) fn body_hash(body: &str) -> String {
     format!("{:x}", Sha256::digest(body.as_bytes()))
 }
 
@@ -272,7 +294,7 @@ impl Completion {
     }
 }
 
-fn private_file() -> OpenOptions {
+pub(super) fn private_file() -> OpenOptions {
     let mut options = OpenOptions::new();
     options.read(true).write(true);
     #[cfg(unix)]
@@ -293,6 +315,18 @@ fn lock_file(dir: &Path) -> Result<File> {
         .create(true)
         .open(dir.join("messages.lock"))
         .context("open message lock")
+}
+
+pub(super) fn lock(dir: &Path) -> Result<File> {
+    let lock = lock_file(dir)?;
+    lock.lock().context("lock controller messages")?;
+    Ok(lock)
+}
+
+pub(super) fn sync_directory(_dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(_dir)?.sync_all()?;
+    Ok(())
 }
 
 impl Inbox {
@@ -324,9 +358,7 @@ impl Inbox {
     }
 
     fn open(dir: &Path) -> Result<Self> {
-        let lock = lock_file(dir)?;
-        lock.lock().context("lock controller messages")?;
-        Self::read_locked(dir, lock)
+        Self::read_locked(dir, lock(dir)?)
     }
 
     fn read_locked(dir: &Path, lock: File) -> Result<Self> {
@@ -459,9 +491,7 @@ impl Inbox {
     }
 
     fn sync_directory(&self) -> Result<()> {
-        #[cfg(unix)]
-        File::open(&self.dir)?.sync_all()?;
-        Ok(())
+        sync_directory(&self.dir)
     }
 }
 
@@ -488,16 +518,21 @@ pub struct Done<'a> {
     report: &'a Path,
     attempt: Option<&'a str>,
     key: Option<&'a str>,
+    owner_token: Option<&'a str>,
 }
 
 impl<'a> Done<'a> {
     pub fn parse(args: &'a [OsString]) -> Result<Self> {
-        let [report, attempt, key] =
-            options(args, ["--report", "--attempt", "--message-id"], None)?;
+        let [report, attempt, key, owner_token] = options(
+            args,
+            ["--report", "--attempt", "--message-id", "--owner-token"],
+            None,
+        )?;
         Ok(Self {
             report: Path::new(report.context("missing --report")?),
             attempt,
             key,
+            owner_token,
         })
     }
 
@@ -511,9 +546,11 @@ impl<'a> Done<'a> {
         let dispatch = env::var("WFC_DISPATCH")
             .context("run done inside a dispatched worker (WFC_DISPATCH)")?;
         ensure!(valid_id(&dispatch), "invalid dispatch ID");
+        let token = controller::token(self.owner_token);
         let check = || {
             let inbox = Inbox::open(&state)?;
             let assignment = Assignment::current(&state, &dispatch, self.attempt)?;
+            assignment.authorize_done(&state, token.as_deref())?;
             // R1 dispatches had neither field and derived the default key from
             // the worker's launch environment. Assignment::current checked it.
             let r1_worker = assignment.report.is_none()
@@ -576,12 +613,16 @@ pub struct Wait<'a> {
     timeout: Duration,
     dispatch: Option<&'a str>,
     scope: Option<&'a str>,
+    owner_token: Option<&'a str>,
 }
 
 impl<'a> Wait<'a> {
     pub fn parse(args: &'a [OsString]) -> Result<Self> {
-        let [timeout, dispatch, scope] =
-            options(args, ["--timeout", "--dispatch", "--scope"], None)?;
+        let [timeout, dispatch, scope, owner_token] = options(
+            args,
+            ["--timeout", "--dispatch", "--scope", "--owner-token"],
+            None,
+        )?;
         let seconds: f64 = timeout
             .unwrap_or("3600")
             .parse()
@@ -593,15 +634,24 @@ impl<'a> Wait<'a> {
             timeout,
             dispatch,
             scope,
+            owner_token,
         })
     }
 
     pub fn run(self) -> Result<Vec<Value>> {
         let state = state_dir()?;
+        let token = controller::token(self.owner_token);
         let start = Instant::now();
         loop {
+            let preflight = || {
+                controller::Owners::read(&state)?.preflight(self.scope, token.as_deref(), "wait")
+            };
+            preflight()?;
             let batch = match Inbox::try_open(&state)? {
-                Some(mut inbox) => inbox.claim(self.dispatch, self.scope, State::Received)?,
+                Some(mut inbox) => {
+                    preflight()?;
+                    inbox.claim(self.dispatch, self.scope, State::Received)?
+                }
                 None => Vec::new(),
             };
             let remaining = self.timeout.saturating_sub(start.elapsed());

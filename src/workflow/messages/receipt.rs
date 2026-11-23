@@ -1,16 +1,16 @@
 //! Receipt transitions and operator evidence. The caller holds the inbox lock
 //! from lookup until the updated receipt and its evidence are published.
 use super::{options, Completion, Inbox};
-use crate::workflow::state_dir;
+use crate::workflow::{controller, state_dir};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::ffi::OsString;
 
-pub const ACK_USAGE: &str = "wfc ack MESSAGE [--body BODY]";
+pub const ACK_USAGE: &str = "wfc ack MESSAGE [--body BODY] [--owner-token TOKEN]";
 pub const RESOLVE_USAGE: &str =
-    "wfc resolve MESSAGE --actor ACTOR [--source SOURCE] --reason REASON --evidence EVIDENCE --body-hash SHA256";
+    "wfc resolve MESSAGE --actor ACTOR [--source SOURCE] --reason REASON --evidence EVIDENCE --body-hash SHA256 [--owner-token TOKEN]";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -111,16 +111,17 @@ enum Confirmation<'a> {
 pub struct Confirm<'a> {
     id: &'a str,
     action: Confirmation<'a>,
+    owner_token: Option<&'a str>,
 }
 
 impl<'a> Confirm<'a> {
     pub fn parse(command: &str, args: &'a [OsString]) -> Result<Self> {
         let mut id = None;
-        let action = if command == "ack" {
-            let [body] = options(args, ["--body"], Some(&mut id))?;
-            Confirmation::Ack { body }
+        let (action, owner_token) = if command == "ack" {
+            let [body, owner_token] = options(args, ["--body", "--owner-token"], Some(&mut id))?;
+            (Confirmation::Ack { body }, owner_token)
         } else {
-            let [actor, source, reason, evidence, hash] = options(
+            let [actor, source, reason, evidence, hash, owner_token] = options(
                 args,
                 [
                     "--actor",
@@ -128,6 +129,7 @@ impl<'a> Confirm<'a> {
                     "--reason",
                     "--evidence",
                     "--body-hash",
+                    "--owner-token",
                 ],
                 Some(&mut id),
             )?;
@@ -137,19 +139,23 @@ impl<'a> Confirm<'a> {
                     .context(name)?
                     .to_owned())
             };
-            Confirmation::Resolve {
-                claim: Claim {
-                    actor: required(actor, "missing actor")?,
-                    source: required(Some(source.unwrap_or("operator")), "missing source")?,
-                    reason: required(reason, "missing reason")?,
-                    evidence: required(evidence, "missing evidence")?,
+            (
+                Confirmation::Resolve {
+                    claim: Claim {
+                        actor: required(actor, "missing actor")?,
+                        source: required(Some(source.unwrap_or("operator")), "missing source")?,
+                        reason: required(reason, "missing reason")?,
+                        evidence: required(evidence, "missing evidence")?,
+                    },
+                    body_hash: hash.context("missing --body-hash")?,
                 },
-                body_hash: hash.context("missing --body-hash")?,
-            }
+                owner_token,
+            )
         };
         Ok(Self {
             id: id.context("missing message id")?,
             action,
+            owner_token,
         })
     }
 
@@ -164,6 +170,16 @@ impl<'a> Confirm<'a> {
             .with_context(|| format!("no controller message with id {}", self.id))?;
         let (earlier, tail) = inbox.messages.split_at_mut(index);
         let message = &mut tail[0];
+        let operation = match &self.action {
+            Confirmation::Ack { .. } => "ack",
+            Confirmation::Resolve { .. } => "resolve",
+        };
+        let token = controller::token(self.owner_token);
+        controller::Owners::read(&state)?.require(
+            message.worker.scope(),
+            token.as_deref(),
+            operation,
+        )?;
         let duplicate = self.action.apply(message, earlier)?;
         let receipt = message.receipt(duplicate);
         if duplicate {

@@ -45,7 +45,7 @@ wfc dispatch --host codex --task task.md --cwd . --report reports/04-review/r1.m
 wfc status --active
 ```
 
-默认使用 tmux。此组合调用同一可执行文件中的 tmux 后端（#31）。宿主可选 codex、opencode 或 claude，`--launch-config` 或 `WFC_LAUNCH_CONFIG` 指向带有 env、hosts 的 JSON 配置。每个宿主可指定 command、runtime 参数数组及 env。完整参数见 `wfc dispatch --help`。独立的 herdr、bundled 后端和控制器授权由对应工单接入。
+默认使用 tmux。此组合调用同一可执行文件中的 tmux 后端（#31）。宿主可选 codex、opencode 或 claude，`--launch-config` 或 `WFC_LAUNCH_CONFIG` 指向带有 env、hosts 的 JSON 配置。每个宿主可指定 command、runtime 参数数组及 env。完整参数见 `wfc dispatch --help`。独立的 herdr 和 bundled 后端由对应工单接入。
 
 `--launch-config` 优先于 `WFC_LAUNCH_CONFIG`。启动参数依次为宿主的 `runtime` 数组、`command` 数组、wfc 为本次任务生成的 Codex 参数。路径含空格时直接写在同一个 JSON 字符串中。例如 npm 安装的 Codex 可以指定 Node 和脚本各自的绝对路径。
 
@@ -114,6 +114,10 @@ wfc wait --scope team-a --timeout 30
 `wait` 默认等待 3600 秒，`--timeout` 接受小数秒，设为 0 可立即查询。它按提交顺序返回 `messages`，包含派发、轮次、attempt、角色、scope、报告路径、Git 快照、数字编号 `id` 和 `messageId`。可按 `--scope NAME`、`--dispatch ID` 或两者共同筛选。首次提交为 `unsent`（版本 1），领取为 `received`（版本 2）。消息在输出前标记为已收取，其他等待者可领取剩余消息。超时返回 `{"messages":[],"timedOut":true}`，退出码为 3。
 
 总控重启后，运行 `wfc status --dispatch ID`，从 `dispatches[0].messages` 找回原消息。历史按提交顺序排列，查询不会改变回执。处理完报告后，用消息的数字编号或稳定编号运行 `wfc ack MESSAGE`。回执变为 `processed`，版本增加一次。并发确认时只有一个调用实际推进状态，其余调用和稍后的重试返回同一版本，并标记 `duplicate: true`。
+
+用 `wfc owner acquire --scope team-a --owner controller-a` 为该组认领默认 60 秒的租约。将返回的 `token` 保存在总控环境的 `WFC_CONTROLLER_TOKEN` 中，或在单次操作时用 `--owner-token` 指定。用 `wfc owner renew --scope team-a` 续租。另一位总控可用 `wfc owner takeover --scope team-a` 接管并领取新凭据。接管完成后，旧凭据的 `wait`、`ack` 和下一批 `relay` 会报 `stale_controller_owner`。
+
+状态目录一旦有租约记录，`wait` 和 `relay` 都需要指定 `--scope`。尚未认领的组仍可用原命令。普通总控可用 `status --dispatch ID` 查看组的 owner、代数和租约状态。
 
 外部投递结果为 `unknown` 时，先核实对方确已收到，再用下面的命令记录证据。
 

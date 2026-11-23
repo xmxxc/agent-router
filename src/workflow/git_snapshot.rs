@@ -43,6 +43,7 @@ fn git(cwd: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
     let mut output = options.open(&path)?;
     fs::remove_file(path)?;
     let mut cmd = Command::new("git");
+    super::controller::strip_credentials(&mut cmd);
     // Local repository variables (git rev-parse --local-env-vars) can point at
     // the caller's index, refs, or objects even after changing directory.
     for name in [

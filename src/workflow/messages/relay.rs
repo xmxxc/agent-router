@@ -6,7 +6,7 @@ mod registration;
 pub use registration::waiters;
 
 use super::{state_dir, Inbox, State};
-use crate::workflow::{read_record, valid_id, worker_owner};
+use crate::workflow::{controller, read_record, valid_id, worker_owner};
 use anyhow::{bail, ensure, Context, Result};
 use codex::Outcome;
 use serde_json::{json, Value};
@@ -29,6 +29,7 @@ pub struct Relay<'a> {
     thread: Option<&'a str>,
     detach: bool,
     lifetime: Option<Duration>,
+    owner_token: Option<&'a str>,
 }
 
 fn seconds(value: &str) -> Result<Duration> {
@@ -58,7 +59,9 @@ impl<'a> Relay<'a> {
                     let v = args
                         .next()
                         .and_then(|v| v.to_str())
-                        .filter(|v| !v.is_empty() && !v.starts_with("--"))
+                        .filter(|v| {
+                            (!v.is_empty() || flag == "--owner-token") && !v.starts_with("--")
+                        })
                         .context("missing relay option value")?;
                     ensure!(opts.insert(flag, v).is_none(), "duplicate {flag}");
                 }
@@ -79,15 +82,16 @@ impl<'a> Relay<'a> {
                 .map(|v| seconds(v))
                 .transpose()?
                 .filter(|d| !d.is_zero()),
+            owner_token: opts.get("--owner-token").copied(),
         })
     }
 
     pub fn run(self) -> Result<()> {
-        ensure!(
-            env::var_os("WFC_WORKER_CALLBACK").is_none_or(|v| v.is_empty()),
-            "worker_callback_only: relay"
-        );
         let state = state_dir()?;
+        let token = controller::token(self.owner_token);
+        let preflight =
+            || controller::Owners::read(&state)?.preflight(self.scope, token.as_deref(), "relay");
+        preflight()?;
         scope_assignments(&state, self.scope)?;
         let current = env::var("CODEX_THREAD_ID").ok();
         let thread = codex::controller(
@@ -115,6 +119,10 @@ impl<'a> Relay<'a> {
             if let Some(limit) = self.lifetime {
                 cmd.args(["--for", &limit.as_secs_f64().to_string()]);
             }
+            if let Some(token) = &token {
+                cmd.env("WFC_CONTROLLER_TOKEN", token)
+                    .env_remove("WFC_OWNER_TOKEN");
+            }
             worker_owner::new_session(&mut cmd);
             let child = cmd
                 .stdin(Stdio::null())
@@ -136,10 +144,12 @@ impl<'a> Relay<'a> {
         let mut budget = page_size as usize * 32;
         let mut diagnosed = HashSet::new();
         while !remaining().is_zero() {
+            preflight()?;
             let order = transport_lock(&state, self.scope)?;
             let batch = match &order {
                 Some(_) => match Inbox::try_open(&state)? {
                     Some(mut inbox) => {
+                        preflight()?;
                         let verified = scope_assignments(&state, self.scope)?;
                         claim_batch(
                             &mut inbox,
@@ -154,7 +164,11 @@ impl<'a> Relay<'a> {
                 None => None,
             };
             if let Some((batch, text)) = batch {
-                let outcome = codex::queue(&thread, &batch, &text, remaining().min(timeout))?;
+                let scope_lock = order
+                    .as_ref()
+                    .and_then(|(_, scope_lock)| scope_lock.as_ref());
+                let outcome =
+                    codex::queue(&thread, &batch, &text, remaining().min(timeout), scope_lock)?;
                 if outcome != Outcome::Uncertain {
                     loop {
                         if let Some(mut inbox) = Inbox::try_open(&state)? {
@@ -190,26 +204,24 @@ impl<'a> Relay<'a> {
 
 // Serialize queue submissions that can overlap, without holding the inbox lock
 // across an external call. Scoped senders still progress on independent scopes.
-fn transport_lock(state: &Path, scope: Option<&str>) -> Result<Option<Vec<File>>> {
-    let mut locks = Vec::new();
-    for (name, shared) in std::iter::once(("relay-transport.lock".into(), scope.is_some()))
-        .chain(scope.map(|s| (format!("relay-{}.lock", super::body_hash(s)), false)))
-    {
-        let lock = super::private_file()
-            .create(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(state.join(name))?;
-        match if shared {
-            lock.try_lock_shared()
-        } else {
-            lock.try_lock()
-        } {
-            Ok(()) => locks.push(lock),
-            Err(TryLockError::WouldBlock) => return Ok(None),
-            Err(TryLockError::Error(e)) => return Err(e.into()),
-        }
+fn transport_lock(state: &Path, scope: Option<&str>) -> Result<Option<(File, Option<File>)>> {
+    let transport = super::private_file()
+        .create(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(state.join("relay-transport.lock"))?;
+    match if scope.is_some() {
+        transport.try_lock_shared()
+    } else {
+        transport.try_lock()
+    } {
+        Ok(()) => (),
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(TryLockError::Error(e)) => return Err(e.into()),
     }
-    Ok(Some(locks))
+    if let Some(scope) = scope {
+        return Ok(controller::try_scope_lock(state, scope)?.map(|lock| (transport, Some(lock))));
+    }
+    Ok(Some((transport, None)))
 }
 
 fn claim_batch(
