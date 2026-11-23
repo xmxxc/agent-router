@@ -12,12 +12,12 @@ defaults:
 
 jobs:
   ask:
-    name: '#11 R3 tmux and Herdr question/close'
+    name: '#11 R4 tmux and Herdr question/close'
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     env:
-      WFC_BUILD_ID: c5d641cafa1cf6700eeb92323933226662cba773
-      PRODUCT_TREE: 8b3b770d26ca0cf6c0c2a73ae5282c866b8d594b
+      WFC_BUILD_ID: d017b54e236281d83672ddedd07a0f5884e25f73
+      PRODUCT_TREE: e1c6957170494371b7f89e5a75df9366a340851b
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       HERDR_SHA256: 14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d
       TRIPLE: x86_64-unknown-linux-gnu
@@ -165,7 +165,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ always() }}
         with:
-          name: linux-11-r3-${{ env.WFC_BUILD_ID }}-attempt-${{ github.run_attempt }}
+          name: linux-11-r4-${{ env.WFC_BUILD_ID }}-attempt-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14
