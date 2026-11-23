@@ -101,24 +101,45 @@ done
 
 | 文件（省略 test_ 前缀和 .py 后缀） | 观测和前提 | Rust 验收归属 |
 | --- | --- | --- |
-| router、backend | 真实 CLI 子进程/SQLite 与 fake tmux、宿主命令、屏幕、HTTP 或 FakeBackend 等；并发、状态、消息、所有权、重放、恢复与故障。有 Unix 专用夹具。 | #4–#18、续派/回收/跨宿主接替和旧库草稿；按协议子表选具体类 |
+| router、backend | 真实 CLI 子进程/SQLite 与 fake tmux、宿主命令、屏幕、HTTP 或 FakeBackend 等；并发、状态、消息、所有权、重放、恢复与故障。有 Unix 专用夹具。 | #4–#18、#30/#34/#35/#36；按协议子表选具体类 |
 | host_launch、platform | argv/环境、退出、收据和诊断，使用受控进程及平台分支/模拟；含真文件锁/进程和仅 Windows 可跑项 | #5/#8/#13/#14/#16，Windows #3/#10 |
-| herdr、herdr_cleanup | Codex 输入框可模型化；HerdrContract 需固定外置服务+受控宿主；服务代际、同 pane/异 pane、断线、工作进程与后代清理，平台限定项另报 | 外置 Herdr 草稿、#12/#18 |
-| bundled、bundled_guard、bundled_completion、bundled_protocol、bundled_fixture_input | 模拟收据、键输入、协议边界；BundledNative 需真实内核和本机隔离能力。Linux 运行在可写委派的 cgroup v2 中，Windows 采用 Job Object。比较签名收据、身份、执行树和活动 waiter；注明 Linux 专用信号/IO 压力与 Windows console 分支。 | Linux bundled 草稿、#5/#12/#13/#17/#18；Windows #3/#10 |
+| herdr、herdr_cleanup | Codex 输入框可模型化；HerdrContract 需固定外置服务+受控宿主；服务代际、同 pane/异 pane、断线、工作进程与后代清理，平台限定项另报 | 外置 Herdr #32、#12/#18 |
+| bundled、bundled_guard、bundled_completion、bundled_protocol、bundled_fixture_input | 模拟收据、键输入、协议边界；BundledNative 需真实内核和本机隔离能力。Linux 运行在可写委派的 cgroup v2 中，Windows 采用 Job Object。比较签名收据、身份、执行树和活动 waiter；注明 Linux 专用信号/IO 压力与 Windows console 分支。 | Linux bundled #33、#5/#12/#13/#17/#18；Windows #3/#10 |
 | bundled_experiment_package、distribution、wfc | 清单/文件哈希/署名、移动目录、Python 单文件入口及 Windows 启动器。Rust 包另验真实下载来源和无 Python 运行环境 | #2/#20/#21；Windows #3/#10 |
 | foreground_evidence、tools 下 startup/desktop_evidence | 模拟窗口证据、Windows 启动与会话投影计数。真实 Windows Desktop 测试另需交互桌面和两条已登录聊天 | #10，Linux 侧在 #12/#17 复用“一个正式输入”的判据 |
 | notify_controller | 历史 hook 的分类/投递回归；标准 wfc 打包入口中无此模块。Claude 控制端可走公开 wait；relay 公开目标见宿主表 | #21 记录接口边界 |
 
 上游 CI 将常规替身、Windows core、真实 Herdr 配受控 worker 分开。Linux 整树回收的复验脚本为 `tools/verify_bundled_linux.sh REPO KERNEL LOG_DIR`，在独占的 `Delegate=yes` 测试单元执行，结束时检查本轮子 cgroup 并释放本轮单元。对真实宿主逐个注明 CLI/模型、已登录账号是否可用、终端后端、控制端传输及会话；保留失败类别和可重跑条件。[CI 定义](https://github.com/xmxxc/workflow-core/blob/60d7d76e4bb861ac9e0bbb043aa1a36946578397/.github/workflows/ci.yml) · [Linux 实机脚本](https://github.com/xmxxc/workflow-core/blob/60d7d76e4bb861ac9e0bbb043aa1a36946578397/tools/verify_bundled_linux.sh)
 
+## 独立审查的可重复样例
+
+审查对象是文档提交 `323fc448`。受控探针在独立状态中比较 #39、#40 与 PR #28，Rust 审查二进制自报 build `503f6cdd2b17e36be99743414c4f3efac4462ff3`，SHA-256 为 `18593fe4ff4e49855a8e06035b7ae95158fd15997c2f26475cbc0a05065ea897`。下列文件名对应独立报告的 `parity-review/evidence-r1/` 归档。两份 `spec-*.log` 的 SHA-256 均为 `714199a4223fa0c3d213d8619ba45475b6c4480bc3623df3ea46219604fe109a`。[独立审查摘要](https://github.com/xmxxc/agent-router/pull/29#issuecomment-7092264384)
+
+| 复验输入 | 观察及归属 | 原始记录 |
+| --- | --- | --- |
+| 分派 A/B/C 到三个 scope，仅对 B 执行 owner acquire。无 token 对三项依次执行 reclaim --yes --dispatch A --dispatch B --dispatch C | 返回 1，stdout 为空，stderr 为 stale_controller_owner。A 已关闭，B/C 仍活，逐项 status 查实际进度。#36/#16/#21 | spec-probes.py、spec-pr39.log、spec-python.log |
+| 受控 tmux 在 interrupt 的 send-keys 处返回失败。取 audit，以固定 actor/evidence 裁决 unknown，成功 handoff 到新 attempt 后原参调用 reconcile | 已裁决旧 audit 返回 0、duplicate=true，同一结果可重取。#18/#21 | 同上 |
+| 在临时 SQLite 中写入 Herdr dispatch、有效 nonce 和服务身份，令受控 RPC 返回同一服务、absent=true、空 snapshot。依次不带、带旧写者停止证据进行 herdr-reconcile | 首次拒绝。第二次 accepted、inputReplayed=false，handle 持久保存 not-started 和空 writerProcesses。#32/#18/#21 | 同上 |
+| 各用全新 HOME 和不同的调用 cwd，分别不设 WFC_STATE、设为空串、按字面传入 '~/custom'。Python 用空 wait --timeout 0 触发写入，Rust 用受控 dispatch 触发写入 | Python 三例均超时码 3，建库在 HOME/.local/state/workflow-core、同一默认、HOME/custom。Rust 三例分别在 HOME/.local/state/agent-router 写记录（0）、empty WFC_STATE（1，无记录）、在 cwd/~/custom 写记录（0）。#30/#4/#21 | discovery.py、discovery.log |
+| 每例独立状态，分别构造普通文件、task 名或 cwd 名末尾含 0xff、缺失 task、task 是目录。用 Python 的 test_router.Env 记录 new-session，用 Rust 子进程写标记，再开 CLI 查询 | 普通路径两端启动。0xff 的两例均失败且无可见派发，诊断不同；缺失与目录两例的校验时点不同。详见[路径实测](python-cli.md#linux-派发路径实测)。#4/#21/#24/#26 | p3.py、p3.jsonl、task-check.py、extra-paths.jsonl |
+| #40 的 HerdrContract.test_read_only_host_refuses_input 和两版的真实 tmux 缺任务试验 | Herdr 0.9.5 + 受控 worker 验只读拒绝及关闭，服务已回收。tmux 3.4 首派和 close 退出 1，status 有记录且 worker 已启动，已清理测试 server。#31/#32/#21 | herdr.log、tmux-observe.log |
+
+复跑归档探针时，用独立的空 HOME，并令 SRC 指向上面检出的 #39 或 #40，RUST_WFC 指向已核对哈希的 #28 文件。在归档目录执行 `PYTHONPATH="$SRC:$SRC/tests" python3 -B spec-probes.py`，再分别执行 `python3 -B p3.py "$SRC" "$RUST_WFC"` 和 `python3 -B task-check.py "$SRC" "$RUST_WFC"`。discovery.py 包含审查机的绝对路径，在临时副本中将 p 和 rpath 指向含两个完整 SHA 检出目录的 trial 和该二进制；三种 WFC_STATE 输入由脚本逐例设置。
+
+独立审查的协议组为 53/54，详见[协议组与单项超时](protocol.md#复验方法与证据层级)。宿主组两次均为 26/27，失败单项独跑通过，详见[宿主组与后端范围](hosts.md#复验取证)。归档分别为 protocol.log、hosts.log、hosts-retry.log 与两份 solo 日志。作者首轮的 54/54、27/27 保留为独立观察。两轮均未重跑 Python 全套、登录模型的 Linux 双聊天、Windows 或 macOS 原生流程。审查机器上的 cgroup v2 为只读，#33 的 Linux 委派清理及 #20/#21 的无 Python 下载件实测待完成。
+
 ## #44 冻结后复查
 
-1. 从 Python #44 的交接正文或所链接的仓内记录取**最终组合提交的完整 SHA**、与 main 的关系、包及审查证据、已验平台/宿主。若仍未给出最终 SHA，把 #21 的“Python 冻结差异”保留为待验。版本字符串、PR merge ref 和当日默认分支可能对应不同源码。[冻结票](https://github.com/xmxxc/workflow-core/issues/44)
-2. 在上面的 Bash 会话执行下列命令；`frozen` 填交接 SHA。即使它与 #40 的祖先关系改变，也直接比较两个提交的**整棵树**，包含新增入口/配置、文档、fixture、打包和 CI。
-3. 把每个变化定位到 CLI/协议/后端行，列出旧值→新值、兼容影响、涉及平台、实际对照用例和负责票。新能力新增行，删除/变更的能力标记最后有效版本。两棵树相同也记录 SHA、tree、空 diff、查到的包/实测差异。重跑变化的 handler、旧数据回归和受影响的真实路径；在同一集成下载件上取得 #21 结果，将差异链接回 #24。
+Python #44 已关闭。冻结产品 `60d7d76e4bb861ac9e0bbb043aa1a36946578397` 正是 #40，tree 为 `a401334e1525b236b654e30385f4ee216c2f9c5e`。相对交接时 main `3c06c0905faaf9e61de49404c33e70720409607f` 领先 7、落后 0。产品组合在 PR #45，文档 PR #46 的 `0ecbe94c95d79b4528d69323fd393181d719c920` 仅增加交接文档及其索引。独立审查时以 #40 做过同树演练；本次按 #44 指定的产品 SHA 复核整树，产品和验收项没有新增差异。[冻结回执](https://github.com/xmxxc/workflow-core/issues/44#issuecomment-7090349752) · [固定交接文档](https://github.com/xmxxc/workflow-core/blob/0ecbe94c95d79b4528d69323fd393181d719c920/docs/verification/python-router-closeout.zh-CN.md)
+
+**Windows 上游证据。** 内层 ZIP SHA-256 为 `d9b9e609b5bd949694c51241fef5b4262c8754e8531ae4a12282fa18298f3adf`。Win11 在两个解压路径各跑 22 项通过、8 项跳过，并用下载件完成一次真实 Codex 单聊天。双聊天沿用与下载件逐件对照过的历史现场。产品 CI 8/8，两个独立审查均无产品阻塞。私有状态删除须查 cleanup.private_state_removed。[下载件与适用范围](https://github.com/xmxxc/workflow-core/issues/43#issuecomment-7090155489) · [产品审查](https://github.com/xmxxc/workflow-core/issues/42#issuecomment-7090084977)
+
+**Linux 待验。** #21/#24 在可写委派的 cgroup v2、已登录 Codex 和两个真实聊天中核对六项：派发、原聊天唤醒、一次问答、接替、重复 ACK、运行时清理。A 先 acquire 并注册同 scope 的 relay，再派发。接替试验中 B takeover 后注册自己的 relay，确认 B waiter 出现且 A 已退出才放行原 worker。核对旧 A 的 ACK 被拒后仍为 received，B 首次 ACK 到 processed，重复 ACK 版本稳定。由当前 owner 关闭，核对签名收据、PID 与创建身份退出、waiter 为零、子 cgroup 移除。Rust 另在同一无 Python 下载件上进行这些测试。[六项通过条件](https://github.com/xmxxc/workflow-core/blob/0ecbe94c95d79b4528d69323fd393181d719c920/docs/verification/python-router-closeout.zh-CN.md)
+
+在本页最前面创建的新临时目录运行以下命令。以后若上游另给产品 SHA，替换 frozen，将非空变化逐行归入 CLI、协议、宿主或旧数据表，并记录受影响的 Rust 工单和包哈希。
 
 ```bash
-# frozen 已由 #44 的固定交接记录赋值
+frozen=60d7d76e4bb861ac9e0bbb043aa1a36946578397
 test "${#frozen}" = 40
 git -C "$trial/ref" fetch --no-tags https://github.com/xmxxc/workflow-core.git "$frozen"
 git -C "$trial/ref" worktree add -q --detach "$trial/frozen" "$frozen"
@@ -134,4 +155,4 @@ diff -u "$trial/40.inventory" "$trial/frozen.inventory" || test "$?" -eq 1
 
 | Python 原 SHA → 冻结 SHA | 功能/行为变化 | 平台、实物/替身和环境条件 | Rust 工单、集成 SHA/包 SHA-256 | 命令、结果、证据 |
 | --- | --- | --- | --- | --- |
-| 60d7d76e → 等 #44 最终 SHA | 待按完整 diff 填写 | 待 #44 列明 | #21/#24，待同一候选 | 待冻结复验 |
+| #40 60d7d76e → #44 60d7d76e | 同一提交，整树及入口快照 diff 为空 | Windows 范围按上游下载件与双聊天记录。Linux 六项待真机 | #21/#24，待集成包 SHA-256 | 上述固定 SHA 的 git diff、inventory 对照；Rust 下载件证据待补 |
