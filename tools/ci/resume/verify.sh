@@ -4,6 +4,15 @@ set -euo pipefail
 
 group=${1:?test group required}
 case "$group" in
+    reconcile)
+        fixture=tools/check_tmux.py
+        selectors=(
+            Backend.test_public_reconcile_resume_after_orphaned_backend
+            Backend.test_public_reconcile_lost_resume_reply_preserves_completion
+            Backend.test_public_reconcile_resume_absence_proof_is_owner_bound_and_consumed
+            Backend.test_public_resume_fences_pending_and_lost_launch_responses
+        )
+        ;;
     public-resume)
         fixture=tools/check_tmux.py
         selectors=(

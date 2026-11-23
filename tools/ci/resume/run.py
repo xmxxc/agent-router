@@ -102,7 +102,8 @@ def run(group_root, fixture, binary, evidence, selectors):
         def record(event, case, **values):
             print(json.dumps({"event": event, "test": unittest.TestCase.id(case), **values}), file=log)
 
-        if any(name.startswith("Backend.test_public_resume_") for name in selectors):
+        if any(name.startswith(("Backend.test_public_resume_", "Backend.test_public_reconcile_"))
+               for name in selectors):
             original_host = module.Backend.resumed_host
             original_exit = module.Backend.end_resume_host
             original_rollout = module.Backend.rollout
@@ -137,6 +138,12 @@ def run(group_root, fixture, binary, evidence, selectors):
                     fields = ("id", "round", "fromAttempt", "toAttempt", "session",
                               "result", "launchResult", "inputResult", "category")
                     witness = {field: event[field] for field in fields if field in event}
+                    if resolution := event.get("resolution"):
+                        witness["resolution"] = {
+                            field: resolution[field]
+                            for field in ("ownerGeneration", "previousResult", "verifiedAbsent", "consumedAt")
+                            if field in resolution
+                        }
                     if witness != getattr(case, "last_resume_witness", None):
                         record("resume-audit", case, dispatch=dispatch, **witness)
                         case.last_resume_witness = witness
