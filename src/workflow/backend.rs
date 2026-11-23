@@ -210,7 +210,9 @@ fn inspect_launch<'a>(
     inspection: &'a Value,
 ) -> Result<Option<&'a str>> {
     let known = receipt_id(row)?;
-    if inspection["result"] != "accepted" {
+    // Session reachability and a verified historical launch are independent.
+    let historical = inspection["result"] == "uncertain" && !inspection["launchId"].is_null();
+    if inspection["result"] != "accepted" && !historical {
         return Ok(known);
     }
     if row["executionId"].is_null() {
@@ -382,6 +384,7 @@ pub fn observe(state: &Path, row: &Value) -> Result<(Value, Value)> {
     } else if archived_exit(&saved) {
         saved["worker"].clone()
     } else if matches!(evidence["category"].as_str(), Some("started") | None)
+        && inspection["result"] == "accepted"
         && inspection["alive"] == true
         && inspection["owned"] == true
         && inspection["workerBound"] == true
@@ -482,6 +485,22 @@ mod tests {
         answer["executionId"] = row["attempt"].clone();
         answer["launchId"] = json!("ffffffffffffffffffffffffffffffff");
         assert!(inspect_launch(&state, &row, &answer).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn offline_legacy_receipt_requires_a_confirmed_association() -> Result<()> {
+        let state = std::env::temp_dir().canonicalize()?;
+        let id = "0123456789abcdef0123456789abcdef";
+        let row = json!({"dispatch":"d-12345678","round":1,"attempt":"a-123456789abc","legacyLaunchId":id});
+        let mut offline = json!({"result":"uncertain"});
+        assert_eq!(inspect_launch(&state, &row, &offline)?, None);
+        offline["legacyExecutionId"] = row["attempt"].clone();
+        offline["launchId"] = json!(id);
+        offline["receipt"] = json!(state.join("launches").join(format!("{id}.json")));
+        assert_eq!(inspect_launch(&state, &row, &offline)?, Some(id));
+        offline["legacyExecutionId"] = json!("a-aaaaaaaaaaaa");
+        assert!(inspect_launch(&state, &row, &offline).is_err());
         Ok(())
     }
 
