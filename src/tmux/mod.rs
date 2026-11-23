@@ -876,6 +876,15 @@ pub(crate) fn attach(state: &Path, dispatch: &str, socket: &Path, token: &str) -
     Ok(())
 }
 
+fn write_refusal(state: &Path, read_only: bool) -> Option<Value> {
+    if read_only {
+        return None;
+    }
+    crate::workflow::ensure_state_writable(state).err().map(|error| {
+        json!({"result":"refused","category":"legacy_state_write_blocked","diagnostic":format!("{error:#}")})
+    })
+}
+
 pub fn execute(state: &Path, request: Request) -> Result<Value> {
     ensure!(
         matches!(request.backend.as_deref(), None | Some("" | "tmux")),
@@ -920,8 +929,8 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
                 && request.legacy_recovery.is_none()),
         "readOnly requires ordinary inspect without legacy recovery"
     );
-    if !request.read_only {
-        crate::workflow::ensure_state_writable(state)?;
+    if let Some(refusal) = write_refusal(state, request.read_only) {
+        return Ok(refusal);
     }
     if matches!(request.op, Operation::Create(_) | Operation::Resume { .. }) {
         fs::create_dir_all(state).context("create tmux state directory")?;
@@ -978,8 +987,8 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
         Ok(lock) => lock,
         Err(result) => return Ok(result),
     };
-    if !request.read_only {
-        crate::workflow::ensure_state_writable(&state)?;
+    if let Some(refusal) = write_refusal(&state, request.read_only) {
+        return Ok(refusal);
     }
     let inspect = matches!(request.op, Operation::Inspect);
     if let Some(execution) = request.execution_id.as_deref().filter(|_| !launching) {

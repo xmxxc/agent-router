@@ -1,8 +1,8 @@
 //! R1 Herdr assignments. A stable lock covers inspection, input claims, close
 //! and reconciliation while atomic replacements publish complete record generations.
 use super::{
-    backend, controller, ensure_no_legacy_db, host, read_record, record_scope, valid_id,
-    valid_identity, writable_state_dir, write_json,
+    backend, controller, ensure_no_legacy_db, ensure_state_writable, host, read_record,
+    record_scope, valid_id, valid_identity, writable_state_dir, write_json,
 };
 use crate::host_launch;
 use anyhow::{ensure, Context, Result};
@@ -51,7 +51,7 @@ impl<'a> Assignment<'a> {
         authorize()?;
         let scope_lock = controller::lock_scope(state, scope)?;
         authorize()?;
-        let unit = Self::lock(state, id, None)?;
+        let unit = Self::lock(state, id, None, false)?;
         ensure!(
             record_scope(&unit.row) == Some(scope),
             "Herdr scope changed"
@@ -59,9 +59,13 @@ impl<'a> Assignment<'a> {
         Ok((unit, scope_lock))
     }
 
-    fn lock(state: &'a Path, id: &str, new: Option<Value>) -> Result<Self> {
+    fn lock(state: &'a Path, id: &str, new: Option<Value>, read_only: bool) -> Result<Self> {
         ensure!(valid_id(id), "invalid dispatch ID");
-        ensure_no_legacy_db(state)?;
+        if read_only {
+            ensure_no_legacy_db(state)?;
+        } else {
+            ensure_state_writable(state)?;
+        }
         let path = state.join("dispatches").join(format!("{id}.json"));
         let lock_path = path.with_extension("herdr-lock");
         let lock = if new.is_some() {
@@ -74,6 +78,9 @@ impl<'a> Assignment<'a> {
             File::open(lock_path).context("missing native Herdr assignment lock")?
         };
         lock.lock()?;
+        if !read_only {
+            ensure_state_writable(state)?;
+        }
         let row = match new {
             Some(row) => {
                 ensure!(!path.try_exists()?, "dispatch already published");
@@ -119,7 +126,7 @@ impl<'a> Assignment<'a> {
     }
 
     fn current(&self) -> Result<()> {
-        ensure_no_legacy_db(self.state)?;
+        ensure_state_writable(self.state)?;
         ensure!(
             read_record(&self.path)? == self.row,
             "Herdr assignment changed during operation"
@@ -251,7 +258,7 @@ pub(super) fn create(state: &Path, row: &Value, launch: host::Launch) -> Result<
         [.., flag, brief] if row["host"] == "opencode" && flag == "--prompt" => Some(brief.clone()),
         _ => None,
     };
-    let mut unit = Assignment::lock(state, id, Some(row.clone()))?;
+    let mut unit = Assignment::lock(state, id, Some(row.clone()), false)?;
     let files = host_launch::prepare(
         state,
         id,
@@ -326,7 +333,7 @@ pub(super) fn create(state: &Path, row: &Value, launch: host::Launch) -> Result<
 pub(super) fn observe(state: &Path, row: &mut Value, read_only: bool) -> Result<(Value, Value)> {
     let observed = (|| -> Result<_> {
         let id = row["dispatch"].as_str().context("missing dispatch")?;
-        let mut unit = Assignment::lock(state, id, None)?;
+        let mut unit = Assignment::lock(state, id, None, read_only)?;
         let bound = unit.bound_record().is_ok();
         let mut close_pending = unit.pending_close();
         let mut invalid_close_worker = false;
@@ -458,11 +465,12 @@ impl Assignment<'_> {
     }
 }
 
-fn lock_close<'a>(state: &'a Path, row: &Value) -> Result<Assignment<'a>> {
+fn lock_close<'a>(state: &'a Path, row: &Value, read_only: bool) -> Result<Assignment<'a>> {
     let unit = Assignment::lock(
         state,
         row["dispatch"].as_str().context("missing dispatch")?,
         None,
+        read_only,
     )?;
     ensure!(
         unit.row["attempt"] == row["attempt"] && record_scope(&unit.row) == record_scope(row),
@@ -472,12 +480,12 @@ fn lock_close<'a>(state: &'a Path, row: &Value) -> Result<Assignment<'a>> {
 }
 
 pub(super) fn read_only_close(state: &Path, row: &Value) -> Result<Option<Value>> {
-    let unit = lock_close(state, row)?;
+    let unit = lock_close(state, row, true)?;
     unit.replay_close(&unit.handle()?)
 }
 
 pub(super) fn close(state: &Path, row: &Value) -> Result<Value> {
-    let mut unit = lock_close(state, row)?;
+    let mut unit = lock_close(state, row, false)?;
     let mut handle = unit.handle()?;
     if let Some(receipt) = unit.replay_close(&handle)? {
         return Ok(receipt);

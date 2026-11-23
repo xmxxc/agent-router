@@ -135,6 +135,7 @@ pub(super) fn ids(dir: &Path) -> Result<BTreeSet<String>> {
 // The pending and published files can have different inodes. Close and new
 // questions must still serialize on the same attempt across that transition.
 pub(super) fn close_lock(state: &Path, row: &Value) -> Result<File> {
+    super::ensure_state_writable(state)?;
     let dir = state.join("close-locks");
     let id = row["dispatch"]
         .as_str()
@@ -151,5 +152,6 @@ pub(super) fn close_lock(state: &Path, row: &Value) -> Result<File> {
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let file = options.open(dir.join(format!("{id}.{attempt}")))?;
     file.lock()?;
+    super::ensure_state_writable(state)?;
     Ok(file)
 }

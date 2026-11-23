@@ -123,9 +123,14 @@ fn run() -> anyhow::Result<ExitCode> {
             return host_launch::supervise(&spec);
         }
         #[cfg(target_os = "linux")]
-        Some("--tmux-backend") if args.is_empty() => {
+        Some("--tmux-backend") if args.len() <= 1 => {
             let request = serde_json::from_reader(std::io::stdin().lock())?;
-            println!("{}", tmux::execute(&workflow::state_dir()?, request)?);
+            let state = match args.first() {
+                Some(path) => Path::new(path).to_owned(),
+                None => workflow::state_dir()?,
+            };
+            anyhow::ensure!(state.is_absolute(), "tmux backend requires an absolute state path");
+            println!("{}", tmux::execute(&state, request)?);
         }
         #[cfg(target_os = "linux")]
         Some("--tmux-attach") if args.len() == 4 => {
