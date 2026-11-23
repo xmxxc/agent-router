@@ -32,6 +32,8 @@ fn main() -> anyhow::Result<ExitCode> {
             println!("Usage: wfc [--help | --version]");
             println!("{}", workflow::DISPATCH_USAGE);
             println!("{}", workflow::STATUS_USAGE);
+            #[cfg(target_os = "linux")]
+            println!("{}", workflow::worker_owner::CLOSE_USAGE);
             println!(
                 "Workflow commands reserved for later builds: {}",
                 RESERVED_COMMANDS.join(", ")
@@ -59,6 +61,19 @@ fn main() -> anyhow::Result<ExitCode> {
                 }
             );
         }
+        #[cfg(target_os = "linux")]
+        Some("--worker-owner") => workflow::worker_owner::run(&args)?,
+        #[cfg(target_os = "linux")]
+        Some("close") => match args.as_slice() {
+            [help] if help == "--help" => println!("{}", workflow::worker_owner::CLOSE_USAGE),
+            [id] if !id.as_encoded_bytes().starts_with(b"-") => {
+                println!("{}", workflow::worker_owner::close(id)?)
+            }
+            _ => {
+                eprintln!("wfc: {}", workflow::worker_owner::CLOSE_USAGE);
+                return Ok(ExitCode::from(2));
+            }
+        },
         Some("dispatch") => {
             let request = match workflow::Dispatch::parse(&args) {
                 Ok(request) => request,

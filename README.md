@@ -36,7 +36,7 @@ prepare 校验并解出仓内的 Ghostty 源码包，校验 zlib 下载字节和
 
 ## 运行和接入 WFC
 
-直接运行 `wfc` 或 `wfc --help` 会列出熟悉的工作流命令名。当前版本支持前台派发和状态查询，预留命令返回退出码 2。`wfc --version` 显示 Rust 标识、包版本、目标平台、构建类型和编译时的 `WFC_BUILD_ID`（未设置、为空或仅含空白时，使用本地构建时间的 Unix 纳秒数）。
+直接运行 `wfc` 或 `wfc --help` 会列出熟悉的工作流命令名。当前版本支持派发和状态查询，Linux 还支持后台运行与按编号关闭，预留命令返回退出码 2。`wfc --version` 显示 Rust 标识、包版本、目标平台、构建类型和编译时的 `WFC_BUILD_ID`（未设置、为空或仅含空白时，使用本地构建时间的 Unix 纳秒数）。
 
 `dispatch` 接收调用方指定的角色、任务文件和工作目录。`--` 后依次放受控 worker 的程序和参数。下面的 Bash 示例让 worker 在工作目录中写出它实际读到的任务，再由另一个 CLI 查回编号。
 
@@ -51,7 +51,13 @@ wfc status
 wfc status --dispatch ID
 ```
 
-任务文件、工作目录和显式指定的程序路径都可以相对于调用方。程序也可使用 PATH 中的命令名。worker 以指定目录为当前目录，从 `WFC_TASK` 取得任务文件的绝对路径，并从 `WFC_ROLE`、`WFC_DISPATCH`、`WFC_ROUND`、`WFC_ATTEMPT` 和 `WFC_STATE` 取得本次派发上下文。派发在前台等待 worker 退出。worker 的标准输入和标准输出连接到空设备，诊断可写标准错误。worker 成功退出后，CLI 保存记录，标准输出返回一行 JSON，含 `dispatch`、`round`（首次为 1）、`attempt`、`role`、`task` 和 `cwd`。`status` 的 `dispatches` 数组列出已成功派发的记录，可用 `--dispatch` 按编号查询。启动失败、worker 返回非零或查询未知编号时，CLI 返回非零退出码并打印诊断。
+任务文件、工作目录和显式指定的程序路径都可以相对于调用方。程序也可使用 PATH 中的命令名。worker 以指定目录为当前目录，从 `WFC_TASK` 取得任务文件的绝对路径，并从 `WFC_ROLE`、`WFC_DISPATCH`、`WFC_ROUND`、`WFC_ATTEMPT` 和 `WFC_STATE` 取得本次派发上下文。任务文件和工作目录的绝对路径需能用 UTF-8 表示。CLI 在标准输出返回一行 JSON，含 `dispatch`、`round`（首次为 1）、`attempt`、`role`、`task` 和 `cwd`。`status` 的 `dispatches` 数组列出已交付记录，可用 `--dispatch` 按编号查询。启动失败或查询未知编号时，CLI 返回非零退出码并打印诊断。
+
+在 Linux 上，`dispatch` 用同一个 `wfc` 启动独立会话。worker 成功启动且记录可查后，派发命令即返回，终端可以关闭。worker 的三个标准流连接到空设备，需要保留的输出应写入文件。使用 `wfc status --dispatch ID` 查询本次进程的结果。回执中的 `worker.state` 初始为 `running`，任务进程树退出后变为 `exited`，附带根进程的 `exit_code` 或 `signal`。例如 worker 退出 7 时，派发回执仍有效，稍后可查到 `exit_code: 7`。
+
+`wfc close ID` 通知该任务的后台进程回收其 worker 和后代。后台进程只向自己尚未回收的子进程发送信号。成功回执含 `operation`、`result`、`dispatch`、`round` 和 `attempt`。重复调用安全，已结束的任务保留原退出结果。根进程被本次关闭终止时，`worker.state` 为 `cancelled`。回收超过 5 秒会返回非零，可再次用同一编号查询或关闭。若后台进程意外退出且未留下结果，状态为 `unknown`，close 会报告无法确认。本版 Linux 实现使用本机状态目录上的文件锁和可读的 procfs 子进程列表。
+
+其他平台沿用前台派发，等待 worker 成功退出后发布记录。worker 的标准错误沿用调用方的标准错误。
 
 Rust 默认使用用户主目录下的 `.local/state/agent-router`，可用 `WFC_STATE` 指定独立状态目录。帮助、版本和内核入口都不会读写调度状态。与 Python 版并排使用时，把两份 `wfc` 放在不同目录，分别使用显式路径，并为每次调用指定各自的 `WFC_STATE`。
 

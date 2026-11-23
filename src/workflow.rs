@@ -5,8 +5,13 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+#[cfg(not(target_os = "linux"))]
+use std::process::Command;
+use std::process::Stdio;
 use uuid::Uuid;
+
+#[cfg(target_os = "linux")]
+pub mod worker_owner;
 
 pub const DISPATCH_USAGE: &str =
     "wfc dispatch --role ROLE --task FILE --cwd DIR -- PROGRAM [ARG ...]";
@@ -86,6 +91,13 @@ impl<'a> Dispatch<'a> {
             "cwd": cwd.to_str().context("worker directory must be UTF-8")?,
         });
 
+        #[cfg(target_os = "linux")]
+        let record = {
+            let mut record = record;
+            record["worker"] = json!({"state": "running"});
+            record
+        };
+
         // Reserve and write the record before starting the worker. Status sees it
         // only after a successful handoff, when the rename publishes it in one step.
         let pending = records.join(format!("{dispatch}.pending"));
@@ -98,7 +110,11 @@ impl<'a> Dispatch<'a> {
             writeln!(file, "{record}")?;
             file.sync_all()?;
             drop(file);
-            let exit = Command::new(program)
+            #[cfg(target_os = "linux")]
+            let mut command = worker_owner::command(&program)?;
+            #[cfg(not(target_os = "linux"))]
+            let mut command = Command::new(program);
+            command
                 .args(&self.worker[1..])
                 .current_dir(&cwd)
                 .env("WFC_STATE", &state)
@@ -107,11 +123,17 @@ impl<'a> Dispatch<'a> {
                 .env("WFC_ATTEMPT", &attempt)
                 .env("WFC_ROLE", self.role)
                 .env("WFC_TASK", &task)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .status()
-                .context("start controlled worker")?;
-            ensure!(exit.success(), "worker for {dispatch} exited with {exit}");
+                .stdin(Stdio::null());
+            #[cfg(target_os = "linux")]
+            worker_owner::launch(command)?;
+            #[cfg(not(target_os = "linux"))]
+            {
+                let exit = command
+                    .stdout(Stdio::null())
+                    .status()
+                    .context("start controlled worker")?;
+                ensure!(exit.success(), "worker for {dispatch} exited with {exit}");
+            }
             Ok(())
         })();
         if let Err(err) = result {
@@ -120,6 +142,7 @@ impl<'a> Dispatch<'a> {
             })?;
             return Err(err);
         }
+        #[cfg(not(target_os = "linux"))]
         fs::rename(&pending, records.join(format!("{dispatch}.json"))).with_context(|| {
             format!("worker succeeded but publishing dispatch {dispatch} failed")
         })?;
@@ -141,7 +164,11 @@ fn state_dir() -> Result<PathBuf> {
 }
 
 fn valid_id(id: &str) -> bool {
-    id.strip_prefix("d-").is_some_and(|hex| {
+    valid_identity(id, "d-")
+}
+
+fn valid_identity(id: &str, prefix: &str) -> bool {
+    id.strip_prefix(prefix).is_some_and(|hex| {
         hex.len() == 32
             && hex
                 .bytes()
@@ -152,8 +179,16 @@ fn valid_id(id: &str) -> bool {
 fn read_record(path: &Path) -> Result<Value> {
     let file =
         File::open(path).with_context(|| format!("open dispatch record {}", path.display()))?;
-    serde_json::from_reader(file)
-        .with_context(|| format!("read dispatch record {}", path.display()))
+    let record: Value = serde_json::from_reader(file)
+        .with_context(|| format!("read dispatch record {}", path.display()))?;
+    ensure!(
+        record["dispatch"]
+            .as_str()
+            .is_some_and(|id| path.file_stem() == Some(OsStr::new(id))),
+        "dispatch record identity mismatch in {}",
+        path.display()
+    );
+    Ok(record)
 }
 
 pub fn status(id: Option<&OsStr>) -> Result<Value> {
@@ -186,6 +221,12 @@ pub fn status(id: Option<&OsStr>) -> Result<Value> {
         paths.sort();
         for path in paths {
             dispatches.push(read_record(&path)?);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    for record in &mut dispatches {
+        if record.get("worker").is_some() {
+            record["worker"] = worker_owner::status(&dir, record)?;
         }
     }
     Ok(json!({ "dispatches": dispatches }))

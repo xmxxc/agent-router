@@ -44,6 +44,26 @@ fn run(command: &mut Command) -> Value {
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
+// On Linux the handoff receipt precedes the worker's exit. Compare all
+// dispatch fields after waiting for the independent process outcome.
+fn completed(f: &Fixture, mut receipt: Value, code: i32) -> Value {
+    if cfg!(target_os = "linux") {
+        let id = receipt["dispatch"].as_str().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let row = run(f.wfc().args(["status", "--dispatch", id]))["dispatches"][0].clone();
+            if row["worker"]["state"] != "running" {
+                receipt["worker"] = json!({"state":"exited","exit_code":code,"signal":null});
+                assert_eq!(row, receipt);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{row}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    receipt
+}
+
 const PYTHON: &str = if cfg!(windows) { "python" } else { "python3" };
 const WORKER: &str = r#"
 import json, os, sys
@@ -64,6 +84,7 @@ fn worker_receives_context_and_a_fresh_cli_finds_the_same_dispatch() {
     let record = run(f
         .dispatch("work dir", role, "task one.md")
         .args([PYTHON, "-c", WORKER, literal]));
+    let record = completed(&f, record, 0);
     let receipt: Value =
         serde_json::from_slice(&fs::read(f.0.join("work dir/receipt.json")).unwrap()).unwrap();
     assert_eq!(record["role"], role);
@@ -109,6 +130,7 @@ while not (Path('..') / sys.argv[1] / 'ready').exists():
     });
     assert_ne!(a["dispatch"], b["dispatch"]);
     assert_ne!(a["attempt"], b["attempt"]);
+    let (a, b) = (completed(&f, a, 0), completed(&f, b, 0));
     let all = run(f.wfc().arg("status"));
     let rows = all["dispatches"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
@@ -138,7 +160,7 @@ while not (Path('..') / sys.argv[1] / 'ready').exists():
 }
 
 #[test]
-fn failed_handoffs_leave_only_the_successful_dispatch_queryable() {
+fn spawn_errors_and_worker_exit_codes_are_distinguished() {
     let f = Fixture::new();
     assert_eq!(run(f.wfc().arg("status")), json!({"dispatches": []}));
     assert!(!f.0.join("state").exists());
@@ -155,12 +177,23 @@ fn failed_handoffs_leave_only_the_successful_dispatch_queryable() {
         .args([PYTHON, "-c", "raise SystemExit(7)"])
         .output()
         .unwrap();
-    for error in [missing, failed] {
-        assert!(!error.status.success());
-        assert!(error.stdout.is_empty());
-        assert!(!error.stderr.is_empty());
+    assert!(!missing.status.success());
+    assert!(missing.stdout.is_empty());
+    assert!(!missing.stderr.is_empty());
+    let good = completed(&f, good, 0);
+    if cfg!(target_os = "linux") {
+        assert!(failed.status.success());
+        let bad = completed(&f, serde_json::from_slice(&failed.stdout).unwrap(), 7);
+        let all = run(f.wfc().arg("status"));
+        let rows = all["dispatches"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&good) && rows.contains(&bad));
+    } else {
+        assert!(!failed.status.success());
+        assert!(failed.stdout.is_empty());
+        assert!(!failed.stderr.is_empty());
+        assert_eq!(run(f.wfc().arg("status")), json!({"dispatches": [good]}));
     }
-    assert_eq!(run(f.wfc().arg("status")), json!({"dispatches": [good]}));
     let unknown = f
         .wfc()
         .args(["status", "--dispatch", "d-00000000000000000000000000000000"])
@@ -168,4 +201,86 @@ fn failed_handoffs_leave_only_the_successful_dispatch_queryable() {
         .unwrap();
     assert!(!unknown.status.success());
     assert!(unknown.stdout.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn detached_worker_can_write_after_dispatch_exits() {
+    let f = Fixture::new();
+    let record = run(f.dispatch("work", "worker", "task.md").args([
+        "sh", "-c",
+        "for i in $(seq 100); do if test -e release; then touch finished; exit 0; fi; sleep .02; done; exit 7",
+    ]));
+    fs::write(f.0.join("work/release"), "").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !f.0.join("work/finished").exists() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let close = run(f
+        .wfc()
+        .args(["close", record["dispatch"].as_str().unwrap()]));
+    assert_eq!(close["result"], "completed");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn closing_a_worker_preserves_a_separately_dispatched_nested_worker() {
+    let f = Fixture::new();
+    let binary = env!("CARGO_BIN_EXE_wfc");
+    let parent = run(f.dispatch("work", "parent", "task.md").args([
+        "sh", "-c",
+        r#""$1" dispatch --role nested --task "$WFC_TASK" --cwd . -- sh -c 'for i in $(seq 500); do if test -f release; then exit 3; fi; sleep .02; done; exit 7' > nested.tmp && mv nested.tmp nested.json; exec sleep 10"#,
+        "worker", binary,
+    ]));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let receipt = f.0.join("work/nested.json");
+    while !receipt.exists() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let nested = serde_json::from_slice(&fs::read(receipt).unwrap()).unwrap();
+    run(f
+        .wfc()
+        .args(["close", parent["dispatch"].as_str().unwrap()]));
+    fs::write(f.0.join("work/release"), "").unwrap();
+    completed(&f, nested, 3);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn close_reaps_an_orphan_in_another_session_and_preserves_the_root_exit() {
+    let f = Fixture::new();
+    let receipt = run(f.dispatch("work", "worker", "task.md").args([
+        PYTHON,
+        "-c",
+        r#"
+import os, sys, time
+from pathlib import Path
+parent = os.getpid()
+if os.fork():
+    os._exit(7)
+os.setsid()
+while os.getppid() == parent:
+    time.sleep(.01)
+Path('pid.tmp').write_text(str(os.getpid()))
+Path('pid.tmp').rename('adopted')
+time.sleep(10)
+"#,
+    ]));
+    let path = f.0.join("work/adopted");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !path.exists() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let pid = fs::read_to_string(path).unwrap();
+    let id = receipt["dispatch"].as_str().unwrap();
+    for _ in 0..2 {
+        let close = run(f.wfc().args(["close", id]));
+        assert_eq!(close["result"], "completed");
+        assert_eq!(close["attempt"], receipt["attempt"]);
+        assert!(!std::path::Path::new("/proc").join(&pid).exists());
+    }
+    completed(&f, receipt, 7);
 }
