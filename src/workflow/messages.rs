@@ -1320,6 +1320,7 @@ impl Reclaimed {
             report: Some(self.report.clone()),
             question_payload: None,
             reply_payload: None,
+            worker_input: None,
             request_key: None,
             body_hash: None,
             delivery: Delivery::unsent(),
