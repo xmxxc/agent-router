@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import select
+import shutil
 import signal
 from pathlib import Path
 import subprocess
@@ -94,6 +95,39 @@ sys.exit(1 if mode else 0)
         self.assertFalse(empty["messages"])
         other, = self.data("wait", "--scope", "other", "--timeout", "0")["messages"]
         self.assertEqual((other["messageId"], other["type"]), (unrelated["messageId"], "done"))
+
+    @unittest.skipUnless(shutil.which("tmux"), "requires real Linux tmux")
+    def test_runtime_notice_through_the_private_queue(self):
+        socket = self.root / "socket"
+        tmux = [shutil.which("tmux"), "-S", str(socket), "-f", "/dev/null"]
+        self.env.update(PATH=os.pathsep.join((str(self.root), os.environ["PATH"])),
+                        WFC_TMUX_SOCKET=str(socket), TERM="xterm", WFC_MAX_TURN_SECONDS="0")
+        subprocess.run([*tmux, "new-session", "-d", "-s", "sentinel", "/bin/cat"],
+                       env=self.env, check=True, timeout=10)
+        self.addCleanup(subprocess.run, [*tmux, "kill-server"], env=self.env,
+                        capture_output=True, timeout=10)
+        secret = "private-queue-fixture-token"
+        config = self.root / "launch.json"
+        fixture = f"import time; print('Quota exceeded: {secret}', flush=True); time.sleep(20)"
+        config.write_text(json.dumps({"hosts": {"codex": {"command": [sys.executable, "-c", fixture]}}}))
+        job = self.data("dispatch", "--task", "task", "--role", "worker", "--scope", "failure",
+                        "--report", "task", "--cwd", ".", "--host", "codex", "--launch-config", str(config))
+
+        self.cli("relay", "--codex", "--scope", "other", "--for", ".25")
+        self.assertEqual(self.calls(), [])
+        self.cli("relay", "--codex", "--scope", "failure", "--for", "2")
+        [call] = self.calls()
+        self.assertTrue(call[4].startswith(PREFIX))
+        self.assertNotIn(secret, call[4])
+        [notice] = json.loads(call[4][len(PREFIX):])["messages"]
+        self.assertEqual((notice["kind"], notice["type"], notice["fault"]["category"]),
+                         ("host_runtime", "blocked", "quota"))
+        for key in ("dispatch", "round", "attempt", "scope"):
+            self.assertEqual(notice[key], job[key])
+        ack = self.data("ack", notice["messageId"])
+        self.assertEqual((ack["state"], ack["statusVersion"]), ("processed", 4))
+        self.cli("relay", "--codex", "--scope", "failure", "--for", "1.25")
+        self.assertEqual(self.calls(), [call])
 
     def test_detached_scope(self):
         other = self.publish("other")

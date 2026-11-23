@@ -179,6 +179,10 @@ pub(crate) fn supervise(spec_path: &Path) -> Result<ExitCode> {
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
     let mut terminal = json!({"category":"process_exited","exitCode":code});
+    if let Some(watching) = &watching {
+        terminal["exitProcess"] = watching.identity();
+        terminal["signal"] = json!(status.signal());
+    }
     if let Some(zero) = watching.and_then(|watching| watching.host_exited(status, observed)) {
         terminal["startupZero"] = zero;
     }

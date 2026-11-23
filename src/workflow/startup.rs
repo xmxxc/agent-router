@@ -191,6 +191,10 @@ pub(crate) struct Running<'a> {
 }
 
 impl Running<'_> {
+    pub(crate) fn identity(&self) -> Value {
+        json!({"pid":self.pid,"processStart":self.process_start})
+    }
+
     fn during_startup(&self, observed: Instant) -> bool {
         observed.saturating_duration_since(self.since) <= STARTUP_WINDOW
     }
@@ -206,7 +210,7 @@ impl Running<'_> {
             return None;
         }
         if status.success() {
-            return Some(json!({"pid":self.pid,"processStart":self.process_start}));
+            return Some(self.identity());
         }
         self.publish_exit(status);
         None

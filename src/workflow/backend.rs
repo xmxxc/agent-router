@@ -1,6 +1,8 @@
 //! Public lifecycle clients for tmux and Herdr.
 use super::{host::Launch, valid_identity, write_json};
 use anyhow::{bail, ensure, Context, Result};
+#[cfg(target_os = "linux")]
+use serde_json::Map;
 use serde_json::{json, Value};
 use std::{
     env,
@@ -164,6 +166,58 @@ fn existing(state: &Path, row: &Value, op: &str) -> Result<Value> {
         request["closeOperationId"] = json!(close_operation(row)?);
     }
     call(state, row, request)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn runtime_screen(state: &Path, row: &Value) -> Result<Option<String>> {
+    if row["backend"] == "herdr" {
+        return super::herdr::runtime_screen(state, row);
+    }
+    let mut reply = existing(state, row, "observe-screen")?;
+    Ok(match reply["screen"].take() {
+        Value::String(screen) if reply["result"] == "accepted" => Some(screen),
+        _ => None,
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn runtime_exit(
+    state: &Path,
+    row: &Value,
+    inspection: &Value,
+) -> Result<Option<Map<String, Value>>> {
+    let receipt = if row["backend"] == "herdr" {
+        row["launch"].clone()
+    } else {
+        private_receipt(state, inspect_launch(state, row, inspection)?)?
+    };
+    let Some(code) = receipt["exitCode"].as_u64().filter(|code| *code <= 255) else {
+        return Ok(None);
+    };
+    if receipt["category"] != "process_exited" {
+        return Ok(None);
+    }
+    let process = &receipt["exitProcess"];
+    let creation = process["processStart"].as_str().filter(|value| {
+        value.len() <= 64
+            && value.strip_prefix("linux:").is_some_and(|suffix| {
+                suffix.split_once(':').is_some_and(|(boot, ticks)| {
+                    uuid::Uuid::parse_str(boot).is_ok() && ticks.parse::<u64>().is_ok()
+                })
+            })
+    });
+    let signal = receipt["signal"]
+        .as_u64()
+        .filter(|signal| (1..=64).contains(signal));
+    let pid = process["pid"]
+        .as_u64()
+        .filter(|pid| (1..=u32::MAX as u64).contains(pid));
+    Ok(Some(Map::from_iter([
+        ("exitCode".into(), json!(code)),
+        ("signal".into(), json!(signal)),
+        ("processStart".into(), json!(creation)),
+        ("pid".into(), json!(pid)),
+    ])))
 }
 
 fn receipt_id(row: &Value) -> Result<Option<&str>> {

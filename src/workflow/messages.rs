@@ -3,6 +3,8 @@
 mod receipt;
 #[cfg(target_os = "linux")]
 pub mod relay;
+#[cfg(target_os = "linux")]
+pub(super) mod runtime;
 pub use receipt::{Confirm, ACK_USAGE, RESOLVE_USAGE};
 use receipt::{Delivery, Resolution, State};
 
@@ -20,6 +22,10 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub const DONE_USAGE: &str = "wfc done --report FILE [--attempt ID] [--message-id KEY]";
+#[cfg(target_os = "linux")]
+pub const WAIT_USAGE: &str =
+    "wfc wait [--timeout SECONDS] [--scope NAME] [--dispatch ID] [--stall-after SECONDS]";
+#[cfg(not(target_os = "linux"))]
 pub const WAIT_USAGE: &str = "wfc wait [--timeout SECONDS] [--scope NAME] [--dispatch ID]";
 
 fn options<'a, const N: usize>(
@@ -702,10 +708,19 @@ pub struct Wait<'a> {
     timeout: Duration,
     dispatch: Option<&'a str>,
     scope: Option<&'a str>,
+    #[cfg(target_os = "linux")]
+    stall_after: Duration,
 }
 
 impl<'a> Wait<'a> {
     pub fn parse(args: &'a [OsString]) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        let [timeout, dispatch, scope, stall_after] = options(
+            args,
+            ["--timeout", "--dispatch", "--scope", "--stall-after"],
+            None,
+        )?;
+        #[cfg(not(target_os = "linux"))]
         let [timeout, dispatch, scope] =
             options(args, ["--timeout", "--dispatch", "--scope"], None)?;
         let seconds: f64 = timeout
@@ -719,12 +734,16 @@ impl<'a> Wait<'a> {
             timeout,
             dispatch,
             scope,
+            #[cfg(target_os = "linux")]
+            stall_after: runtime::seconds(stall_after.unwrap_or("300"))?,
         })
     }
 
     pub fn run(self) -> Result<Vec<Value>> {
         let state = state_dir()?;
         let start = Instant::now();
+        #[cfg(target_os = "linux")]
+        let mut runtime = runtime::Monitor::new(self.stall_after);
         loop {
             let batch = match Inbox::try_open(&state)? {
                 Some(mut inbox) => inbox.claim(self.dispatch, self.scope, State::Received)?,
@@ -734,7 +753,15 @@ impl<'a> Wait<'a> {
             if !batch.is_empty() || remaining.is_zero() {
                 return Ok(batch);
             }
-            std::thread::sleep(remaining.min(Duration::from_millis(100)));
+            #[cfg(target_os = "linux")]
+            if runtime.poll(&state, self.dispatch, self.scope)? {
+                continue;
+            }
+            std::thread::sleep(
+                self.timeout
+                    .saturating_sub(start.elapsed())
+                    .min(Duration::from_millis(100)),
+            );
         }
     }
 }
