@@ -81,7 +81,8 @@ const EXCLUSIVE_WINDOW: &str = "#{==:#{window_linked_sessions},1}";
 struct Target {
     socket_fd: File,
     worker_pane: Option<String>,
-    legacy_host_pid: Option<u32>,
+    supervised: bool,
+    supervisor: Option<(String, u32)>,
     token: String,
     socket: String,
     server_start: String,
@@ -93,9 +94,17 @@ struct Target {
 }
 
 impl Target {
+    fn guard_supervisor(&self, condition: &str) -> String {
+        match self.supervisor.as_ref() {
+            Some((_, pid)) => format!("#{{&&:{condition},#{{==:#{{pane_pid}},{pid}}}}}"),
+            None => condition.to_owned(),
+        }
+    }
+
     fn worker_pane(&self) -> Reply<&str> {
         self.worker_pane
             .as_deref()
+            .filter(|_| !self.supervised || self.supervisor.is_some())
             .ok_or_else(|| failure("uncertain", "original worker pane is unverified"))
     }
 }
@@ -242,7 +251,8 @@ impl Tmux<'_> {
             socket: socket.to_string_lossy().into_owned(),
             socket_fd,
             worker_pane: None,
-            legacy_host_pid: None,
+            supervised: false,
+            supervisor: None,
             server_start: server_start.to_string(),
             session: session.to_string(),
             pane: pane.to_string(),
@@ -273,7 +283,7 @@ impl Tmux<'_> {
         Ok(match self.target()? {
             None => json!({"result":"accepted","alive":false,"owned":false}),
             Some(t) if t.owned => json!({"result":"accepted","alive":true,"owned":true,
-                "session":self.session, "workerBound":t.worker_pane.is_some(), "attach":self.attach_argv(&t)?}),
+                "session":self.session, "workerBound":t.worker_pane().is_ok(), "attach":self.attach_argv(&t)?}),
             Some(_) => json!({"result":"accepted","alive":true,"owned":false,
                 "diagnostic":"session ownership does not match WFC_STATE"}),
         })
@@ -349,15 +359,17 @@ impl Tmux<'_> {
     }
 
     fn worker_command(&self, t: &Target, action: &str) -> Reply<String> {
-        let condition = t
-            .legacy_host_pid
-            .map(|pid| format!("#{{&&:{EXCLUSIVE_WINDOW},#{{==:#{{pane_pid}},{pid}}}}}"));
-        self.guarded(
-            t,
-            t.worker_pane()?,
-            action,
-            condition.as_deref().unwrap_or(EXCLUSIVE_WINDOW),
-        )
+        if let Some((id, pid)) = &t.supervisor {
+            if binding::host_launch_id(*pid, self.state, self.dispatch, t).as_ref() != Some(id) {
+                return Err(failure("refused", "original worker is no longer running"));
+            }
+        }
+        let live = format!("#{{&&:{EXCLUSIVE_WINDOW},#{{==:#{{pane_dead}},0}}}}");
+        self.guarded(t, t.worker_pane()?, action, &t.guard_supervisor(&live))
+    }
+
+    fn worker_screen(&self, t: &Target) -> Reply<String> {
+        self.worker_command(t, &format!("capture-pane -p -t {}", t.worker_pane()?))
     }
 
     fn capture(&self, t: &Target, pane: &str) -> Reply<String> {
@@ -485,6 +497,23 @@ impl Tmux<'_> {
         }
     }
 
+    fn guarded_close(
+        &self,
+        t: &Target,
+        pane: &str,
+        action: &str,
+        condition: &str,
+    ) -> Reply<String> {
+        self.record_close(CloseOperation::Pending)?;
+        match self.guarded(t, pane, action, condition) {
+            Err(e) if e["result"] == "refused" || e["result"] == "definitely-not-sent" => {
+                self.record_close(CloseOperation::NotExecuted)?;
+                Err(e)
+            }
+            outcome => outcome,
+        }
+    }
+
     fn close(&self) -> Reply<Value> {
         self.revoke_pending_launch()?;
         let effect = if let Some(t) = self.target()? {
@@ -496,27 +525,30 @@ impl Tmux<'_> {
             }
             let exclusive = "#{m/r:^1+$,#{W:#{?#{==:#{window_linked_sessions},1},1,0}}}";
             let kill = format!("kill-session -t '{}'", t.session);
-            let worker_pane = t.worker_pane()?;
+            let worker_pane = t.worker_pane.as_deref().ok_or_else(binding::unknown)?;
             let worker = self.close_worker(&t)?;
             if worker == binding::Worker::Exited {
                 // Once absent from the pinned server, a pane ID cannot move back.
-                let pane = if self.worker_pane_absent(&t)? {
-                    &t.pane
+                if self.worker_pane_absent(&t)? {
+                    self.guarded_close(&t, &t.pane, &kill, exclusive)?;
                 } else {
-                    worker_pane
-                };
-                self.record_close(CloseOperation::Pending)?;
-                self.guarded(&t, pane, &kill, exclusive)?;
+                    let dead_pane = format!("#{{&&:{exclusive},#{{pane_dead}}}}");
+                    self.guarded_close(&t, worker_pane, &kill, &dead_pane)?;
+                }
                 CloseEffect::WorkerExited
             } else {
                 worker.check_before_kill()?;
+                t.worker_pane()?;
                 // Leave a retained dead pane intact for reconciliation.
                 let action = format!(
                     "if-shell -F -t {} '#{{pane_dead}}' {{ display-message -p dead }} {{ {kill} }}",
                     worker_pane
                 );
-                self.record_close(CloseOperation::Pending)?;
-                let outcome = self.guarded(&t, worker_pane, &action, exclusive)?;
+                let outcome =
+                    self.guarded_close(&t, worker_pane, &action, &t.guard_supervisor(exclusive))?;
+                if outcome == "dead\n" {
+                    self.record_close(CloseOperation::NotExecuted)?;
+                }
                 if !outcome.is_empty() {
                     return Err(failure("uncertain", "worker pane is no longer active"));
                 }
@@ -531,7 +563,10 @@ impl Tmux<'_> {
         } else {
             if let (Some(id), Some(operation)) = (self.legacy_execution_id, self.close_operation_id)
             {
-                if self.previous_close(id, operation)?.is_some() {
+                if matches!(
+                    self.previous_close(id, operation)?,
+                    Some(CloseOperation::Pending)
+                ) {
                     return Err(failure(
                         "uncertain",
                         "original close action was not confirmed",
@@ -703,8 +738,9 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
             }
             error
         });
-    if inspect && result["result"] == "accepted" {
-        let launch = if let Some(execution) = &request.execution_id {
+    if inspect {
+        let accepted = result["result"] == "accepted";
+        let launch = if let Some(execution) = request.execution_id.as_ref().filter(|_| accepted) {
             let id = backend
                 .legacy_execution_id
                 .expect("resolved execution selector");
@@ -714,7 +750,7 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
             result["executionId"] = json!(execution);
             Some(id.to_owned())
         } else if let Some(execution) = &request.legacy_execution_id {
-            match backend.observed_launch(execution) {
+            match backend.observed_launch(execution, !accepted) {
                 Ok(Some(id)) => {
                     result["legacyExecutionId"] = json!(execution);
                     Some(id)

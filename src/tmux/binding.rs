@@ -44,6 +44,24 @@ pub(super) struct LegacyHints {
 }
 
 impl LegacyHints {
+    fn expected_launch<'a>(&'a self, execution: Option<&'a str>) -> Option<&'a str> {
+        self.launch
+            .as_deref()
+            .or_else(|| execution.filter(|id| valid_launch_id(id)))
+    }
+
+    fn lookup(&self, t: &Tmux<'_>) -> Self {
+        if t.legacy_worker_pane.is_none() && t.legacy_launch_id.is_none() {
+            return self.clone();
+        }
+        // Probe the new hints on their own; an unverified stale hint must
+        // neither hide a verified match nor authorize a pane-only fallback.
+        Self {
+            pane: t.legacy_worker_pane.map(str::to_owned),
+            launch: t.legacy_launch_id.map(str::to_owned),
+        }
+    }
+
     fn merge(&mut self, t: &Tmux<'_>) -> Reply<()> {
         for (saved, supplied) in [
             (&mut self.pane, t.legacy_worker_pane),
@@ -95,7 +113,12 @@ pub(super) fn valid_launch_id(id: &str) -> bool {
             .all(|c| c.is_ascii_digit() || matches!(c, b'a'..=b'f'))
 }
 
-fn host_launch_id(pid: u32, state: &Path, dispatch: &str, target: &Target) -> Option<String> {
+pub(super) fn host_launch_id(
+    pid: u32,
+    state: &Path,
+    dispatch: &str,
+    target: &Target,
+) -> Option<String> {
     // A pane can move. The R1 supervisor inherited its original dispatch and
     // tmux server/session at startup, independently of its current window.
     let environment = fs::read(format!("/proc/{pid}/environ")).ok()?;
@@ -123,13 +146,11 @@ fn host_launch_id(pid: u32, state: &Path, dispatch: &str, target: &Target) -> Op
     let receipt = super::launch::read_receipt(&state.join("launches").join(format!("{id}.json")))?;
     let child = u32::try_from(receipt["pid"].as_u64()?).ok()?;
     let stat = fs::read_to_string(format!("/proc/{child}/stat")).ok()?;
-    let parent = stat
-        .rsplit_once(") ")?
-        .1
-        .split_whitespace()
-        .nth(1)?
-        .parse::<u32>()
-        .ok()?;
+    let mut fields = stat.rsplit_once(") ")?.1.split_whitespace();
+    if matches!(fields.next()?, "Z" | "X") {
+        return None;
+    }
+    let parent: u32 = fields.next()?.parse().ok()?;
     (receipt["category"] == "started" && parent == pid).then(|| id.to_owned())
 }
 
@@ -349,14 +370,16 @@ impl Tmux<'_> {
             return Err(unknown());
         };
         let target = self.owned()?;
-        hints.merge(self)?;
-        let live = self.legacy_worker(&target, Some(id), hints)?;
+        let mut lookup = hints.lookup(self);
+        let live = self.find_supervisor(&target, Some(id), &mut lookup)?;
         if let Some((launch, _)) = live {
             if receipt.as_deref().is_some_and(|old| old != launch) {
                 return Err(unknown());
             }
+            *hints = lookup;
             *receipt = Some(launch);
         } else {
+            hints.merge(self)?;
             // The caller must supply the authoritative pane, even if this old
             // record contains a pane guessed from the active window.
             let pane = self.legacy_worker_pane.ok_or_else(unknown)?;
@@ -415,10 +438,16 @@ impl Tmux<'_> {
                     {
                         return Err(unknown());
                     }
-                    let old = hints.clone();
-                    hints.merge(self)?;
-                    if old != *hints {
-                        save(&self.claim_path(), &observed).map_err(|_| unknown())?;
+                    // A first compatible pane hint must survive a disconnected
+                    // observation. Resolve conflicting unverified hints on the live target.
+                    let mut merged = hints.clone();
+                    match merged.merge(self) {
+                        Ok(()) if merged != *hints => {
+                            *hints = merged;
+                            save(&self.claim_path(), &observed).map_err(|_| unknown())?;
+                        }
+                        Err(e) if receipt.is_some() => return Err(e),
+                        _ => (),
                     }
                 }
                 return Ok(());
@@ -438,6 +467,12 @@ impl Tmux<'_> {
                 }
             }
             Some(previous) => self.confirm_absence(Some(previous), true)?,
+        }
+        if self.legacy_launch_id.is_some() {
+            pending.launch = None;
+        }
+        if self.legacy_worker_pane.is_some() {
+            pending.pane = None;
         }
         pending.merge(self)?;
         self.replace_claim(&Claim::LegacyPending {
@@ -576,19 +611,16 @@ impl Tmux<'_> {
         Err(unknown())
     }
 
-    // R1 writes the launch ID in the supervisor argv and the actual worker PID
+    // The launcher writes the launch ID in the supervisor argv and the actual worker PID
     // in its private receipt. Require both on the same pane before retaining
     // that receipt for a later close. The filename alone proves no association.
-    fn legacy_worker(
+    fn find_supervisor(
         &self,
         t: &Target,
         execution: Option<&str>,
         hints: &mut LegacyHints,
     ) -> Reply<Option<(String, u32)>> {
-        let expected = hints
-            .launch
-            .as_deref()
-            .or_else(|| execution.filter(|id| valid_launch_id(id)));
+        let expected = hints.expected_launch(execution);
         if hints.pane.is_none() && expected.is_none() {
             return Ok(None);
         }
@@ -618,9 +650,6 @@ impl Tmux<'_> {
                 continue;
             };
             if expected.is_some_and(|wanted| wanted != id) {
-                if hints.pane.is_some() {
-                    return Err(unknown());
-                }
                 continue;
             }
             hints.pane = Some(pane.to_owned());
@@ -635,10 +664,18 @@ impl Tmux<'_> {
                 if t.token != id {
                     return Err(unknown());
                 }
-                let server = self.binding(Claim::Launch(id))?;
+                let server = self.binding(Claim::Launch(id.clone()))?;
                 server.verify(t)?;
                 if !server.pane.as_deref().is_some_and(valid_pane) {
                     return Err(unknown());
+                }
+                let mut hints = LegacyHints {
+                    pane: server.pane.clone(),
+                    launch: Some(id),
+                };
+                t.supervised = true;
+                if t.owned {
+                    t.supervisor = self.find_supervisor(t, None, &mut hints)?;
                 }
                 t.worker_pane = server.pane;
                 return Ok(());
@@ -690,13 +727,24 @@ impl Tmux<'_> {
                 (execution, hints, None, server, true)
             }
         };
-        let checked = if t.owned && (receipt.is_none() || self.input_request) {
-            self.legacy_worker(t, execution.as_deref(), &mut hints)?
+        let saved = hints.clone();
+        if receipt.is_none() && self.legacy_execution_id.is_some() {
+            hints = saved.lookup(self);
+        }
+        let checked = if t.owned {
+            self.find_supervisor(t, execution.as_deref(), &mut hints)?
         } else {
             None
         };
-        let (checked, host_pid) = checked.unzip();
-        t.legacy_host_pid = host_pid;
+        if checked.is_none() && saved != hints {
+            // Keep a trusted pane-only observation stable. Never downgrade an
+            // outstanding launch hint to pane-only input without fresh proof.
+            let mut compatible = saved.clone();
+            compatible.merge(self)?;
+            hints = compatible;
+        }
+        t.supervisor = checked.filter(|(id, _)| receipt.as_ref().is_none_or(|saved| saved == id));
+        let checked = t.supervisor.as_ref().map(|(id, _)| id.clone());
         if self.input_request && receipt.is_some() && checked != receipt {
             return Err(failure(
                 "uncertain",
@@ -704,7 +752,11 @@ impl Tmux<'_> {
             ));
         }
         let newly_verified = receipt.is_none() && checked.is_some();
-        t.worker_pane = if hints.launch.is_some() && checked.is_none() && receipt.is_none() {
+        t.supervised = receipt.is_some() || checked.is_some();
+        t.worker_pane = if hints.expected_launch(execution.as_deref()).is_some()
+            && checked.is_none()
+            && receipt.is_none()
+        {
             None
         } else {
             hints.pane.clone()
@@ -719,7 +771,7 @@ impl Tmux<'_> {
             )?;
             t.token = token;
         }
-        if adopting || newly_verified {
+        if adopting || newly_verified || saved != hints {
             self.replace_claim(&Claim::Observed {
                 execution,
                 hints,

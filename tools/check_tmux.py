@@ -201,12 +201,13 @@ os.execv({TMUX!r}, [{TMUX!r}, *a])
         self.assertIn("Enter", reply["diagnostic"])
         events = self.events(log, 4)
         self.assertEqual(bytes.fromhex("".join(e[0] for e in events)), b"once")
-        self.call("close")
+        closed = self.call("close")
+        self.assertEqual(closed["result"], "completed", closed)
         for argv, category in [(["/no/such/wfc-program"], "executable_missing"),
                                (["/bin/sh", "-c", "exit 23"], "process_exited")]:
             reply = self.call("create", **{**self.launch, "argv": argv})
             expected = "uncertain" if category == "process_exited" else "definitely-not-sent"
-            self.assertEqual((reply["result"], reply["category"]), (expected, category))
+            self.assertEqual((reply["result"], reply.get("category")), (expected, category), (argv, reply))
             if category == "process_exited":
                 self.assertEqual(reply["exitCode"], 23)
 
@@ -1035,6 +1036,183 @@ os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
         self.assertEqual(self.call("create", executionId="attempt-B", **self.launch)["result"], "accepted")
         self.assertEqual(self.call("close", **args)["closeEffect"], "already_absent")
         self.assertTrue(self.call("inspect", executionId="attempt-B")["owned"])
+
+    def test_native_inputs_require_the_live_original_worker(self):
+        trigger, receipt = self.gated_exit()
+        pane = self.active_pane()
+        subprocess.run(self.tmux + ["set-option", "-w", "-t", pane, "remain-on-exit", "on"], check=True)
+        self.assertTrue(self.call("inspect")["workerBound"])
+        trigger.touch()
+        deadline = time.monotonic() + 5
+        while subprocess.check_output(self.tmux + ["display-message", "-pt", pane, "#{pane_dead}"]).strip() != b"1":
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.02)
+        self.assertEqual(json.loads(receipt.read_bytes())["exitCode"], 37)
+        log = self.root / "replacement.log"
+        subprocess.run(self.tmux + ["respawn-pane", "-t", pane, sys.executable, str(Path(__file__).resolve()),
+                                    "--composer", "ready", str(log), "replacement"], check=True)
+        deadline = time.monotonic() + 5
+        while "model" not in self.call("read")["screen"]:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.02)
+        self.assertFalse(self.call("inspect")["workerBound"])
+        for op, fields in [("submit", {"text": "boundary"}), ("interrupt", {})]:
+            result = self.call(op, **fields)
+            self.assertNotEqual(result["result"], "accepted", result)
+            self.assertEqual(result["inputResult"], "definitely-not-sent", result)
+        self.assertEqual(self.call("close")["result"], "refused")
+        self.assertIn("model", self.call("read")["screen"])
+        self.assertEqual(self.events(log, 0), [])
+
+    def switch_worker_during_command(self, operation):
+        trigger, receipt = self.gated_exit()
+        pane = self.active_pane()
+        subprocess.run(self.tmux + ["set-option", "-w", "-t", pane, "remain-on-exit", "on"], check=True)
+        after_enter = self.root / "enter"
+        shim = self.work / "tmux"
+        shim.write_text(f"""#!{sys.executable}
+import os, subprocess, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+entered = Path({str(after_enter)!r})
+if any("send-keys -t " in x and " Enter ; " in x for x in args):
+    subprocess.run([{TMUX!r}, *args], check=True)
+    entered.touch()
+    sys.exit(0)
+close = any("kill-session -t " in x for x in args)
+observe = entered.exists() and any("capture-pane -p" in x for x in args)
+if close or observe:
+    Path({str(trigger)!r}).touch()
+    deadline = time.monotonic() + 5
+    while subprocess.check_output({self.tmux!r}+["display-message","-pt",{pane!r},"#{{pane_dead}}"]).strip() != b"1":
+        assert time.monotonic() < deadline
+        time.sleep(.02)
+    subprocess.run({self.tmux!r}+["respawn-pane","-t",{pane!r},"/bin/cat"], check=True)
+os.execv({TMUX!r}, [{TMUX!r}, *args])
+""")
+        shim.chmod(0o700)
+        reply = self.call(operation, environ={"PATH": str(self.work)}, **({"text": "check"} if operation == "submit" else {}))
+        self.assertEqual(json.loads(receipt.read_bytes()).get("exitCode"), 37)
+        self.assertEqual(self.active_pane(), pane)
+        self.assertFalse(self.call("inspect")["workerBound"])
+        return reply
+
+    def test_close_preserves_replacement_during_final_guard(self):
+        self.assertEqual(self.switch_worker_during_command("close")["result"], "refused")
+
+    def test_submit_does_not_confirm_from_replacement_screen(self):
+        reply = self.switch_worker_during_command("submit")
+        self.assertEqual((reply["result"], reply.get("category")), ("uncertain", "input_uncertain"), reply)
+
+    def test_refused_close_operation_may_retry_after_exit(self):
+        trigger = self.root / "go"
+        argv = [sys.executable, "-c", "import pathlib,sys,time\nwhile not pathlib.Path(sys.argv[1]).exists(): time.sleep(.01)\nsys.exit(41)", str(trigger)]
+        reply = self.call("create", **{**self.launch, "argv": argv}, executionId="original")
+        self.assertEqual(reply["result"], "accepted", reply)
+        pane = self.active_pane()
+        subprocess.run(self.tmux + ["link-window", "-s", pane, "-t", "=sibling:"], check=True)
+        args = dict(executionId="original", closeOperationId="close-original")
+        self.assertEqual(self.call("close", **args)["result"], "refused")
+        self.assertTrue(self.call("inspect", executionId="original")["workerBound"])
+        trigger.touch()
+        deadline = time.monotonic() + 5
+        while self.call("inspect", executionId="original").get("alive") is not False:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.02)
+        self.assertEqual(json.loads(Path(reply["receipt"]).read_bytes())["exitCode"], 41)
+        for _ in range(2):
+            result = self.call("close", **args)
+            self.assertEqual((result.get("closeEffect"), result.get("closeOperationId")), ("already_absent", "close-original"), result)
+
+    @unittest.skipUnless(LEGACY_WFC, "set WFC_TEST_R1_BINARY to the R1 executable for the upgrade test")
+    def test_r1_equal_launch_hint_and_offline_terminal_receipt(self):
+        trigger, receipt = self.gated_exit(binary=LEGACY_WFC)
+        pane = self.active_pane()
+        args = dict(legacyExecutionId=receipt.stem, legacyWorkerPane=pane)
+        hold = receipt.with_suffix(".hold")
+        receipt.rename(hold)
+        try:
+            for extra in [{}, {"legacyLaunchId": receipt.stem}]:
+                seen = self.call("inspect", **args, **extra)
+                self.assertFalse(seen["workerBound"], seen)
+                self.assertNotIn("receipt", seen)
+                for op, fields in [("submit", {"text": "unverified"}), ("interrupt", {})]:
+                    self.assertNotEqual(self.call(op, **args, **extra, **fields)["result"], "accepted")
+        finally:
+            hold.rename(receipt)
+        seen = self.call("inspect", **args)
+        self.assertTrue(seen["workerBound"], seen)
+        subprocess.run(self.tmux + ["new-window", "-t", "=wfc-d-abc12345:", "/bin/cat"], check=True)
+        parked = self.root / "parked"
+        os.rename(self.socket, parked)
+        try:
+            live = self.call("inspect", **args)
+            self.assertEqual(live["result"], "uncertain")
+            self.assertNotIn("receipt", live)
+            trigger.touch()
+            deadline = time.monotonic() + 5
+            while json.loads(receipt.read_bytes()).get("exitCode") != 37:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.02)
+            offline = self.call("inspect", **args)
+            self.assertEqual(offline["result"], "uncertain", offline)
+            self.assertNotIn("alive", offline)
+            for key in ("legacyExecutionId", "launchId", "receipt"):
+                self.assertEqual(offline.get(key), seen[key], offline)
+            self.assertEqual(self.call("close", **args)["result"], "uncertain")
+            self.assertNotIn("receipt", self.call("inspect", **args, legacyLaunchId="b"*32))
+            receipt.rename(hold)
+            self.assertNotIn("receipt", self.call("inspect", **args))
+            receipt.symlink_to(hold)
+            self.assertNotIn("receipt", self.call("inspect", **args))
+            receipt.unlink()
+            hold.rename(receipt)
+        finally:
+            os.rename(parked, self.socket)
+        self.assertEqual(self.call("close", **args)["closeEffect"], "worker_exited")
+
+    @unittest.skipUnless(LEGACY_WFC, "set WFC_TEST_R1_BINARY to the R1 executable for the upgrade test")
+    def test_correct_unverified_r1_launch_hint(self):
+        launches = {}
+        for dispatch in ("left", "right"):
+            made = self.call("create", dispatch=dispatch, binary=LEGACY_WFC, **self.launch)
+            self.assertEqual(made["result"], "accepted", made)
+            launches[dispatch] = Path(made["receipt"])
+        for dispatch, other in [("left", "right"), ("right", "left")]:
+            args = dict(dispatch=dispatch, legacyExecutionId="legacy-"+dispatch)
+            wrong = self.call("inspect", **args, legacyLaunchId=launches[other].stem)
+            self.assertNotIn("receipt", wrong)
+            hint = dict(legacyWorkerPane=self.active_pane(dispatch))
+            if dispatch == "left":
+                hint["legacyLaunchId"] = launches[dispatch].stem
+            verified = self.call("inspect", **args, **hint)
+            self.assertEqual((verified.get("legacyExecutionId"), verified.get("launchId"), verified.get("receipt")),
+                             (args["legacyExecutionId"], launches[dispatch].stem, str(launches[dispatch])), verified)
+            self.assertNotIn("receipt", self.call("inspect", **args, legacyLaunchId=launches[other].stem))
+            self.assertEqual(self.call("inspect", **args).get("receipt"), str(launches[dispatch]))
+
+    def test_terminal_receipt_during_start_verification(self):
+        trigger = self.root / "go"
+        shim = self.work / "tmux"
+        shim.write_text(f"""#!{sys.executable}
+import json, os, sys, time
+from pathlib import Path
+directory = Path({str(self.state / "launches")!r})
+if "#{{pane_active}}" in sys.argv and directory.exists():
+    receipt, = directory.glob("*.json")
+    if json.loads(receipt.read_bytes()).get("category") == "started":
+        Path({str(trigger)!r}).touch()
+        deadline = time.monotonic() + 5
+        while json.loads(receipt.read_bytes()).get("exitCode") != 23:
+            assert time.monotonic() < deadline
+            time.sleep(.01)
+os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
+""")
+        shim.chmod(0o700)
+        argv = [sys.executable, "-c", "import pathlib,sys,time\nwhile not pathlib.Path(sys.argv[1]).exists(): time.sleep(.01)\nsys.exit(23)", str(trigger)]
+        reply = self.call("create", **{**self.launch, "argv": argv}, environ={"PATH": str(self.work)})
+        self.assertEqual((reply["result"], reply.get("category"), reply.get("exitCode")),
+                         ("uncertain", "process_exited", 23), reply)
 
     def test_lifecycle(self):
         # Keep the worker alive across Ctrl-C so close tests the active-session path.
