@@ -1,6 +1,6 @@
 //! Per-dispatch execution identities and replayable close operations.
 use super::binding::{save, unknown, valid_launch_id, Claim};
-use super::{failure, launch, Reply, Tmux};
+use super::{failure, Reply, Tmux};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -14,6 +14,7 @@ pub(super) enum CloseEffect {
     AlreadyAbsent,
     SessionClosed,
     WorkerExited,
+    UnstartedSessionClosed,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -75,6 +76,14 @@ impl Tmux<'_> {
             .filter(|id| valid_launch_id(id) && registry.closed.contains(*id))
             .cloned()
             .ok_or_else(unknown)
+    }
+
+    pub(super) fn archived_execution(&self, launch_id: &str) -> Reply<Option<String>> {
+        Ok(self
+            .registry()?
+            .launches
+            .into_iter()
+            .find_map(|(execution, launch)| (launch == launch_id).then_some(execution)))
     }
 
     pub(super) fn observed_launch(
@@ -185,7 +194,7 @@ impl Tmux<'_> {
         {
             if active == execution {
                 // Retry only a proven unstarted reservation before any keyed close.
-                if launch::cancelled(self.state, &id)
+                if self.cancellation(&id, Some(execution))?.is_some()
                     && !self.was_released(&id)?
                     && !self.registry()?.close_operations.contains_key(&id)
                 {
