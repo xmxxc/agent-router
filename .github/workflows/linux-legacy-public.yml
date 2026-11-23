@@ -1,0 +1,143 @@
+name: Linux public legacy ledger regression
+on:
+  push:
+    branches: [rust-router/linux-ci-legacy-public]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  legacy-public:
+    name: '#30 Public read-only legacy ledger'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      WFC_BUILD_ID: de5a8a48e19ab1b05ff9bc7d38486a631e43abe8
+      PRODUCT_TREE: cddd34b05d05db3c1e8e1cdece17504fea213f1f
+      LEGACY_TREE: 034a9cad954bc952812b35bec6fef840c6abc3a1
+      NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+      TRIPLE: x86_64-unknown-linux-gnu
+      EVIDENCE: ${{ github.workspace }}/linux-legacy-public-evidence
+      CARGO_BUILD_JOBS: '2'
+      PYTHONUTF8: '1'
+    steps:
+      - name: Record run identity
+        run: |
+          mkdir -p "$EVIDENCE"
+          printf 'Workflow %s\nRun %s attempt %s\nExpected product %s\n' \
+            "$GITHUB_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$WFC_BUILD_ID" | tee "$EVIDENCE/run.log"
+          uname -a | tee -a "$EVIDENCE/run.log"
+      - name: Check out the pinned product
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.WFC_BUILD_ID }}
+          path: product
+          persist-credentials: false
+      - name: Check out the verified native CI zlib archive
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.NATIVE_INPUT_SHA }}
+          path: native-input
+          sparse-checkout: vendor/zlib-1.3.1.tar.gz
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        with:
+          version: '0.16.0'
+      - name: Verify sources and prepare the native build
+        working-directory: product
+        run: |
+          git log -1 --format='Rust HEAD %H tree %T' | tee "$EVIDENCE/sources.log"
+          test "$(git rev-parse HEAD)" = "$WFC_BUILD_ID"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          legacy_tree=$(git rev-parse HEAD:crates/legacy-state)
+          printf 'Legacy component tree %s\n' "$legacy_tree" | tee -a "$EVIDENCE/sources.log"
+          test "$legacy_tree" = "$LEGACY_TREE"
+          git -C ../native-input log -1 --format='zlib source checkout HEAD %H tree %T' | tee -a "$EVIDENCE/sources.log"
+          test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
+          sha256sum vendor/INPUTS.sha256 tests/legacy_public.py | tee "$EVIDENCE/inputs.log"
+          sha256sum -c vendor/INPUTS.sha256 2>&1 | tee -a "$EVIDENCE/inputs.log"
+          rustup toolchain install 1.96.1 --profile minimal 2>&1 | tee "$EVIDENCE/toolchain.log"
+          {
+            rustc -vV
+            cargo --version
+            zig version
+            python --version
+            python -c 'import sqlite3; print("Python SQLite", sqlite3.sqlite_version); assert sqlite3.sqlite_version_info >= (3, 38)'
+          } 2>&1 | tee -a "$EVIDENCE/toolchain.log"
+          zlib=../native-input/vendor/zlib-1.3.1.tar.gz
+          sha256sum "$zlib" | tee -a "$EVIDENCE/inputs.log"
+          python tools/prepare.py --zlib-archive "$zlib" 2>&1 | tee -a "$EVIDENCE/inputs.log"
+      - name: Build and identify the release ELF binaries
+        id: build
+        working-directory: product
+        run: |
+          cargo build --release --locked --target "$TRIPLE" -p wfc -p wfc-legacy-state 2>&1 | tee "$EVIDENCE/build.log"
+          dir="target/$TRIPLE/release"
+          sha256sum "$dir/wfc" "$dir/wfc-legacy-state" | tee "$EVIDENCE/binaries.log"
+          version=$("$dir/wfc" --version)
+          printf '%s\n' "$version" | tee -a "$EVIDENCE/binaries.log"
+          [[ "$version" == *"(Rust, $TRIPLE, release, build $WFC_BUILD_ID)" ]]
+          readelf -hW "$dir/wfc" "$dir/wfc-legacy-state" | tee "$EVIDENCE/elf.log"
+      - name: Record the SQLite engine linked into the public CLI
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: |
+          cargo tree --locked --target "$TRIPLE" -p wfc -e features -i libsqlite3-sys 2>&1 | tee "$EVIDENCE/sqlite.log"
+          dir="target/$TRIPLE/release"
+          dynamic=$(readelf -dW "$dir/wfc")
+          printf '%s\n' "$dynamic" | tee -a "$EVIDENCE/elf.log"
+          [[ "$dynamic" != *libsqlite3.so* ]]
+          archives=("$dir"/build/libsqlite3-sys-*/out/libsqlite3.a)
+          test "${#archives[@]}" -eq 1
+          test -f "${archives[0]}"
+          sha256sum "${archives[0]}" | tee -a "$EVIDENCE/sqlite.log"
+          probe="$RUNNER_TEMP/wfc-sqlite-version"
+          cc -x c - -x none "${archives[0]}" -lm -ldl -pthread -o "$probe" <<'C'
+          #include <stdio.h>
+          extern const char *sqlite3_libversion(void);
+          extern const char *sqlite3_sourceid(void);
+          extern int sqlite3_libversion_number(void);
+          int main(void) {
+              printf("Bundled SQLite %s\nSource ID %s\n", sqlite3_libversion(), sqlite3_sourceid());
+              return sqlite3_libversion_number() < 3038000;
+          }
+          C
+          "$probe" | tee -a "$EVIDENCE/sqlite.log"
+      - name: Run the public legacy read-only matrix
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: python -Bu tests/legacy_public.py "target/$TRIPLE/release/wfc" 2>&1 | tee "$EVIDENCE/legacy-public.log"
+      - name: Ensure native tmux is available
+        id: tmux
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          if ! command -v tmux >/dev/null; then
+            sudo apt-get update 2>&1 | tee "$EVIDENCE/tmux-install.log"
+            sudo apt-get install -y --no-install-recommends tmux 2>&1 | tee -a "$EVIDENCE/tmux-install.log"
+          fi
+          tmux -V | tee "$EVIDENCE/tmux-version.log"
+      - name: Run the Rust workspace tests
+        if: ${{ !cancelled() && steps.tmux.outcome == 'success' }}
+        working-directory: product
+        run: cargo test --workspace --release --locked --target "$TRIPLE" 2>&1 | tee "$EVIDENCE/workspace-tests.log"
+      - name: Checksum the evidence logs
+        if: ${{ always() }}
+        run: |
+          cd "$EVIDENCE"
+          sha256sum -- *.log > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() }}
+        with:
+          name: linux-30-public-${{ env.WFC_BUILD_ID }}-attempt-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 14
