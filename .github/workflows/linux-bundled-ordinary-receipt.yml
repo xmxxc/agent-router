@@ -1,0 +1,141 @@
+name: Linux bundled ordinary-directory rejection
+on:
+  push:
+    branches: [rust-router/linux-33-ordinary-receipt-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  ordinary-directory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      WFC_BUILD_ID: db8144e25568b410cea97e36628dfbe09db4deed
+      PRODUCT_TREE: 88e506f072a82fd4ad290af1d22bbcd68a673330
+      PRODUCT_PARENT: beacb150e76330413596c5acfaf385e6110ed12f
+      NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+      ZLIB_SHA256: 17e88863f3600672ab49182f217281b6fc4d3c762bde361935e436a95214d05c
+      TEST_NAME: workflow::backend::bundled::tests::cleanup_receipt_ordinary_directory
+      EVIDENCE: ${{ github.workspace }}/linux-bundled-ordinary-evidence
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - name: Record the workflow identity and delegation status
+        run: |
+          mkdir -p "$EVIDENCE"
+          test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
+          {
+            printf 'workflow %s\nrun %s attempt %s\nref %s\nproduct %s\n' \
+              "$GITHUB_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_REF" "$WFC_BUILD_ID"
+            uname -a
+          } | tee "$EVIDENCE/run.log"
+          printf '%s\n' 'UNVERIFIED: delegated cgroup cleanup receipts are outside this job.' \
+            | tee "$EVIDENCE/delegation.log" >> "$GITHUB_STEP_SUMMARY"
+      - name: Check out the fixed R3 product
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.WFC_BUILD_ID }}
+          path: product
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Check out the pinned native archive
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.NATIVE_INPUT_SHA }}
+          path: native-input
+          sparse-checkout: vendor/zlib-1.3.1.tar.gz
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        with:
+          version: '0.16.0'
+      - name: Check the product tree and prepare pinned inputs
+        working-directory: product
+        run: |
+          git log -1 --format='product %H tree %T parent %P' | tee "$EVIDENCE/source.log"
+          test "$(git rev-parse HEAD)" = "$WFC_BUILD_ID"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          test "$(git show -s --format=%P HEAD)" = "$PRODUCT_PARENT"
+          test -z "$(git status --porcelain)"
+          test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
+          git -C ../native-input log -1 --format='native archive source %H tree %T' | tee -a "$EVIDENCE/source.log"
+          zlib=../native-input/vendor/zlib-1.3.1.tar.gz
+          printf '%s  %s\n' "$ZLIB_SHA256" "$zlib" | sha256sum --check --strict | tee "$EVIDENCE/inputs.log"
+          sha256sum vendor/INPUTS.sha256 Cargo.lock src/workflow/backend/bundled/tests.rs | tee -a "$EVIDENCE/inputs.log"
+          sha256sum --check --strict vendor/INPUTS.sha256 | tee -a "$EVIDENCE/inputs.log"
+          rustup toolchain install 1.96.1 --profile minimal
+          { rustc -vV; cargo --version; zig version; python --version; } | tee "$EVIDENCE/toolchain.log"
+          python tools/prepare.py --zlib-archive "$zlib" 2>&1 | tee "$EVIDENCE/prepare.log"
+      - name: Build and identify the release and test executables
+        working-directory: product
+        run: |
+          cargo build --release --locked --bin wfc 2>&1 | tee "$EVIDENCE/build.log"
+          install -m 0500 target/release/wfc "$EVIDENCE/wfc-release"
+          version=$("$EVIDENCE/wfc-release" --version)
+          [[ "$version" == *"(Rust, x86_64-unknown-linux-gnu, release, build $WFC_BUILD_ID)" ]]
+          printf '%s\n' "$version" | tee "$EVIDENCE/version.log"
+
+          if ! cargo test --release --locked --bin wfc --no-run --message-format=json \
+            > "$EVIDENCE/test-build.jsonl" 2> "$EVIDENCE/test-build.log"; then
+            cat "$EVIDENCE/test-build.log" >&2
+            exit 1
+          fi
+          harness=$(python - "$EVIDENCE/test-build.jsonl" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as records:
+              executables = {
+                  item["executable"]
+                  for item in map(json.loads, records)
+                  if item.get("reason") == "compiler-artifact"
+                  and item["target"]["name"] == "wfc"
+                  and item["target"]["kind"] == ["bin"]
+                  and item["profile"]["test"] is True
+                  and item.get("executable")
+              }
+          if len(executables) != 1:
+              raise SystemExit(f"expected one wfc test executable, found {len(executables)}")
+          print(executables.pop())
+          PY
+          )
+          install -m 0500 "$harness" "$EVIDENCE/wfc-test"
+          (
+            cd "$EVIDENCE"
+            sha256sum -- wfc-release wfc-test | tee executables.sha256
+          )
+      - name: Execute the exact ordinary-directory rejection fixture
+        run: |
+          cd "$EVIDENCE"
+          sha256sum --check --strict executables.sha256
+          printf 'selector %s\n' "$TEST_NAME" | tee "$EVIDENCE/selector.log"
+          env -i PATH=/usr/bin:/bin TMPDIR="$RUNNER_TEMP" WFC_TEST_BINARY="$EVIDENCE/wfc-release" \
+            "$EVIDENCE/wfc-test" --ignored --exact --nocapture --test-threads=1 "$TEST_NAME" \
+            2>&1 | tee "$EVIDENCE/fixture.log"
+          grep -Fx 'running 1 test' "$EVIDENCE/fixture.log"
+          grep -F "test $TEST_NAME ..." "$EVIDENCE/fixture.log"
+          grep -Fx 'BUNDLED_CLEANUP_RECEIPT_ORDINARY_DIRECTORY_REJECTED' "$EVIDENCE/fixture.log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$EVIDENCE/fixture.log"
+          sha256sum --check --strict executables.sha256
+          printf '%s\n' 'PASS: ordinary directory rejected by the fixed release.' \
+            | tee "$EVIDENCE/ordinary.log" >> "$GITHUB_STEP_SUMMARY"
+      - name: Checksum every evidence file
+        if: ${{ always() }}
+        run: |
+          cd "$EVIDENCE"
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 |
+            LC_ALL=C sort -z | xargs -0 -r sha256sum > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() }}
+        with:
+          name: linux-bundled-ordinary-${{ env.WFC_BUILD_ID }}-ci-${{ github.workflow_sha }}-attempt-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 14
