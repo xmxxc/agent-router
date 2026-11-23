@@ -20,7 +20,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 printf '%s\n' \
-    'CI host coverage: GitHub-hosted Linux x64 with a controlled Bash worker and local procfs.' \
+    'Smoke coverage: controlled Bash worker on Linux x86-64 with local procfs.' \
     'Worker tools: Bash, cat, and sleep. No model host or terminal backend is started.' \
     'Issue #21 covers real model hosts and final download acceptance on the same frozen candidate.'
 
