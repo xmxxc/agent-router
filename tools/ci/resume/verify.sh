@@ -10,7 +10,13 @@ case "$group" in
             Backend.test_public_reconcile_resume_after_orphaned_backend
             Backend.test_public_reconcile_lost_resume_reply_preserves_completion
             Backend.test_public_reconcile_resume_absence_proof_is_owner_bound_and_consumed
+            Backend.test_public_reconcile_offline_missing_or_broken_receipt_is_not_no_send
+            Backend.test_public_reconcile_requires_unique_immediate_predecessor
+            Backend.test_public_reconcile_same_owner_cannot_consume_another_audits_idle_proof
+            Backend.test_public_reconcile_duplicate_requires_dispatch_directory_sync
             Backend.test_public_resume_fences_pending_and_lost_launch_responses
+            Backend.test_public_resume_records_definite_spawn_failure
+            Backend.test_public_resume_dot_codex_home_created_after_dispatch
         )
         ;;
     public-resume)
