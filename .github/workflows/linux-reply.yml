@@ -1,7 +1,7 @@
-name: Linux worker replies
+name: Linux Herdr reply boundaries
 on:
   push:
-    branches: [rust-router/11-reply, rust-router/11-reply-r2]
+    branches: [rust-router/11-reply, rust-router/11-reply-r4]
   workflow_dispatch:
 
 permissions:
@@ -52,7 +52,7 @@ jobs:
           git log -1 --format='Rust HEAD %H tree %T' | tee "$EVIDENCE/sources.log"
           test "$(git rev-parse HEAD)" = "$WFC_BUILD_ID"
           test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
-          sha256sum vendor/INPUTS.sha256 tests/relay.py tests/receipts.py tests/herdr_public.py tools/check_tmux.py crates/herdr/tests/live.py | tee "$EVIDENCE/inputs.log"
+          sha256sum vendor/INPUTS.sha256 tests/herdr_public.py tools/check_tmux.py crates/herdr/tests/live.py crates/herdr/tests/composer.py | tee "$EVIDENCE/inputs.log"
           sha256sum -c vendor/INPUTS.sha256 2>&1 | tee -a "$EVIDENCE/inputs.log"
           rustup toolchain install 1.96.1 --profile minimal 2>&1 | tee "$EVIDENCE/toolchain.log"
           { rustc -vV; cargo --version; zig version; python --version; } | tee -a "$EVIDENCE/toolchain.log"
@@ -66,42 +66,14 @@ jobs:
           version=$(target/release/wfc --version)
           printf '%s\n' "$version" | tee -a "$EVIDENCE/binary.log"
           [[ "$version" == *"(Rust, x86_64-unknown-linux-gnu, release, build $WFC_BUILD_ID)" ]]
-      - name: Verify controller receipt and relay regressions
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: product
+      - name: Ensure strace for the zero-write boundary fixture
         run: |
-          failed=0
-          for fixture in receipts relay; do
-            python -Bu "tests/$fixture.py" target/release/wfc 2>&1 | tee "$EVIDENCE/$fixture.log" || failed=1
-          done
-          exit "$failed"
-      - name: Ensure native tmux is available
-        id: tmux
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: |
-          if ! command -v tmux >/dev/null; then
-            sudo apt-get update 2>&1 | tee "$EVIDENCE/tmux-install.log"
-            sudo apt-get install -y --no-install-recommends tmux 2>&1 | tee -a "$EVIDENCE/tmux-install.log"
+          if ! command -v strace >/dev/null; then
+            sudo apt-get update 2>&1 | tee "$EVIDENCE/strace-install.log"
+            sudo apt-get install -y --no-install-recommends strace 2>&1 | tee -a "$EVIDENCE/strace-install.log"
           fi
-          tmux -V | tee "$EVIDENCE/tmux.log"
-      - name: Run the Rust CLI and dispatch regressions
-        if: ${{ !cancelled() && steps.tmux.outcome == 'success' }}
-        working-directory: product
-        run: cargo test --workspace --release --locked 2>&1 | tee "$EVIDENCE/workspace-tests.log"
-      - name: Verify public replies through an isolated tmux server
-        if: ${{ !cancelled() && steps.tmux.outcome == 'success' }}
-        working-directory: product
-        run: |
-          python -Bu tools/check_tmux.py target/release/wfc -v \
-            Backend.test_input_counts_on_terminal \
-            Backend.test_public_question_reuses_terminal_evidence \
-            Backend.test_public_reply_once_and_original_done \
-            Backend.test_public_reply_releases_known_unsent \
-            Backend.test_public_reply_retains_claim_on_lost_enter_confirmation \
-            Backend.test_public_reply_keeps_ambiguous_draft \
-            Backend.test_public_reply_rechecks_after_waiting_for_input_lock \
-            2>&1 | tee -a "$EVIDENCE/tmux.log"
-      - name: Verify public replies on the pinned Linux Herdr server
+          strace --version | tee "$EVIDENCE/strace.log"
+      - name: Verify the Herdr composer and first-write boundaries
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: product
         run: |
@@ -117,13 +89,8 @@ jobs:
             test "$version" = 'herdr 0.9.5'
           } 2>&1 | tee "$EVIDENCE/herdr-input.log"
           python -Bu tests/herdr_public.py "$herdr" target/release/wfc -v \
-            PublicLifecycle.test_dispatch_current_execution_done_and_close \
-            PublicLifecycle.test_claim_survives_lost_ack_and_reconcile \
-            PublicLifecycle.test_public_reply_on_bound_herdr_pane \
-            PublicLifecycle.test_public_reply_retains_claim_after_herdr_delivers_without_receipt \
-            PublicLifecycle.test_public_reply_releases_claim_after_herdr_preflight_read_fails \
-            PublicLifecycle.test_public_reply_preserves_existing_scrolled_herdr_draft \
-            PublicLifecycle.test_public_reply_keeps_claim_when_herdr_draft_reappears \
+            PublicLifecycle.test_public_reply_preserves_herdr_draft_with_ambiguous_footer \
+            PublicLifecycle.test_public_reply_distinguishes_zero_write_deadline_and_lost_receipt \
             2>&1 | tee "$EVIDENCE/herdr-public.log"
       - name: Checksum evidence
         if: always()

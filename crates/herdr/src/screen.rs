@@ -60,7 +60,7 @@ fn complete_draft(lines: &[&str]) -> Option<String> {
 fn codex_box<'a>(
     screen: &'a Screen,
     prior_footer: &[&str],
-    expected: &str,
+    expected: Option<&str>,
 ) -> Option<Composer<'a>> {
     // Herdr can truncate old scrollback even when the entire bottom composer is visible.
     let lines: Vec<_> = screen.text.trim_end().lines().map(str::trim_end).collect();
@@ -83,19 +83,21 @@ fn codex_box<'a>(
         end -= match adjacent {
             2 if !prior_footer.is_empty() && lines.ends_with(prior_footer) => prior_footer.len(),
             2 => {
-                // The two possible drafts differ by a line containing “ · ”.
-                // Without a reference, a key is in doubt only if one matches.
-                let drafts = [
-                    complete_draft(&lines[start..end - 1]),
-                    complete_draft(&lines[start..end - 2]),
-                ];
-                let scrolled = drafts.iter().any(Option::is_none);
-                let matching = drafts
-                    .into_iter()
-                    .flatten()
-                    .find(|draft| !draft.is_empty() && compact(draft) == expected);
-                return (scrolled || matching.is_some()).then_some(Composer {
-                    draft: matching,
+                let longer = complete_draft(&lines[start..end - 1]);
+                let shorter = complete_draft(&lines[start..end - 2]);
+                let scrolled = longer.is_none() || shorter.is_none();
+                let draft = match expected {
+                    Some(expected) => [longer, shorter]
+                        .into_iter()
+                        .flatten()
+                        .find(|draft| !draft.is_empty() && compact(draft) == expected),
+                    // Before typing, use only the text present with either
+                    // footer boundary. A scroll marker still means occupied.
+                    None if scrolled => None,
+                    None => shorter,
+                };
+                return (scrolled || draft.is_some()).then_some(Composer {
+                    draft,
                     footer: None,
                 });
             }
@@ -121,7 +123,7 @@ fn codex_box<'a>(
 }
 
 pub(super) fn has_codex_draft(screen: &Screen) -> bool {
-    codex_box(screen, &[], "").is_some_and(|c| c.draft.is_none_or(|draft| !draft.is_empty()))
+    codex_box(screen, &[], None).is_some_and(|c| c.draft.is_none_or(|draft| !draft.is_empty()))
 }
 
 pub(super) fn confirm_codex(
@@ -132,7 +134,7 @@ pub(super) fn confirm_codex(
     save: &mut impl FnMut(&Handle) -> std::io::Result<()>,
 ) -> Result<()> {
     let expected = compact(text);
-    let footer = codex_box(before, &[], &expected)
+    let footer = codex_box(before, &[], Some(&expected))
         .filter(|c| c.draft.is_some())
         .and_then(|c| c.footer)
         .unwrap_or_default();
@@ -142,7 +144,7 @@ pub(super) fn confirm_codex(
         if read_only(&screen.text) || refusals(&screen.text) > refusals(&before.text) {
             return Err(Failure::unknown("worker refused or paused input"));
         }
-        let composer = codex_box(&screen, &footer, &expected)
+        let composer = codex_box(&screen, &footer, Some(&expected))
             .and_then(|c| Some((c.draft?, c.footer.is_some())));
         match composer {
             Some((draft, certain)) if !draft.is_empty() && compact(&draft) == expected => {
@@ -262,12 +264,18 @@ mod tests {
         };
         for footer in [&[][..], &["  previous · footer"][..]] {
             for text in ["draft", "draft tail · value"] {
-                let composer = codex_box(&screen, footer, &compact(text)).unwrap();
+                let composer = codex_box(&screen, footer, Some(&compact(text))).unwrap();
                 assert!(composer.footer.is_none());
                 assert_eq!(compact(composer.draft.as_deref().unwrap()), compact(text));
             }
-            assert!(codex_box(&screen, footer, "unrelated").is_none());
+            assert!(codex_box(&screen, footer, Some("unrelated")).is_none());
         }
+        assert!(has_codex_draft(&screen));
+        let empty = Screen {
+            text: "› Ask Codex to do anything\n  model · dir\n  keys · help".into(),
+            ..screen
+        };
+        assert!(!has_codex_draft(&empty));
     }
 
     #[test]
@@ -281,7 +289,7 @@ mod tests {
             codex_box(
                 &screen("› hello\n  世界\n\n  model · dir"),
                 &[],
-                "hello世界"
+                Some("hello世界")
             )
             .and_then(|c| c.draft)
             .as_deref(),
@@ -293,7 +301,7 @@ mod tests {
             "› hello\ntranscript\n  model · dir",
             "› Ask Codex to do anything\n\n  model · dir",
         ] {
-            assert!(codex_box(&screen(s), &[], "hello")
+            assert!(codex_box(&screen(s), &[], Some("hello"))
                 .and_then(|c| c.draft)
                 .is_none_or(|d| d.is_empty()));
         }
