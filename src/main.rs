@@ -35,6 +35,8 @@ fn main() -> anyhow::Result<ExitCode> {
             println!("Usage: wfc [--help | --version]");
             println!("{}", workflow::DISPATCH_USAGE);
             println!("{}", workflow::STATUS_USAGE);
+            #[cfg(target_os = "linux")]
+            println!("{}", workflow::worker_owner::CLOSE_USAGE);
             println!("{DONE_USAGE}");
             println!("{WAIT_USAGE}");
             println!("{ACK_USAGE}");
@@ -88,6 +90,21 @@ fn main() -> anyhow::Result<ExitCode> {
             };
             println!("{usage}");
         }
+        #[cfg(target_os = "linux")]
+        Some("--worker-owner") => workflow::worker_owner::run(&args)?,
+        #[cfg(target_os = "linux")]
+        Some("close") => match args.as_slice() {
+            [help] if help == "--help" || help == "-h" => {
+                println!("{}", workflow::worker_owner::CLOSE_USAGE)
+            }
+            [id] if !id.as_encoded_bytes().starts_with(b"-") => {
+                println!("{}", workflow::worker_owner::close(id)?)
+            }
+            _ => {
+                eprintln!("wfc: {}", workflow::worker_owner::CLOSE_USAGE);
+                return Ok(ExitCode::from(2));
+            }
+        },
         Some("dispatch") => {
             let request = match workflow::Dispatch::parse(&args) {
                 Ok(request) => request,
@@ -99,15 +116,16 @@ fn main() -> anyhow::Result<ExitCode> {
             println!("{}", request.run()?);
         }
         Some("status") => {
-            let id = match args.as_slice() {
-                [] => None,
-                [flag, id] if flag == "--dispatch" => Some(id.as_os_str()),
+            let (id, active) = match args.as_slice() {
+                [] => (None, false),
+                [flag] if flag == "--active" => (None, true),
+                [flag, id] if flag == "--dispatch" => (Some(id.as_os_str()), false),
                 _ => {
                     eprintln!("wfc: {}", workflow::STATUS_USAGE);
                     return Ok(ExitCode::from(2));
                 }
             };
-            println!("{}", workflow::status(id)?);
+            println!("{}", workflow::status(id, active)?);
         }
         Some("done") => {
             let request = match Done::parse(&args) {
