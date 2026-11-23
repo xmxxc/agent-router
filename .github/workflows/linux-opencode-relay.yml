@@ -1,7 +1,7 @@
-name: Linux OpenCode target validation
+name: Linux OpenCode target compatibility
 on:
   push:
-    branches: [rust-router/38-opencode-target-jammy-ci]
+    branches: [rust-router/38-opencode-target-contract-jammy-ci]
 
 permissions:
   contents: read
@@ -14,9 +14,9 @@ jobs:
       run:
         shell: bash
     env:
-      PRODUCT_SHA: d69868d0e66478c85dcaac7a8e00db326aca8724
-      PRODUCT_TREE: 19cc8b6e844ae45de27139c197cbd6c1b7e2d047
-      PRODUCT_PARENTS: '3578eebb0aa13e7470ef72a088d5fa074546e268 d18ce9add97c9296c3e55c6f7330349e984f7de7'
+      PRODUCT_SHA: fdfcaec8adebaadd5046ce66603a23849d6e277e
+      PRODUCT_TREE: 4af8412b15442c4151d3516d420366b3eb0d5080
+      PRODUCT_PARENTS: '3578eebb0aa13e7470ef72a088d5fa074546e268 f22f0daf9a8ff6831406d0df32305351ae0dafe6'
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TARGET: x86_64-unknown-linux-gnu
       CARGO_BUILD_JOBS: '2'
@@ -213,7 +213,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: linux-opencode-target-jammy-${{ github.run_id }}-${{ github.run_attempt }}
+          name: linux-opencode-contract-jammy-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14
