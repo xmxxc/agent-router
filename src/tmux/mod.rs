@@ -81,7 +81,7 @@ const EXCLUSIVE_WINDOW: &str = "#{==:#{window_linked_sessions},1}";
 struct Target {
     socket_fd: File,
     worker_pane: Option<String>,
-    supervised: bool,
+    pane_process: Option<binding::PaneProcess>,
     supervisor: Option<(String, u32)>,
     token: String,
     socket: String,
@@ -94,9 +94,14 @@ struct Target {
 }
 
 impl Target {
-    fn guard_supervisor(&self, condition: &str) -> String {
-        match self.supervisor.as_ref() {
-            Some((_, pid)) => format!("#{{&&:{condition},#{{==:#{{pane_pid}},{pid}}}}}"),
+    fn guard_worker_process(&self, condition: &str) -> String {
+        let pid = self
+            .supervisor
+            .as_ref()
+            .map(|(_, pid)| *pid)
+            .or_else(|| self.pane_process.as_ref().map(|p| p.pid));
+        match pid {
+            Some(pid) => format!("#{{&&:{condition},#{{==:#{{pane_pid}},{pid}}}}}"),
             None => condition.to_owned(),
         }
     }
@@ -104,7 +109,9 @@ impl Target {
     fn worker_pane(&self) -> Reply<&str> {
         self.worker_pane
             .as_deref()
-            .filter(|_| !self.supervised || self.supervisor.is_some())
+            .filter(|_| {
+                self.supervisor.is_some() || self.pane_process.as_ref().is_some_and(|p| p.live())
+            })
             .ok_or_else(|| failure("uncertain", "original worker pane is unverified"))
     }
 }
@@ -251,7 +258,7 @@ impl Tmux<'_> {
             socket: socket.to_string_lossy().into_owned(),
             socket_fd,
             worker_pane: None,
-            supervised: false,
+            pane_process: None,
             supervisor: None,
             server_start: server_start.to_string(),
             session: session.to_string(),
@@ -365,7 +372,7 @@ impl Tmux<'_> {
             }
         }
         let live = format!("#{{&&:{EXCLUSIVE_WINDOW},#{{==:#{{pane_dead}},0}}}}");
-        self.guarded(t, t.worker_pane()?, action, &t.guard_supervisor(&live))
+        self.guarded(t, t.worker_pane()?, action, &t.guard_worker_process(&live))
     }
 
     fn worker_screen(&self, t: &Target) -> Reply<String> {
@@ -544,8 +551,12 @@ impl Tmux<'_> {
                     "if-shell -F -t {} '#{{pane_dead}}' {{ display-message -p dead }} {{ {kill} }}",
                     worker_pane
                 );
-                let outcome =
-                    self.guarded_close(&t, worker_pane, &action, &t.guard_supervisor(exclusive))?;
+                let outcome = self.guarded_close(
+                    &t,
+                    worker_pane,
+                    &action,
+                    &t.guard_worker_process(exclusive),
+                )?;
                 if outcome == "dead\n" {
                     self.record_close(CloseOperation::NotExecuted)?;
                 }
@@ -740,15 +751,18 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
         });
     if inspect {
         let accepted = result["result"] == "accepted";
-        let launch = if let Some(execution) = request.execution_id.as_ref().filter(|_| accepted) {
+        let launch = if let Some(execution) = &request.execution_id {
             let id = backend
                 .legacy_execution_id
                 .expect("resolved execution selector");
-            if let Err(e) = backend.confirm_launch(id) {
-                return Ok(e);
+            match backend.confirm_launch(id) {
+                Ok(worker) if accepted || worker == binding::Worker::Exited => {
+                    result["executionId"] = json!(execution);
+                    Some(id.to_owned())
+                }
+                Err(e) if accepted => return Ok(e),
+                _ => None,
             }
-            result["executionId"] = json!(execution);
-            Some(id.to_owned())
         } else if let Some(execution) = &request.legacy_execution_id {
             match backend.observed_launch(execution, !accepted) {
                 Ok(Some(id)) => {

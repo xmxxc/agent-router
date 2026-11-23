@@ -60,7 +60,14 @@ pub(super) fn read_receipt(path: &Path) -> Option<Value> {
     if !file.metadata().ok()?.is_file() {
         return None;
     }
-    serde_json::from_reader(file).ok()
+    let record: Value = serde_json::from_reader(file).ok()?;
+    if record
+        .get("launchId")
+        .is_some_and(|value| value.as_str() != path.file_stem().and_then(|s| s.to_str()))
+    {
+        return None;
+    }
+    Some(record)
 }
 
 // Both parties must unlink the same one-shot spec before proceeding. Only
@@ -342,14 +349,17 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
     }
-    let started = super::binding::save(&receipt, &json!({"category":"started","pid":child.id()}));
+    let started = super::binding::save(
+        &receipt,
+        &json!({"category":"started","pid":child.id(),"launchId":id}),
+    );
     let status = child.wait()?;
     let code = status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
     super::binding::save(
         &receipt,
-        &json!({"category":"process_exited","exitCode":code}),
+        &json!({"category":"process_exited","exitCode":code,"launchId":id}),
     )?;
     started?;
     Ok(ExitCode::from(code as u8))
