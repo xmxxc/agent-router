@@ -1,7 +1,7 @@
-name: Linux same-session resume
+name: Linux resume receipt compatibility
 on:
   push:
-    branches: [rust-router/14-resume-r2-ci]
+    branches: [rust-router/14-resume-r4-receipts-ci]
 
 permissions:
   contents: read
@@ -12,7 +12,7 @@ defaults:
 
 jobs:
   linux-resume:
-    name: '#15 same-session resume and callback compatibility'
+    name: '#15 receipt compatibility follow-up'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -25,7 +25,7 @@ jobs:
       TMUX_REFERENCE_TREE: dd18a02b2e9bbb78e1c8aa33a5e859d8a727a22b
       TARGET: x86_64-unknown-linux-gnu
       CARGO_BUILD_JOBS: '2'
-      EVIDENCE: ${{ github.workspace }}/linux-resume-evidence
+      EVIDENCE: ${{ github.workspace }}/linux-resume-receipts-evidence
     steps:
       - name: Record workflow and run identity
         run: |
@@ -67,7 +67,7 @@ jobs:
         run: |
           {
             test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
-            test "$GITHUB_REF" = refs/heads/rust-router/14-resume-r2-ci
+            test "$GITHUB_REF" = refs/heads/rust-router/14-resume-r4-receipts-ci
             test "$(git -C ../ci rev-parse HEAD)" = "$GITHUB_WORKFLOW_SHA"
             git -C ../ci show -s --format='ci=%H tree=%T parents=%P'
             test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
@@ -172,22 +172,6 @@ jobs:
             sha256sum "$binary" | tee "$EVIDENCE/elf.sha256"
             readelf -hW "$binary"
           } 2>&1 | tee "$EVIDENCE/build.log"
-      - name: Verify the four public resume cases
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: product
-        run: bash ../ci/tools/ci/resume/verify.sh public-resume 2>&1 | tee "$EVIDENCE/public-resume.log"
-      - name: Verify the two tmux backend resume cases
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: product
-        run: bash ../ci/tools/ci/resume/verify.sh tmux-resume 2>&1 | tee "$EVIDENCE/tmux-resume.log"
-      - name: Verify the managed tmux worker callback
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: product
-        run: bash ../ci/tools/ci/resume/verify.sh tmux-owner 2>&1 | tee "$EVIDENCE/tmux-owner.log"
-      - name: Verify scope and callback compatibility
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: product
-        run: bash ../ci/tools/ci/resume/verify.sh scope 2>&1 | tee "$EVIDENCE/scope.log"
       - name: Verify receipt and acknowledgement compatibility
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: product
@@ -204,7 +188,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: linux-resume-${{ github.run_id }}-${{ github.run_attempt }}
+          name: linux-resume-receipts-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14

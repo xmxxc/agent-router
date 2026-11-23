@@ -19,7 +19,11 @@ def run(fixture, binary, evidence, selectors):
 
     loader = unittest.TestLoader()
     suite = loader.loadTestsFromNames(selectors, module)
-    matches = [test.id().removeprefix(spec.name + ".") for group in suite for test in group]
+    # Some fixtures use the instance's id field for a dispatch ID after setup.
+    matches = [
+        unittest.TestCase.id(test).removeprefix(spec.name + ".")
+        for group in suite for test in group
+    ]
     print(f"selectors={len(selectors)} matches={len(matches)} requested={json.dumps(selectors)}")
     if loader.errors or matches != selectors:
         print(f"matched_names={json.dumps(matches)} loader_errors={loader.errors}", file=sys.stderr)
@@ -28,7 +32,7 @@ def run(fixture, binary, evidence, selectors):
     scratch = Path(os.environ["TMPDIR"]).resolve()
     with Path(evidence).open("w", encoding="utf-8", buffering=1) as log:
         def record(event, case, **values):
-            print(json.dumps({"event": event, "test": case.id(), **values}), file=log)
+            print(json.dumps({"event": event, "test": unittest.TestCase.id(case), **values}), file=log)
 
         if any(name.startswith("Backend.test_public_resume_") for name in selectors):
             original_host = module.Backend.resumed_host
