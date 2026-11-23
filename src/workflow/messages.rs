@@ -213,7 +213,33 @@ impl Assignment {
         );
         // A continued task has the original host's environment. Selection
         // by explicit attempt is provisional until the callback is verified.
-        if reference.is_none() {
+        // On a proven pre-credential launch, an explicit current attempt
+        // selects the new task; authorize_callback still requires its owner.
+        let legacy_continue = expected_attempt == Some(worker.attempt.as_str())
+            && assignment.callback_hash.is_none()
+            && assignment.callback_ref_hash.is_none()
+            && row["backend"] == "tmux"
+            && row["host"] == "codex"
+            && row["audit"].as_array().into_iter().flatten().any(|event| {
+                event["operation"] == "continue"
+                    && event["legacyOwnerCallback"] == true
+                    && matches!(
+                        event["result"].as_str(),
+                        Some("pending" | "accepted" | "uncertain")
+                    )
+                    && event["round"] == worker.round
+                    && event["attempt"] == worker.attempt
+            });
+        if legacy_continue {
+            ensure!(
+                matches!(
+                    super::backend::execution_row(&row)?,
+                    std::borrow::Cow::Owned(_)
+                ),
+                "cannot verify the original execution for the legacy callback"
+            );
+        }
+        if reference.is_none() && !legacy_continue {
             if let Some(round) = env::var_os("WFC_ROUND") {
                 ensure!(
                     round.to_str().and_then(|s| s.parse::<u64>().ok()) == Some(worker.round),
@@ -290,7 +316,7 @@ struct Message {
     additional_fields: Map<String, Value>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum WorkerInput {
     Continue { task: String, report: String },
@@ -298,6 +324,13 @@ enum WorkerInput {
 }
 
 impl WorkerInput {
+    #[cfg(target_os = "linux")]
+    fn from_audit(event: &Value) -> Result<Self> {
+        let mut payload = event.clone();
+        payload["type"] = event["operation"].clone();
+        Ok(Self::deserialize(payload)?)
+    }
+
     fn kind(&self) -> &'static str {
         match self {
             Self::Continue { .. } => "continue",
@@ -418,6 +451,9 @@ impl Message {
         let mut body = self.original_body();
         if let Some(input) = &self.worker_input {
             body.insert("scope".into(), json!(self.worker.scope()));
+            if let Some(evidence) = self.additional_fields.get("inputEvidence") {
+                body.insert("inputEvidence".into(), evidence.clone());
+            }
             match input {
                 WorkerInput::Continue { task, report } => {
                     body.insert("task".into(), json!(task));
@@ -792,33 +828,87 @@ impl Inbox {
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) fn publish_worker_input(&mut self, row: &Value, event: &Value) -> Result<u64> {
-        let worker = Identity::deserialize(row).context("read worker input identity")?;
-        let mut payload = event.clone();
-        payload["type"] = event["operation"].clone();
-        let input = WorkerInput::deserialize(payload)?;
-        let key = event["id"]
+    fn worker_input_key(event: &Value) -> Result<String> {
+        let id = event["id"]
             .as_str()
             .and_then(|id| id.strip_prefix("i-"))
             .context("invalid input audit ID")?;
-        let mut message = Message::new(self.messages.len() as u64 + 1, worker, None);
-        message.message_id = format!("m-{key}");
-        message.worker_input = Some(input);
-        message.claim(State::Received)?;
-        if let Some(previous) = self
+        Ok(format!("m-{id}"))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn worker_input_receipt(
+        &self,
+        row: &Value,
+        event: &Value,
+    ) -> Result<Option<(u64, Value)>> {
+        let key = Self::worker_input_key(event)?;
+        let Some(message) = self
             .messages
             .iter()
-            .find(|row| row.message_id == message.message_id)
-        {
-            ensure!(
-                previous.worker == message.worker
-                    && previous.body() == message.body()
-                    && previous.worker_input.as_ref().map(WorkerInput::kind)
-                        == message.worker_input.as_ref().map(WorkerInput::kind),
-                "worker input history conflict"
-            );
-            return Ok(previous.id);
+            .find(|message| message.message_id == key)
+        else {
+            return Ok(None);
+        };
+        let worker = Identity::deserialize(row).context("read worker input identity")?;
+        let input = WorkerInput::from_audit(event)?;
+        ensure!(
+            message.worker == worker
+                && message.worker_input.as_ref() == Some(&input)
+                && message.delivery.state == State::Received
+                && message
+                    .body_hash
+                    .as_ref()
+                    .is_some_and(|hash| message.matches_hash(hash)),
+            "worker input history conflict"
+        );
+        let proof = message
+            .additional_fields
+            .get("inputEvidence")
+            .map(Value::as_str);
+        use crate::tmux::APPENDED_USER_ENTRY;
+        match (event["result"].as_str(), proof) {
+            (Some("pending"), Some(Some(APPENDED_USER_ENTRY))) => {
+                Ok(Some((message.id, json!(APPENDED_USER_ENTRY))))
+            }
+            (Some("accepted"), Some(Some(APPENDED_USER_ENTRY)))
+                if event["message"] == message.id
+                    && event["inputEvidence"] == APPENDED_USER_ENTRY =>
+            {
+                Ok(Some((message.id, json!(APPENDED_USER_ENTRY))))
+            }
+            // R15 kept the evidence on its settled audit only.
+            (Some("accepted"), None)
+                if event["message"] == message.id
+                    && event["inputEvidence"] == "new-transcript-entry" =>
+            {
+                Ok(Some((message.id, event["inputEvidence"].clone())))
+            }
+            _ => Ok(None),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn publish_worker_input(&mut self, row: &Value, event: &Value) -> Result<u64> {
+        ensure!(
+            event["inputEvidence"] == crate::tmux::APPENDED_USER_ENTRY,
+            "missing worker input evidence"
+        );
+        let worker = Identity::deserialize(row).context("read worker input identity")?;
+        let mut message = Message::new(self.messages.len() as u64 + 1, worker, None);
+        message.message_id = Self::worker_input_key(event)?;
+        ensure!(
+            !self
+                .messages
+                .iter()
+                .any(|prior| prior.message_id == message.message_id),
+            "worker input history conflict"
+        );
+        message.worker_input = Some(WorkerInput::from_audit(event)?);
+        message
+            .additional_fields
+            .insert("inputEvidence".into(), event["inputEvidence"].clone());
+        message.claim(State::Received)?;
         let id = message.id;
         self.publish(message)?;
         Ok(id)
@@ -843,7 +933,7 @@ impl Inbox {
         self.sync_directory()
     }
 
-    fn sync_directory(&self) -> Result<()> {
+    pub(super) fn sync_directory(&self) -> Result<()> {
         sync_directory(&self.dir)
     }
 }

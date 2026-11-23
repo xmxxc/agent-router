@@ -1,7 +1,7 @@
 name: Linux continue and nudge
 on:
   push:
-    branches: [rust-router/34-continue-nudge-r3]
+    branches: [rust-router/34-continue-nudge-r4]
 
 permissions:
   contents: read
@@ -135,6 +135,10 @@ jobs:
             Backend.test_public_nudge_rechecks_completion_and_lease_before_text \
             Backend.test_public_continue_checks_draft_and_does_not_infer_from_empty \
             Backend.test_public_continue_rolls_back_confirmed_refusal \
+            Backend.test_public_nudge_recovers_after_settlement_sync_failure \
+            Backend.test_public_nudge_rechecks_draft_and_lease_after_inbox_wait \
+            Backend.test_public_nudge_does_not_attribute_reappearing_history \
+            Backend.test_public_continue_verifies_legacy_worker_and_current_owner \
             2>&1 | tee -a "$EVIDENCE/tmux-public.log"
       - name: Checksum the evidence logs
         if: ${{ always() }}

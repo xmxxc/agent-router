@@ -2249,13 +2249,17 @@ time.sleep(45)
                 owner = self.call("inspect", dispatch=other["dispatch"], executionId=other["attempt"])
                 self.assertTrue(owner["alive"] and owner["owned"] and owner["workerBound"], owner)
 
-    def public_input_worker(self, scope="rounds"):
+    def public_input_worker(self, scope="rounds", legacy=False):
         worker = self.work / "round-worker.py"
-        worker.write_text(r"""import json, os, select, shlex, subprocess, time, tty
+        worker.write_text(r"""import json, os, select, shlex, subprocess, sys, time, tty
 from pathlib import Path
 
+legacy = Path("legacy-worker").exists()
+if legacy and "WFC_WORKER_CALLBACK" in os.environ:
+    env = {key: val for key, val in os.environ.items() if key != "WFC_WORKER_CALLBACK"}
+    os.execve(sys.executable, [sys.executable, __file__], env)
 tty.setraw(0)
-assert os.environ["WFC_WORKER_CALLBACK"]
+assert bool(os.environ.get("WFC_WORKER_CALLBACK")) != legacy
 assert not any(os.environ.get(key) for key in ("WFC_CONTROLLER_TOKEN", "WFC_OWNER_TOKEN"))
 binary = os.environ["WFC_BIN"]
 original = os.environ["WFC_ATTEMPT"]
@@ -2263,8 +2267,9 @@ report = os.environ["WFC_REPORT"]
 draft = b""
 local_draft = False
 assignment = None
-transcript = ""
-notice = ""
+transcript = "Previous assistant output\r\n\r\n"
+old_text = "› [router] Message from the controller: historical\r\n"
+old_refusal = "This conversation is read-only or unavailable; no operation was sent.\r\n"
 
 def write_json(name, value):
     tmp = Path(name + ".tmp")
@@ -2282,8 +2287,9 @@ def draw():
     if draft and Path("unknown-draft").exists():
         print("\x1b[2J\x1b[Hunknown shell mode", end="", flush=True)
         return
-    print(f"\x1b[2J\x1b[H{notice}{transcript}› {shown}\r\n\r\n  model · cwd", end="", flush=True)
-    Path("screen").write_text("draft" if local_draft else "ready")
+    print(f"\x1b[2J\x1b[H{transcript}› {shown}\r\n\r\n  model · cwd", end="", flush=True)
+    display = "draft" if local_draft else "partial" if draft and Path("change-draft").exists() else "ready"
+    Path("screen").write_text(display)
 
 def callback(*args):
     return subprocess.run([binary, *args], text=True, capture_output=True, timeout=10)
@@ -2298,11 +2304,31 @@ while time.monotonic() < deadline:
     if Path("draft").exists() != local_draft:
         local_draft = not local_draft
         draw()
+    if draft and Path("refresh-draft").exists():
+        Path("refresh-draft").unlink()
+        draw()
+    if Path("seed-history").exists():
+        mode = Path("seed-history").read_text()
+        Path("seed-history").unlink()
+        old = old_refusal if mode == "refusal" else old_text
+        print("\x1b[2J\x1b[H" + old + "".join(f"history {i}\r\n" for i in range(35)), end="", flush=True)
+        draw()
+        Path("history-ready").touch()
     if Path("finish-first-externally").exists():
         Path("finish-first-externally").unlink()
         Path(report).write_text("first report")
-        result = done(report, original)
+        owner = Path("legacy-owner")
+        result = done(report, original, *(["--owner-token", owner.read_text()] if legacy else []))
         write_json("first-done", json.loads(result.stdout))
+    if assignment and legacy and Path("legacy-finish").exists():
+        Path("legacy-finish").unlink()
+        target, attempt, reference = assignment
+        assert reference is None
+        Path(target).write_text("legacy second report")
+        no_owner = done(target, attempt)
+        previous = done(target, original, "--owner-token", Path("legacy-owner").read_text())
+        done_current = done(target, attempt, "--owner-token", Path("legacy-owner").read_text())
+        write_json("legacy-results", [no_owner.returncode, previous.returncode, json.loads(done_current.stdout)])
     if assignment and Path("finish-next").exists():
         Path("finish-next").unlink()
         target, attempt, reference = assignment
@@ -2335,14 +2361,17 @@ while time.monotonic() < deadline:
             continue
         draft = b""
         if Path("refuse-input").exists():
-            notice = "This conversation is read-only or unavailable; no operation was sent.\r\n"
+            transcript += old_refusal
             draw()
             continue
-        notice = ""
+        if Path("expose-history").exists():
+            transcript += old_refusal if Path("expose-history").read_text() == "refusal" else old_text
+            draw()
+            continue
         with open("formal-input", "a") as log:
             print(json.dumps(line), file=log)
         if not Path("omit-transcript").exists():
-            transcript = f"› {line}\r\n\r\n"
+            transcript += f"› {line}\r\n\r\n"
         draw()
         if line == "[router] Message from the controller: finish first":
             Path(report).write_text("first report")
@@ -2350,7 +2379,7 @@ while time.monotonic() < deadline:
             write_json("first-done", json.loads(result.stdout))
         elif line.startswith("[router] New task for you"):
             args = shlex.split(line)
-            assignment = tuple(args[args.index(flag) + 1].rstrip(".")
+            assignment = tuple(args[args.index(flag) + 1].rstrip(".") if flag in args else None
                                for flag in ("--report", "--attempt", "--callback-ref"))
             write_json("accepted-round", assignment)
             if Path("fast-r2-complete").exists():
@@ -2363,6 +2392,8 @@ while time.monotonic() < deadline:
         draw()
 """)
         config = self.work / "launch.json"
+        if legacy:
+            (self.work / "legacy-worker").touch()
         config.write_text(json.dumps({"hosts": {"codex": {"command": [sys.executable, str(worker)]}}}))
         for name in ("task", "next-task"):
             (self.work / name).write_text(name)
@@ -2380,6 +2411,15 @@ while time.monotonic() < deadline:
         first = cli("dispatch", "--host", "codex", "--scope", scope, "--task", "task",
                     "--cwd", ".", "--report", "report1", "--launch-config", str(config), token=owner)
         self.await_input_value(lambda: (self.work / "worker-pid").exists())
+        if legacy:
+            # Reproduce the pre-credential assignment without changing its launch.
+            path = self.state / "dispatches" / f"{first['dispatch']}.json"
+            row = json.loads(path.read_text())
+            row.pop("workerCallbackHash")
+            path.write_text(json.dumps(row))
+            owner_file = self.work / "legacy-owner"
+            owner_file.touch(mode=0o600)
+            owner_file.write_text(owner)
         return cli, first, owner, env
 
     def public_input_gate(self, env, mode):
@@ -2400,6 +2440,20 @@ if mode == "lose-enter-response" and enter:
     if result.returncode == 0:
         (root / "enter-sent").touch()
     sys.exit(1)
+if read and mode in ("before-text", "before-enter") and not (root / "input-boundary").exists():
+    typed = (root / "input-bytes").exists()
+    if typed == (mode == "before-enter"):
+        # Return the screen captured before the test acquires the Inbox lock.
+        result = subprocess.run([real, *args], close_fds=False, capture_output=True)
+        (root / "input-boundary").touch()
+        deadline = time.monotonic() + 12
+        while not (root / "release-input-boundary").exists():
+            if time.monotonic() >= deadline:
+                sys.exit(2)
+            time.sleep(.02)
+        sys.stdout.buffer.write(result.stdout)
+        sys.stderr.buffer.write(result.stderr)
+        sys.exit(result.returncode)
 if read and (mode == "first-read" or
              (mode == "after-enter" and (root / "accepted-round").exists())):
     (root / "input-boundary").touch()
@@ -2660,6 +2714,187 @@ os.execv(real, [real, *args])
         resumed = cli(*args, token=token)
         self.assertEqual(resumed["round"], 2)
         self.assertEqual(len(formal.read_text().splitlines()), 2)
+
+    def test_public_nudge_recovers_after_settlement_sync_failure(self):
+        cli, first, token, _ = self.public_input_worker()
+        dispatch = first["dispatch"]
+        source = self.work / "settlement-sync.c"
+        source.write_text(r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+int fsync(int fd) {
+    static unsigned dispatch_syncs;
+    int (*real_fsync)(int) = dlsym(RTLD_NEXT, "fsync");
+    const char *directory = getenv("WFC_TEST_SETTLEMENT_DIR");
+    char link[64];
+    char path[4096];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t count = readlink(link, path, sizeof(path) - 1);
+    if (directory && count >= 0) {
+        path[count] = '\0';
+        if (strcmp(directory, path) == 0 && ++dispatch_syncs == 2) {
+            FILE *marker = fopen("injected-settlement-sync", "w");
+            if (marker) fclose(marker);
+            errno = EIO;
+            return -1;
+        }
+    }
+    return real_fsync(fd);
+}
+""")
+        shim = self.work / "settlement-sync.so"
+        subprocess.run(["cc", "-shared", "-fPIC", "-o", shim, source, "-ldl"], check=True)
+        args = ("nudge", dispatch, "--text")
+        cli(*args, "safely repeat   ", token=token, expected=1, LD_PRELOAD=str(shim),
+            WFC_TEST_SETTLEMENT_DIR=str(self.state / "dispatches"))
+        self.assertTrue((self.work / "injected-settlement-sync").exists())
+        status = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        settled = status["audit"][-1]
+        self.assertEqual((settled["result"], settled["text"]), ("accepted", "safely repeat"))
+        formal = self.work / "formal-input"
+        self.assertEqual([json.loads(line) for line in formal.read_text().splitlines()],
+                         ["[router] Message from the controller: safely repeat"])
+        visible = cli(*args, "safely repeat", token=token)
+        self.assertEqual((visible["message"], visible["audit"], visible["duplicate"]),
+                         (settled["message"], settled["id"], True))
+        # Reconstruct the pre-rename disk state while retaining the proven receipt.
+        assignment = self.state / "dispatches" / f"{dispatch}.json"
+        row = json.loads(assignment.read_text())
+        pending = row["audit"][-1]
+        pending["result"] = "pending"
+        pending.pop("message")
+        pending.pop("inputEvidence")
+        assignment.write_text(json.dumps(row))
+        for text in ("safely repeat", "safely repeat  "):
+            result = cli(*args, text, token=token)
+            self.assertEqual((result["message"], result["audit"], result["duplicate"]),
+                             (settled["message"], settled["id"], True))
+        self.assertEqual(len(formal.read_text().splitlines()), 1)
+        status = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual(status["audit"][-1], settled)
+        self.assertEqual([m["id"] for m in status["messages"] if m["to"] == "worker"],
+                         [settled["message"]])
+
+    def test_public_nudge_rechecks_draft_and_lease_after_inbox_wait(self):
+        original = self.work
+        for mode in ("text-draft", "enter-draft", "enter-lease"):
+            with self.subTest(mode=mode):
+                self.work = original / mode
+                self.work.mkdir()
+                cli, first, token, env = self.public_input_worker(scope=mode)
+                dispatch = first["dispatch"]
+                if mode == "enter-lease":
+                    cli("renew", "--scope", mode, "--lease", "4", token=token)
+                before_text = mode == "text-draft"
+                gate = self.public_input_gate(env, "before-text" if before_text else "before-enter")
+                argv = [WFC, "nudge", dispatch, "--text", "boundary", "--owner-token", token]
+                with subprocess.Popen(argv, cwd=self.work, env={**env, **gate},
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as pending:
+                    self.await_input_value(lambda: (self.work / "input-boundary").exists())
+                    with (self.state / "messages.lock").open("a+") as inbox:
+                        fcntl.flock(inbox, fcntl.LOCK_EX)
+                        (self.work / "release-input-boundary").touch()
+                        self.await_input_value(
+                            lambda: "lock_inode_wait" in Path(f"/proc/{pending.pid}/wchan").read_text())
+                        if before_text:
+                            (self.work / "draft").touch()
+                            self.await_input_value(lambda: (self.work / "screen").read_text() == "draft")
+                        elif mode == "enter-draft":
+                            (self.work / "change-draft").touch()
+                            (self.work / "refresh-draft").touch()
+                            self.await_input_value(lambda: (self.work / "screen").read_text() == "partial")
+                        else:
+                            time.sleep(4.1)
+                        self.assertIsNone(pending.poll())
+                    out, error = pending.communicate(timeout=15)
+                self.assertEqual((pending.returncode, out), (1, ""))
+                self.assertIn("definitely-not-sent" if before_text else "uncertain", error)
+                if mode == "enter-lease":
+                    self.assertIn("stale_controller_owner", error)
+                    token = cli("takeover", "--scope", mode, "--owner", "B")["token"]
+                data = self.work / "input-bytes"
+                if before_text:
+                    self.assertFalse(data.exists())
+                else:
+                    self.assertEqual(data.read_bytes(), b"[router] Message from the controller: boundary")
+                self.assertFalse((self.work / "typed").exists())
+                self.assertFalse((self.work / "formal-input").exists())
+                self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
+        self.work = original
+
+    def test_public_nudge_does_not_attribute_reappearing_history(self):
+        original = self.work
+        for mode in ("same-text", "refusal"):
+            with self.subTest(mode=mode):
+                self.work = original / mode
+                self.work.mkdir()
+                cli, first, token, _ = self.public_input_worker(scope=mode)
+                dispatch = first["dispatch"]
+                (self.work / "seed-history").write_text(mode)
+                self.await_input_value(lambda: (self.work / "history-ready").exists())
+                pane = self.active_pane(dispatch)
+                hidden = "historical" if mode == "same-text" else "no operation was sent"
+                capture = self.tmux + ["capture-pane", "-p", "-J", "-t", pane]
+                self.assertNotIn(hidden, subprocess.check_output(capture, text=True))
+                self.assertIn(hidden, subprocess.check_output(capture + ["-S", "-"], text=True))
+                (self.work / "expose-history").write_text(mode)
+                args = ("nudge", dispatch, "--text", "historical")
+                self.assertIn("nudge uncertain", cli(*args, token=token, expected=1))
+                row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+                self.assertEqual(row["audit"][-1]["result"], "uncertain")
+                self.assertTrue(all(m["to"] != "worker" for m in row["messages"]))
+                self.assertIn("pending or uncertain", cli(*args, token=token, expected=1))
+                self.assertEqual(len((self.work / "typed").read_text().splitlines()), 1)
+                self.assertFalse((self.work / "formal-input").exists())
+                self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
+        self.work = original
+
+    def test_public_continue_verifies_legacy_worker_and_current_owner(self):
+        cli, first, token, _ = self.public_input_worker(legacy=True)
+        dispatch = first["dispatch"]
+        pane = self.active_pane(dispatch)
+        (self.work / "finish-first-externally").touch()
+        self.await_input_value(lambda: (self.work / "first-done").exists())
+        args = ("continue", dispatch, "--task", "next-task", "--report", "report2")
+        self.assertEqual(json.loads(cli(*args, expected=1))["error"], "stale_controller_owner")
+        accepted = cli(*args, token=token)
+        self.assertEqual(self.active_pane(dispatch), pane)
+        self.assertEqual(accepted["round"], 2)
+        self.await_input_value(lambda: (self.work / "accepted-round").exists())
+        _, attempt, reference = json.loads((self.work / "accepted-round").read_text())
+        self.assertEqual((attempt, reference), (accepted["attempt"], None))
+        (self.work / "legacy-finish").touch()
+        self.await_input_value(lambda: (self.work / "legacy-results").exists())
+        unowned, old_attempt, done = json.loads((self.work / "legacy-results").read_text())
+        self.assertEqual((unowned, old_attempt), (1, 1))
+        row = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual(row["executionId"], first["executionId"])
+        self.assertEqual(row["rounds"][-1]["result"]["id"], done["message"])
+        self.assertEqual(row["state"], "done")
+        (self.work / "next-task").unlink()
+        self.assertEqual(cli(*args, token=token), {**accepted, "duplicate": True})
+
+        # A missing JSON hash is insufficient when the actual worker has a secret.
+        self.work = self.root / "unverified worker"
+        self.work.mkdir()
+        cli, first, token, _ = self.public_input_worker(scope="unverified")
+        dispatch = first["dispatch"]
+        (self.work / "finish-first-externally").touch()
+        self.await_input_value(lambda: (self.work / "first-done").exists())
+        assignment = self.state / "dispatches" / f"{dispatch}.json"
+        old_row = json.loads(assignment.read_text())
+        old_row.pop("workerCallbackHash")
+        assignment.write_text(json.dumps(old_row))
+        error = cli("continue", dispatch, "--task", "next-task", "--report", "report2",
+                    token=token, expected=1)
+        self.assertIn("verify the original worker callback authorization", error)
+        self.assertFalse((self.work / "input-bytes").exists())
 
     def test_lifecycle(self):
         # Keep the worker alive across Ctrl-C so close tests the active-session path.

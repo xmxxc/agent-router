@@ -92,41 +92,66 @@ impl<'a> Request<'a> {
         let scope = record_scope(&original).context("invalid dispatch scope")?;
         let token = controller::token(self.token);
         controller::Owners::read(&state)?.require(scope, token.as_deref(), operation)?;
+        let nudge = match &self.action {
+            Action::Nudge(text) => Some(nudge_text(text)?),
+            _ => None,
+        };
+        let original_unresolved = assignment::input_unresolved(&original);
         ensure!(
-            !assignment::input_unresolved(&original),
+            !original_unresolved
+                || replay_index(&original, &self.action, nudge.as_deref())
+                    .is_some_and(|index| original["audit"][index]["result"] == "pending"),
             "input is pending or uncertain; verify the prior input before retrying"
         );
         let (_scope, _execution) =
             lock_input(&state, &original, scope, token.as_deref(), operation)?;
-        let current = super::read_record(&path)?;
+        let mut current = super::read_record(&path)?;
         ensure!(
             record_scope(&current) == Some(scope),
             "scope changed while waiting for input"
         );
         controller::Owners::read(&state)?.require(scope, token.as_deref(), operation)?;
         ensure!(
-            !assignment::input_unresolved(&current),
-            "input is pending or uncertain; verify the prior input before retrying"
+            ["host", "backend", "executionId", "tmuxSocket", "create"]
+                .iter()
+                .all(|key| current[*key] == original[*key]),
+            "execution changed while waiting for input"
         );
-        if let Action::Continue { task, report } = &self.action {
-            if let Some(event) = accepted_continue(&current, task, report)? {
-                return Ok(input_response(self.dispatch, event, true));
+        let same_round =
+            current["round"] == original["round"] && current["attempt"] == original["attempt"];
+        let replay = replay_index(&current, &self.action, nudge.as_deref()).filter(|index| {
+            let event = &current["audit"][*index];
+            same_round
+                || (operation == "continue"
+                    && event["fromRound"] == original["round"]
+                    && event["fromAttempt"] == original["attempt"])
+        });
+        if let Some(index) = replay {
+            let mut event = current["audit"][index].clone();
+            let inbox = messages::Inbox::open(&state)?;
+            authorized_generation(&state, scope, token.as_deref(), operation)?;
+            let (id, evidence) = inbox
+                .worker_input_receipt(&current, &event)?
+                .context("input is pending or uncertain; verify the prior input before retrying")?;
+            inbox
+                .sync_directory()
+                .context("sync the worker input receipt")?;
+            if event["result"] == "pending" {
+                event["message"] = json!(id);
+                event["inputEvidence"] = evidence;
+                event["result"] = json!("accepted");
+                current["audit"][index] = event.clone();
+                save(&path, &dir, &current)?;
+            } else {
+                messages::sync_directory(&dir).context("sync the settled worker input")?;
             }
+            return Ok(input_response(self.dispatch, &event, true));
         }
         ensure!(
-            [
-                "round",
-                "attempt",
-                "host",
-                "backend",
-                "executionId",
-                "tmuxSocket",
-                "create"
-            ]
-            .iter()
-            .all(|key| current[*key] == original[*key]),
-            "assignment changed while waiting for input"
+            !original_unresolved && !assignment::input_unresolved(&current),
+            "input is pending or uncertain; verify the prior input before retrying"
         );
+        ensure!(same_round, "assignment changed while waiting for input");
         ensure!(
             current["controllerOwner"].is_null()
                 && assignment::identified(&current)
@@ -158,6 +183,12 @@ impl<'a> Request<'a> {
                 && worker["state"] == "running",
             "execution is not a verified writable worker"
         );
+        let legacy_callback = operation == "continue"
+            && current[controller::CALLBACK_HASH].is_null()
+            && current[controller::CALLBACK_REF_HASH].is_null();
+        if legacy_callback {
+            backend::verify_legacy_worker_callback(&state, self.dispatch, &observed)?;
+        }
 
         let (mut next, index, text, generation) = {
             let _inbox = messages::lock_for_publish(&state)?;
@@ -178,9 +209,9 @@ impl<'a> Request<'a> {
                     );
                     let (task, report) = next_paths(&current, &projected, &history, task, report)?;
                     ensure!(
-                        current[controller::CALLBACK_HASH]
+                        legacy_callback || current[controller::CALLBACK_HASH]
                             .as_str()
-                            .is_some_and(|hash| !hash.is_empty()),
+                            .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())),
                         "original worker has no independent callback credential; verify its launch before continuing"
                     );
                     let round = current["round"]
@@ -188,8 +219,8 @@ impl<'a> Request<'a> {
                         .and_then(|value| value.checked_add(1))
                         .context("invalid next round")?;
                     let attempt = format!("a-{}", Uuid::new_v4().simple());
-                    let reference =
-                        format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+                    let reference = (!legacy_callback)
+                        .then(|| format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()));
                     let created = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
                     next["rounds"] = projected["rounds"].clone();
                     next["rounds"].as_array_mut().context("invalid round history")?.push(json!({
@@ -200,12 +231,22 @@ impl<'a> Request<'a> {
                     next["attempt"] = json!(attempt);
                     next["task"] = json!(task);
                     next["report"] = json!(report);
-                    next[controller::CALLBACK_REF_HASH] = json!(messages::body_hash(&reference));
+                    if let Some(reference) = &reference {
+                        next[controller::CALLBACK_REF_HASH] = json!(messages::body_hash(reference));
+                    } else {
+                        event["legacyOwnerCallback"] = json!(true);
+                    }
                     event["task"] = json!(task);
                     event["report"] = json!(report);
-                    continued_brief(self.dispatch, &task, &report, &attempt, &reference)
+                    continued_brief(
+                        self.dispatch,
+                        &task,
+                        &report,
+                        &attempt,
+                        reference.as_deref(),
+                    )
                 }
-                Action::Nudge(text) => {
+                Action::Nudge(_) => {
                     ensure!(
                         projected["state"] != "done",
                         "dispatch already finished its task; give the next one with continue"
@@ -214,18 +255,7 @@ impl<'a> Request<'a> {
                         matches!(projected["state"].as_str(), Some("working" | "asking")),
                         "current round is not writable"
                     );
-                    let text = text
-                        .replace("\r\n", "\n")
-                        .split_terminator([
-                            '\n', '\r', '\x0b', '\x0c', '\x1c', '\x1d', '\x1e', '\u{85}',
-                            '\u{2028}', '\u{2029}',
-                        ])
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    ensure!(
-                        !text.trim().is_empty() && !text.chars().any(char::is_control),
-                        "invalid nudge text"
-                    );
+                    let text = nudge.as_deref().context("missing nudge text")?;
                     event["text"] = json!(text);
                     format!("[router] Message from the controller: {text}")
                 }
@@ -246,31 +276,34 @@ impl<'a> Request<'a> {
 
         let mut first_write_error = None;
         let answer = backend::submit_checked(&state, &current, &text, &mut |boundary| {
+            use crate::tmux::InputBoundary::{Enter, PrepareEnter, PrepareText, Text};
             let check = || -> Result<()> {
-                let _inbox = messages::lock_for_publish(&state)?;
-                let current_generation =
-                    authorized_generation(&state, scope, token.as_deref(), operation)?;
-                ensure!(
-                    current_generation == generation,
-                    "scope owner changed before input"
-                );
-                ensure!(
-                    super::read_record(&path)? == next,
-                    "assignment changed before input"
-                );
-                let history =
-                    view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
-                let mut projected = current.clone();
-                view::project(&mut projected, &history, Some(true), false)?;
-                if operation == "nudge" {
+                if matches!(boundary, PrepareText | PrepareEnter) {
+                    let _inbox = messages::lock_for_publish(&state)?;
                     ensure!(
-                        matches!(projected["state"].as_str(), Some("working" | "asking")),
-                        "current round is no longer writable; use continue after completion"
+                        super::read_record(&path)? == next,
+                        "assignment changed before input"
                     );
+                    let history =
+                        view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
+                    let mut projected = current.clone();
+                    view::project(&mut projected, &history, Some(true), false)?;
+                    if operation == "nudge" {
+                        ensure!(
+                            matches!(projected["state"].as_str(), Some("working" | "asking")),
+                            "current round is no longer writable; use continue after completion"
+                        );
+                    } else {
+                        ensure!(
+                            projected["state"] == "done",
+                            "continue lost its completed base round"
+                        );
+                    }
                 } else {
                     ensure!(
-                        projected["state"] == "done",
-                        "continue lost its completed base round"
+                        authorized_generation(&state, scope, token.as_deref(), operation)?
+                            == generation,
+                        "scope owner changed before input"
                     );
                 }
                 Ok(())
@@ -278,11 +311,11 @@ impl<'a> Request<'a> {
             check().map_err(|error| {
                 let diagnostic = format!("{error:#}");
                 let result = match boundary {
-                    crate::tmux::InputBoundary::Text => {
+                    PrepareText | Text => {
                         first_write_error = Some(error);
                         "definitely-not-sent"
                     }
-                    crate::tmux::InputBoundary::Enter => "uncertain",
+                    PrepareEnter | Enter => "uncertain",
                 };
                 json!({"result":result, "diagnostic":diagnostic})
             })
@@ -369,24 +402,51 @@ fn input_response(dispatch: &str, event: &Value, duplicate: bool) -> Value {
     result
 }
 
-fn accepted_continue<'a>(row: &'a Value, task: &Path, report: &Path) -> Result<Option<&'a Value>> {
-    let event = row["audit"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .rev()
-        .find(|event| {
-            event["operation"] == "continue"
-                && event["result"] == "accepted"
-                && event["round"] == row["round"]
-                && event["attempt"] == row["attempt"]
-                && event["message"].is_u64()
-        });
-    let Some(event) = event else {
-        return Ok(None);
-    };
-    let (task, report) = input_paths(row, task, report)?;
-    Ok((event["task"] == task && event["report"] == report).then_some(event))
+fn replay_index(row: &Value, action: &Action<'_>, nudge: Option<&str>) -> Option<usize> {
+    let audit = row["audit"].as_array()?;
+    let unresolved = assignment::input_unresolved(row);
+    audit.iter().rposition(|event| {
+        event["operation"] == action.name()
+            && matches!(event["result"].as_str(), Some("accepted" | "pending"))
+            && (!unresolved || event["result"] == "pending")
+            && event["round"] == row["round"]
+            && event["attempt"] == row["attempt"]
+            && match action {
+                Action::Continue { task, report } => {
+                    let resolved = task.canonicalize().or_else(|error| {
+                        if error.kind() == ErrorKind::NotFound {
+                            canonical_parent_path(task)
+                        } else {
+                            Err(error)
+                        }
+                    });
+                    resolved
+                        .ok()
+                        .and_then(|path| path_text(path).ok())
+                        .is_some_and(|task| event["task"] == task)
+                        && canonical_parent_path(report)
+                            .ok()
+                            .and_then(|path| path_text(path).ok())
+                            .is_some_and(|report| event["report"] == report)
+                }
+                Action::Nudge(_) => event["text"].as_str().map(str::trim_end) == nudge,
+            }
+    })
+}
+
+fn nudge_text(text: &str) -> Result<String> {
+    let text = text
+        .replace("\r\n", "\n")
+        .split_terminator([
+            '\n', '\r', '\x0b', '\x0c', '\x1c', '\x1d', '\x1e', '\u{85}', '\u{2028}', '\u{2029}',
+        ])
+        .collect::<Vec<_>>()
+        .join(" ");
+    ensure!(
+        !text.trim_end().is_empty() && !text.chars().any(char::is_control),
+        "invalid nudge text"
+    );
+    Ok(text.trim_end().to_owned())
 }
 
 fn authorized_generation(
@@ -461,18 +521,19 @@ fn input_paths(current: &Value, task: &Path, report: &Path) -> Result<(String, S
             .as_str()
             .context("missing original report")?,
     );
-    let absolute = std::path::absolute(report)?;
-    let parent = absolute
-        .parent()
-        .context("missing report directory")?
-        .canonicalize()
-        .context("resolve report directory")?;
+    let report = canonical_parent_path(report)?;
     ensure!(
-        original.parent() == Some(parent.as_path()),
+        original.parent() == report.parent(),
         "next report must be in the original report directory"
     );
-    let report = parent.join(absolute.file_name().context("missing report filename")?);
     Ok((path_text(task)?, path_text(report)?))
+}
+
+fn canonical_parent_path(path: &Path) -> std::io::Result<PathBuf> {
+    let missing = || std::io::Error::new(ErrorKind::InvalidInput, "missing parent or filename");
+    let absolute = std::path::absolute(path)?;
+    let parent = absolute.parent().ok_or_else(missing)?.canonicalize()?;
+    Ok(parent.join(absolute.file_name().ok_or_else(missing)?))
 }
 
 fn path_text(path: PathBuf) -> Result<String> {
@@ -493,13 +554,15 @@ fn continued_brief(
     task: &str,
     report: &str,
     attempt: &str,
-    reference: &str,
+    reference: Option<&str>,
 ) -> String {
     let task = task.replace('\'', "'\\''");
     let report = report.replace('\'', "'\\''");
+    let reference = reference.map_or_else(String::new, |reference| {
+        format!(" --callback-ref {reference}")
+    });
     format!("[router] New task for you (dispatch {dispatch}). Read and do the task in '{task}'. \
         Stop any server or background process you started before reporting. Write the report to '{report}'. \
-        Run \"$WFC_BIN\" done --report '{report}' --attempt {attempt} --callback-ref {reference}. \
-        If you need a decision, run \"$WFC_BIN\" ask \"<question>\" --attempt {attempt} \
-        --callback-ref {reference} and end your turn.")
+        Run \"$WFC_BIN\" done --report '{report}' --attempt {attempt}{reference}. \
+        If you need a decision, run \"$WFC_BIN\" ask \"<question>\" --attempt {attempt}{reference} and end your turn.")
 }

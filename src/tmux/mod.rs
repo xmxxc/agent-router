@@ -63,9 +63,13 @@ enum Operation {
 
 type Reply<T> = std::result::Result<T, Value>;
 
+pub(crate) const APPENDED_USER_ENTRY: &str = "appended-user-entry";
+
 #[derive(Clone, Copy)]
 pub(crate) enum InputBoundary {
+    PrepareText,
     Text,
+    PrepareEnter,
     Enter,
 }
 

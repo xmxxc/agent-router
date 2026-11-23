@@ -209,6 +209,46 @@ pub(super) fn submit_checked(
     )
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn verify_legacy_worker_callback(
+    state: &Path,
+    dispatch: &str,
+    observed: &Value,
+) -> Result<()> {
+    let verify = || -> Result<()> {
+        let launch = observed["launchId"]
+            .as_str()
+            .filter(|id| valid_launch(id))
+            .context("missing launch ID")?;
+        let receipt = private_receipt(state, Some(launch))?;
+        let pid = receipt["pid"]
+            .as_u64()
+            .filter(|pid| *pid > 0)
+            .context("missing worker PID")?;
+        ensure!(receipt["category"] == "started", "worker no longer running");
+        let env = std::fs::read(format!("/proc/{pid}/environ"))?;
+        let field = |prefix: &[u8]| {
+            env.split(|b| *b == 0)
+                .find_map(|entry| entry.strip_prefix(prefix))
+        };
+        ensure!(
+            field(b"WFC_STATE=") == Some(state.canonicalize()?.as_os_str().as_encoded_bytes())
+                && field(b"WFC_DISPATCH=") == Some(dispatch.as_bytes()),
+            "original worker environment does not identify this execution"
+        );
+        ensure!(
+            env.split(|b| *b == 0).all(|entry| {
+                entry
+                    .strip_prefix(b"WFC_WORKER_CALLBACK=")
+                    .is_none_or(|secret| secret.is_empty())
+            }),
+            "original worker has a callback credential absent from the assignment"
+        );
+        Ok(())
+    };
+    verify().context("verify the original worker callback authorization before continuing")
+}
+
 fn existing_request(row: &Value, mut request: Value) -> Result<Value> {
     let attempt = row["attempt"]
         .as_str()
