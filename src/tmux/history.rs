@@ -19,6 +19,7 @@ pub(super) enum CloseEffect {
 #[derive(Clone, Copy, Deserialize, Serialize)]
 pub(super) enum CloseOperation {
     Pending,
+    NotExecuted,
     Confirmed(CloseEffect),
 }
 
@@ -76,7 +77,11 @@ impl Tmux<'_> {
             .ok_or_else(unknown)
     }
 
-    pub(super) fn observed_launch(&self, execution: &str) -> Reply<Option<String>> {
+    pub(super) fn observed_launch(
+        &self,
+        execution: &str,
+        terminal_only: bool,
+    ) -> Reply<Option<String>> {
         let claim = self.claim()?;
         let launch = match &claim {
             Some(observed @ Claim::Observed { receipt, .. })
@@ -89,7 +94,9 @@ impl Tmux<'_> {
         Ok(launch.filter(|id| {
             valid_launch_id(id)
                 && self.legacy_launch_id.is_none_or(|hint| hint == id)
-                && self.receipt_worker(id).is_ok()
+                && self
+                    .receipt_worker(id)
+                    .is_ok_and(|worker| !terminal_only || worker == super::binding::Worker::Exited)
         }))
     }
 

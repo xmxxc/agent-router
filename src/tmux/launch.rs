@@ -52,7 +52,15 @@ fn private_file(path: &Path, value: &impl Serialize) -> Result<()> {
 }
 
 pub(super) fn read_receipt(path: &Path) -> Option<Value> {
-    serde_json::from_reader(File::open(path).ok()?).ok()
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    serde_json::from_reader(file).ok()
 }
 
 // Both parties must unlink the same one-shot spec before proceeding. Only
@@ -225,11 +233,18 @@ impl Tmux<'_> {
                             != format!(
                                 "{} {} {}",
                                 target.session,
-                                target.worker_pane()?,
+                                target
+                                    .worker_pane
+                                    .as_deref()
+                                    .ok_or_else(started_unverified)?,
                                 target.server_pid
                             )
                         {
                             return Err(started_unverified());
+                        }
+                        let latest = read_receipt(&receipt).ok_or_else(started_unverified)?;
+                        if latest["category"] != "started" {
+                            return Err(launch_failure(latest));
                         }
                         return Ok(target);
                     }
@@ -244,6 +259,25 @@ impl Tmux<'_> {
         started.map(|t| (t, receipt.clone())).map_err(|mut e| {
             if let Some(cancelled) = revoke_spec(&spec_path, &receipt) {
                 return cancelled;
+            }
+            // The worker can finish after the started check but before tmux
+            // confirms its pane. Prefer this launch's published terminal facts.
+            if let Some(final_receipt) = read_receipt(&receipt).filter(|r| {
+                matches!(
+                    r["category"].as_str(),
+                    Some(
+                        "process_exited"
+                            | "executable_missing"
+                            | "permission_denied"
+                            | "spawn_failed"
+                    )
+                )
+            }) {
+                let mut terminal = launch_failure(final_receipt);
+                if let Some(started) = e.get("launchResult") {
+                    terminal["launchResult"] = started.clone();
+                }
+                e = terminal;
             }
             e["receipt"] = json!(receipt);
             e
