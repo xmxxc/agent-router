@@ -21,6 +21,8 @@ mod backend;
 #[cfg(target_os = "linux")]
 pub mod herdr;
 pub mod host;
+#[cfg(target_os = "linux")]
+pub(crate) mod startup;
 mod view;
 
 pub const DISPATCH_USAGE: &str =
@@ -263,7 +265,36 @@ impl<'a> Dispatch<'a> {
                 record["executionId"] = record["attempt"].clone();
                 record["tmuxLaunchProtocol"] = json!(backend::LAUNCH_PROTOCOL);
             }
-            Some(host.prepare(&state, &mut record)?)
+            match host.prepare(&state, &mut record) {
+                Ok(launch) => Some(launch),
+                Err(err) => {
+                    #[cfg(target_os = "linux")]
+                    if let Some(failure) = err.downcast_ref::<host::ScriptUnavailable>() {
+                        // Owner changes lock scope then ledger. Herdr must
+                        // stay unowned through the same publication boundary.
+                        let _scope = (host.backend == "herdr")
+                            .then(|| controller::lock_scope(&state, &scope))
+                            .transpose()?;
+                        let ledger = messages::lock_for_publish(&state)?;
+                        let managed = authorize()?;
+                        ensure!(
+                            host.backend != "herdr" || !managed,
+                            "Herdr dispatch requires an unowned scope"
+                        );
+                        if host.backend == "herdr" {
+                            herdr::native_state(&state)?;
+                        }
+                        record["create"] = json!({"result":"definitely-not-sent","category":failure.category(),
+                            "dispatch":dispatch,"attempt":attempt,"round":round,"scope":scope});
+                        record["worker"] =
+                            json!({"state":"not_started","exit_code":null,"signal":null});
+                        write_json(&records.join(format!("{dispatch}.json")), &record, None)?;
+                        startup::Startup::new(&state, &dispatch, &attempt, None)
+                            .script_unavailable(*failure, ledger);
+                    }
+                    return Err(err);
+                }
+            }
         } else {
             None
         };
@@ -301,7 +332,13 @@ impl<'a> Dispatch<'a> {
             if let Some(launch) = launch {
                 let mut answer = backend::create(&state, &record, launch)?;
                 let accepted = answer["result"] == "accepted";
-                if accepted || answer["result"] == "uncertain" {
+                if accepted
+                    || answer["result"] == "uncertain"
+                    || matches!(
+                        answer["category"].as_str(),
+                        Some("executable_missing" | "permission_denied" | "spawn_failed")
+                    )
+                {
                     preserve_binding = true;
                     // Bind the launch receipt to the assignment that requested it.
                     answer["dispatch"] = record["dispatch"].clone();
@@ -312,6 +349,10 @@ impl<'a> Dispatch<'a> {
                     write_json(&published, &record, None).with_context(|| {
                         format!("could not publish launch evidence for {dispatch}; retaining its pending assignment")
                     })?;
+                    #[cfg(target_os = "linux")]
+                    if backend::publish_unconfirmed_tmux_exit(&state, &record).is_err() {
+                        eprintln!("wfc: could not publish confirmed startup failure");
+                    }
                     fs::remove_file(&pending)?;
                 }
                 ensure!(
@@ -366,9 +407,15 @@ impl<'a> Dispatch<'a> {
             if preserve_binding {
                 return Err(err);
             }
-            fs::remove_file(&pending).with_context(|| {
-                format!("{err:#}; removing unpublished dispatch {dispatch} also failed")
-            })?;
+            match fs::remove_file(&pending) {
+                Ok(()) => (),
+                Err(e) if e.kind() == ErrorKind::NotFound => (),
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("{err:#}; removing unpublished dispatch {dispatch} also failed")
+                    })
+                }
+            }
             return Err(err);
         }
         #[cfg(not(target_os = "linux"))]
@@ -513,7 +560,7 @@ fn read_record(path: &Path) -> Result<Value> {
 }
 
 fn decode_record(file: File, path: &Path) -> Result<Value> {
-    let mut record: Value = serde_json::from_reader(file)
+    let mut record: Value = serde_json::from_reader(std::io::BufReader::new(file))
         .with_context(|| format!("read dispatch record {}", path.display()))?;
     ensure!(
         record["dispatch"]
