@@ -203,10 +203,29 @@ pub(super) fn unconfirmed_tmux_exit(
     launch_id: &str,
     receipt: &Value,
 ) -> Result<()> {
+    if let Some(failure) = tmux_failure(launch_id, receipt)? {
+        let Some((dispatch, attempt)) = row["dispatch"].as_str().zip(row["attempt"].as_str())
+        else {
+            return Ok(());
+        };
+        super::messages::publish_startup_failure(state, dispatch, attempt, &failure)?;
+    }
+    Ok(())
+}
+
+pub(super) fn tmux_failure<'a>(
+    launch_id: &'a str,
+    receipt: &'a Value,
+) -> Result<Option<Failure<'a>>> {
     let Some(evidence) = receipt.get("startupExit") else {
         // Older supervisors recorded raw identity only for an unconfirmed zero.
-        unconfirmed_zero(state, row, launch_id, receipt);
-        return Ok(());
+        let zero = &receipt["startupZero"];
+        return Ok((receipt["category"] == "process_exited"
+            && receipt["exitCode"] == 0
+            && zero["pid"]
+                .as_u64()
+                .is_some_and(|pid| pid > 0 && pid <= u32::MAX as u64))
+        .then(|| unconfirmed_failure(launch_id, zero, Some(0), None)));
     };
     let (exit_code, signal, encoded) =
         match (evidence["exitCode"].as_i64(), evidence["signal"].as_i64()) {
@@ -222,8 +241,9 @@ pub(super) fn unconfirmed_tmux_exit(
         receipt["exitCode"] == encoded,
         "tmux startup exit evidence does not match receipt"
     );
-    publish_unconfirmed_exit(state, row, launch_id, evidence, exit_code, signal);
-    Ok(())
+    Ok(Some(unconfirmed_failure(
+        launch_id, evidence, exit_code, signal,
+    )))
 }
 
 fn publish_unconfirmed_exit(
@@ -237,11 +257,21 @@ fn publish_unconfirmed_exit(
     let Some((dispatch, attempt)) = row["dispatch"].as_str().zip(row["attempt"].as_str()) else {
         return;
     };
+    Startup::new(state, dispatch, attempt, Some(launch_id))
+        .publish(unconfirmed_failure(launch_id, evidence, exit_code, signal));
+}
+
+fn unconfirmed_failure<'a>(
+    launch_id: &'a str,
+    evidence: &'a Value,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+) -> Failure<'a> {
     let pid = evidence["pid"]
         .as_u64()
         .and_then(|pid| u32::try_from(pid).ok())
         .filter(|&pid| pid > 0);
-    Startup::new(state, dispatch, attempt, Some(launch_id)).publish(Failure {
+    Failure {
         category: "process_exited",
         diagnostic: "Worker exited before host startup was confirmed",
         exit_code,
@@ -250,7 +280,7 @@ fn publish_unconfirmed_exit(
         pid,
         process_start: evidence["processStart"].as_str(),
         requires_decision: true,
-    });
+    }
 }
 
 pub(crate) struct Running<'a> {

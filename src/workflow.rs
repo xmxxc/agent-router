@@ -351,7 +351,7 @@ impl<'a> Dispatch<'a> {
                     })?;
                     #[cfg(target_os = "linux")]
                     if backend::publish_unconfirmed_tmux_exit(&state, &record).is_err() {
-                        eprintln!("wfc: could not verify early host exit");
+                        eprintln!("wfc: could not publish confirmed startup failure");
                     }
                     fs::remove_file(&pending)?;
                 }

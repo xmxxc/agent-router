@@ -278,9 +278,25 @@ fn private_receipt(state: &Path, launch: Option<&str>) -> Result<Value> {
 
 #[cfg(target_os = "linux")]
 pub(super) fn publish_unconfirmed_tmux_exit(state: &Path, row: &Value) -> Result<()> {
+    if let Some(receipt) = verified_unconfirmed_tmux_receipt(state, row)? {
+        super::startup::unconfirmed_tmux_exit(
+            state,
+            row,
+            receipt["launchId"].as_str().context("missing launch ID")?,
+            &receipt,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn verified_unconfirmed_tmux_receipt(
+    state: &Path,
+    row: &Value,
+) -> Result<Option<Value>> {
     let create = &row["create"];
     if create["result"] != "uncertain" || create["category"] != "process_exited" {
-        return Ok(());
+        return Ok(None);
     }
     ensure!(
         row["backend"] == "tmux" && row["executionId"] == row["attempt"],
@@ -304,7 +320,7 @@ pub(super) fn publish_unconfirmed_tmux_exit(state: &Path, row: &Value) -> Result
             && receipt["exitCode"].as_u64().is_some_and(|code| code <= 255),
         "early-exit launch identity or outcome mismatch"
     );
-    super::startup::unconfirmed_tmux_exit(state, row, id, &receipt)
+    Ok(Some(receipt))
 }
 
 fn script_preflight_failed(row: &Value) -> bool {
