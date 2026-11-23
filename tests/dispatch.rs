@@ -174,10 +174,10 @@ fn failed_handoffs_leave_only_the_successful_dispatch_queryable() {
 fn live_worker_reports_once_and_wait_returns_the_same_receipt() {
     let f = Fixture::new();
     let worker = r#"
-import json, subprocess, sys
+import json, os, subprocess, sys
 from pathlib import Path
 Path("report.md").write_text("finished")
-args = [sys.argv[1], "done", "--report", "report.md"]
+args = [sys.argv[1], "done", "--report", os.environ["WFC_REPORT"], "--attempt", os.environ["WFC_ATTEMPT"]]
 first = json.loads(subprocess.check_output(args))
 assert first["state"] == "unsent" and not first["duplicate"]
 "#;
@@ -193,7 +193,13 @@ assert first["state"] == "unsent" and not first["duplicate"]
         .env("WFC_DISPATCH", record["dispatch"].as_str().unwrap())
         .env("WFC_ROUND", "1")
         .env("WFC_ATTEMPT", record["attempt"].as_str().unwrap())
-        .args(["done", "--report", "work/report.md"]));
+        .args([
+            "done",
+            "--report",
+            "work/report.md",
+            "--attempt",
+            record["attempt"].as_str().unwrap(),
+        ]));
     assert_eq!(receipt["duplicate"], true);
     let messages = batch["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 1);
@@ -227,6 +233,7 @@ fn invalid_callbacks_leave_the_queue_empty_and_parallel_retries_share_one_receip
     let record = run(f
         .dispatch("work", "reviewer", "task.md")
         .args([PYTHON, "-c", "pass"]));
+    fs::write(f.0.join("work/report.md"), "done").unwrap();
     let id = record["dispatch"].as_str().unwrap();
     let done = |report: &str| {
         let mut cmd = f.wfc();
@@ -239,17 +246,17 @@ fn invalid_callbacks_leave_the_queue_empty_and_parallel_retries_share_one_receip
     for mut cmd in [
         done("absent.md"),
         {
-            let mut c = done("task.md");
+            let mut c = done("work/report.md");
             c.env("WFC_ROUND", "2");
             c
         },
         {
-            let mut c = done("task.md");
+            let mut c = done("work/report.md");
             c.env("WFC_ATTEMPT", "stale");
             c
         },
         {
-            let mut c = done("task.md");
+            let mut c = done("work/report.md");
             c.args(["--attempt", "stale"]);
             c
         },
@@ -269,8 +276,8 @@ fn invalid_callbacks_leave_the_queue_empty_and_parallel_retries_share_one_receip
         Some(3)
     );
     let (a, b) = std::thread::scope(|scope| {
-        let other = scope.spawn(|| run(&mut done("task.md")));
-        (run(&mut done("task.md")), other.join().unwrap())
+        let other = scope.spawn(|| run(&mut done("work/report.md")));
+        (run(&mut done("work/report.md")), other.join().unwrap())
     });
     assert_eq!(a["messageId"], b["messageId"]);
     assert_ne!(a["duplicate"], b["duplicate"]);
@@ -280,9 +287,181 @@ fn invalid_callbacks_leave_the_queue_empty_and_parallel_retries_share_one_receip
     assert!(String::from_utf8_lossy(&conflict.stderr).contains("conflicts"));
     let messages = run(f.wfc().args(["wait", "--timeout", "0"]));
     assert_eq!(messages["messages"].as_array().unwrap().len(), 1);
-    let replay = run(&mut done("task.md"));
+    let replay = run(&mut done("work/report.md"));
     assert_eq!(replay["duplicate"], true);
     assert_eq!(replay["state"], "received");
     assert_eq!(replay["statusVersion"], 2);
     assert_eq!(replay["messageId"], a["messageId"]);
+}
+
+#[test]
+fn bound_report_unkeyed_callbacks_and_scope_follow_the_assignment() {
+    let f = Fixture::new();
+    fs::write(f.0.join("task"), "").unwrap();
+    let record = run(f.wfc().args([
+        "dispatch",
+        "--role",
+        "worker",
+        "--task",
+        "task",
+        "--cwd",
+        ".",
+        "--report",
+        "reports/current.md",
+        "--scope",
+        "team",
+        "--",
+        PYTHON,
+        "-c",
+        "pass",
+    ]));
+    fs::write(f.0.join("reports/current.md"), "finished").unwrap();
+    let callback = |path: &str| {
+        let mut c = f.wfc();
+        c.env_remove("WFC_ROUND")
+            .env_remove("WFC_ATTEMPT")
+            .env("WFC_DISPATCH", record["dispatch"].as_str().unwrap())
+            .args(["done", "--report", path]);
+        c
+    };
+    assert_eq!(
+        callback("task")
+            .args(["--message-id", "X"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(1)
+    );
+    let a = run(&mut callback("reports/current.md"));
+    let b = run(&mut callback("reports/current.md"));
+    assert_ne!(a["messageId"], b["messageId"]);
+    let mut ids = Vec::new();
+    for key in ["X", "Y", "X"] {
+        ids.push(
+            run(callback("reports/current.md").args(["--message-id", key]))["messageId"].clone(),
+        );
+    }
+    assert_ne!(ids[0], ids[1]);
+    assert_eq!(ids[0], ids[2]);
+    let other = f
+        .wfc()
+        .args(["wait", "--scope", "other", "--timeout", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(other.status.code(), Some(3));
+    let batch = run(f.wfc().args(["wait", "--scope", "team", "--timeout", "0"]));
+    let msgs = batch["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 4);
+    assert!(msgs.iter().all(|m| m["scope"] == "team"
+        && m.get("head") == Some(&Value::Null)
+        && m.get("dirty") == Some(&Value::Null)));
+}
+
+#[test]
+fn git_snapshot_is_taken_in_worker_directory_and_preserved_on_keyed_retry() {
+    let f = Fixture::new();
+    let work = f.0.join("work");
+    fs::create_dir(&work).unwrap();
+    let git = |args: &[&str]| {
+        let o = Command::new("git")
+            .current_dir(&work)
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-q"]);
+    git(&["commit", "--allow-empty", "-qm", "first"]);
+    let first_head = git(&["rev-parse", "HEAD"]);
+    fs::write(f.0.join("task"), "").unwrap();
+    let record = run(f.wfc().args([
+        "dispatch",
+        "--cwd",
+        "work",
+        "--role",
+        "tester",
+        "--task",
+        "task",
+        "--report",
+        "out/current",
+        "--",
+        PYTHON,
+        "-c",
+        "pass",
+    ]));
+    fs::write(f.0.join("out/current"), "done").unwrap();
+    let done = |key: &str| {
+        run(f
+            .wfc()
+            .env("GIT_DIR", f.0.join("other.git"))
+            .env("GIT_INDEX_FILE", f.0.join("other.index"))
+            .env_remove("WFC_ROUND")
+            .env_remove("WFC_ATTEMPT")
+            .env("WFC_DISPATCH", record["dispatch"].as_str().unwrap())
+            .args(["done", "--report", "out/current", "--message-id", key]))
+    };
+    let first = done("clean");
+    git(&["commit", "--allow-empty", "-qm", "second"]);
+    fs::write(work.join("untracked"), "").unwrap();
+    assert_eq!(done("clean")["messageId"], first["messageId"]);
+    done("dirty");
+    let batch = run(f.wfc().args(["wait", "--timeout", "0"]));
+    assert_eq!(batch["messages"][0]["head"], first_head);
+    assert_eq!(batch["messages"][0]["dirty"], false);
+    assert_eq!(batch["messages"][1]["head"], git(&["rev-parse", "HEAD"]));
+    assert_eq!(batch["messages"][1]["dirty"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_or_timed_out_git_leaves_both_snapshot_fields_null() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    let f = Fixture::new();
+    let record = run(f
+        .dispatch("work", "reviewer", "task")
+        .args([PYTHON, "-c", "pass"]));
+    fs::write(f.0.join("work/report.md"), "").unwrap();
+    let git = f.0.join("git");
+    let path = std::env::join_paths(
+        std::iter::once(f.0.clone())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let done = |key| {
+        run(f
+            .wfc()
+            .env("PATH", &path)
+            .env_remove("WFC_ROUND")
+            .env_remove("WFC_ATTEMPT")
+            .env("WFC_DISPATCH", record["dispatch"].as_str().unwrap())
+            .args(["done", "--report", "work/report.md", "--message-id", key]))
+    };
+    fs::write(&git, "#!/bin/sh\nexit 128\n").unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
+    done("failed");
+    // HEAD succeeds; status hangs. A partial snapshot cannot describe this tree.
+    fs::write(&git, "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then echo 0123456789abcdef0123456789abcdef01234567; else exec sleep 60; fi\n").unwrap();
+    let started = Instant::now();
+    let first = done("timeout");
+    assert!(started.elapsed() < Duration::from_secs(15));
+    let retry = Instant::now();
+    assert_eq!(done("timeout")["messageId"], first["messageId"]);
+    assert!(retry.elapsed() < Duration::from_secs(4));
+    let batch = run(f.wfc().args(["wait", "--timeout", "0"]));
+    let messages = batch["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert!(messages
+        .iter()
+        .all(|m| m.get("head") == Some(&Value::Null) && m.get("dirty") == Some(&Value::Null)));
 }

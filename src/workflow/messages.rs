@@ -1,6 +1,6 @@
-//! A worker posts one completion for its attempt. A controller claims a batch
+//! A worker can retry a keyed completion. A controller claims a batch
 //! before printing it, so another waiter cannot deliver the same messages.
-use super::{state_dir, valid_id};
+use super::{git_snapshot::Snapshot, state_dir, valid_id};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub const DONE_USAGE: &str = "wfc done --report FILE [--attempt ID] [--message-id KEY]";
-pub const WAIT_USAGE: &str = "wfc wait [--timeout SECONDS] [--dispatch ID]";
+pub const WAIT_USAGE: &str = "wfc wait [--timeout SECONDS] [--scope NAME] [--dispatch ID]";
 
 fn options<'a, const N: usize>(
     args: &'a [OsString],
@@ -46,18 +46,29 @@ struct Identity {
     round: u64,
     attempt: String,
     role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
 }
 
 impl Identity {
-    fn from_worker(state: &Path, expected_attempt: Option<&str>) -> Result<Self> {
-        let dispatch = env::var("WFC_DISPATCH")
-            .context("run done inside a dispatched worker (WFC_DISPATCH)")?;
-        ensure!(valid_id(&dispatch), "invalid dispatch ID");
-        let round: u64 = env::var("WFC_ROUND")
-            .context("missing worker round")?
-            .parse()
-            .context("invalid worker round")?;
-        let attempt = env::var("WFC_ATTEMPT").context("missing worker attempt")?;
+    fn scope(&self) -> &str {
+        // Pre-scope receipts still have a stable, per-dispatch scope.
+        self.scope.as_deref().unwrap_or(&self.dispatch)
+    }
+}
+
+#[derive(Deserialize)]
+struct Assignment {
+    #[serde(flatten)]
+    worker: Identity,
+    report: Option<PathBuf>,
+    cwd: PathBuf,
+    #[serde(rename = "controllerOwner")]
+    controller_owner: Option<Value>,
+}
+
+impl Assignment {
+    fn current(state: &Path, dispatch: &str, expected_attempt: Option<&str>) -> Result<Self> {
         let dir = state.join("dispatches");
         // Foreground dispatch writes and syncs .pending before launching us,
         // then renames it to .json. This order of opens also covers the rename.
@@ -68,16 +79,28 @@ impl Identity {
             result => result,
         }
         .with_context(|| format!("open dispatch {dispatch}"))?;
-        let identity: Self = serde_json::from_reader(file).context("read worker identity")?;
+        let assignment: Self = serde_json::from_reader(file).context("read worker assignment")?;
+        let worker = &assignment.worker;
         ensure!(
-            identity.dispatch == dispatch && identity.round == round,
-            "dispatch or round mismatch for {dispatch}"
+            worker.dispatch == dispatch,
+            "dispatch mismatch for {dispatch}"
         );
         ensure!(
-            identity.attempt == attempt && expected_attempt.is_none_or(|id| id == attempt),
+            assignment.controller_owner.is_none(),
+            "controller owner authorization required for {dispatch}"
+        );
+        if let Some(round) = env::var_os("WFC_ROUND") {
+            ensure!(
+                round.to_str().and_then(|s| s.parse::<u64>().ok()) == Some(worker.round),
+                "round mismatch for {dispatch}"
+            );
+        }
+        ensure!(
+            env::var_os("WFC_ATTEMPT").is_none_or(|v| v.to_str() == Some(worker.attempt.as_str()))
+                && expected_attempt.is_none_or(|id| id == worker.attempt),
             "attempt is no longer accepted for {dispatch}"
         );
-        Ok(identity)
+        Ok(assignment)
     }
 }
 
@@ -89,25 +112,33 @@ struct Completion {
     #[serde(flatten)]
     worker: Identity,
     report: PathBuf,
-    request_key: String,
+    request_key: Option<String>,
+    #[serde(flatten)]
+    snapshot: Snapshot,
     received: bool,
 }
 
 impl Completion {
-    fn receipt(&self, duplicate: bool) -> Value {
-        let (state, version) = if self.received {
+    fn delivery(&self) -> (&'static str, u8) {
+        if self.received {
             ("received", 2)
         } else {
             ("unsent", 1)
-        };
+        }
+    }
+
+    fn receipt(&self, duplicate: bool) -> Value {
+        let (state, version) = self.delivery();
         json!({"message": self.id, "messageId": self.message_id, "state": state,
-            "statusVersion": version, "duplicate": duplicate})
+            "statusVersion": version, "duplicate": duplicate, "scope": self.worker.scope()})
     }
 
     fn receive(&mut self) -> Value {
         self.received = true;
+        let (state, version) = self.delivery();
         json!({"id": self.id, "messageId": self.message_id, "dispatch": self.worker.dispatch,
-            "type": "done", "state": "received", "statusVersion": 2,
+            "type": "done", "state": state, "statusVersion": version,
+            "scope": self.worker.scope(), "head": self.snapshot.head, "dirty": self.snapshot.dirty,
             "report": self.report, "role": self.worker.role, "round": self.worker.round,
             "attempt": self.worker.attempt})
     }
@@ -151,6 +182,72 @@ impl Inbox {
             messages,
             _lock: lock,
         })
+    }
+
+    fn validate_done(
+        &self,
+        assignment: &Assignment,
+        report: &Path,
+        key: Option<&str>,
+        attempt: Option<&str>,
+    ) -> Result<Option<Value>> {
+        let worker = &assignment.worker;
+        let history = || {
+            self.messages
+                .iter()
+                .filter(|m| m.worker.dispatch == worker.dispatch)
+        };
+        let prior = key.and_then(|key| history().find(|m| m.request_key.as_deref() == Some(key)));
+        if let (Some(key), Some(prior)) = (key, prior) {
+            ensure!(
+                prior.worker.attempt == worker.attempt
+                    && prior.worker.round == worker.round
+                    && prior.report == report,
+                "message request {key} conflicts with an existing receipt"
+            );
+        }
+        let previous = history()
+            .find(|m| m.worker.round == worker.round && m.worker.attempt == worker.attempt);
+        if let Some(bound) = assignment
+            .report
+            .as_deref()
+            .or_else(|| previous.map(|m| m.report.as_path()))
+        {
+            ensure!(
+                report == bound,
+                "the current round reports to {}",
+                bound.display()
+            );
+        } else {
+            // Pre-binding Rust records carry no intended filename. Only the original
+            // attempt can establish it, and concurrent first submissions recheck it.
+            ensure!(
+                attempt.is_some() || env::var_os("WFC_ATTEMPT").is_some(),
+                "legacy dispatch has no bound report; supply --attempt"
+            );
+        }
+        if let Some(prior) = prior {
+            return Ok(Some(prior.receipt(true)));
+        }
+        if attempt.is_none() {
+            ensure!(
+                !history().any(|m| (m.worker.round != worker.round
+                    || m.worker.attempt != worker.attempt)
+                    && m.report == report),
+                "ambiguous report for {}; supply --attempt",
+                worker.dispatch
+            );
+            let earlier_rounds: std::collections::BTreeSet<_> = history()
+                .map(|m| m.worker.round)
+                .filter(|round| (1..worker.round).contains(round))
+                .collect();
+            ensure!(
+                worker.round.checked_sub(1) == Some(earlier_rounds.len() as u64),
+                "incomplete round history for {}; supply --attempt",
+                worker.dispatch
+            );
+        }
+        Ok(None)
     }
 
     fn save(&self) -> Result<()> {
@@ -199,31 +296,45 @@ impl<'a> Done<'a> {
         ensure!(report.is_file(), "report not found: {}", report.display());
         ensure!(report.to_str().is_some(), "report path must be UTF-8");
         let state = state_dir()?;
-        let lock = lock_file(&state)?;
-        lock.lock().context("lock controller messages")?;
-        let worker = Identity::from_worker(&state, self.attempt)?;
+        let dispatch = env::var("WFC_DISPATCH")
+            .context("run done inside a dispatched worker (WFC_DISPATCH)")?;
+        ensure!(valid_id(&dispatch), "invalid dispatch ID");
         let key = self
             .key
             .map(str::to_owned)
-            .unwrap_or_else(|| format!("done:{}:{}", worker.dispatch, worker.attempt));
-        let mut inbox = Inbox::read_locked(&state, lock)?;
-        if let Some(prior) = inbox.messages.iter().find(|m| {
-            m.worker.dispatch == worker.dispatch
-                && (m.request_key == key || m.worker.attempt == worker.attempt)
-        }) {
-            ensure!(
-                prior.worker.attempt == worker.attempt
-                    && prior.worker.round == worker.round
-                    && prior.report == report
-                    && prior.request_key == key,
-                "message request {key} conflicts with an existing receipt"
-            );
-            return Ok(prior.receipt(true));
+            .or_else(|| self.attempt.map(|id| format!("done:{dispatch}:{id}")));
+        let check = || {
+            let lock = lock_file(&state)?;
+            lock.lock().context("lock controller messages")?;
+            let assignment = Assignment::current(&state, &dispatch, self.attempt)?;
+            let inbox = Inbox::read_locked(&state, lock)?;
+            let receipt =
+                inbox.validate_done(&assignment, &report, key.as_deref(), self.attempt)?;
+            Ok::<_, anyhow::Error>((assignment, inbox, receipt))
+        };
+        let (initial, inbox, duplicate) = check()?;
+        if let Some(receipt) = duplicate {
+            return Ok(receipt);
+        }
+        // Git can block. Let unrelated callbacks and waits proceed while sampling.
+        drop(inbox);
+        let snapshot = Snapshot::read(&initial.cwd);
+        let (current, mut inbox, duplicate) = check()?;
+        ensure!(
+            initial.worker.round == current.worker.round
+                && initial.worker.attempt == current.worker.attempt
+                && initial.cwd == current.cwd
+                && initial.worker.scope() == current.worker.scope(),
+            "assignment changed while sampling {dispatch}"
+        );
+        if let Some(receipt) = duplicate {
+            return Ok(receipt);
         }
         let message = Completion {
             id: inbox.messages.len() as u64 + 1,
             message_id: format!("m-{}", Uuid::new_v4().simple()),
-            worker,
+            worker: current.worker,
+            snapshot,
             report,
             request_key: key,
             received: false,
@@ -238,11 +349,12 @@ impl<'a> Done<'a> {
 pub struct Wait<'a> {
     timeout: Duration,
     dispatch: Option<&'a str>,
+    scope: Option<&'a str>,
 }
 
 impl<'a> Wait<'a> {
     pub fn parse(args: &'a [OsString]) -> Result<Self> {
-        let [timeout, dispatch] = options(args, ["--timeout", "--dispatch"])?;
+        let [timeout, dispatch, scope] = options(args, ["--timeout", "--dispatch", "--scope"])?;
         let seconds: f64 = timeout
             .unwrap_or("3600")
             .parse()
@@ -250,7 +362,11 @@ impl<'a> Wait<'a> {
         ensure!(seconds.is_finite(), "expected a finite timeout");
         let timeout = Duration::try_from_secs_f64(seconds.max(0.0)).context("invalid timeout")?;
         ensure!(dispatch.is_none_or(valid_id), "invalid dispatch ID");
-        Ok(Self { timeout, dispatch })
+        Ok(Self {
+            timeout,
+            dispatch,
+            scope,
+        })
     }
 
     fn take(&self, state: &Path) -> Result<Vec<Value>> {
@@ -264,7 +380,11 @@ impl<'a> Wait<'a> {
         let batch: Vec<_> = inbox
             .messages
             .iter_mut()
-            .filter(|m| !m.received && self.dispatch.is_none_or(|id| id == m.worker.dispatch))
+            .filter(|m| {
+                !m.received
+                    && self.dispatch.is_none_or(|id| id == m.worker.dispatch)
+                    && self.scope.is_none_or(|scope| scope == m.worker.scope())
+            })
             .map(Completion::receive)
             .collect();
         if !batch.is_empty() {
