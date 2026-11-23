@@ -488,7 +488,7 @@ fn read_record(path: &Path) -> Result<Value> {
 }
 
 fn decode_record(file: File, path: &Path) -> Result<Value> {
-    let mut record: Value = serde_json::from_reader(file)
+    let mut record: Value = serde_json::from_reader(std::io::BufReader::new(file))
         .with_context(|| format!("read dispatch record {}", path.display()))?;
     ensure!(
         record["dispatch"]
