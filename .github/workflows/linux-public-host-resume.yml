@@ -1,0 +1,234 @@
+name: Jammy public host resume with verified Claude retry
+
+on:
+  push:
+    branches: [rust-router/19-opencode-cli-resume-r12-jammy-ci]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  public-host-resume:
+    name: '#15, #19, #36, #37 public host resume'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    env:
+      WFC_BUILD_ID: 89c5c0e26dc93467ce345e4fa4ef1d56ed63baa6
+      WFC_PRODUCT_TREE: 0f0ad045975d4cc6e71f0d4bd60ecbf41d3f3a5a
+      WFC_PRODUCT_PARENTS: '5a5edf6172fb278c5138fa60c0b256ad127ee7e0 a355fefa46da1583978c4ed7f55e25fbdbc3cbb6'
+      WFC_INPUTS_SHA256: bd32a344f0503054155eea7281a27119893a437a504a785dccc8aca464a4bffe
+      NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TERM_COLOR: never
+      PYTHONUTF8: '1'
+      EVIDENCE: ${{ github.workspace }}/linux-public-host-resume-evidence
+    steps:
+      - name: Record run identity
+        run: |
+          mkdir -p "$EVIDENCE"
+          printf 'Workflow %s\nRun %s attempt %s\nProduct %s\nTree %s\n' \
+            "$GITHUB_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            "$WFC_BUILD_ID" "$WFC_PRODUCT_TREE" | tee "$EVIDENCE/run.log"
+          { cat /etc/os-release; getconf GNU_LIBC_VERSION; uname -a; } | tee -a "$EVIDENCE/run.log"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.WFC_BUILD_ID }}
+          path: product
+          persist-credentials: false
+      - name: Check out the callback fixture and verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: ci
+          persist-credentials: false
+      - name: Check out the verified native CI zlib archive
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.NATIVE_INPUT_SHA }}
+          sparse-checkout: vendor/zlib-1.3.1.tar.gz
+          sparse-checkout-cone-mode: false
+          path: native-input
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '20.19.6'
+      - name: Test private adoption and focused resume plugins with a synthetic TUI
+        working-directory: product
+        run: |
+          node --version | tee "$EVIDENCE/node.log"
+          node --test tests/opencode_adoption.mjs tests/opencode_resume.mjs 2>&1 | tee -a "$EVIDENCE/node.log"
+          grep -F '# tests 4' "$EVIDENCE/node.log"
+          grep -F '# fail 0' "$EVIDENCE/node.log"
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        with:
+          version: '0.16.0'
+      - name: Verify sources and prepare the native build
+        working-directory: product
+        run: |
+          git log -1 --format='Product %H tree %T parent %P' | tee "$EVIDENCE/sources.log"
+          test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
+          test "$(git rev-parse HEAD)" = "$WFC_BUILD_ID"
+          parents=$(git cat-file -p HEAD | sed -n '/^$/q; s/^parent //p' | paste -sd' ' -)
+          test "$parents" = "$WFC_PRODUCT_PARENTS"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$WFC_PRODUCT_TREE"
+          test "$(git -C ../ci rev-parse HEAD)" = "$GITHUB_WORKFLOW_SHA"
+          test "$(git -C ../ci cat-file -p HEAD | sed -n '/^$/q; s/^parent //p')" = "$WFC_BUILD_ID"
+          test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
+          sha256sum src/workflow/host.rs src/workflow/messages.rs \
+            src/workflow/host/claude.rs src/workflow/host/claude/tests.rs \
+            src/workflow/host/opencode.rs src/workflow/host/opencode/tests.rs src/workflow/resume.rs \
+            src/workflow/host/opencode/{adoption,resume}.{rs,mjs} tests/opencode_{adoption,resume}.mjs \
+            tests/claude_resume.py tests/public_host_resume.py tools/check_tmux.py \
+            vendor/INPUTS.sha256 ../native-input/vendor/zlib-1.3.1.tar.gz \
+            | tee "$EVIDENCE/inputs.log"
+          printf '%s  %s\n' "$WFC_INPUTS_SHA256" vendor/INPUTS.sha256 | sha256sum --check --strict
+          sha256sum -c vendor/INPUTS.sha256 2>&1 | tee -a "$EVIDENCE/inputs.log"
+          rustup toolchain install 1.96.1 --profile minimal 2>&1 | tee "$EVIDENCE/toolchain.log"
+          { rustc -vV; cargo --version; zig version; python --version; } 2>&1 \
+            | tee -a "$EVIDENCE/toolchain.log"
+          python tools/prepare.py --zlib-archive ../native-input/vendor/zlib-1.3.1.tar.gz \
+            2>&1 | tee -a "$EVIDENCE/inputs.log"
+      - name: Prime the pinned Wuffs package with bounded download retries
+        working-directory: product/vendor/libghostty-vt
+        run: |
+          url=https://deps.files.ghostty.org/wuffs-7411f488fe2e2c205c3d3b3d28638b7356522930.tar.gz
+          archive="$RUNNER_TEMP/wuffs.tar.gz"
+          {
+            printf 'Wuffs source %s\n' "$url"
+            curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+              --retry-max-time 120 --connect-timeout 15 --max-time 60 "$url" -o "$archive"
+            printf '%s  %s\n' 17877d346f7988651d6c62e45b2e3b05c86809a6442c5e34612374b2a9719a1c "$archive" | sha256sum -c
+            package=$(zig fetch "$archive")
+            printf 'Wuffs Zig package %s\n' "$package"
+            test "$package" = 'N-V-__8AAP5JWgCGP_AD0teWpa4krRvE9VPZzvviGdbmN4jI'
+          } 2>&1 | tee "$EVIDENCE/wuffs.log"
+      - name: Build the fixed release CLI
+        id: build
+        working-directory: product
+        run: |
+          cargo build --release --locked --bin wfc 2>&1 | tee "$EVIDENCE/build.log"
+          sha256sum target/release/wfc | tee "$EVIDENCE/binary.log" "$EVIDENCE/release-elf.sha256"
+          readelf -hW -- target/release/wfc | tee -a "$EVIDENCE/binary.log"
+          version=$(target/release/wfc --version)
+          printf '%s\n' "$version" | tee -a "$EVIDENCE/binary.log"
+          [[ "$version" == *"(Rust, x86_64-unknown-linux-gnu, release, build $WFC_BUILD_ID)" ]]
+      - name: Verify both host proof adapters
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: |
+          failed=0
+          for host in claude opencode; do
+            cargo test --release --locked --bin wfc "workflow::host::$host::tests::" \
+              -- --nocapture 2>&1 | tee "$EVIDENCE/$host-rust.log" || failed=1
+          done
+          test_elf=$(sed -nE 's/^[[:space:]]*Running unittests src\/main\.rs \((target\/release\/deps\/wfc-[[:xdigit:]]+)\)[[:space:]]*$/\1/p' "$EVIDENCE/claude-rust.log")
+          other_elf=$(sed -nE 's/^[[:space:]]*Running unittests src\/main\.rs \((target\/release\/deps\/wfc-[[:xdigit:]]+)\)[[:space:]]*$/\1/p' "$EVIDENCE/opencode-rust.log")
+          if [[ -n "$test_elf" ]]; then
+            sha256sum -- "$test_elf" | tee "$EVIDENCE/test-elf.log"
+            readelf -hW -- "$test_elf" | tee -a "$EVIDENCE/test-elf.log"
+          fi
+          test "$failed" = 0
+          test -x "$test_elf"
+          test "$other_elf" = "$test_elf"
+          grep -F 'test result: ok. 8 passed; 0 failed; 0 ignored;' "$EVIDENCE/claude-rust.log"
+          grep -F 'test result: ok. 7 passed; 0 failed; 0 ignored;' "$EVIDENCE/opencode-rust.log"
+      - name: Verify the OpenCode first-launch transaction against WAL and SHM
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: |
+          cargo test --release --locked --bin wfc \
+            workflow::host::opencode::adoption::tests::v1_receipt_uses_committed_wal_and_survives_pending_promotion \
+            -- --exact --nocapture 2>&1 | tee "$EVIDENCE/opencode-adoption-rust.log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$EVIDENCE/opencode-adoption-rust.log"
+      - name: Download pinned OpenCode for the synthetic native configuration probe
+        id: native_opencode
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          opencode_dir=$(mktemp -d "$RUNNER_TEMP/opencode-config-probe.XXXXXX")
+          archive="$opencode_dir/opencode-linux-x64-baseline.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 --max-time 120 \
+            https://github.com/anomalyco/opencode/releases/download/v1.19.5/opencode-linux-x64-baseline.tar.gz \
+            -o "$archive"
+          printf '%s  %s\n' 17c200fd4b2289954cc01552559f9b6d03ec157b2ddfb5eb54144f491656333d "$archive" |
+            sha256sum --check --strict | tee "$EVIDENCE/opencode-native.log"
+          tar -xzf "$archive" -C "$opencode_dir"
+          sha256sum "$opencode_dir/opencode" | tee -a "$EVIDENCE/opencode-native.log"
+          version=$(env -i PATH=/usr/bin:/bin HOME="$opencode_dir" "$opencode_dir/opencode" --version)
+          test "$version" = 1.19.5
+          printf 'OpenCode %s\n' "$version" | tee -a "$EVIDENCE/opencode-native.log"
+          printf 'WFC_TEST_OPENCODE_V1=%s\n' "$opencode_dir/opencode" >> "$GITHUB_ENV"
+      - name: Ensure isolated tmux fixture prerequisites
+        id: tmux
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: |
+          sha256sum --check --strict "$EVIDENCE/release-elf.sha256" | tee "$EVIDENCE/release-check.log"
+          if ! command -v tmux >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends tmux
+          fi
+          tmux -V | tee "$EVIDENCE/tmux.log"
+          sudo -n true
+      - name: Verify public OpenCode and Claude resume and the native JSONC configuration
+        if: ${{ !cancelled() && steps.tmux.outcome == 'success' && steps.native_opencode.outcome == 'success' }}
+        working-directory: product
+        run: |
+          failed=0
+          python -Bu tests/public_host_resume.py target/release/wfc PublicHostResume \
+            2>&1 | tee "$EVIDENCE/public-host-resume.log" || failed=1
+          python -Bu tests/claude_resume.py target/release/wfc ClaudeDispatch \
+            2>&1 | tee "$EVIDENCE/claude-first-launch.log" || failed=1
+          test "$failed" = 0
+          grep -F "Ran 13 tests" "$EVIDENCE/public-host-resume.log"
+          grep -F "Ran 2 tests" "$EVIDENCE/claude-first-launch.log"
+          if grep -Eq 'skipped=' "$EVIDENCE/public-host-resume.log" "$EVIDENCE/claude-first-launch.log"; then exit 1; fi
+      - name: Verify signed Codex resume and reclaim regressions
+        if: ${{ !cancelled() && steps.tmux.outcome == 'success' }}
+        working-directory: product
+        env:
+          WFC_TEST_STICKY_OWNERSHIP: '1'
+        run: |
+          overlay=$(mktemp -d "$RUNNER_TEMP/callback-overlay.XXXXXX")
+          python -Bu ../ci/tools/ci/resume/prepare-callback-overlay.py tools/check_tmux.py "$overlay" \
+            2>&1 | tee "$EVIDENCE/callback-overlay.log"
+          python -Bu "$overlay/tools/check_tmux.py" target/release/wfc \
+            Backend.test_public_resume_preserves_conversation_rounds_and_callback_fences \
+            Backend.test_public_resume_fences_pending_and_lost_launch_responses \
+            Backend.test_public_resume_records_definite_spawn_failure \
+            Backend.test_public_resume_after_reclaim_preserves_history \
+            Backend.test_public_reclaim_requires_sticky_ownership \
+            2>&1 | tee "$EVIDENCE/codex-resume-reclaim.log"
+          grep -F "Ran 5 tests" "$EVIDENCE/codex-resume-reclaim.log"
+          grep -F '"callbackRejections": ["round", "attempt", "callback"]' "$EVIDENCE/codex-resume-reclaim.log"
+          if grep -Eq 'skipped=' "$EVIDENCE/codex-resume-reclaim.log"; then exit 1; fi
+      - name: Verify public tmux reply draft and transient empty composer
+        if: ${{ !cancelled() && steps.tmux.outcome == 'success' }}
+        working-directory: product
+        run: |
+          python -Bu tools/check_tmux.py target/release/wfc \
+            Backend.test_public_reply_requires_confirmed_tmux_chat_composer \
+            Backend.test_public_reply_keeps_claim_when_tmux_draft_reappears \
+            2>&1 | tee "$EVIDENCE/tmux-reply.log"
+          grep -F "Ran 2 tests" "$EVIDENCE/tmux-reply.log"
+          if grep -Eq 'skipped=' "$EVIDENCE/tmux-reply.log"; then exit 1; fi
+      - name: Checksum the evidence logs
+        if: ${{ always() }}
+        run: |
+          cd "$EVIDENCE"
+          shopt -s nullglob
+          sha256sum -- *.log *.sha256 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() }}
+        with:
+          name: linux-opencode-cli-resume-r12-${{ env.WFC_BUILD_ID }}-attempt-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 14
