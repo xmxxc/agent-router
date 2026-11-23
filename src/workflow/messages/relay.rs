@@ -265,11 +265,12 @@ impl<'a> Relay<'a> {
                 if matches!(outcome, Outcome::Delivered | Outcome::TooLong) {
                     continue;
                 }
-            }
-            drop(order);
-            if was_first || (recovery.is_empty() && scan.in_progress()) {
+            } else if was_first || (recovery.is_empty() && scan.in_progress()) {
+                // Advance an idle recovery scan promptly. A transport attempt
+                // that reaches the retry path still waits below.
                 continue;
             }
+            drop(order);
             std::thread::sleep(remaining().min(Duration::from_millis(500)));
         }
         Ok(())
