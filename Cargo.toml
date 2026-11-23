@@ -19,6 +19,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 serde = { version = "1", features = ["derive"] }
+wfc-legacy-state = { path = "crates/legacy-state" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

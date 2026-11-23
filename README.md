@@ -130,6 +130,20 @@ wfc resolve MESSAGE --actor reviewer --reason "核对外部送达记录" \
 
 Rust 默认使用用户主目录下的 `.local/state/agent-router`，可用 `WFC_STATE` 指定独立状态目录。帮助、版本和内核入口都不会读写调度状态。与 Python 版并排使用时，把两份 `wfc` 放在不同目录，分别使用显式路径，并为每次调用指定各自的 `WFC_STATE`。
 
+### 在 Linux 查看 Python 历史
+
+```sh
+WFC_STATE=/path/to/copied-state wfc status
+WFC_STATE=/path/to/copied-state wfc status --dispatch ID
+WFC_STATE=/path/to/copied-state wfc reclaim --dispatch ID
+```
+
+Linux 的 `status` 优先使用原 Rust 目录中的派工、消息账本或仍持有注册锁的 relay。只留空目录时，命令按 Python 规则查找 `router.db` 并显示旧库历史。可通过绝对路径选择独立的旧库副本。两种记录共处一处时，`wfc-legacy-state status` 可直接查看 SQLite 历史。
+
+Python 状态目录在 `WFC_STATE` 缺省或为空字符串时为 `~/.local/state/workflow-core`，字面值 `~/custom` 按用户主目录展开。空字符串让 Linux `status` 直接选择 Python 目录。缺省或非空设置在两处都没有记录时，`status` 返回原 Rust 路径的空视图。带账号的路径无法展开时，`status` 保留原 Rust 字面路径。选中旧目录时，循环链接等文件系统错误会显示诊断。`reclaim` 始终按 Python 规则选择目录，并输出只读预览。旧库的会话存活情况显示为未知。旧 schema 缺项会提示，WAL 模式需先用 SQLite 导出私有副本再查看。
+
+Linux 组合验证可用 `python3 -B tests/legacy_public.py target/release/wfc`。停写、核对原回执、后端查证和副本还原见 [Python 状态组件](crates/legacy-state/README.md)。
+
 启动 `wfc --kernel` 会收到一行 JSON 握手，其中含协议版本 1 和本次启动的 generation。保持标准输入打开，每行发送一个 JSON 请求。spawn 返回 nonce，后续 read、input、resize 和 close 使用同一个 unit、generation 和 nonce。关闭标准输入会结束内核。smoke 启动真实子进程，等待它就绪，调整窗口，输入随机文本并核对它回写的反转文本。
 
 WFC 的 `build.py --bundled-kernel <内核文件> --kernel-notices <许可证目录>` 接收以上两项输出，将内核放在 WFC 旁边，命名为 `wfc-kernel` 或 `wfc-kernel.exe`。这份同名兼容副本支持 Python 的无参数内核调用。运行时也可将 `WFC_BUNDLED_KERNEL` 指向该副本。Windows 默认使用系统 ConPTY（Windows 的伪终端接口）。

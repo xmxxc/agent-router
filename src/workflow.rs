@@ -446,7 +446,55 @@ fn decode_record(file: File, path: &Path) -> Result<Value> {
 }
 
 pub fn status(id: Option<&OsStr>, active: bool) -> Result<Value> {
+    #[cfg(target_os = "linux")]
+    if let Some(state) = legacy_status_state()? {
+        let dispatch = id
+            .map(|id| id.to_str().context("invalid dispatch ID"))
+            .transpose()?;
+        return wfc_legacy_state::status(&state, dispatch, active);
+    }
     status_with_history(id, active, messages::history)
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_status_state() -> Result<Option<PathBuf>> {
+    let configured = env::var_os("WFC_STATE");
+    if configured.as_ref().is_some_and(|value| value.is_empty()) {
+        return Ok(Some(wfc_legacy_state::state_dir()?));
+    }
+    let legacy = wfc_legacy_state::state_dir()
+        .and_then(|state| Ok(state.join("router.db").try_exists()?.then_some(state)));
+    if matches!(legacy, Ok(None)) {
+        return Ok(None);
+    }
+    let native = state_dir()?;
+    // Prefer the original Rust view when both stores have records. Their dispatch
+    // and receipt IDs are independent, so one query must use a single store.
+    if native.join("messages.json").try_exists()?
+        || !assignment::ids(&native.join("dispatches"))?.is_empty()
+        || !messages::relay::waiters(&native)?.is_empty()
+    {
+        return Ok(None);
+    }
+    // ~account/dir is also a valid literal Rust path. A missing account is
+    // reported without a system error by legacy discovery.
+    let named_home = configured.as_deref().is_some_and(|path| {
+        Path::new(path)
+            .components()
+            .find(|part| *part != Component::CurDir)
+            .is_some_and(|part| {
+                matches!(part, Component::Normal(name)
+                if name != "~" && name.as_encoded_bytes().starts_with(b"~"))
+            })
+    });
+    match legacy {
+        Err(error)
+            if named_home && !error.is::<std::io::Error>() && error.chain().nth(1).is_none() =>
+        {
+            Ok(None)
+        }
+        result => result,
+    }
 }
 
 // The integrated message ledger supplies #7's read-only messages::history.
