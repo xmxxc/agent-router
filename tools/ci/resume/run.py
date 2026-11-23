@@ -8,7 +8,76 @@ import unittest
 from uuid import UUID
 
 
-def run(fixture, binary, evidence, selectors):
+def group_layout(root):
+    root = Path(root).resolve(strict=True)
+    layout = {}
+    for field, variable, child in (
+        ("home", "HOME", "home"),
+        ("codexHome", "CODEX_HOME", "codex"),
+        ("state", "WFC_STATE", "state"),
+        ("socket", "WFC_TMUX_SOCKET", "tmux.sock"),
+        ("tmp", "TMPDIR", "tmp"),
+    ):
+        path = root / child
+        if os.environ.get(variable) != str(path) or path.resolve() != path:
+            raise ValueError(f"{variable} does not match the private group path")
+        layout[field] = path
+    return layout
+
+
+def resolved_path(path):
+    if not path.is_absolute() or ".." in path.parts:
+        return None
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
+def path_is_gone(path):
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        pass
+    return False
+
+
+def cleanup_status(reported, layout):
+    root = Path(reported["root"]) if reported["root"] is not None else None
+    tmp = layout["tmp"]
+    valid_root = (
+        root is not None and root != tmp and root.is_relative_to(tmp) and resolved_path(root) == root
+    )
+    fixture_paths, group_paths, invalid_paths, remaining = {}, {}, {}, {}
+    for field, value in reported.items():
+        if value is None:
+            continue
+        path = Path(value)
+        resolved = resolved_path(path)
+        if path == layout.get(field) and resolved == path:
+            # The outer shell verifies removal of its own group directory.
+            group_paths[field] = str(path)
+        elif (
+            valid_root and path.is_relative_to(root)
+            and resolved is not None and resolved.is_relative_to(root)
+        ):
+            fixture_paths[field] = str(path)
+            if not path_is_gone(path):
+                remaining[field] = str(path)
+        else:
+            invalid_paths[field] = str(path)
+    isolated = valid_root and not invalid_paths
+    return {
+        "isolated": isolated, "removed": isolated and not remaining,
+        "fixturePaths": fixture_paths, "groupPaths": group_paths,
+        "invalidPaths": invalid_paths, "fixtureRemaining": remaining,
+    }
+
+
+def run(group_root, fixture, binary, evidence, selectors):
+    layout = group_layout(group_root)
     fixture = Path(fixture).resolve()
     sys.argv[:] = [str(fixture), binary]
     sys.path.insert(0, str(fixture.parent))
@@ -29,7 +98,6 @@ def run(fixture, binary, evidence, selectors):
         print(f"matched_names={json.dumps(matches)} loader_errors={loader.errors}", file=sys.stderr)
         return 1
 
-    scratch = Path(os.environ["TMPDIR"]).resolve()
     with Path(evidence).open("w", encoding="utf-8", buffering=1) as log:
         def record(event, case, **values):
             print(json.dumps({"event": event, "test": unittest.TestCase.id(case), **values}), file=log)
@@ -87,16 +155,17 @@ def run(fixture, binary, evidence, selectors):
                 socket = getattr(case, "socket", env.get("WFC_TMUX_SOCKET"))
                 state = getattr(case, "state", env.get("WFC_STATE"))
                 codex_home = getattr(case, "codex_home", env.get("CODEX_HOME"))
-                if codex_home is None and "HOME" in env:
-                    codex_home = Path(env["HOME"]) / ".codex"
-                paths = [Path(p) for p in (root, socket, state, codex_home) if p is not None]
-                isolated = root is not None and all(p.is_relative_to(scratch) for p in paths)
-                removed = isolated and all(not os.path.lexists(p) for p in paths)
-                self.incomplete_cleanup |= not removed
-                record(
-                    "fixture-cleanup", case, root=str(root), state=str(state),
-                    codexHome=str(codex_home), socket=socket, isolated=isolated, removed=removed,
-                )
+                home = env.get("HOME")
+                if codex_home is None and home is not None:
+                    codex_home = Path(home) / ".codex"
+                reported = {
+                    field: str(value) if value is not None else None
+                    for field, value in (("root", root), ("state", state), ("home", home),
+                                         ("codexHome", codex_home), ("socket", socket))
+                }
+                cleanup = cleanup_status(reported, layout)
+                self.incomplete_cleanup |= not cleanup["removed"]
+                record("fixture-cleanup", case, **reported, **cleanup)
                 super().stopTest(case)
 
         result = unittest.TextTestRunner(verbosity=2, resultclass=Results).run(suite)
@@ -112,5 +181,5 @@ def run(fixture, binary, evidence, selectors):
 
 
 if __name__ == "__main__":
-    fixture, binary, evidence, *selectors = sys.argv[1:]
-    sys.exit(run(fixture, binary, evidence, selectors))
+    group_root, fixture, binary, evidence, *selectors = sys.argv[1:]
+    sys.exit(run(group_root, fixture, binary, evidence, selectors))

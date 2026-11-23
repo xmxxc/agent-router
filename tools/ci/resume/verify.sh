@@ -45,7 +45,7 @@ scratch=$(mktemp -d /tmp/wfc-resume-XXXXXXXX)
 cleanup() {
     local status=$? removed=no
     trap - EXIT
-    if rm -rf -- "$scratch" && test ! -e "$scratch"; then
+    if rm -rf -- "$scratch" && [[ ! -e "$scratch" && ! -L "$scratch" ]]; then
         removed=yes
     else
         status=1
@@ -77,6 +77,6 @@ env -i PATH="$PATH" LC_ALL=C.UTF-8 TERM=xterm-256color PYTHONUTF8=1 \
     HOME="$scratch/home" CODEX_HOME="$scratch/codex" WFC_STATE="$scratch/state" \
     TMPDIR="$scratch/tmp" WFC_TMUX_SOCKET="$scratch/tmux.sock" \
     "$python" -Bu "$reaper" timeout --kill-after=10s 4m "$python" -Bu "$runner" \
-    "$fixture" "$binary" "$EVIDENCE/$group-observations.log" "${selectors[@]}" || status=$?
+    "$scratch" "$fixture" "$binary" "$EVIDENCE/$group-observations.log" "${selectors[@]}" || status=$?
 sha256sum --check --strict "$EVIDENCE/elf.sha256"
 exit "$status"
