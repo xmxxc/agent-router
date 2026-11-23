@@ -44,7 +44,10 @@ fn attached_store(spec: &Value) -> Result<Store> {
     let unit = unit_dir(field(ticket, "unit")?)?;
     let _guard = lock(&unit)?;
     let (_, store) = store::current(&unit)?.context("missing current execution")?;
-    ensure!(store.ticket == *ticket, "stale create");
+    ensure!(
+        store.ticket == *ticket && store::ordered(&unit, &store)?,
+        "stale create"
+    );
     Ok(store)
 }
 
@@ -101,10 +104,13 @@ fn create(req: &Value) -> Result<Value> {
         Err(_) => return Ok(unknown_cleanup()),
     };
     if let Some((record, prior)) = &current {
+        if !store::ordered(&unit_path, prior).unwrap_or(false) {
+            return Ok(unknown_cleanup());
+        }
         if req["previous"] != prior.ticket || prior.ticket["attempt"] == attempt {
             return Ok(json!({"result":"refused","diagnostic":"current create fence"}));
         }
-        if !store::ordered(&unit_path, prior).unwrap_or(false) || !prior.replaceable(record) {
+        if !prior.replaceable(record) {
             return Ok(unknown_cleanup());
         }
     } else {
@@ -184,9 +190,10 @@ fn service_changed() -> Value {
     json!({"result":"uncertain","delivery":"definitely-not-sent","cleanup":"unknown","category":"bundled_restart","reconcile":true})
 }
 
-fn rpc(store: &Store, ready: &Value, req: &Value) -> Value {
+// The flag records whether the authenticated request frame may have left the client.
+fn rpc(store: &Store, ready: &Value, req: &Value) -> (Value, bool) {
     if store::process_state(&ready["service"]) != "alive" {
-        return service_changed();
+        return (service_changed(), false);
     }
     let mut sent = false;
     let outcome = (|| -> Result<Value> {
@@ -226,12 +233,13 @@ fn rpc(store: &Store, ready: &Value, req: &Value) -> Value {
         );
         Ok(reply)
     })();
-    outcome.unwrap_or_else(|_| {
+    let reply = outcome.unwrap_or_else(|_| {
         if !sent && store::process_state(&ready["service"]) != "alive" {
             return service_changed();
         }
         json!({"result":if sent {"uncertain"} else {"definitely-not-sent"}, "cleanup":"unknown"})
-    })
+    });
+    (reply, sent)
 }
 
 fn unknown_cleanup() -> Value {
@@ -247,8 +255,7 @@ fn terminal_reply(store: &Store, proof: Value, op: &str) -> Value {
     }
 }
 
-// In an unordered legacy history the caller can still address an individual
-// runtime. Only its authenticated live response authorizes a targeted close.
+// A directed operation addresses the authenticated runtime of this exact ticket.
 fn live_operation(store: &Store, req: &Value, op: &str, targeted: bool) -> Value {
     let observing = matches!(op, "inspect" | "close" | "read");
     if targeted && !observing && store.run.join("cleanup.json").try_exists().unwrap_or(true) {
@@ -257,31 +264,37 @@ fn live_operation(store: &Store, req: &Value, op: &str, targeted: bool) -> Value
     let Ok(ready) = store.signed("ready") else {
         return unknown_cleanup();
     };
-    let mut answer = rpc(store, &ready, req);
-    if answer["result"] == "accepted" {
+    let (mut answer, attempted) = rpc(store, &ready, req);
+    let accepted = answer["result"] == "accepted";
+    if op == "close" && (accepted || (targeted && attempted && answer["result"] == "uncertain")) {
+        let end = Instant::now() + TIMEOUT;
+        loop {
+            if let Ok(proof) = store.proof() {
+                if targeted {
+                    answer["scope"] = json!("execution");
+                    answer["ticket"] = store.ticket.clone();
+                    answer["cleanup"] = json!("unknown");
+                    answer["execution_cleanup"] = json!("confirmed");
+                    answer["execution_proof"] = proof;
+                    return answer;
+                }
+                return terminal_reply(store, proof, op);
+            }
+            // A lost reply gets one read-only check. Only an acknowledged
+            // close waits for the guardian to finish publishing its receipt.
+            if !accepted || Instant::now() >= end {
+                return unknown_cleanup();
+            }
+            thread::sleep(TICK);
+        }
+    }
+    if accepted {
         if targeted {
             answer["scope"] = json!("execution");
             answer["cleanup"] = json!("unknown");
         }
         if op == "inspect" {
             answer["identity"] = ready;
-        }
-        if op == "close" {
-            let end = Instant::now() + TIMEOUT;
-            loop {
-                if let Ok(proof) = store.proof() {
-                    if targeted {
-                        answer["execution_cleanup"] = json!("confirmed");
-                        answer["execution_proof"] = proof;
-                        return answer;
-                    }
-                    return terminal_reply(store, proof, op);
-                }
-                if Instant::now() >= end {
-                    return unknown_cleanup();
-                }
-                thread::sleep(TICK);
-            }
         }
     } else if answer["result"] != "refused" {
         // A terminal receipt can settle an observation or a pre-send failure.
@@ -360,7 +373,7 @@ fn operate(req: &Value) -> Result<Value> {
         "unknown operation"
     );
     if !store::ordered(&unit, &store).unwrap_or(false) {
-        if ticket.get("version").is_none() && matches!(op, "inspect" | "read" | "close") {
+        if matches!(op, "inspect" | "read" | "close") {
             if let Ok(target) = Store::open(&unit, ticket) {
                 return Ok(live_operation(&target, req, op, true));
             }
@@ -432,6 +445,69 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
+    fn authenticate_client(
+        socket: &mut wire::Wire<TcpStream>,
+        token: &str,
+        end: Instant,
+    ) -> Result<()> {
+        let hello = socket.read(256, end)?;
+        let client = field(&hello, "challenge")?;
+        let challenge = fresh();
+        let proof = store::sign(token, format!("server:{client}:{challenge}").as_bytes());
+        socket.write(&json!({"challenge":challenge,"proof":proof}), end)?;
+        let auth = socket.read(256, end)?;
+        store::verify(
+            token,
+            format!("client:{client}:{challenge}").as_bytes(),
+            field(&auth, "proof")?,
+        )
+    }
+
+    #[test]
+    fn lost_directed_close_reply_confirms_only_the_execution() -> Result<()> {
+        let store = Store {
+            run: std::env::temp_dir().join(fresh()),
+            ticket: json!({"unit":"probe","attempt":"close","generation":fresh(),"nonce":fresh()}),
+            token: fresh(),
+        };
+        store::private_dir(&store.run)?;
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let pid = store::identity(std::process::id())?;
+        let ready = json!({"guardian":pid, "service":pid, "kernel":pid, "worker":pid,
+            "endpoint":listener.local_addr()?.port(), "kernel_generation":fresh(),
+            "containment":{"kind":"cgroup-v2","path":"/fixture","device":1,"inode":2}});
+        let proof = json!({"state":"closed","proves":"execution-empty","identity":ready});
+        store.save_signed("ready", ready)?;
+        let answer = thread::scope(|scope| -> Result<Value> {
+            let peer = scope.spawn(|| -> Result<()> {
+                let mut socket = wire::Wire::new(listener.accept()?.0);
+                let end = Instant::now() + TIMEOUT;
+                authenticate_client(&mut socket, &store.token, end)?;
+                let frame = socket.read(wire::LIMIT, end)?;
+                assert_eq!(frame["op"], "close");
+                assert_eq!(frame["ticket"], store.ticket);
+                store.save_signed("cleanup", proof.clone())
+            });
+            let req = json!({"op":"close","ticket":store.ticket});
+            let answer = live_operation(&store, &req, "close", true);
+            peer.join().unwrap()?;
+            Ok(answer)
+        })?;
+        listener.set_nonblocking(true)?;
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(answer["result"], "uncertain");
+        assert_eq!(answer["ticket"], store.ticket);
+        assert_eq!(answer["scope"], "execution");
+        assert_eq!(answer["execution_cleanup"], "confirmed");
+        assert_eq!(answer["execution_proof"], proof);
+        assert_eq!(answer["cleanup"], "unknown");
+        fs::remove_dir_all(store.run)?;
+        Ok(())
+    }
+
     #[test]
     fn input_failure_tracks_whether_the_request_left_the_client() {
         let store = Store {
@@ -447,16 +523,12 @@ mod tests {
                 let server = scope.spawn(move || {
                     let mut socket = wire::Wire::new(listener.accept().unwrap().0);
                     let end = Instant::now()+TIMEOUT;
-                    let hello = socket.read(256,end).unwrap();
-                    let client = field(&hello,"challenge").unwrap();
-                    let challenge = fresh();
                     let key = if fault == "wrong-server" {"other"} else {token};
-                    socket.write(&json!({"challenge":challenge,"proof":store::sign(key, format!("server:{client}:{challenge}").as_bytes())}),end).unwrap();
+                    let auth = authenticate_client(&mut socket, key, end);
                     if fault == "wrong-server" {
-                        assert!(socket.read(256,end).is_err());
+                        assert!(auth.is_err());
                     } else {
-                        let auth = socket.read(256,end).unwrap();
-                        store::verify(token,format!("client:{client}:{challenge}").as_bytes(),field(&auth,"proof").unwrap()).unwrap();
+                        auth.unwrap();
                         let frame = socket.read(wire::LIMIT,end).unwrap();
                         assert_eq!(frame["text"],"once");
                         if fault == "wrong-id" {
@@ -467,7 +539,7 @@ mod tests {
                     listener.set_nonblocking(true).unwrap();
                     assert!(listener.accept().is_err());
                 });
-                let answer = rpc(
+                let (answer, attempted) = rpc(
                     &store,
                     &ready,
                     &json!({"op":"input","seq":1,"text":"once","ticket":store.ticket}),
@@ -480,6 +552,7 @@ mod tests {
                         "uncertain"
                     }
                 );
+                assert_eq!(attempted, fault != "wrong-server");
                 server.join().unwrap();
             });
         }

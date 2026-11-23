@@ -201,7 +201,10 @@ impl Store {
     }
 
     fn signed_body(&self, slot: &str) -> Result<Value> {
-        let obj = read(&self.run.join(format!("{slot}.json")))?;
+        self.verify_body(read(&self.run.join(format!("{slot}.json")))?)
+    }
+
+    fn verify_body(&self, obj: Value) -> Result<Value> {
         let body = &obj["body"];
         verify(
             &self.token,
@@ -409,22 +412,42 @@ fn has_entry(path: &Path) -> io::Result<bool> {
     }
 }
 
-// A legacy receipt has no predecessor link. Even two terminal receipts
-// cannot establish which generation was last selected.
+// An older writer can install a successor without retiring a signed index.
+// Every other generation must be on one authenticated path to the selected tip.
 pub fn ordered(unit: &Path, selected: &Store) -> Result<bool> {
-    if selected.ticket["version"] == 2 {
-        return Ok(true);
+    if has_entry(&selected.run.join("superseded.json"))? {
+        return Ok(false);
     }
+    let mut predecessors = std::collections::HashMap::new();
     for entry in fs::read_dir(unit)? {
         let entry = entry?;
-        if entry.path() != selected.run
-            && entry.file_name() != "current.json"
-            && entry.file_name() != "lock"
-        {
+        let name = entry.file_name();
+        if name == "current.json" || name == "lock" || entry.path() == selected.run {
+            continue;
+        }
+        if selected.ticket["version"] != 2 || !entry.file_type()?.is_dir() {
+            return Ok(false);
+        }
+        let envelope = read(&entry.path().join("superseded.json"))?;
+        let ticket = &envelope["body"]["ticket"];
+        let generation = field(ticket, "generation")?.to_owned();
+        ensure!(
+            name.to_str() == Some(&generation) && ticket["unit"] == selected.ticket["unit"],
+            "misplaced retirement record"
+        );
+        let prior = Store::open(unit, ticket)?;
+        let body = prior.verify_body(envelope)?;
+        ensure!(body["kind"] == "superseded", "invalid retirement record");
+        let successor = field(&body["data"], "generation")?.to_owned();
+        if predecessors.insert(successor, generation).is_some() {
             return Ok(false);
         }
     }
-    Ok(true)
+    let mut generation = field(&selected.ticket, "generation")?.to_owned();
+    while let Some(previous) = predecessors.remove(&generation) {
+        generation = previous;
+    }
+    Ok(predecessors.is_empty())
 }
 
 fn verify_index(mut record: Value, store: &Store) -> Result<Value> {
@@ -469,10 +492,6 @@ pub fn current(unit: &Path) -> Result<Option<(Value, Store)>> {
         "invalid current index"
     );
     let store = Store::open(unit, ticket)?;
-    ensure!(
-        !store.run.join("superseded.json").try_exists()?,
-        "superseded current index"
-    );
     let backup = store.run.join("index.json");
     if ticket.get("version").is_some()
         || record.get("indexSignature").is_some()
@@ -574,6 +593,35 @@ mod tests {
         receipt["state"] = json!("closed");
         store.save_signed("cleanup", receipt)?;
         assert!(store.proof().is_err());
+        fs::remove_dir_all(unit)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_history_requires_one_signed_chain_ending_at_the_selected_generation() -> Result<()> {
+        let unit = std::env::temp_dir().join(fresh());
+        let legacy = generation(&unit, true)?;
+        let new = generation(&unit, false)?;
+        assert!(!ordered(&unit, &new).unwrap_or(false));
+        let retire = |from: &Store, to: &Store| {
+            from.save_signed("superseded", json!({"generation":to.ticket["generation"]}))
+        };
+        retire(&legacy, &new)?;
+        assert!(ordered(&unit, &new)?);
+        let latest = generation(&unit, false)?;
+        retire(&new, &latest)?;
+        assert!(ordered(&unit, &latest)?);
+        assert!(!ordered(&unit, &new).unwrap_or(false));
+        retire(&legacy, &latest)?;
+        assert!(!ordered(&unit, &latest).unwrap_or(false));
+        retire(&legacy, &new)?;
+        retire(&new, &legacy)?;
+        assert!(!ordered(&unit, &latest).unwrap_or(false));
+        fs::copy(
+            new.run.join("superseded.json"),
+            legacy.run.join("superseded.json"),
+        )?;
+        assert!(!ordered(&unit, &latest).unwrap_or(false));
         fs::remove_dir_all(unit)?;
         Ok(())
     }
