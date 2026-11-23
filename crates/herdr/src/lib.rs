@@ -398,6 +398,17 @@ impl Handle {
         serde_json::from_value(data["read"].clone()).map_err(|_| INVALID)
     }
 
+    fn prepare_send(
+        &mut self,
+        input: bool,
+        save: &mut impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<Session> {
+        let rpc = self.session()?;
+        self.checkpoint_writers(&rpc, save)?;
+        self.guarded(&rpc, input)?;
+        Ok(rpc)
+    }
+
     fn send(
         &mut self,
         method: &str,
@@ -405,10 +416,7 @@ impl Handle {
         input: bool,
         save: &mut impl FnMut(&Self) -> std::io::Result<()>,
     ) -> Result<()> {
-        let rpc = self.session()?;
-        self.checkpoint_writers(&rpc, save)?;
-        self.guarded(&rpc, input)?;
-        rpc.call(method, params)?;
+        self.prepare_send(input, save)?.call(method, params)?;
         Ok(())
     }
 
@@ -426,20 +434,51 @@ impl Handle {
         &mut self,
         text: &str,
         codex: bool,
+        save: impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<()> {
+        self.submit_input(text, codex, false, save)
+    }
+
+    pub fn submit_reply(
+        &mut self,
+        text: &str,
+        codex: bool,
+        save: impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<()> {
+        self.submit_input(text, codex, true, save)
+    }
+
+    fn submit_input(
+        &mut self,
+        text: &str,
+        codex: bool,
+        confirm_reply: bool,
         mut save: impl FnMut(&Self) -> std::io::Result<()>,
     ) -> Result<()> {
-        let before = self.read()?;
+        let before_input = |error: Failure| {
+            if confirm_reply {
+                error.before_effect()
+            } else {
+                error
+            }
+        };
+        let before = self.read().map_err(before_input)?;
         if screen::read_only(&before.text) {
             return Err(Failure::refused("worker input is paused"));
         }
-        self.send(
+        if codex && confirm_reply && screen::has_codex_draft(&before) {
+            return Err(Failure::unsent("Codex composer already contains a draft"));
+        }
+        // Preparation performs only observation and local checkpoints. An
+        // incomplete response to the subsequent input call may be post-effect.
+        let rpc = self.prepare_send(true, &mut save).map_err(before_input)?;
+        rpc.call(
             "pane.send_input",
             json!({"pane_id":self.pane,"text":text,"keys":["Enter"]}),
-            true,
-            &mut save,
         )?;
         if codex {
-            screen::confirm_codex(self, text, &before, &mut save).map_err(Failure::after_effect)?;
+            screen::confirm_codex(self, text, &before, confirm_reply, &mut save)
+                .map_err(Failure::after_effect)?;
         }
         Ok(())
     }

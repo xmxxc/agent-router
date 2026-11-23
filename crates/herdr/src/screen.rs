@@ -38,7 +38,8 @@ fn compact(text: &str) -> String {
 }
 
 struct Composer<'a> {
-    draft: String,
+    // A visible scroll marker identifies an occupied but incomplete composer.
+    draft: Option<String>,
     // None when only one of two plausible footer boundaries yields this draft.
     footer: Option<Vec<&'a str>>,
 }
@@ -84,13 +85,19 @@ fn codex_box<'a>(
             2 => {
                 // The two possible drafts differ by a line containing “ · ”.
                 // Without a reference, a key is in doubt only if one matches.
-                return (1..=2)
-                    .filter_map(|n| complete_draft(&lines[start..end - n]))
-                    .find(|draft| !draft.is_empty() && compact(draft) == expected)
-                    .map(|draft| Composer {
-                        draft,
-                        footer: None,
-                    });
+                let drafts = [
+                    complete_draft(&lines[start..end - 1]),
+                    complete_draft(&lines[start..end - 2]),
+                ];
+                let scrolled = drafts.iter().any(Option::is_none);
+                let matching = drafts
+                    .into_iter()
+                    .flatten()
+                    .find(|draft| !draft.is_empty() && compact(draft) == expected);
+                return (scrolled || matching.is_some()).then_some(Composer {
+                    draft: matching,
+                    footer: None,
+                });
             }
             count => count,
         };
@@ -108,40 +115,63 @@ fn codex_box<'a>(
         return None;
     }
     Some(Composer {
-        draft: complete_draft(&lines[start..end])?,
+        draft: complete_draft(&lines[start..end]),
         footer: Some(footer),
     })
+}
+
+pub(super) fn has_codex_draft(screen: &Screen) -> bool {
+    codex_box(screen, &[], "").is_some_and(|c| c.draft.is_none_or(|draft| !draft.is_empty()))
 }
 
 pub(super) fn confirm_codex(
     handle: &mut Handle,
     text: &str,
     before: &Screen,
+    confirm_reply: bool,
     save: &mut impl FnMut(&Handle) -> std::io::Result<()>,
 ) -> Result<()> {
     let expected = compact(text);
     let footer = codex_box(before, &[], &expected)
+        .filter(|c| c.draft.is_some())
         .and_then(|c| c.footer)
         .unwrap_or_default();
-    let sample = |handle: &Handle| {
+    let sample = |handle: &Handle| -> Result<Option<(String, bool)>> {
         sleep(Duration::from_millis(300));
         let screen = handle.read()?;
         if read_only(&screen.text) || refusals(&screen.text) > refusals(&before.text) {
             return Err(Failure::unknown("worker refused or paused input"));
         }
-        Ok(codex_box(&screen, &footer, &expected)
-            .filter(|c| !c.draft.is_empty() && compact(&c.draft) == expected)
-            .map(|c| (c.draft, c.footer.is_some())))
+        let composer = codex_box(&screen, &footer, &expected)
+            .and_then(|c| Some((c.draft?, c.footer.is_some())));
+        match composer {
+            Some((draft, certain)) if !draft.is_empty() && compact(&draft) == expected => {
+                Ok(Some((draft, certain)))
+            }
+            Some((draft, true)) if draft.is_empty() => Ok(None),
+            _ if !confirm_reply => Ok(None),
+            _ => Err(Failure::unknown("Codex composer did not confirm the reply")),
+        }
     };
     for retry in 0..=2 {
         let first = sample(handle)?;
         let second = sample(handle)?;
+        if confirm_reply && first.is_none() && second.is_some() {
+            return Err(Failure::unknown(
+                "Codex showed the reply draft after an empty composer",
+            ));
+        }
         let (Some((first_draft, first_certain)), Some((second_draft, second_certain))) =
             (first, second)
         else {
             return Ok(());
         };
         if first_draft != second_draft {
+            if confirm_reply {
+                return Err(Failure::unknown(
+                    "Codex composer changed before Enter could be retried",
+                ));
+            }
             return Ok(());
         }
         if !first_certain || !second_certain {
@@ -234,7 +264,7 @@ mod tests {
             for text in ["draft", "draft tail · value"] {
                 let composer = codex_box(&screen, footer, &compact(text)).unwrap();
                 assert!(composer.footer.is_none());
-                assert_eq!(compact(&composer.draft), compact(text));
+                assert_eq!(compact(composer.draft.as_deref().unwrap()), compact(text));
             }
             assert!(codex_box(&screen, footer, "unrelated").is_none());
         }
@@ -253,7 +283,7 @@ mod tests {
                 &[],
                 "hello世界"
             )
-            .map(|c| c.draft)
+            .and_then(|c| c.draft)
             .as_deref(),
             Some("hello   世界")
         );
@@ -263,7 +293,9 @@ mod tests {
             "› hello\ntranscript\n  model · dir",
             "› Ask Codex to do anything\n\n  model · dir",
         ] {
-            assert!(codex_box(&screen(s), &[], "hello").is_none_or(|c| c.draft.is_empty()));
+            assert!(codex_box(&screen(s), &[], "hello")
+                .and_then(|c| c.draft)
+                .is_none_or(|d| d.is_empty()));
         }
         assert_eq!(
             opencode_box("┃ hello attempt-01\n┃ agent · model\n╹▀▀▀").as_deref(),

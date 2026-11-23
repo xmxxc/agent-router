@@ -122,6 +122,21 @@ impl Tmux<'_> {
             .copied())
     }
 
+    pub(super) fn close_blocks_input(&self, id: &str) -> Reply<bool> {
+        Ok(self
+            .registry()?
+            .close_operations
+            .get(id)
+            .is_some_and(|ops| {
+                ops.values().any(|operation| {
+                    matches!(
+                        operation,
+                        CloseOperation::Pending | CloseOperation::Confirmed(_)
+                    )
+                })
+            }))
+    }
+
     pub(super) fn record_close(&self, effect: CloseOperation) -> Reply<()> {
         if let (Some(id), Some(operation)) = (self.legacy_execution_id, self.close_operation_id) {
             let mut registry = self.registry()?;

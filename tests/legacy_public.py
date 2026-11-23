@@ -112,6 +112,8 @@ def legacy_case(binary, label, setting):
             assert "unknown dispatch d-000000ff" in err, err
         run(binary, cwd, home, setting, ("reclaim", "--yes"), code=2)
         run(binary, cwd, home, setting, ("reclaim", "--dispatch"), code=2)
+        err = run(binary, cwd, home, setting, ("reply", "30", "native reply"), code=1)
+        assert "reply requires the native Rust question ledger" in err, err
         assert snapshot(root) == before
         print(label, "selected", legacy, "five legacy reads, errors, no writes")
 
