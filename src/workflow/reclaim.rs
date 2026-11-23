@@ -222,6 +222,10 @@ fn inspect(state: &Path, dir: &Path, row: &Value) -> Result<(Value, bool)> {
         item["note"] = json!("dispatch execution changed; skipped");
         return Ok((item, false));
     }
+    if let Err(error) = worker_owner::require_resolved_resume(&current) {
+        failure(&mut item, "failed", format!("{error:#}"));
+        return Ok((item, false));
+    }
     let result = observation["result"].as_str().unwrap_or("uncertain");
     let diagnostic = observation["diagnostic"].as_str().unwrap_or(result);
     let close_pending =

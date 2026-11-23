@@ -170,7 +170,7 @@ pub fn close(id: &str, explicit_token: Option<&str>) -> Result<Value> {
     let authorize = || controller::Owners::read(&state)?.require(scope, token.as_deref(), "close");
     let hosted = record["host"].is_string();
     let controlled = record.get("worker").is_some();
-    if !authorize()? {
+    if !authorize()? && super::assignment::unresolved_resume(&record).is_none() {
         // A confirmed archive can be read before taking a write lock. Any
         // inconclusive or failed read goes through the usual locked path.
         let archived = if hosted {
@@ -187,7 +187,9 @@ pub fn close(id: &str, explicit_token: Option<&str>) -> Result<Value> {
             Ok(None)
         };
         if let Ok(Some(receipt)) = archived {
-            if !authorize()? {
+            if !authorize()?
+                && super::assignment::public_record(&dir, id)?.as_ref() == Some(&record)
+            {
                 return Ok(receipt);
             }
         }
@@ -219,10 +221,31 @@ fn raw_close_receipt(record: &Value, already_gone: bool) -> Value {
     receipt
 }
 
+pub(super) fn require_resolved_resume(record: &Value) -> Result<()> {
+    if let Some(event) = super::assignment::unresolved_resume(record) {
+        anyhow::bail!(
+            "resume audit {} is unresolved; inspect status and reconcile before closing",
+            event["id"]
+        );
+    }
+    Ok(())
+}
+
 // The caller holds the authorized scope lock for this assignment.
-pub(super) fn close_locked(state: &Path, record: &Value) -> Result<Value> {
-    let id = record["dispatch"].as_str().context("missing dispatch")?;
+pub(super) fn close_locked(state: &Path, selected: &Value) -> Result<Value> {
+    let id = selected["dispatch"].as_str().context("missing dispatch")?;
     let dir = state.join("dispatches");
+    let current = super::assignment::public_record(&dir, id)?
+        .context("dispatch disappeared while preparing close")?;
+    let record = &current;
+    ensure!(
+        record_scope(record) == record_scope(selected)
+            && record["round"] == selected["round"]
+            && record["attempt"] == selected["attempt"],
+        "dispatch changed while preparing close; inspect status and retry"
+    );
+    validate_close(record)?;
+    require_resolved_resume(record)?;
     if record["host"].is_string() {
         return super::backend::close(state, record);
     }

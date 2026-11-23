@@ -218,9 +218,29 @@ fn claude_trust(cwd: &Path) -> Result<Option<PathBuf>> {
     Ok(ancestor)
 }
 
+pub(super) const FIRST_BRIEF: &str = "You are a worker dispatched by the controller";
+
+pub(super) fn worker_brief(record: &Value, opening: &str) -> Result<String> {
+    let task = record["task"].as_str().context("missing task")?;
+    let report = record["report"].as_str().context("missing report")?;
+    let dispatch = record["dispatch"].as_str().context("missing dispatch")?;
+    Ok(format!(
+        "{opening} (dispatch {dispatch}). Read and do the task in {task}. Stop any server or background process you started before reporting. Write the report to {report}. Run \"$WFC_BIN\" done --report \"$WFC_REPORT\" --attempt \"$WFC_ATTEMPT\". If you need a decision, run \"$WFC_BIN\" ask \"<question>\" [--options a,b] --attempt \"$WFC_ATTEMPT\" and end your turn. The answer arrives as your next message."
+    ))
+}
+
 impl Options<'_> {
     pub fn prepare(&self, state: &Path, record: &mut Value) -> Result<Launch> {
-        let cwd = Path::new(record["cwd"].as_str().context("missing cwd")?);
+        self.prepare_worker(state, record, None)
+    }
+
+    pub(super) fn prepare_worker(
+        &self,
+        state: &Path,
+        record: &mut Value,
+        resume: Option<&str>,
+    ) -> Result<Launch> {
+        let cwd = PathBuf::from(record["cwd"].as_str().context("missing cwd")?);
         let report = Path::new(record["report"].as_str().context("missing report")?);
         let mut writable = vec![
             state.to_owned(),
@@ -229,11 +249,7 @@ impl Options<'_> {
                 .context("missing report directory")?
                 .to_owned(),
         ];
-        let task = record["task"].as_str().context("missing task")?;
-        let mut brief = format!(
-            "You are a worker dispatched by the controller (dispatch {}). Read and do the task in {}. Stop any server or background process you started before reporting. Write the report to {}. Run \"$WFC_BIN\" done --report \"$WFC_REPORT\" --attempt \"$WFC_ATTEMPT\". If you need a decision, run \"$WFC_BIN\" ask \"<question>\" [--options a,b] --attempt \"$WFC_ATTEMPT\" and end your turn. The answer arrives as your next message.",
-            record["dispatch"].as_str().context("missing dispatch")?, task, report.display()
-        );
+        let mut brief = worker_brief(record, resume.unwrap_or(FIRST_BRIEF))?;
         if self.name == "opencode" && self.backend == "herdr" {
             brief.push_str(&format!(
                 " Current attempt {}.",
@@ -241,6 +257,9 @@ impl Options<'_> {
             ));
         }
         let path = self.config.map(PathBuf::from).or_else(|| {
+            if resume.is_some() {
+                return None;
+            }
             env::var_os("WFC_LAUNCH_CONFIG")
                 .filter(|p| !p.is_empty())
                 .map(PathBuf::from)
@@ -256,7 +275,7 @@ impl Options<'_> {
                 };
                 let path = path.canonicalize().context("invalid launch config path")?;
                 selected_config = Some(path.clone());
-                configured(&path, self.name, cwd).map_err(|_| {
+                configured(&path, self.name, &cwd).map_err(|_| {
                     anyhow::anyhow!("invalid launch config or missing configured script")
                 })?
             }
@@ -269,6 +288,9 @@ impl Options<'_> {
         let mut ignored = Vec::new();
         match self.name {
             "codex" => {
+                if resume.is_some() {
+                    a.push("resume".into());
+                }
                 a.extend(
                     ["--no-alt-screen", "-s", "workspace-write", "-a", "never"].map(String::from),
                 );
@@ -285,7 +307,7 @@ impl Options<'_> {
                 }
                 if self.git {
                     for flag in ["--git-dir", "--git-common-dir"] {
-                        let path = git_dir(cwd, flag).context("--git requires a Git worktree")?;
+                        let path = git_dir(&cwd, flag).context("--git requires a Git worktree")?;
                         if !writable.contains(&path) {
                             writable.push(path);
                         }
@@ -330,7 +352,7 @@ impl Options<'_> {
                     a.push(p.to_str().context("writable path must be UTF-8")?.into());
                 }
                 #[cfg(unix)]
-                match claude_trust(cwd) {
+                match claude_trust(&cwd) {
                     Ok(Some(ancestor)) => record["trustedBy"] = json!(ancestor),
                     Ok(None) => {}
                     Err(_) => eprintln!("wfc: could not confirm Claude worktree trust"),
@@ -362,17 +384,92 @@ impl Options<'_> {
         if let Some(path) = selected_config {
             record["launchConfig"] = json!(path);
         }
+        #[cfg(target_os = "linux")]
+        if self.name == "codex" && self.backend == "tmux" {
+            match codex_home(&cwd, &launch.env) {
+                Ok(home) => {
+                    record["codexHome"] = json!(home);
+                    if resume.is_some() {
+                        launch.env.insert("CODEX_HOME".into(), json!(home));
+                    }
+                }
+                Err(error) if resume.is_some() => return Err(error),
+                Err(_) => {}
+            }
+            if resume.is_none() {
+                record["codexBriefHash"] = json!(super::messages::body_hash(
+                    launch.argv.last().context("missing Codex brief")?
+                ));
+            }
+        }
         for key in ["dispatch", "scope", "role", "attempt", "task", "report"] {
             launch.env.insert(
                 format!("WFC_{}", key.to_ascii_uppercase()),
                 record[key].clone(),
             );
         }
-        launch.env.insert("WFC_ROUND".into(), json!("1"));
+        launch.env.insert(
+            "WFC_ROUND".into(),
+            json!(record["round"].as_u64().context("missing round")?.to_string()),
+        );
         launch.env.insert("WFC_STATE".into(), json!(state));
         launch
             .env
             .insert("WFC_BIN".into(), json!(env::current_exe()?));
         Ok(launch)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn codex_home(cwd: &Path, settings: &Map<String, Value>) -> Result<PathBuf> {
+    let effective = |key| {
+        settings
+            .get(key)
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .or_else(|| env::var_os(key).map(PathBuf::from))
+            .filter(|p| !p.as_os_str().is_empty())
+    };
+    let path = match effective("CODEX_HOME") {
+        Some(path) => path,
+        None => effective("HOME")
+            .or_else(env::home_dir)
+            .context("missing home directory")?
+            .join(".codex"),
+    };
+    let path = cwd.join(path);
+    let path = match path.canonicalize() {
+        Ok(path) => path,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => path,
+        Err(e) => return Err(e).context("resolve Codex home"),
+    };
+    ensure!(path.to_str().is_some(), "Codex home must be UTF-8");
+    Ok(path)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn matches_unresolved_codex_home(saved: &Path, current: &Path) -> bool {
+    use std::path::Component;
+
+    // A home saved before creation can contain "." as well as "..".
+    // Accept alternate spellings only after checking the actual directories.
+    if !saved.is_absolute() {
+        return false;
+    }
+    let mut checked = PathBuf::new();
+    for part in saved.components() {
+        if part == Component::ParentDir {
+            checked.pop();
+            continue;
+        }
+        checked.push(part);
+        // Check before popping any component. A symlink followed by ".."
+        // resolves relative to the symlink's target, not its spelling.
+        if matches!(part, Component::Normal(_))
+            && !fs::symlink_metadata(&checked).is_ok_and(|metadata| metadata.is_dir())
+        {
+            return false;
+        }
+    }
+    checked.as_path() == current && saved.canonicalize().is_ok_and(|path| path == checked)
 }

@@ -57,6 +57,26 @@ pub(super) fn identified(row: &Value) -> bool {
         && row["round"].as_u64().is_some_and(|n| n > 0)
 }
 
+pub(super) fn resume_audit(row: &Value) -> Option<&Value> {
+    row["audit"].as_array()?.iter().rev().find(|event| {
+        event["operation"] == "resume"
+            && event["attempt"] == row["attempt"]
+            && event["round"] == row["round"]
+    })
+}
+
+pub(super) fn unresolved_resume(row: &Value) -> Option<&Value> {
+    resume_audit(row)
+        .filter(|event| matches!(event["result"].as_str(), Some("pending" | "uncertain")))
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn unresolved_lifecycle(row: &Value) -> Option<&Value> {
+    row["audit"].as_array()?.iter().rev().find(|event| {
+        matches!(event["result"].as_str(), Some("pending" | "uncertain"))
+    })
+}
+
 pub(super) fn public_record(dir: &Path, id: &str) -> Result<Option<Value>> {
     let (file, path) = match open_assignment(dir, id) {
         Ok(pair) => pair,

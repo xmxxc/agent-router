@@ -140,8 +140,10 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
         {
             let unconfirmed_create =
                 row["backend"] == "herdr" && row["create"]["result"] != "accepted";
+            let unconfirmed_resume = super::assignment::resume_audit(row)
+                .is_some_and(|event| event["result"] != "accepted");
             let state = match row["worker"]["state"].as_str() {
-                _ if unresolved_worker => "unknown",
+                _ if unresolved_worker || unconfirmed_resume => "unknown",
                 _ if unconfirmed_create && row["worker"]["state"] != "cancelled" => {
                     round["result"] = row["create"].clone();
                     "unknown"
