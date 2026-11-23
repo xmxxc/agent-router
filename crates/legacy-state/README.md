@@ -55,6 +55,7 @@
 逐轮核对会保留已有结果原文和快照完成时间。Python 写入快照与 done 收件时分别读取时钟；
 快照时间丢失时，仅能以唯一匹配的 done 收件时间作为完成的观察时间。两处时间都缺失时会拒写。
 现代账本可包含同一报告多次完成的回执。按消息编号核对提交顺序，最终快照须能印证同一 attempt 的最后一次 Git 结果。
+同一 attempt 的回执按解析后的 JSON 值比较，属性顺序差异不会改变结果。每条回执保留自己的正文、摘要、标识、版本和时间。
 早期 Python 升级器按数字编号选取当前报告的第一条旧 done，直接复制其正文与时间。重复提交的旧回执保留各自的创建时间。现代 worker 随后提交时则由末次带 attempt 的回执核验更新后的快照。按任务、当前轮次和 attempt 核对父行与快照的报告路径，运行中快照也可从派工记录补回路径。两处都缺失时，从能确认归属的记录在同一事务内恢复。
 现代完成结果中的 report、head、dirty 分别核验。缺键时仅补有证据的值，保留已有字段及完成时间；非 Git 工作区写入的 JSON null 是有效值。早期仅含报告路径的回执按其原格式恢复。
 早期 done 曾只记录报告路径。升级后再次提交时，按旧回执当时已有的字段核对归属，由末次回执核验最终的 Git 结果和完成时间。
@@ -73,6 +74,7 @@ python3 crates/legacy-state/tests/python_recovery.py /path/to/workflow-core-chec
 python3 -B crates/legacy-state/tests/python_fields.py /path/to/workflow-core-checkout target/debug/wfc-legacy-state
 python3 -B crates/legacy-state/tests/python_history.py /path/to/workflow-core-checkout target/debug/wfc-legacy-state
 python3 -B crates/legacy-state/tests/python_pre_attempt.py /path/to/pr39 /path/to/pr40 target/debug/wfc-legacy-state
+python3 -B crates/legacy-state/tests/python_equivalent.py /path/to/pr39 /path/to/pr40 target/debug/wfc-legacy-state
 ```
 
 跨版本检查用 #39 或 #40 固定版自带的隔离宿主夹具生成两轮记录。它在副本上核对已有 scope、

@@ -1,7 +1,7 @@
 //! Reconcile the durable snapshot and its completion receipt before returning a writer.
 use anyhow::{ensure, Context, Result};
 use rusqlite::{params, Connection};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::recovery::{agree, text};
@@ -12,6 +12,81 @@ struct Done {
     raw: String,
     body: Value,
     created: Option<f64>,
+}
+
+// Normalize an exact JSON number to its significant digits and base-10 exponent.
+fn comparison_number(token: &str) -> Result<String> {
+    let (sign, unsigned) = token.strip_prefix('-').map_or(("", token), |n| ("-", n));
+    let (mantissa, exponent) = unsigned.split_once(['e', 'E']).unwrap_or((unsigned, "0"));
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{integer}{fraction}");
+    let significant = digits.trim_matches('0');
+    if significant.is_empty() {
+        return Ok("0".into());
+    }
+    let trailing = digits.len() - digits.trim_end_matches('0').len();
+    let offset = trailing as i128 - fraction.len() as i128;
+    let exponent = exponent
+        .parse::<i128>()
+        .ok()
+        .and_then(|n| n.checked_add(offset))
+        .context("JSON number exponent exceeds comparison range")?;
+    Ok(format!("{sign}{significant}e{exponent}"))
+}
+
+// The original JSON has already been parsed and validated at this point.
+// Encode exact numbers and strings with distinct prefixes in a comparison-only
+// value. Object keys still use serde's usual decoding and order-independent map.
+fn comparison_fields(raw: &str) -> Result<Map<String, Value>> {
+    let bytes = raw.as_bytes();
+    let mut comparison = String::with_capacity(raw.len());
+    let (mut copied, mut index) = (0, 0);
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                let start = index;
+                index += 1;
+                while bytes[index] != b'"' {
+                    index += if bytes[index] == b'\\' { 2 } else { 1 };
+                }
+                index += 1;
+                if !raw[index..].trim_start().starts_with(':') {
+                    comparison.push_str(&raw[copied..start + 1]);
+                    comparison.push('s');
+                    copied = start + 1;
+                }
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = index;
+                while matches!(
+                    bytes.get(index),
+                    Some(b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+                ) {
+                    index += 1;
+                }
+                comparison.push_str(&raw[copied..start]);
+                comparison.push_str("\"n");
+                comparison.push_str(&comparison_number(&raw[start..index])?);
+                comparison.push('"');
+                copied = index;
+            }
+            _ => index += 1,
+        }
+    }
+    comparison.push_str(&raw[copied..]);
+    Ok(serde_json::from_str(&comparison)?)
+}
+
+fn differing_fields(
+    left: &str,
+    right: &str,
+) -> Result<Option<(Map<String, Value>, Map<String, Value>)>> {
+    if left == right {
+        return Ok(None);
+    }
+    let left = comparison_fields(left)?;
+    let right = comparison_fields(right)?;
+    Ok((left != right).then_some((left, right)))
 }
 
 fn valid_git_pair(head: Option<&Value>, dirty: Option<&Value>) -> bool {
@@ -139,9 +214,7 @@ impl Snapshot {
             // in the same transaction. Numeric message ID is the commit order.
             let modern = body["round"].as_i64() == Some(self.round)
                 && body["attempt"].as_str() == Some(self.attempt.as_str());
-            if previous.raw != raw {
-                let old = previous.body.as_object().unwrap();
-                let new = body.as_object().unwrap();
+            if let Some((old, new)) = differing_fields(&previous.raw, &raw)? {
                 let pre_attempt = !old.contains_key("round") && !old.contains_key("attempt");
                 // The earliest Python writer stored only the path. Git fields
                 // first appeared together; an isolated missing field is damage.
@@ -367,14 +440,12 @@ impl Snapshot {
                     "stored completion time precedes the final done receipt"
                 );
             }
-            if let Some(original) = &stored {
-                let fields = original
-                    .as_object()
-                    .context("invalid stored completion result")?;
+            if let Some(original) = self.result.as_deref() {
+                let difference = differing_fields(original, &receipt.raw)?;
                 ensure!(
-                    fields
+                    difference.is_none_or(|(fields, evidence)| fields
                         .iter()
-                        .all(|(k, v)| receipt.body.get(k).is_none_or(|other| other == v)),
+                        .all(|(k, v)| evidence.get(k).is_none_or(|other| other == v))),
                     "conflicting stored result and final done receipt"
                 );
             }

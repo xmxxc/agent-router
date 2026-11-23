@@ -63,6 +63,11 @@ def check(source, binary, dispatch, label, *, damage="", repair="", refuse=False
         copies = list(root.glob("router.before-*.db"))
         assert len(copies) == (2 if refuse else int(bool(repair)))
         assert all(dump(p) == prior and p.stat().st_mode & 0o777 == 0o600 for p in copies)
+        if refuse:
+            restored = root / "restored.db"
+            for copy in copies:
+                backup(copy, restored)
+                assert dump(restored) == prior
         assert digest(source) == original_sha
         print(label, "source", original_sha, "before", before, "after/retry", after,
               "backups", [digest(p) for p in copies], "diagnostic", result.stderr.strip())
