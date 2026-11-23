@@ -24,6 +24,7 @@ pub const USAGE: &str = "wfc owner {acquire|claim|renew|takeover} --scope S [--o
 pub const ALIASES: &[&str] = &["acquire", "claim", "renew", "takeover"];
 pub(super) const WORKER_CALLBACK: &str = "WFC_WORKER_CALLBACK";
 pub(super) const CALLBACK_HASH: &str = "workerCallbackHash";
+pub(super) const CALLBACK_REF_HASH: &str = "workerCallbackRefHash";
 
 pub(crate) fn is_credential(key: &str) -> bool {
     ["WFC_CONTROLLER_TOKEN", "WFC_OWNER_TOKEN", WORKER_CALLBACK]

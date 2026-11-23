@@ -49,6 +49,8 @@ enum Operation {
         host: Option<String>,
         #[serde(default)]
         confirm_reply: bool,
+        #[serde(default)]
+        confirm_transcript: bool,
     },
     Interrupt,
     Resume {
@@ -64,6 +66,16 @@ enum Operation {
 }
 
 type Reply<T> = std::result::Result<T, Value>;
+
+pub(crate) const APPENDED_USER_ENTRY: &str = "appended-user-entry";
+
+#[derive(Clone, Copy)]
+pub(crate) enum InputBoundary {
+    PrepareText,
+    Text,
+    PrepareEnter,
+    Enter,
+}
 
 fn failure(result: &str, diagnostic: &str) -> Value {
     json!({"result":result, "diagnostic":diagnostic})
@@ -444,12 +456,20 @@ impl Tmux<'_> {
         }))
     }
 
-    fn operate(&self, op: Operation, fresh: bool) -> Reply<Value> {
+    fn operate(
+        &self,
+        op: Operation,
+        fresh: bool,
+        check_input: &mut dyn FnMut(InputBoundary) -> Reply<()>,
+    ) -> Reply<Value> {
         if let Some(id) = self.legacy_execution_id {
             if matches!(
                 &op,
                 Operation::Submit {
                     confirm_reply: true,
+                    ..
+                } | Operation::Submit {
+                    confirm_transcript: true,
                     ..
                 }
             ) && self.close_blocks_input(id).map_err(|_| {
@@ -581,9 +601,14 @@ impl Tmux<'_> {
                 text,
                 host,
                 confirm_reply,
-            } => self
-                .input_target()
-                .and_then(|target| self.submit(&target, &text, host.as_deref(), confirm_reply)),
+                confirm_transcript,
+            } => self.input_target().and_then(|target| {
+                if confirm_transcript {
+                    self.checked_submit(&target, &text, host.as_deref(), check_input)
+                } else {
+                    self.submit(&target, &text, host.as_deref(), confirm_reply, check_input)
+                }
+            }),
             Operation::Resume {
                 launch,
                 host,
@@ -905,6 +930,15 @@ pub(crate) fn attach(state: &Path, dispatch: &str, socket: &Path, token: &str) -
 }
 
 pub fn execute(state: &Path, request: Request) -> Result<Value> {
+    execute_checked(state, request, None, &mut |_| Ok(()))
+}
+
+pub(crate) fn execute_checked(
+    state: &Path,
+    request: Request,
+    socket: Option<&str>,
+    check_input: &mut dyn FnMut(InputBoundary) -> std::result::Result<(), Value>,
+) -> Result<Value> {
     ensure!(
         matches!(request.backend.as_deref(), None | Some("" | "tmux")),
         "request selects another execution backend"
@@ -995,7 +1029,9 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
             .filter(|_| request.close_operation_id.is_some()),
         input_request: matches!(request.op, Operation::Submit { .. } | Operation::Interrupt),
         session: format!("wfc-{}", request.dispatch),
-        socket: env::var_os("WFC_TMUX_SOCKET")
+        socket: socket
+            .map(std::ffi::OsString::from)
+            .or_else(|| env::var_os("WFC_TMUX_SOCKET"))
             .map(std::path::absolute)
             .transpose()?,
     };
@@ -1012,7 +1048,7 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
         backend.legacy_execution_id = Some(&native_id);
     }
     let mut result = backend
-        .operate(request.op, request.fresh_dispatch)
+        .operate(request.op, request.fresh_dispatch, check_input)
         .unwrap_or_else(|mut error| {
             if backend.input_request && error["result"] == "definitely-not-sent" {
                 error["category"] = json!("input_not_delivered");

@@ -1,0 +1,158 @@
+name: Linux continue and nudge
+on:
+  push:
+    branches: [rust-router/34-continue-nudge-r19]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  continue-nudge:
+    name: '#34 Continue and nudge the same Codex/tmux worker'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      WFC_BUILD_ID: ${{ github.sha }}
+      NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+      TMUX_FIXTURE_SHA: 5ced6218637c11d9ca73fa3285a1ff98fadad6fc
+      TRIPLE: x86_64-unknown-linux-gnu
+      EVIDENCE: ${{ github.workspace }}/linux-continue-nudge-evidence
+      CARGO_BUILD_JOBS: '2'
+      PYTHONUTF8: '1'
+    steps:
+      - name: Record run identity
+        run: |
+          mkdir -p "$EVIDENCE"
+          printf 'Workflow %s\nRun %s attempt %s\nExpected product %s\n' \
+            "$GITHUB_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$WFC_BUILD_ID" \
+            | tee "$EVIDENCE/run.log"
+          uname -a | tee -a "$EVIDENCE/run.log"
+      - name: Check out the triggering product
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.WFC_BUILD_ID }}
+          path: product
+          persist-credentials: false
+      - name: Check out the verified native CI zlib archive
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.NATIVE_INPUT_SHA }}
+          path: native-input
+          sparse-checkout: vendor/zlib-1.3.1.tar.gz
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        with:
+          version: '0.16.0'
+      - name: Verify sources and prepare the native build
+        working-directory: product
+        run: |
+          git log -1 --format='Rust HEAD %H tree %T parent %P' | tee "$EVIDENCE/sources.log"
+          test "$(git rev-parse HEAD)" = "$WFC_BUILD_ID"
+          git -C ../native-input log -1 --format='zlib source checkout HEAD %H tree %T' | tee -a "$EVIDENCE/sources.log"
+          test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
+          sha256sum vendor/INPUTS.sha256 tools/check_tmux.py | tee "$EVIDENCE/inputs.log"
+          sha256sum -c vendor/INPUTS.sha256 2>&1 | tee -a "$EVIDENCE/inputs.log"
+          rustup toolchain install 1.96.1 --profile minimal 2>&1 | tee "$EVIDENCE/toolchain.log"
+          {
+            rustc -vV
+            cargo --version
+            zig version
+            python --version
+          } 2>&1 | tee -a "$EVIDENCE/toolchain.log"
+          zlib=../native-input/vendor/zlib-1.3.1.tar.gz
+          sha256sum "$zlib" | tee -a "$EVIDENCE/inputs.log"
+          python tools/prepare.py --zlib-archive "$zlib" 2>&1 | tee -a "$EVIDENCE/inputs.log"
+      - name: Prime the pinned Wuffs package with bounded download retries
+        working-directory: product/vendor/libghostty-vt
+        run: |
+          url=https://deps.files.ghostty.org/wuffs-7411f488fe2e2c205c3d3b3d28638b7356522930.tar.gz
+          archive="$RUNNER_TEMP/wuffs.tar.gz"
+          {
+            printf 'Wuffs source %s\n' "$url"
+            curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+              --retry-max-time 120 --connect-timeout 15 --max-time 60 "$url" -o "$archive"
+            printf '%s  %s\n' 17877d346f7988651d6c62e45b2e3b05c86809a6442c5e34612374b2a9719a1c "$archive" | sha256sum -c
+            package=$(zig fetch "$archive")
+            printf 'Wuffs Zig package %s\n' "$package"
+            test "$package" = 'N-V-__8AAP5JWgCGP_AD0teWpa4krRvE9VPZzvviGdbmN4jI'
+          } 2>&1 | tee "$EVIDENCE/wuffs.log"
+      - name: Build and identify the release wfc ELF
+        id: build
+        working-directory: product
+        run: |
+          cargo build --release --locked --target "$TRIPLE" -p wfc 2>&1 | tee "$EVIDENCE/build.log"
+          binary="target/$TRIPLE/release/wfc"
+          sha256sum "$binary" | tee "$EVIDENCE/binaries.log"
+          version=$("$binary" --version)
+          printf '%s\n' "$version" | tee -a "$EVIDENCE/binaries.log"
+          [[ "$version" == *"(Rust, $TRIPLE, release, build $WFC_BUILD_ID)" ]]
+          readelf -hW "$binary" | tee "$EVIDENCE/elf.log"
+      - name: Ensure native tmux is available
+        id: tmux
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          if ! command -v tmux >/dev/null; then
+            sudo apt-get update 2>&1 | tee "$EVIDENCE/tmux-install.log"
+            sudo apt-get install -y --no-install-recommends tmux 2>&1 | tee -a "$EVIDENCE/tmux-install.log"
+          fi
+          tmux -V | tee "$EVIDENCE/tmux-version.log"
+      - name: Check out the reviewed Linux process reaper
+        id: fixtures
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.TMUX_FIXTURE_SHA }}
+          path: tmux-r11-fixtures
+          sparse-checkout: tools/ci/tmux-r11/reap.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Verify the reviewed reaper source
+        id: fixture-identity
+        if: ${{ !cancelled() && steps.fixtures.outcome == 'success' }}
+        working-directory: tmux-r11-fixtures
+        run: |
+          test "$(git rev-parse HEAD)" = "$TMUX_FIXTURE_SHA"
+          git log -1 --format='Fixture HEAD %H tree %T' | tee "$EVIDENCE/backend-fixture-inputs.log"
+          sha256sum tools/ci/tmux-r11/reap.py | tee -a "$EVIDENCE/backend-fixture-inputs.log"
+      - name: Run public continue and nudge against an isolated tmux server
+        if: ${{ !cancelled() && steps.tmux.outcome == 'success' && steps.fixture-identity.outcome == 'success' }}
+        working-directory: product
+        run: |
+          head -n 1 "$EVIDENCE/binaries.log" | sha256sum --check --strict | tee "$EVIDENCE/tmux-public.log"
+          reaper="$GITHUB_WORKSPACE/tmux-r11-fixtures/tools/ci/tmux-r11/reap.py"
+          python -B "$reaper" python -Bu tools/check_tmux.py "target/$TRIPLE/release/wfc" -v \
+            Backend.test_public_continue_and_nudge_share_live_worker \
+            Backend.test_public_continue_preserves_uncertain_round \
+            Backend.test_public_continue_rejects_overlap_before_fast_r2_done \
+            Backend.test_public_nudge_rechecks_completion_and_lease_before_text \
+            Backend.test_public_continue_checks_draft_and_does_not_infer_from_empty \
+            Backend.test_public_continue_rolls_back_confirmed_refusal \
+            Backend.test_public_nudge_recovers_after_settlement_sync_failure \
+            Backend.test_public_nudge_rechecks_draft_and_lease_after_inbox_wait \
+            Backend.test_public_nudge_does_not_attribute_reappearing_history \
+            Backend.test_public_continue_verifies_legacy_worker_and_current_owner \
+            Backend.test_public_nudge_distinguishes_new_intent_and_keyed_replay \
+            Backend.test_public_continue_confirms_soft_wrap_with_transcript_scroll \
+            Backend.test_public_continue_restores_round_on_unique_refusal_before_enter \
+            2>&1 | tee -a "$EVIDENCE/tmux-public.log"
+      - name: Checksum the evidence logs
+        if: ${{ always() }}
+        run: |
+          cd "$EVIDENCE"
+          sha256sum -- *.log > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() }}
+        with:
+          name: linux-34-continue-nudge-${{ env.WFC_BUILD_ID }}-attempt-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 14
