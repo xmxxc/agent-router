@@ -1,0 +1,183 @@
+--- a/tools/check_tmux.py
++++ b/tools/check_tmux.py
+@@ -1,5 +1,6 @@
+ """Exercise the public CLI and private backend with a fresh tmux server and state roots."""
+ from contextlib import contextmanager
++import errno
+ import fcntl
+ import hashlib
+ import json
+@@ -2775,9 +2776,17 @@
+         self.assertEqual(len(formal.read_text().splitlines()), 2)
+
+     def test_public_nudge_recovers_after_settlement_sync_failure(self):
+-        cli, first, token, _ = self.public_input_worker()
++        cli, first, token, env = self.public_input_worker()
+         dispatch = first["dispatch"]
+-        source = self.work / "settlement-sync.c"
++        self.assertIn(" ", str(self.work))
++        # glibc tokenizes LD_PRELOAD on spaces and colons, without an escape.
++        loader = tempfile.TemporaryDirectory(prefix="wfc-settlement-loader-", dir="/tmp")
++        self.addCleanup(loader.cleanup)
++        loader_dir = Path(loader.name)
++        shim = loader_dir / "settlement-sync.so"
++        self.assertFalse(any(char in str(shim) for char in " :\t\r\n"))
++        self.assertEqual(stat.S_IMODE(loader_dir.stat().st_mode), 0o700)
++        source = loader_dir / "settlement-sync.c"
+         source.write_text(r"""
+ #define _GNU_SOURCE
+ #include <dlfcn.h>
+@@ -2787,9 +2796,26 @@
+ #include <string.h>
+ #include <unistd.h>
+
++static void record_event(const char *event, unsigned ordinal, int error) {
++    const char *log = getenv("WFC_TEST_SETTLEMENT_LOG");
++    if (!log) return;
++    FILE *file = fopen(log, "a");
++    if (!file) return;
++    fprintf(file, "%ld %s %u %d\n", (long)getpid(), event, ordinal, error);
++    fclose(file);
++}
++
++__attribute__((constructor)) static void loaded(void) {
++    record_event("loaded", 0, 0);
++}
++
+ int fsync(int fd) {
+     static unsigned dispatch_syncs;
+     int (*real_fsync)(int) = dlsym(RTLD_NEXT, "fsync");
++    if (!real_fsync) {
++        errno = ENOSYS;
++        return -1;
++    }
+     const char *directory = getenv("WFC_TEST_SETTLEMENT_DIR");
+     char link[64];
+     char path[4096];
+@@ -2797,31 +2823,90 @@
+     ssize_t count = readlink(link, path, sizeof(path) - 1);
+     if (directory && count >= 0) {
+         path[count] = '\0';
+-        if (strcmp(directory, path) == 0 && ++dispatch_syncs == 2) {
+-            FILE *marker = fopen("injected-settlement-sync", "w");
+-            if (marker) fclose(marker);
+-            errno = EIO;
+-            return -1;
++        if (strcmp(directory, path) == 0) {
++            unsigned ordinal = ++dispatch_syncs;
++            if (ordinal == 2) {
++                record_event("directory-sync", ordinal, EIO);
++                errno = EIO;
++                return -1;
++            }
++            int result = real_fsync(fd);
++            int saved_errno = errno;
++            record_event("directory-sync", ordinal, result == 0 ? 0 : saved_errno);
++            errno = saved_errno;
++            return result;
+         }
+     }
+     return real_fsync(fd);
+ }
+ """)
+-        shim = self.work / "settlement-sync.so"
+         subprocess.run(["cc", "-shared", "-fPIC", "-o", shim, source, "-ldl"], check=True)
++
++        def run_with_loader(phase, args, **extra):
++            log = loader_dir / f"{phase}.log"
++            test_env = {**env, "LC_ALL": "C", "LD_PRELOAD": str(shim),
++                        "WFC_TEST_SETTLEMENT_LOG": str(log), **extra}
++            with subprocess.Popen([WFC, *args], cwd=self.work, env=test_env,
++                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child:
++                try:
++                    stdout, stderr = child.communicate(timeout=15)
++                except subprocess.TimeoutExpired:
++                    child.kill()
++                    child.communicate()
++                    raise
++            events = []
++            if log.exists():
++                for line in log.read_text().splitlines():
++                    pid, event, ordinal, error = line.split()
++                    if int(pid) == child.pid:
++                        events.append([event, int(ordinal), int(error)])
++            print("R18 settlement loader " + json.dumps({
++                "phase": phase, "exit": child.returncode, "main_process_events": events,
++                "loader_warning": "ld.so" in stderr,
++            }), flush=True)
++            self.assertNotIn("ld.so", stderr)
++            return child.returncode, stdout, stderr, events
++
++        rc, version, error, events = run_with_loader("preflight", ("--version",))
++        self.assertEqual((rc, error, events), (0, "", [["loaded", 0, 0]]))
++        self.assertIn("(Rust,", version)
++        print("R18 settlement shim SHA-256 " + hashlib.sha256(shim.read_bytes()).hexdigest(), flush=True)
++        before = cli("status", "--dispatch", dispatch)["dispatches"][0]
++        self.assertFalse(any(message["to"] == "worker" for message in before["messages"]))
++        byte_log = self.work / "input-bytes"
++        typed = self.work / "typed"
++        formal = self.work / "formal-input"
++        self.assertTrue(all(not path.exists() for path in (byte_log, typed, formal)))
++
+         args = ("nudge", dispatch, "--text")
+-        cli(*args, "safely repeat   ", token=token, expected=1, LD_PRELOAD=str(shim),
+-            WFC_TEST_SETTLEMENT_DIR=str(self.state / "dispatches"))
+-        self.assertTrue((self.work / "injected-settlement-sync").exists())
++        rc, output, error, events = run_with_loader(
++            "fault", (*args, "safely repeat   ", "--owner-token", token),
++            WFC_TEST_SETTLEMENT_DIR=str((self.state / "dispatches").resolve()))
++        self.assertEqual(events, [["loaded", 0, 0], ["directory-sync", 1, 0],
++                                  ["directory-sync", 2, errno.EIO]])
++        self.assertEqual((rc, output), (1, ""))
++        self.assertIn(f"os error {errno.EIO}", error)
++
+         status = cli("status", "--dispatch", dispatch)["dispatches"][0]
+         settled = status["audit"][-1]
+-        self.assertEqual((settled["result"], settled["text"]), ("accepted", "safely repeat"))
+-        formal = self.work / "formal-input"
+-        self.assertEqual([json.loads(line) for line in formal.read_text().splitlines()],
+-                         ["[router] Message from the controller: safely repeat"])
++        self.assertEqual((settled["result"], settled["text"], settled["inputEvidence"]),
++                         ("accepted", "safely repeat", "appended-user-entry"))
++        receipt = settled["message"]
++        self.assertIsInstance(receipt, int)
++        expected_entry = "[router] Message from the controller: safely repeat"
++        expected_bytes = expected_entry.encode() + b"\r"
++        self.assertEqual(byte_log.read_bytes(), expected_bytes)
++        self.assertEqual([json.loads(line) for line in typed.read_text().splitlines()], [expected_entry])
++        self.assertEqual([json.loads(line) for line in formal.read_text().splitlines()], [expected_entry])
++        self.assertEqual([m["id"] for m in status["messages"] if m["to"] == "worker"], [receipt])
++        ledger = self.state / "messages.json"
++        confirmed_ledger = ledger.read_bytes()
++
+         visible = cli(*args, "safely repeat", token=token)
+         self.assertEqual((visible["message"], visible["audit"], visible["duplicate"]),
+-                         (settled["message"], settled["id"], True))
++                         (receipt, settled["id"], True))
++        self.assertEqual(byte_log.read_bytes(), expected_bytes)
++        self.assertEqual(ledger.read_bytes(), confirmed_ledger)
+         # Reconstruct the pre-rename disk state while retaining the proven receipt.
+         assignment = self.state / "dispatches" / f"{dispatch}.json"
+         row = json.loads(assignment.read_text())
+@@ -2833,12 +2918,18 @@
+         for text in ("safely repeat", "safely repeat  "):
+             result = cli(*args, text, token=token)
+             self.assertEqual((result["message"], result["audit"], result["duplicate"]),
+-                             (settled["message"], settled["id"], True))
++                             (receipt, settled["id"], True))
++            self.assertEqual(byte_log.read_bytes(), expected_bytes)
++            self.assertEqual(ledger.read_bytes(), confirmed_ledger)
++        self.assertEqual(len(typed.read_text().splitlines()), 1)
+         self.assertEqual(len(formal.read_text().splitlines()), 1)
+         status = cli("status", "--dispatch", dispatch)["dispatches"][0]
+         self.assertEqual(status["audit"][-1], settled)
+-        self.assertEqual([m["id"] for m in status["messages"] if m["to"] == "worker"],
+-                         [settled["message"]])
++        self.assertEqual([m["id"] for m in status["messages"] if m["to"] == "worker"], [receipt])
++        print("R18 settlement replay " + json.dumps({
++            "numeric_receipt_preserved": True, "ledger_bytes_preserved": True,
++            "literal_bytes": len(expected_bytes) - 1, "enter_count": 1, "formal_count": 1,
++        }), flush=True)
+
+     def test_public_nudge_rechecks_draft_and_lease_after_inbox_wait(self):
+         original = self.work

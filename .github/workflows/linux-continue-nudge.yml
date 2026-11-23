@@ -1,7 +1,7 @@
-name: Linux continue and nudge
+name: Linux continue and nudge settlement fixture
 on:
   push:
-    branches: [rust-router/34-continue-nudge-r5]
+    branches: [rust-router/34-continue-nudge-r18-fixture-ci]
 
 permissions:
   contents: read
@@ -12,11 +12,11 @@ defaults:
 
 jobs:
   continue-nudge:
-    name: '#34 Continue and nudge the same Codex/tmux worker'
+    name: '#34 Settlement recovery with the pinned worker build'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      WFC_BUILD_ID: ${{ github.sha }}
+      WFC_BUILD_ID: 0c63508764bd1ac2e028921d74c31acadf8f8947
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TMUX_FIXTURE_SHA: 5ced6218637c11d9ca73fa3285a1ff98fadad6fc
       TRIPLE: x86_64-unknown-linux-gnu
@@ -31,11 +31,19 @@ jobs:
             "$GITHUB_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$WFC_BUILD_ID" \
             | tee "$EVIDENCE/run.log"
           uname -a | tee -a "$EVIDENCE/run.log"
-      - name: Check out the triggering product
+      - name: Check out the pinned product
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.WFC_BUILD_ID }}
           path: product
+          persist-credentials: false
+      - name: Check out the CI-only settlement fixture
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: ci-overlay
+          sparse-checkout: tools/ci/tmux-r18/settlement-loader.patch
+          sparse-checkout-cone-mode: false
           persist-credentials: false
       - name: Check out the verified native CI zlib archive
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -122,23 +130,27 @@ jobs:
           test "$(git rev-parse HEAD)" = "$TMUX_FIXTURE_SHA"
           git log -1 --format='Fixture HEAD %H tree %T' | tee "$EVIDENCE/backend-fixture-inputs.log"
           sha256sum tools/ci/tmux-r11/reap.py | tee -a "$EVIDENCE/backend-fixture-inputs.log"
-      - name: Run public continue and nudge against an isolated tmux server
+      - name: Run the settlement case and redraw control with the same release ELF
         if: ${{ !cancelled() && steps.tmux.outcome == 'success' && steps.fixture-identity.outcome == 'success' }}
         working-directory: product
         run: |
           head -n 1 "$EVIDENCE/binaries.log" | sha256sum --check --strict | tee "$EVIDENCE/tmux-public.log"
           reaper="$GITHUB_WORKSPACE/tmux-r11-fixtures/tools/ci/tmux-r11/reap.py"
-          python -B "$reaper" python -Bu tools/check_tmux.py "target/$TRIPLE/release/wfc" -v \
-            Backend.test_public_continue_and_nudge_share_live_worker \
-            Backend.test_public_continue_preserves_uncertain_round \
-            Backend.test_public_continue_rejects_overlap_before_fast_r2_done \
-            Backend.test_public_nudge_rechecks_completion_and_lease_before_text \
-            Backend.test_public_continue_checks_draft_and_does_not_infer_from_empty \
-            Backend.test_public_continue_rolls_back_confirmed_refusal \
+          test "$(git -C ../ci-overlay rev-parse HEAD)" = "$GITHUB_WORKFLOW_SHA"
+          git -C ../ci-overlay log -1 --format='CI overlay HEAD %H tree %T' \
+            | tee "$EVIDENCE/settlement-fixture.log"
+          patch="$GITHUB_WORKSPACE/ci-overlay/tools/ci/tmux-r18/settlement-loader.patch"
+          overlay="$RUNNER_TEMP/settlement-overlay"
+          mkdir -p "$overlay/tools"
+          cp tools/check_tmux.py "$overlay/tools/check_tmux.py"
+          git -C "$overlay" apply --check "$patch"
+          git -C "$overlay" apply "$patch"
+          sha256sum tools/check_tmux.py "$patch" "$overlay/tools/check_tmux.py" \
+            | tee -a "$EVIDENCE/settlement-fixture.log"
+          git diff --exit-code
+          python -B "$reaper" python -Bu "$overlay/tools/check_tmux.py" "$PWD/target/$TRIPLE/release/wfc" -v \
             Backend.test_public_nudge_recovers_after_settlement_sync_failure \
-            Backend.test_public_nudge_rechecks_draft_and_lease_after_inbox_wait \
-            Backend.test_public_nudge_does_not_attribute_reappearing_history \
-            Backend.test_public_continue_verifies_legacy_worker_and_current_owner \
+            Backend.test_public_continue_and_nudge_share_live_worker \
             2>&1 | tee -a "$EVIDENCE/tmux-public.log"
       - name: Checksum the evidence logs
         if: ${{ always() }}
@@ -149,7 +161,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ always() }}
         with:
-          name: linux-34-continue-nudge-${{ env.WFC_BUILD_ID }}-attempt-${{ github.run_attempt }}
+          name: linux-34-r18-${{ env.WFC_BUILD_ID }}-ci-${{ github.workflow_sha }}-attempt-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14
