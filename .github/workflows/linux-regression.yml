@@ -38,11 +38,12 @@ jobs:
           ref: ${{ env.PRODUCT_SHA }}
           path: product
           persist-credentials: false
-      - name: Check out the historical Python CLI fixture
+      - name: Check out the historical Python CLI and its Git objects
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: xmxxc/workflow-core
           ref: ${{ env.PYTHON_39_SHA }}
+          fetch-depth: 0
           path: python-39
           persist-credentials: false
       - name: Check out the frozen Python CLI and its historical Git objects
