@@ -418,13 +418,16 @@ done"#;
                 );
             }
         }
+        fs::write(&receipt, &old_receipt).unwrap();
         for op in ["input", "resize"] {
             let answer = backend(
                 json!({"op":op,"ticket":ticket,"seq":2,"text":"never","cols":55,"rows":20}),
             );
-            assert_eq!(answer["result"], "uncertain");
+            assert_eq!(answer["result"], "definitely-not-sent");
+            assert_eq!(answer["cleanup"], "confirmed");
+            assert_eq!(answer["proof"], result["proof"]);
             assert_eq!(answer["delivery"], "definitely-not-sent");
-            assert_eq!(answer["reconcile"], true);
+            assert_ne!(answer["reconcile"], true);
         }
         for corrupt in [changed.as_slice(), b"{}".as_slice(), b"broken"] {
             fs::write(&receipt, corrupt).unwrap();
@@ -455,11 +458,27 @@ done"#;
     );
     let early_ticket = &early["ticket"];
     assert_eq!(early["result"], "uncertain");
+    // Under an unprivileged delegation the marker can commit even when
+    // its current-index mirror cannot. A retry only repairs the mirror.
+    let unit = state.join("bundled/early");
+    let deny_mirror = unsafe { libc::geteuid() } != 0;
+    if deny_mirror {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&unit, fs::Permissions::from_mode(0o500)).unwrap();
+        let partial = backend(json!({"op":"reconcile","ticket":early_ticket}));
+        fs::set_permissions(&unit, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(partial["result"], "uncertain");
+        assert_eq!(partial["recovery_pending"], true);
+        assert_eq!(partial["newly_applied"], true);
+        assert_eq!(partial["applied"], true);
+        assert_eq!(partial["proof"]["state"], "faulted");
+    }
     let early_proof = backend(json!({"op":"reconcile","ticket":early_ticket}));
     assert_eq!(early_proof["proof"]["state"], "faulted", "{early_proof}");
     assert!(early_proof["proof"]["identity"]["service"].is_object());
     assert!(early_proof["proof"]["identity"]["kernel"].is_null());
-    assert_eq!(early_proof["newly_applied"], true);
+    assert_eq!(early_proof["newly_applied"], !deny_mirror);
+    assert_eq!(early_proof["recovery_pending"], false);
     assert_eq!(
         backend(json!({"op":"reconcile","ticket":early_ticket}))["newly_applied"],
         false

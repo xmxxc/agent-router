@@ -246,32 +246,97 @@ impl Store {
             )))
     }
 
-    pub fn replaceable(&self, current: &Value) -> bool {
-        self.authorizes_unstarted().unwrap_or(false)
-            || self
-                .proof()
-                .and_then(|proof| self.applied(current, &proof))
-                .unwrap_or(false)
-    }
-
-    pub fn applied(&self, current: &Value, proof: &Value) -> Result<bool> {
-        let indexed = current["applied"] == true;
-        if indexed && self.ticket["version"] == 2 {
-            ensure!(
-                current["appliedProof"] == digest(&serde_json::to_vec(proof)?),
-                "indexed proof changed"
-            );
-        }
-        if fs::symlink_metadata(self.run.join("applied.json"))
-            .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
-        {
-            return Ok(indexed);
+    fn marked(&self, proof: &Value) -> Result<bool> {
+        if !has_entry(&self.run.join("applied.json"))? {
+            return Ok(false);
         }
         ensure!(
             self.signed("applied")? == *proof,
             "applied cleanup proof changed"
         );
+        // Also seals a rename that was visible after a directory sync error.
+        File::open(&self.run)?.sync_all()?;
         Ok(true)
+    }
+
+    fn indexed(&self, current: &Value, proof: &Value) -> Result<bool> {
+        if self.ticket["version"] != 2 || current["applied"] != true {
+            return Ok(false);
+        }
+        ensure!(
+            current["appliedProof"] == digest(&serde_json::to_vec(proof)?),
+            "indexed proof changed"
+        );
+        Ok(true)
+    }
+
+    pub fn current_proof(&self) -> Result<Value> {
+        let proof = self.proof()?;
+        if self.ticket.get("version").is_none() {
+            ensure!(self.marked(&proof)?, "legacy application unknown");
+        }
+        Ok(proof)
+    }
+
+    pub fn replaceable(&self, current: &Value) -> bool {
+        if self.ticket["version"] == 2 && self.authorizes_unstarted().unwrap_or(false) {
+            return true;
+        }
+        (|| -> Result<bool> {
+            let proof = self.proof()?;
+            let indexed = self.indexed(current, &proof)?;
+            Ok(self.marked(&proof)? && (self.ticket["version"].is_null() || indexed))
+        })()
+        .unwrap_or(false)
+    }
+
+    // The first durable signed copy commits application. The index mirrors it.
+    // Called under the unit lock with a verified current proof.
+    pub fn reconcile(&self, path: &Path, mut current: Value, proof: Value) -> Result<Value> {
+        let indexed = self.indexed(&current, &proof)?;
+        let marked = self.marked(&proof)?;
+        ensure!(
+            self.ticket["version"] == 2 || marked,
+            "legacy application unknown"
+        );
+        let mut result = json!({"result":"uncertain", "proof":proof, "ticket":self.ticket,
+                                "recovery_pending":true});
+        if !marked && self.save_signed("applied", proof.clone()).is_err() {
+            match self.marked(&proof) {
+                Ok(true) => (),
+                Ok(false) => {
+                    result["applied"] = json!(indexed);
+                    result["newly_applied"] = json!(false);
+                    return Ok(result);
+                }
+                Err(_) => {
+                    if indexed {
+                        result["applied"] = json!(true);
+                        result["newly_applied"] = json!(false);
+                    }
+                    return Ok(result);
+                }
+            }
+        }
+        result["applied"] = json!(true);
+        result["newly_applied"] = json!(!marked && !indexed);
+        if current["applied"] != true {
+            current["applied"] = json!(true);
+            if self.ticket["version"] == 2 {
+                current["appliedProof"] = json!(digest(&serde_json::to_vec(&proof)?));
+            }
+            if publish_current(path, current, self).is_err() {
+                return Ok(result);
+            }
+        } else if File::open(path.parent().context("missing unit")?)
+            .and_then(|dir| dir.sync_all())
+            .is_err()
+        {
+            return Ok(result);
+        }
+        result["result"] = json!("completed");
+        result["recovery_pending"] = json!(false);
+        Ok(result)
     }
 
     pub fn proof(&self) -> Result<Value> {
@@ -282,16 +347,18 @@ impl Store {
                 && matches!(state, "closed" | "exited" | "faulted"),
             "invalid cleanup state"
         );
-        let phase = if fs::symlink_metadata(self.run.join("ready.json"))
-            .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
-        {
-            "starting"
+        let ready = has_entry(&self.run.join("ready.json"))?;
+        let binding = if ready {
+            self.signed_body("ready")?
         } else {
-            "ready"
+            ensure!(state == "faulted", "pre-ready cleanup must be faulted");
+            self.signed_body("starting")?
         };
-        let identity = self.signed(phase)?;
+        let phase = field(&binding, "kind")?;
+        ensure!(!ready || phase == "ready", "invalid ready binding");
+        let identity = &binding["data"];
         ensure!(
-            identity == receipt["identity"],
+            *identity == receipt["identity"],
             "creation identity mismatch"
         );
         let group = &identity["containment"];
@@ -334,37 +401,48 @@ fn process_record(v: &Value) -> bool {
             .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok())
 }
 
-// The first format had an unsigned index and no supersession marker. An
-// old copy may point to an already-cleaned generation while a sibling runs.
-pub fn check_legacy_siblings(unit: &Path, selected: &Store) -> Result<()> {
-    if selected.ticket.get("version").is_some() {
-        return Ok(());
+fn has_entry(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+// A legacy receipt has no predecessor link. Even two terminal receipts
+// cannot establish which generation was last selected.
+pub fn ordered(unit: &Path, selected: &Store) -> Result<bool> {
+    if selected.ticket["version"] == 2 {
+        return Ok(true);
     }
     for entry in fs::read_dir(unit)? {
         let entry = entry?;
-        let dir = entry.path();
-        if dir == selected.run || !entry.file_type()?.is_dir() {
-            continue;
+        if entry.path() != selected.run
+            && entry.file_name() != "current.json"
+            && entry.file_name() != "lock"
+        {
+            return Ok(false);
         }
-        let slot = if dir.join("cleanup.json").try_exists()? {
-            "cleanup"
-        } else {
-            "unstarted"
-        };
-        let file = read(&dir.join(format!("{slot}.json")))?;
-        let ticket = &file["body"]["ticket"];
-        ensure!(
-            ticket["unit"] == selected.ticket["unit"]
-                && Some(std::ffi::OsStr::new(field(ticket, "generation")?)) == dir.file_name(),
-            "unexpected generation"
-        );
-        let sibling = Store::open(unit, ticket)?;
-        ensure!(
-            sibling.proof().is_ok() || sibling.authorizes_unstarted().unwrap_or(false),
-            "another generation lacks terminal evidence"
-        );
     }
-    Ok(())
+    Ok(true)
+}
+
+fn verify_index(mut record: Value, store: &Store) -> Result<Value> {
+    ensure!(
+        record["ticket"]["version"] == 2,
+        "unsupported current ticket"
+    );
+    let tag = record
+        .as_object_mut()
+        .context("invalid current index")?
+        .remove("indexSignature")
+        .context("unsigned current index")?;
+    verify(
+        &store.token,
+        &serde_json::to_vec(&json!(["current", record]))?,
+        tag.as_str().context("invalid current signature")?,
+    )?;
+    Ok(record)
 }
 
 // Called with the unit lock held. Only a unit containing the lock alone is new.
@@ -395,26 +473,32 @@ pub fn current(unit: &Path) -> Result<Option<(Value, Store)>> {
         !store.run.join("superseded.json").try_exists()?,
         "superseded current index"
     );
-    if ticket.get("version").is_some() {
-        ensure!(ticket["version"] == 2, "unsupported current ticket");
-        let tag = record
-            .as_object_mut()
-            .context("invalid current index")?
-            .remove("indexSignature")
-            .context("unsigned current index")?;
-        verify(
-            &store.token,
-            &serde_json::to_vec(&json!(["current", record]))?,
-            tag.as_str().context("invalid current signature")?,
-        )?;
-    }
-    if store.ticket.get("version").is_none() {
-        for slot in ["ready", "cleanup", "unstarted"] {
-            if store.run.join(format!("{slot}.json")).try_exists()? {
-                store.signed(slot)?;
+    let backup = store.run.join("index.json");
+    if ticket.get("version").is_some()
+        || record.get("indexSignature").is_some()
+        || has_entry(&backup)?
+    {
+        record = verify_index(record, &store)?;
+        let original = verify_index(read(&backup)?, &store)?;
+        for key in ["ticket", "creator", "pending_until_ms"] {
+            ensure!(original[key] == record[key], "generation index mismatch");
+        }
+    } else {
+        // A pending record without independent format or identity evidence
+        // could also be a damaged new-format index.
+        let mut bound = false;
+        for slot in ["ready", "cleanup", "unstarted", "starting"] {
+            if has_entry(&store.run.join(format!("{slot}.json")))? {
+                let body = store.signed_body(slot)?;
+                ensure!(
+                    body["kind"] == slot || (slot == "starting" && body["kind"] == "ready"),
+                    "legacy binding kind mismatch"
+                );
+                bound = true;
                 break;
             }
         }
+        ensure!(bound, "unverified legacy ticket");
     }
     Ok(Some((record, store)))
 }
@@ -427,4 +511,98 @@ pub fn publish_current(path: &Path, mut record: Value, store: &Store) -> Result<
         ));
     }
     publish(path, &record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn generation(unit: &Path, legacy: bool) -> Result<Store> {
+        let token = fresh();
+        let mut ticket = json!({"unit":unit.file_name().unwrap().to_str(), "attempt":"one",
+            "generation":fresh(), "nonce":fresh(), "capabilityHash":digest(token.as_bytes())});
+        if !legacy {
+            ticket["version"] = json!(2);
+        }
+        let run = unit.join(field(&ticket, "generation")?);
+        private_dir(unit)?;
+        private_dir(&run)?;
+        publish(&run.join("key.json"), &json!(token))?;
+        Store::open(unit, &ticket)
+    }
+
+    #[test]
+    fn pending_index_keeps_its_format() -> Result<()> {
+        let unit = std::env::temp_dir().join(fresh());
+        let store = generation(&unit, false)?;
+        let record = json!({"ticket":store.ticket, "applied":false,
+            "creator":identity(std::process::id())?, "pending_until_ms":1});
+        let path = unit.join("current.json");
+        let backup = store.run.join("index.json");
+        publish_current(&backup, record, &store)?;
+        let mut damaged = read(&backup)?;
+        damaged["ticket"].as_object_mut().unwrap().remove("version");
+        publish(&path, &damaged)?;
+        assert!(current(&unit).is_err());
+        damaged.as_object_mut().unwrap().remove("indexSignature");
+        publish(&path, &damaged)?;
+        assert!(current(&unit).is_err());
+        fs::copy(&backup, &path)?;
+        assert_eq!(current(&unit)?.unwrap().1.ticket, store.ticket);
+        fs::remove_dir_all(unit)?;
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_ready_keeps_its_binding() -> Result<()> {
+        let unit = std::env::temp_dir().join(fresh());
+        let store = generation(&unit, false)?;
+        let process = identity(std::process::id())?;
+
+        let actual = json!({"guardian":process, "service":process, "kernel":process,
+            "worker":process,"endpoint":42,"kernel_generation":fresh(),
+            "containment":{"kind":"cgroup-v2","path":"/test-fixture","device":1,"inode":2}});
+        let ready = store.run.join("ready.json");
+        fs::create_dir(&ready)?;
+        assert!(store.save_signed("ready", actual.clone()).is_err());
+        let mut receipt = json!({"proves":"execution-empty","state":"faulted","identity":actual});
+        store.save_signed("cleanup", receipt.clone())?;
+        assert!(store.proof().is_err());
+        fs::remove_dir(&ready)?;
+        assert!(store.signed("ready").is_err());
+        assert_eq!(store.proof()?, receipt);
+        receipt["state"] = json!("closed");
+        store.save_signed("cleanup", receipt)?;
+        assert!(store.proof().is_err());
+        fs::remove_dir_all(unit)?;
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_application_and_order_need_independent_evidence() -> Result<()> {
+        let unit = std::env::temp_dir().join(fresh());
+        let first = generation(&unit, true)?;
+        let actual = json!({"guardian":identity(std::process::id())?,
+            "containment":{"kind":"cgroup-v2","path":"/fixture","device":1,"inode":2}});
+        let proof = json!({"proves":"execution-empty","state":"faulted","identity":actual});
+        first.save_signed("starting", actual.clone())?;
+        first.save_signed("cleanup", proof.clone())?;
+        assert!(ordered(&unit, &first)?);
+        assert!(first.current_proof().is_err());
+        for bit in [false, true] {
+            assert!(!first.replaceable(&json!({"applied":bit})));
+        }
+        first.save_signed("applied", proof.clone())?;
+        assert_eq!(first.current_proof()?, proof);
+        assert!(first.replaceable(&json!({"applied":false})));
+        let second = generation(&unit, true)?;
+        second.save_signed("starting", actual)?;
+        second.save_signed("cleanup", proof)?;
+        assert!(second.proof().is_ok());
+        for run in [&first, &second] {
+            assert!(!ordered(&unit, run)?);
+        }
+        fs::remove_dir_all(unit)?;
+        Ok(())
+    }
 }

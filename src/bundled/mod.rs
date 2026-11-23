@@ -104,7 +104,7 @@ fn create(req: &Value) -> Result<Value> {
         if req["previous"] != prior.ticket || prior.ticket["attempt"] == attempt {
             return Ok(json!({"result":"refused","diagnostic":"current create fence"}));
         }
-        if !prior.replaceable(record) || store::check_legacy_siblings(&unit_path, prior).is_err() {
+        if !store::ordered(&unit_path, prior).unwrap_or(false) || !prior.replaceable(record) {
             return Ok(unknown_cleanup());
         }
     } else {
@@ -238,11 +238,66 @@ fn unknown_cleanup() -> Value {
     json!({"result":"uncertain","cleanup":"unknown"})
 }
 
-fn completed(store: &Store) -> Option<Value> {
-    store
-        .proof()
-        .ok()
-        .map(|p| json!({"result":"completed","proof":p,"ticket":store.ticket}))
+fn terminal_reply(store: &Store, proof: Value, op: &str) -> Value {
+    if matches!(op, "input" | "resize") {
+        json!({"result":"definitely-not-sent", "delivery":"definitely-not-sent",
+               "cleanup":"confirmed", "proof":proof, "ticket":store.ticket})
+    } else {
+        json!({"result":"completed", "proof":proof, "ticket":store.ticket})
+    }
+}
+
+// In an unordered legacy history the caller can still address an individual
+// runtime. Only its authenticated live response authorizes a targeted close.
+fn live_operation(store: &Store, req: &Value, op: &str, targeted: bool) -> Value {
+    let observing = matches!(op, "inspect" | "close" | "read");
+    if targeted && !observing && store.run.join("cleanup.json").try_exists().unwrap_or(true) {
+        return unknown_cleanup();
+    }
+    let Ok(ready) = store.signed("ready") else {
+        return unknown_cleanup();
+    };
+    let mut answer = rpc(store, &ready, req);
+    if answer["result"] == "accepted" {
+        if targeted {
+            answer["scope"] = json!("execution");
+            answer["cleanup"] = json!("unknown");
+        }
+        if op == "inspect" {
+            answer["identity"] = ready;
+        }
+        if op == "close" {
+            let end = Instant::now() + TIMEOUT;
+            loop {
+                if let Ok(proof) = store.proof() {
+                    if targeted {
+                        answer["execution_cleanup"] = json!("confirmed");
+                        answer["execution_proof"] = proof;
+                        return answer;
+                    }
+                    return terminal_reply(store, proof, op);
+                }
+                if Instant::now() >= end {
+                    return unknown_cleanup();
+                }
+                thread::sleep(TICK);
+            }
+        }
+    } else if answer["result"] != "refused" {
+        // A terminal receipt can settle an observation or a pre-send failure.
+        // It says nothing about bytes sent before a reply was lost.
+        let unsent = answer["delivery"] == "definitely-not-sent"
+            || answer["result"] == "definitely-not-sent";
+        if !targeted && (observing || unsent) {
+            if let Ok(proof) = store.current_proof() {
+                return terminal_reply(store, proof, op);
+            }
+        }
+        if observing && answer["reconcile"] != true {
+            return unknown_cleanup();
+        }
+    }
+    answer
 }
 
 fn unix_ms() -> Result<u64> {
@@ -265,14 +320,17 @@ fn operate(req: &Value) -> Result<Value> {
             Ok(None) => bail!("unknown unit"),
             Err(_) => return Ok(unknown_cleanup()),
         };
+        if !store::ordered(&unit, &store).unwrap_or(false) {
+            return Ok(unknown_cleanup());
+        }
         ensure!(
             current["ticket"]["attempt"] == req["attempt"],
             "wrong attempt"
         );
-        let phase = if store.proof().is_ok() {
+        let phase = if store.current_proof().is_ok() {
             "cleaned"
         } else if store.run.join("cleanup.json").try_exists()? {
-            "unknown"
+            return Ok(unknown_cleanup());
         } else if store.signed("unstarted").is_ok() {
             "unstarted"
         } else if store.signed("ready").is_ok() {
@@ -288,83 +346,47 @@ fn operate(req: &Value) -> Result<Value> {
     }
     let ticket = &req["ticket"];
     let unit = unit_dir(field(ticket, "unit")?)?;
-    let guard = lock(&unit)?;
-    let path = unit.join("current.json");
-    let (mut current, store) = match store::current(&unit) {
+    let _guard = lock(&unit)?;
+    let (current, store) = match store::current(&unit) {
         Ok(Some(c)) => c,
         Ok(None) => bail!("unknown unit"),
         Err(_) => return Ok(unknown_cleanup()),
     };
+    ensure!(
+        matches!(
+            op,
+            "inspect" | "close" | "input" | "read" | "resize" | "cleanup-receipt" | "reconcile"
+        ),
+        "unknown operation"
+    );
+    if !store::ordered(&unit, &store).unwrap_or(false) {
+        if ticket.get("version").is_none() && matches!(op, "inspect" | "read" | "close") {
+            if let Ok(target) = Store::open(&unit, ticket) {
+                return Ok(live_operation(&target, req, op, true));
+            }
+        }
+        return Ok(unknown_cleanup());
+    }
     if current["ticket"] != *ticket {
         return Ok(json!({"result":"refused","diagnostic":"stale execution identity"}));
     }
-    if matches!(op, "cleanup-receipt" | "reconcile") {
-        if store::check_legacy_siblings(&unit, &store).is_err() {
-            return Ok(unknown_cleanup());
-        }
-        let Some(mut result) = completed(&store) else {
-            return Ok(unknown_cleanup());
-        };
+    if let Ok(proof) = store.current_proof() {
         if op == "reconcile" {
-            let proof = &result["proof"];
-            let Ok(applied) = store.applied(&current, proof) else {
-                return Ok(unknown_cleanup());
-            };
-            if !store.run.join("applied.json").try_exists()? {
-                store.save_signed("applied", proof.clone())?;
-            }
-            if current["applied"] == false {
-                if store.ticket["version"] == 2 {
-                    current["appliedProof"] = json!(store::digest(&serde_json::to_vec(proof)?));
-                }
-                current["applied"] = json!(true);
-                store::publish_current(&path, current, &store)?;
-            }
-            result["newly_applied"] = json!(!applied);
+            return Ok(store
+                .reconcile(&unit.join("current.json"), current, proof)
+                .unwrap_or_else(|_| unknown_cleanup()));
         }
-        return Ok(result);
+        return Ok(terminal_reply(&store, proof, op));
     }
-    drop(guard);
-    ensure!(
-        matches!(op, "inspect" | "close" | "input" | "read" | "resize"),
-        "unknown operation"
-    );
-    let observing = matches!(op, "inspect" | "close" | "read");
-    if observing {
-        if let Some(result) = completed(&store) {
-            return Ok(result);
-        }
+    if matches!(op, "cleanup-receipt" | "reconcile") {
+        return Ok(unknown_cleanup());
     }
-    let ready = match store.signed("ready") {
-        Ok(v) => v,
-        Err(_) => return Ok(unknown_cleanup()),
-    };
-    let mut answer = rpc(&store, &ready, req);
-    if op == "inspect" && answer["result"] == "accepted" {
-        answer["identity"] = ready;
-    }
-    if op == "close" && answer["result"] == "accepted" {
-        let end = Instant::now() + TIMEOUT;
-        loop {
-            if let Some(result) = completed(&store) {
-                return Ok(result);
-            }
-            if Instant::now() >= end {
-                return Ok(unknown_cleanup());
-            }
-            thread::sleep(TICK);
-        }
-    }
-    if observing && answer["result"] != "refused" && answer["result"] != "accepted" {
-        return Ok(completed(&store).unwrap_or_else(|| {
-            if answer["reconcile"] == true {
-                answer
-            } else {
-                unknown_cleanup()
-            }
-        }));
-    }
-    Ok(answer)
+    Ok(live_operation(
+        &store,
+        req,
+        op,
+        ticket.get("version").is_none(),
+    ))
 }
 
 pub fn run(stage: &str) -> Result<u8> {
