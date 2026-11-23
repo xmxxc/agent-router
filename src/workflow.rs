@@ -205,7 +205,7 @@ fn report_destination(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn state_dir() -> Result<PathBuf> {
+pub(crate) fn state_dir() -> Result<PathBuf> {
     let root = match env::var_os("WFC_STATE") {
         Some(dir) => {
             ensure!(!dir.is_empty(), "empty WFC_STATE");
