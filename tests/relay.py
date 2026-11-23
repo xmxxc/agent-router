@@ -41,7 +41,7 @@ while Path('gate').exists():
     time.sleep(.01)
 mode = os.environ.get('OUTCOME')
 if mode == 'missing':
-    print('x' * 70000, flush=True)
+    print(' ' * 70000, flush=True)
     print('codex queue: Error: no rollout found for thread id ' + sys.argv[3], file=sys.stderr)
 sys.exit(1 if mode else 0)
 """)
@@ -239,6 +239,89 @@ sys.exit(1)
         row, = self.data("status")["undelivered"]
         self.assertEqual((row["messageId"], row["state"], row["statusVersion"]), (m["messageId"], "unknown", 2))
 
+    def test_contradictory_refusal_never_resends(self):
+        self.queue.write_text(f"#!{sys.executable}\n" + """
+import os, sys
+from pathlib import Path
+with Path('accepted').open('a') as output:
+    output.write(sys.argv[5] + '\\n')
+refusal = 'Error: no rollout found for thread ' + sys.argv[3]
+lines = [refusal, 'Final result: confirmation lost after submission']
+if os.environ.get('REVERSE'):
+    lines.reverse()
+print(*lines, sep='\\n', file=sys.stderr)
+sys.exit(1)
+""")
+        for reverse in ("", "1"):
+            receipt = self.publish("ours")
+            self.cli("relay", "--codex", "--scope", "ours", "--for", ".4", REVERSE=reverse)
+            self.cli("relay", "--codex", "--scope", "ours", "--for", ".1")
+            received = (self.root / "accepted").read_text().splitlines()
+            accepted = [json.loads(line[len(PREFIX):])["messages"][0]["messageId"] for line in received]
+            self.assertEqual(accepted.count(receipt["messageId"]), 1)
+            row = self.data("status")["undelivered"][-1]
+            self.assertEqual((row["messageId"], row["state"], row["statusVersion"]),
+                             (receipt["messageId"], "unknown", 2))
+
+    def test_ordinary_backlog_preserves_queue_order_across_relays(self):
+        scope = "ordinary-review"
+        report = "reports/ordinary-review/release-candidate/dispatch-result.md"
+        (self.root / report).parent.mkdir(parents=True)
+        (self.root / report).write_text("completed review")
+        d = self.data("dispatch", "--task", "task", "--scope", scope, "--role", "release-reviewer",
+                      "--report", report, "--cwd", ".", "--", "/bin/true")
+        receipts = [self.data("done", "--report", report, "--attempt", d["attempt"], "--message-id",
+                              f"receipt-{i}", WFC_DISPATCH=d["dispatch"]) for i in range(291)]
+        (self.root / "gate").touch()
+        runners = [self.foreground(5, scope=scope) for _ in range(2)]
+        self.until(self.calls)
+        self.assertEqual(len(self.calls()), 1)
+        (self.root / "gate").unlink()
+        for proc in runners:
+            output = proc.communicate(timeout=8)
+            self.assertEqual(proc.returncode, 0, output)
+        self.cli("relay", "--codex", "--scope", scope, "--for", ".1")
+        batches = [cmd[4] for cmd in self.calls()]
+        sizes = [len(text.encode()) + 1 for text in batches]
+        groups = [json.loads(text[len(PREFIX):])["messages"] for text in batches]
+        if os.sysconf("SC_PAGE_SIZE") == 4096:
+            self.assertGreater(len(sizes), 1)
+        self.assertLessEqual(max(sizes), 32 * os.sysconf("SC_PAGE_SIZE"))
+        originals = [(r["message"], r["messageId"]) for r in receipts]
+        self.assertEqual([(m["id"], m["messageId"]) for group in groups for m in group], originals)
+        self.assertEqual([m["deliveryAttempt"] for group in groups for m in group],
+                         [f"relay:{mid}:2" for _, mid in originals])
+        self.data("wait", "--scope", scope, "--timeout", "0", code=3)
+        for _, mid in originals:
+            ack = self.data("ack", mid)
+            self.assertEqual((ack["messageId"], ack["state"], ack["statusVersion"]), (mid, "processed", 4))
+        self.assertTrue(self.data("ack", originals[-1][1])["duplicate"])
+        print(json.dumps({"batchSizesIncludingNul": sizes, "batchCounts": list(map(len, groups)),
+                          "originalAcks": len(originals), "first": originals[0], "last": originals[-1]}))
+
+    def test_escaped_single_over_limit_leaves_legal_messages_available(self):
+        first = self.publish("ours")
+        role = '"' * (16 * os.sysconf("SC_PAGE_SIZE"))
+        d = self.data("dispatch", "--task", "task", "--scope", "ours", "--role", role,
+                      "--report", "task", "--cwd", ".", "--", "/bin/true")
+        large = self.data("done", "--report", "task", "--attempt", d["attempt"], WFC_DISPATCH=d["dispatch"])
+        last = self.publish("ours")
+        other = self.publish("theirs")
+        diagnostic = self.cli("relay", "--codex", "--scope", "ours", "--for", ".7")
+        self.assertEqual(diagnostic.count(large["messageId"]), 1)
+        cmd, = self.calls()
+        messages = json.loads(cmd[4][len(PREFIX):])["messages"]
+        self.assertEqual([m["messageId"] for m in messages], [first["messageId"], last["messageId"]])
+        remaining = self.data("status")["undelivered"]
+        self.assertEqual([(r["messageId"], r["state"], r["statusVersion"]) for r in remaining],
+                         [(r["messageId"], "unsent", 1) for r in (large, other)])
+        row, = self.data("wait", "--scope", "ours", "--timeout", "0")["messages"]
+        self.assertEqual(row["messageId"], large["messageId"])
+        for receipt in (first, large, last):
+            self.assertEqual(self.data("ack", receipt["messageId"])["state"], "processed")
+        print(json.dumps({"oversized": diagnostic.strip(), "queueIds": [m["messageId"] for m in messages],
+                          "manualId": row["messageId"], "other": other["messageId"]}))
+
     def test_shorthand_home_validates_and_launches_in_the_same_home(self):
         self.queue.write_text(f"#!{sys.executable}\n" + """
 import os, sys
@@ -262,7 +345,7 @@ from pathlib import Path
 helper = subprocess.Popen(['/bin/sleep', '12'])
 host = subprocess.Popen(['/bin/sleep', '12'], start_new_session=True, stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-Path('pids.tmp').write_text(json.dumps([os.getpid(), helper.pid, host.pid]))
+Path('pids.tmp').write_text(json.dumps([os.getpid(), helper.pid, host.pid, os.getppid()]))
 Path('pids.tmp').rename('pids')
 while not Path('release').exists():
     time.sleep(.01)
@@ -280,15 +363,15 @@ while not Path('release').exists():
             finally:
                 os.close(fd)
 
-        for outcome in ("success", "timeout", "relay-killed"):
+        for outcome in ("success", "timeout", "relay-killed", "supervisor-killed"):
             with self.subTest(outcome=outcome):
-                self.publish("ours")
+                receipt = self.publish("ours")
                 proc = self.foreground(1.5 if outcome == "timeout" else 4)
                 pids_path = self.root / "pids"
                 self.until(pids_path.exists)
-                queue, helper, host = json.loads(pids_path.read_text())
+                queue, helper, host, supervisor = json.loads(pids_path.read_text())
                 fds = []
-                for pid in (queue, helper, host):
+                for pid in (queue, helper, host, supervisor):
                     fd = os.pidfd_open(pid)
                     self.addCleanup(cleanup, fd)
                     fds.append(fd)
@@ -296,6 +379,8 @@ while not Path('release').exists():
                 self.assertEqual(os.getsid(host), host)
                 if outcome == "relay-killed":
                     proc.kill()
+                elif outcome == "supervisor-killed":
+                    signal.pidfd_send_signal(fds[3], signal.SIGKILL)
                 elif outcome == "success":
                     (self.root / "release").touch()
                 out = proc.communicate(timeout=6)
@@ -304,8 +389,96 @@ while not Path('release').exists():
                 self.assertTrue(exited(fds[1], 1000))
                 self.assertFalse(exited(fds[2], 0))
                 self.assertEqual(self.data("status")["waiters"], [])
+                if outcome == "supervisor-killed":
+                    row = self.data("status")["undelivered"][-1]
+                    self.assertEqual((row["messageId"], row["state"], row["statusVersion"]),
+                                     (receipt["messageId"], "unknown", 2))
                 pids_path.unlink()
+                if outcome == "supervisor-killed":
+                    (self.root / "release").touch()
+                    self.cli("relay", "--codex", "--scope", "ours", "--for", ".3")
+                    self.assertFalse(pids_path.exists())
                 (self.root / "release").unlink(missing_ok=True)
+
+    def test_scoped_delivery_beside_complete_and_truncated_reservations(self):
+        def publish(scope):
+            dispatch = self.data("dispatch", "--task", "task", "--report", "task", "--role", "review",
+                                 "--scope", scope, "--cwd", ".", "--", "/bin/true")
+            receipt = self.data("done", "--report", "task", "--attempt", dispatch["attempt"],
+                                WFC_DISPATCH=dispatch["dispatch"])
+            path = Path(self.env["WFC_STATE"]) / "dispatches" / (dispatch["dispatch"] + ".json")
+            return receipt, path
+
+        def deliver(scope):
+            self.cli("relay", "--codex", "--scope", scope, "--for", "1.5")
+
+        def confirm(receipt):
+            ack = self.data("ack", receipt["messageId"])
+            self.assertEqual((ack["message"], ack["state"], ack["statusVersion"]),
+                             (receipt["message"], "processed", 4))
+            return ack
+
+        other, path = publish("neighbor")
+        pending = path.with_suffix(".pending")
+        path.rename(pending)
+        first = self.publish("ready")
+        deliver("ready")
+        full_ack = confirm(first)
+
+        damaged, path = publish("ready")
+        torn = path.with_suffix(".pending")
+        path.rename(torn)
+        fragment = b'{"dispatch":'
+        torn.write_bytes(fragment)
+        stale, stale_path = publish("ready")
+        row = json.loads(stale_path.read_bytes())
+        row["attempt"] = "a-000000000000"
+        stale_path.write_text(json.dumps(row))
+        protected, owner_path = publish("owned")
+        row = json.loads(owner_path.read_bytes())
+        row["controllerOwner"] = {"owner": "fixture", "generation": 1}
+        owner_path.write_text(json.dumps(row))
+        second = self.publish("ready")
+        self.cli("relay", "--codex", "--for", ".1", code=1)
+        self.cli("relay", "--codex", "--scope", "owned", "--for", ".1", code=1)
+        deliver("ready")
+        torn_ack = confirm(second)
+        deliver("ready")
+        sent = [m["messageId"] for call in self.calls()
+                for m in json.loads(call[4][len(PREFIX):])["messages"]]
+        self.assertEqual(sent, [first["messageId"], second["messageId"]])
+        for r in (other, damaged, stale, protected):
+            self.cli("ack", r["messageId"], code=1)
+        ledger = json.loads((Path(self.env["WFC_STATE"]) / "messages.json").read_bytes())
+        self.assertEqual({(r["messageId"], r["state"], r["statusVersion"]) for r in ledger if r["state"] != "processed"},
+                         {(r["messageId"], "unsent", 1) for r in (other, damaged, stale, protected)})
+        self.assertEqual(torn.read_bytes(), fragment)
+        self.assertTrue(pending.is_file())
+        print(json.dumps({"completePending": pending.name, "completeAck": full_ack,
+                          "truncatedPending": torn.name, "truncatedNeighborAck": torn_ack,
+                          "untouched": {"differentScope": other["messageId"], "damaged": damaged["messageId"],
+                                        "differentAttempt": stale["messageId"], "owned": protected["messageId"]}}))
+
+    def test_conflicting_complete_generations_preserve_owner_and_identity(self):
+        original = self.publish("ours")
+        ready = self.publish("ours")
+        rows = self.data("status")["undelivered"]
+        path = Path(self.env["WFC_STATE"]) / "dispatches" / (rows[0]["dispatch"] + ".json")
+        reservation = json.loads(path.read_bytes())
+        pending = path.with_suffix(".pending")
+        reservation["controllerOwner"] = {"owner": "fixture"}
+        pending.write_text(json.dumps(reservation))
+        self.cli("relay", "--codex", "--scope", "ours", "--for", ".2", code=1)
+        self.assertEqual(self.calls(), [])
+        reservation.pop("controllerOwner")
+        reservation["attempt"] = "a-000000000001"
+        pending.write_text(json.dumps(reservation))
+        self.cli("relay", "--codex", "--scope", "ours", "--for", "1.5")
+        self.assertEqual(self.data("ack", ready["messageId"])["state"], "processed")
+        self.cli("ack", original["messageId"], code=1)
+        call, = self.calls()
+        row, = json.loads(call[4][len(PREFIX):])["messages"]
+        self.assertEqual(row["messageId"], ready["messageId"])
 
     def test_thread_and_owner_preflight(self):
         args = ["relay", "--codex-thread", self.thread, "--scope", "ours", "--detach", "--for", ".1"]

@@ -7,12 +7,69 @@ use std::{
     env,
     ffi::OsStr,
     fs, io,
+    os::{fd::AsRawFd, unix::process::CommandExt},
     process::{Child, Command, ExitCode, ExitStatus, Stdio},
     time::{Duration, Instant},
 };
 use uuid::Uuid;
 
-fn launch(thread: &OsStr, message: &OsStr) -> io::Result<(Child, fs::File)> {
+// Install a sibling in the queue's new process group before exec. Its own group
+// membership pins the target even if the supervisor and queue leader both die.
+// The supervisor is a subreaper, so codex does not inherit a child to manage.
+fn guard_group(cmd: &mut Command) -> io::Result<io::PipeWriter> {
+    let (reader, writer) = io::pipe()?;
+    let fd_limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    if fd_limit < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: after fork use only raw async-signal-safe operations. The child
+    // of the intermediate exits via _exit and never returns to Rust's runtime.
+    unsafe {
+        cmd.pre_exec(move || {
+            let intermediate = libc::fork();
+            if intermediate == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if intermediate == 0 {
+                match libc::fork() {
+                    -1 => libc::_exit(1),
+                    0 => {
+                        if libc::dup2(reader.as_raw_fd(), 0) >= 0 {
+                            // Includes the pipe writer and Command's exec-error fd.
+                            if libc::syscall(libc::SYS_close_range, 1u32, u32::MAX, 0u32) == -1 {
+                                for fd in 1..fd_limit {
+                                    libc::close(fd as i32);
+                                }
+                            }
+                            let mut byte = 0u8;
+                            while libc::read(0, (&raw mut byte).cast(), 1) < 0
+                                && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+                            {
+                            }
+                        }
+                        libc::kill(0, libc::SIGKILL);
+                        libc::_exit(1);
+                    }
+                    _ => libc::_exit(0),
+                }
+            }
+            let mut status = 0;
+            while libc::waitpid(intermediate, &mut status, 0) < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            if status != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+            }
+            Ok(())
+        });
+    }
+    Ok(writer)
+}
+
+fn launch(thread: &OsStr, message: &OsStr) -> io::Result<(Child, fs::File, io::PipeWriter)> {
     let path = env::temp_dir().join(format!("wfc-queue-{}", Uuid::new_v4()));
     let output = private_file().create_new(true).open(&path)?;
     fs::remove_file(path)?;
@@ -34,7 +91,8 @@ fn launch(thread: &OsStr, message: &OsStr) -> io::Result<(Child, fs::File)> {
             cmd.env_remove(name);
         }
     }
-    Ok((cmd.spawn()?, output))
+    let lifetime = guard_group(&mut cmd)?;
+    Ok((cmd.spawn()?, output, lifetime))
 }
 
 fn completed(pid: libc::pid_t) -> io::Result<bool> {
@@ -93,8 +151,11 @@ pub fn run(parent: &OsStr, limit: &OsStr, thread: &OsStr, message: &OsStr) -> Re
         "configure queue supervisor: {}",
         io::Error::last_os_error()
     );
-    let (mut child, mut output) = match launch(thread, message) {
+    let (mut child, mut output, _lifetime) = match launch(thread, message) {
         Ok(started) => started,
+        Err(e) if e.raw_os_error() == Some(libc::E2BIG) => {
+            return Ok(ExitCode::from(Outcome::TooLong as u8))
+        }
         Err(e) => {
             println!("router relay: codex queue could not start: {e}");
             return Ok(ExitCode::from(Outcome::Failed as u8));
