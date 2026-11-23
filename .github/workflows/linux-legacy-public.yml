@@ -1,7 +1,7 @@
-name: Linux ask, ownership, and legacy ledger combination regression
+name: Linux startup, ask, and ownership combination regression
 on:
   push:
-    branches: [rust-router/linux-ci-ask-owner-legacy-combination]
+    branches: [rust-router/linux-ci-startup-ask-combination]
 
 permissions:
   contents: read
@@ -12,27 +12,28 @@ defaults:
 
 jobs:
   legacy-public:
-    name: '#11, #16, and #30 Ask, ownership, and legacy ledger'
+    name: '#13 startup boundaries with #11 ask, ownership, and legacy ledger'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      WFC_BUILD_ID: d3e8e90684794bd71b9b577237ae8245f06f2cef
-      PRODUCT_TREE: e902e0d87e26b46643c9565df6f6716737d9f3a6
-      INPUTS_SHA256: 1af347d40943e298f3447bd195f3732e7fffcccceb4471783fe5fae780455d09
+      WFC_BUILD_ID: 59b9539181daaba91ebaa7303e15eb410fca5216
+      PRODUCT_TREE: 910457b6e408df19bc312db33041e97643a0c068
+      PRODUCT_PARENTS: 3578eebb0aa13e7470ef72a088d5fa074546e268 f42b4471e5f850f526ef471a02dc997bb542e33a
+      INPUTS_SHA256: ebc4e26a03f776681c2d4da6578c925e02a7399dff15029325743ebeca9feecb
       LEGACY_TREE: 034a9cad954bc952812b35bec6fef840c6abc3a1
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
       TMUX_FIXTURE_SHA: 5ced6218637c11d9ca73fa3285a1ff98fadad6fc
       HERDR_SHA256: 14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d
       TRIPLE: x86_64-unknown-linux-gnu
-      EVIDENCE: ${{ github.workspace }}/linux-legacy-public-evidence
+      EVIDENCE: ${{ github.workspace }}/linux-startup-ask-combination-evidence
       CARGO_BUILD_JOBS: '2'
       PYTHONUTF8: '1'
     steps:
       - name: Record run identity
         run: |
           mkdir -p "$EVIDENCE"
-          printf 'Workflow %s\nRun %s attempt %s\nExpected product %s tree %s\n' \
-            "$GITHUB_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$WFC_BUILD_ID" "$PRODUCT_TREE" \
+          printf 'Workflow %s\nRun %s attempt %s\nExpected product %s tree %s\nExpected parents %s\n' \
+            "$GITHUB_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$WFC_BUILD_ID" "$PRODUCT_TREE" "$PRODUCT_PARENTS" \
             | tee "$EVIDENCE/run.log"
           uname -a | tee -a "$EVIDENCE/run.log"
       - name: Check out the pinned product
@@ -61,12 +62,15 @@ jobs:
           git log -1 --format='Rust HEAD %H tree %T' | tee "$EVIDENCE/sources.log"
           test "$(git rev-parse HEAD)" = "$WFC_BUILD_ID"
           test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          parents=$(git cat-file -p HEAD | sed -n -e '/^$/q' -e 's/^parent //p' | paste -sd' ' -)
+          test "$parents" = "$PRODUCT_PARENTS"
+          printf 'Product parents %s\n' "$parents" | tee -a "$EVIDENCE/sources.log"
           legacy_tree=$(git rev-parse HEAD:crates/legacy-state)
           printf 'Legacy component tree %s\n' "$legacy_tree" | tee -a "$EVIDENCE/sources.log"
           test "$legacy_tree" = "$LEGACY_TREE"
           git -C ../native-input log -1 --format='zlib source checkout HEAD %H tree %T' | tee -a "$EVIDENCE/sources.log"
           test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
-          sha256sum vendor/INPUTS.sha256 tests/{dispatch.rs,legacy_public.py,herdr_public.py,owner.py,receipts.py,relay.py} \
+          sha256sum vendor/INPUTS.sha256 tests/{dispatch.rs,legacy_public.py,herdr_public.py,owner.py,receipts.py,relay.py,startup_failure.py} \
             tools/check_tmux.py | tee "$EVIDENCE/inputs.log"
           printf '%s  vendor/INPUTS.sha256\n' "$INPUTS_SHA256" | sha256sum --check --strict | tee -a "$EVIDENCE/inputs.log"
           sha256sum -c vendor/INPUTS.sha256 2>&1 | tee -a "$EVIDENCE/inputs.log"
@@ -80,6 +84,8 @@ jobs:
           } 2>&1 | tee -a "$EVIDENCE/toolchain.log"
           zlib=../native-input/vendor/zlib-1.3.1.tar.gz
           sha256sum "$zlib" | tee -a "$EVIDENCE/inputs.log"
+          printf '%s  %s\n' 17e88863f3600672ab49182f217281b6fc4d3c762bde361935e436a95214d05c "$zlib" \
+            | sha256sum --check --strict | tee -a "$EVIDENCE/inputs.log"
           python tools/prepare.py --zlib-archive "$zlib" 2>&1 | tee -a "$EVIDENCE/inputs.log"
       - name: Prime the pinned Wuffs package with bounded download retries
         working-directory: product/vendor/libghostty-vt
@@ -175,6 +181,61 @@ jobs:
             Backend.test_managed_dispatch_callback_survives_takeover \
             Backend.test_read_only_unowned_close_replays_confirmed_archive \
             2>&1 | tee -a "$EVIDENCE/tmux-public.log"
+      - name: Verify controlled startup failures and cancellation
+        if: ${{ !cancelled() && steps.fixture-identity.outcome == 'success' }}
+        working-directory: product
+        run: |
+          log="$EVIDENCE/startup-controlled.log"
+          head -n 2 "$EVIDENCE/binaries.log" | sha256sum --check --strict | tee "$log"
+          reaper="$GITHUB_WORKSPACE/tmux-r11-fixtures/tools/ci/tmux-r11/reap.py"
+          status=0
+          python -B "$reaper" python -Bu tests/startup_failure.py "target/$TRIPLE/release/wfc" -v \
+            StartupFailure.test_controlled_failures_and_completion \
+            StartupFailure.test_close_distinguishes_natural_exit_and_cancellation \
+            2>&1 | tee -a "$log" || status=$?
+          printf 'startup-controlled exit=%s\n' "$status" | tee -a "$EVIDENCE/startup-results.log"
+          exit "$status"
+      - name: Verify real tmux startup boundaries and script access
+        if: ${{ !cancelled() && steps.tmux.outcome == 'success' && steps.fixture-identity.outcome == 'success' }}
+        working-directory: product
+        run: |
+          log="$EVIDENCE/startup-tmux.log"
+          head -n 2 "$EVIDENCE/binaries.log" | sha256sum --check --strict | tee "$log"
+          test "$(id -u)" -ne 0
+          reaper="$GITHUB_WORKSPACE/tmux-r11-fixtures/tools/ci/tmux-r11/reap.py"
+          status=0
+          python -B "$reaper" python -Bu tests/startup_failure.py "target/$TRIPLE/release/wfc" -v \
+            StartupFailure.test_hosted_failures \
+            StartupFailure.test_tmux_zero_follows_the_create_confirmation \
+            StartupFailure.test_script_lookup_permission_failure \
+            2>&1 | tee -a "$log" || status=$?
+          printf 'startup-tmux exit=%s\n' "$status" | tee -a "$EVIDENCE/startup-results.log"
+          if grep -Eq ' \.\.\. skipped |OK \(skipped=' "$log"; then
+            echo 'A required startup case was skipped' | tee -a "$log"
+            exit 1
+          fi
+          exit "$status"
+      - name: Verify startup receipt and observation unit cases
+        if: ${{ !cancelled() && steps.fixture-identity.outcome == 'success' }}
+        working-directory: product
+        run: |
+          log="$EVIDENCE/startup-unit.log"
+          reaper="$GITHUB_WORKSPACE/tmux-r11-fixtures/tools/ci/tmux-r11/reap.py"
+          status=0
+          python -B "$reaper" cargo test --locked --release --target "$TRIPLE" --bin wfc \
+            startup -- --test-threads=1 2>&1 | tee "$log" || status=$?
+          printf 'startup-unit exit=%s\n' "$status" | tee -a "$EVIDENCE/startup-results.log"
+          if (( status != 0 )); then
+            exit "$status"
+          fi
+          for case in \
+            workflow::messages::tests::startup_receipt_with_report_does_not_count_as_done \
+            workflow::startup::tests::startup_publication_uses_the_current_attempt_and_one_durable_key \
+            workflow::startup::tests::unreaped_exit_keeps_creation_identity_across_a_slow_started_receipt \
+            workflow::worker_owner::tests::startup_observes_natural_exit_during_controlled_publication
+          do
+            grep -Fx "test $case ... ok" "$log"
+          done
       - name: Run focused public commands with a real Herdr protocol 22 service
         if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.herdr-download.outcome == 'success' && steps.fixture-identity.outcome == 'success' }}
         working-directory: product
@@ -186,22 +247,26 @@ jobs:
             PublicLifecycle.test_question_replays_after_herdr_close_intent \
             PublicLifecycle.test_close_during_first_done_git_sample \
             PublicLifecycle.test_close_after_scope_takeover_fences_stale_herdr_controls \
+            PublicLifecycle.test_dispatch_current_execution_done_and_close \
+            PublicLifecycle.test_named_status_during_done_then_exit \
             2>&1 | tee -a "$EVIDENCE/herdr-public.log"
       - name: Run focused owner takeover and scoped delivery tests
         if: ${{ !cancelled() && steps.fixture-identity.outcome == 'success' }}
         working-directory: product
         run: |
           head -n 2 "$EVIDENCE/binaries.log" | sha256sum --check --strict | tee "$EVIDENCE/owner.log"
+          test "$(id -u)" -ne 0
           reaper="$GITHUB_WORKSPACE/tmux-r11-fixtures/tools/ci/tmux-r11/reap.py"
           python -B "$reaper" python -Bu - "target/$TRIPLE/release/wfc" \
             test_takeover_fences_wait_and_ack_but_worker_keeps_its_callback \
             test_takeover_waits_for_scoped_delivery_and_unregisters_detached_relay \
             test_question_requires_current_owner_or_original_worker_callback \
+            test_startup_preflight_rechecks_scope_owner \
             <<'PYTEST' 2>&1 | tee -a "$EVIDENCE/owner.log"
           import sys
           import unittest
           test_names = sys.argv[2:]
-          assert len(test_names) == 3
+          assert len(test_names) == 4
           sys.path.insert(0, "tests")
           from owner import Owner
           suite = unittest.TestSuite(Owner(test) for test in test_names)
@@ -226,6 +291,7 @@ jobs:
             Relay.test_two_relays_and_wait_claim_once_and_resolution_wins \
             Relay.test_scoped_delivery_beside_complete_and_truncated_reservations \
             Relay.test_question_envelope_matches_python_json_separators \
+            Relay.test_startup_failure_uses_the_existing_scope_and_ack \
             2>&1 | tee -a "$EVIDENCE/relay.log"
       - name: Run exact Rust dispatch selectors for ask and controlled close
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
@@ -262,7 +328,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ always() }}
         with:
-          name: linux-11-16-30-combination-${{ env.WFC_BUILD_ID }}-attempt-${{ github.run_attempt }}
+          name: linux-startup-ask-combination-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14
