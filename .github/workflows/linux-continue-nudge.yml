@@ -1,7 +1,7 @@
 name: Linux continue and nudge
 on:
   push:
-    branches: [rust-router/34-continue-nudge-r4]
+    branches: [rust-router/34-continue-nudge-r5]
 
 permissions:
   contents: read

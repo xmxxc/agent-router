@@ -2287,7 +2287,8 @@ def draw():
     if draft and Path("unknown-draft").exists():
         print("\x1b[2J\x1b[Hunknown shell mode", end="", flush=True)
         return
-    print(f"\x1b[2J\x1b[H{transcript}› {shown}\r\n\r\n  model · cwd", end="", flush=True)
+    visible = "Changed assistant output\r\n\r\n" + transcript if draft and Path("change-history").exists() else transcript
+    print(f"\x1b[2J\x1b[H{visible}› {shown}\r\n\r\n  model · cwd", end="", flush=True)
     display = "draft" if local_draft else "partial" if draft and Path("change-draft").exists() else "ready"
     Path("screen").write_text(display)
 
@@ -2425,7 +2426,7 @@ while time.monotonic() < deadline:
     def public_input_gate(self, env, mode):
         shim = self.work / "tmux"
         shim.write_text(f"""#!{sys.executable}
-import os, subprocess, sys, time
+import json, os, subprocess, sys, time
 from pathlib import Path
 
 args = sys.argv[1:]
@@ -2434,6 +2435,40 @@ root = Path({str(self.work)!r})
 mode = os.environ["INPUT_TEST_GATE"]
 read = any("capture-pane -p -J -t " in arg for arg in args)
 enter = any("send-keys -t " in arg and " Enter" in arg for arg in args)
+if read and mode == "trace-redraw":
+    index = next(i for i, arg in enumerate(args) if "capture-pane -p -J -t " in arg)
+    action = args[index]
+    result = subprocess.run([real, *args], close_fds=False, capture_output=True)
+    trace = root / "redraw-frames"
+    if result.returncode == 0:
+        expected = "› [router] Message from the controller: finish first"
+        def summarize(kind, out):
+            rows = [line.rstrip() for line in out.decode(errors="replace").splitlines()[1:-1]
+                    if line.strip()]
+            prompt = next((i for i in range(len(rows) - 1, -1, -1)
+                           if rows[i] == "›" or rows[i].startswith("› ")), None)
+            draft = "unrecognized" if prompt is None else "empty" if rows[prompt] == "›" else (
+                "exact" if rows[prompt] == expected else "different")
+            return {{"kind": kind, "draft": draft, "rows_before_prompt": prompt,
+                    "exact_entries": rows[:prompt].count(expected) if prompt is not None else 0}}
+
+        kind = "history" if " -S - ;" in action else "viewport"
+        frame = summarize(kind, result.stdout)
+        prior = trace.read_text().splitlines() if trace.exists() else []
+        with trace.open("a") as log:
+            if len(prior) < 12:
+                print(json.dumps(frame), file=log)
+                if len(prior) < 11 and kind == "viewport" and frame["draft"] == "exact" and not any(
+                        "redraw-history" in line for line in prior):
+                    probe_args = args.copy()
+                    probe_args[index] = action.replace(" ; display-message -p wfc-tmux-confirmed",
+                                                       " -S - ; display-message -p wfc-tmux-confirmed")
+                    probe = subprocess.run([real, *probe_args], close_fds=False, capture_output=True)
+                    if probe.returncode == 0:
+                        print(json.dumps(summarize("redraw-history", probe.stdout)), file=log)
+    sys.stdout.buffer.write(result.stdout)
+    sys.stderr.buffer.write(result.stderr)
+    sys.exit(result.returncode)
 if mode == "lose-enter-response" and enter:
     result = subprocess.run([real, *args], close_fds=False, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
@@ -2502,7 +2537,29 @@ os.execv(real, [real, *args])
         self.assertEqual(json.loads(error)["error"], "stale_controller_owner")
         self.assertFalse((self.work / "typed").exists())
 
-        nudged = cli("nudge", dispatch, "--text", "finish\r\nfirst", token=token)
+        trace = self.work / "redraw-frames"
+        try:
+            nudged = cli("nudge", dispatch, "--text", "finish\r\nfirst", token=token,
+                         **self.public_input_gate(env, "trace-redraw"))
+        finally:
+            frames = [json.loads(line) for line in trace.read_text().splitlines()] if trace.exists() else []
+            byte_log = self.work / "input-bytes"
+            data = byte_log.read_bytes() if byte_log.exists() else b""
+            formal = self.work / "formal-input"
+            formal_count = len(formal.read_text().splitlines()) if formal.exists() else 0
+            print("R17 synthetic redraw " + json.dumps({
+                "frames": frames, "literal_bytes": len(data) - data.count(b"\r"),
+                "enter_count": data.count(b"\r"), "formal_count": formal_count,
+            }), flush=True)
+        baseline = next(frame for frame in frames if frame["kind"] == "viewport" and frame["draft"] == "empty")
+        drafts = [frame for frame in frames if frame["kind"] == "viewport" and frame["draft"] == "exact"]
+        self.assertGreaterEqual(len(drafts), 2)
+        self.assertTrue(all(frame["rows_before_prompt"] == baseline["rows_before_prompt"] for frame in drafts))
+        redraw = next(frame for frame in frames if frame["kind"] == "redraw-history")
+        self.assertEqual(redraw["draft"], "exact")
+        self.assertGreater(redraw["rows_before_prompt"], baseline["rows_before_prompt"])
+        self.assertEqual(data, b"[router] Message from the controller: finish first\r")
+        self.assertEqual(formal_count, 1)
         self.assertEqual((nudged["round"], nudged["attempt"]), (1, attempt))
         self.await_input_value(lambda: (self.work / "first-done").exists())
         finished = status()
@@ -2670,7 +2727,7 @@ os.execv(real, [real, *args])
 
     def test_public_continue_checks_draft_and_does_not_infer_from_empty(self):
         original = self.work
-        for mode in ("change-draft", "hard-wrap-draft", "unknown-draft", "swallow-draft",
+        for mode in ("change-draft", "change-history", "hard-wrap-draft", "unknown-draft", "swallow-draft",
                      "omit-transcript"):
             with self.subTest(mode=mode):
                 self.work = original / mode
@@ -2689,6 +2746,8 @@ os.execv(real, [real, *args])
                     self.assertIn("did not show the submitted input", result)
                 else:
                     self.assertIn("Enter was not sent", result)
+                if mode == "change-history":
+                    self.assertIn("visible transcript changed", result)
                 expected = 2 if mode == "omit-transcript" else 1
                 self.assertEqual(len((self.work / "formal-input").read_text().splitlines()), expected)
                 self.assertEqual(len((self.work / "typed").read_text().splitlines()), expected)
@@ -2845,7 +2904,9 @@ int fsync(int fd) {
                 self.assertIn(hidden, subprocess.check_output(capture + ["-S", "-"], text=True))
                 (self.work / "expose-history").write_text(mode)
                 args = ("nudge", dispatch, "--text", "historical")
-                self.assertIn("nudge uncertain", cli(*args, token=token, expected=1))
+                result = cli(*args, token=token, expected=1)
+                self.assertIn("nudge uncertain", result)
+                self.assertIn("no entry attributable", result)
                 row = cli("status", "--dispatch", dispatch)["dispatches"][0]
                 self.assertEqual(row["audit"][-1]["result"], "uncertain")
                 self.assertTrue(all(m["to"] != "worker" for m in row["messages"]))

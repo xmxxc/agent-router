@@ -142,11 +142,21 @@ fn refusal_entry(line: &str) -> bool {
     line.strip_prefix(['■', '•']).unwrap_or(line).trim_start() == REFUSAL
 }
 
-fn appended_result(screen: &str, before: &[&str], text: &str) -> Reply<Option<Value>> {
+struct InputBaseline<'a> {
+    visible: Vec<&'a str>,
+    saw_same_input: bool,
+    saw_refusal: bool,
+}
+
+fn user_entry(line: &str, text: &str) -> bool {
+    line.strip_prefix("› ") == Some(text)
+}
+
+fn appended_result(screen: &str, before: &InputBaseline<'_>, text: &str) -> Reply<Option<Value>> {
     let Some((after, "")) = strict_screen(screen) else {
         return Ok(None);
     };
-    let Some(added) = after.strip_prefix(before) else {
+    let Some(added) = after.strip_prefix(before.visible.as_slice()) else {
         return Err(uncertain(
             "Codex transcript continuity was lost after input",
         ));
@@ -154,10 +164,9 @@ fn appended_result(screen: &str, before: &[&str], text: &str) -> Reply<Option<Va
     let Some(first) = added.first() else {
         return Ok(None);
     };
-    let matches = |line: &str| line.strip_prefix("› ") == Some(text);
-    if matches(first)
-        && !before.iter().any(|line| matches(line))
-        && added.iter().filter(|line| matches(line)).count() == 1
+    if user_entry(first, text)
+        && !before.saw_same_input
+        && added.iter().filter(|line| user_entry(line, text)).count() == 1
         && !added.iter().any(|line| refusal_entry(line))
     {
         return Ok(Some(
@@ -166,7 +175,7 @@ fn appended_result(screen: &str, before: &[&str], text: &str) -> Reply<Option<Va
     }
     // A refusal must be the sole new entry, with no earlier identical notice
     // that a redraw could have exposed again.
-    if added.len() == 1 && refusal_entry(first) && !before.iter().any(|line| refusal_entry(line)) {
+    if added.len() == 1 && refusal_entry(first) && !before.saw_refusal {
         let mut result = refused(REFUSAL);
         result["inputEvidence"] = json!("new-host-refusal");
         return Err(result);
@@ -263,7 +272,7 @@ impl Tmux<'_> {
             return Err(failure("definitely-not-sent", "tmux input contains NUL"));
         }
         let screen = (if confirm_reply {
-            self.joined_worker_screen(t)
+            self.joined_worker_screen(t, false)
         } else {
             self.worker_screen(t)
         })
@@ -288,24 +297,38 @@ impl Tmux<'_> {
                     "could not verify an empty Codex composer",
                 )
             };
-            let (before, "") = strict_screen(&screen).ok_or_else(unavailable)? else {
+            let (visible, "") = strict_screen(&screen).ok_or_else(unavailable)? else {
                 return Err(unavailable());
             };
             if host != Some("codex") {
                 return Err(unavailable());
             }
             check_input(InputBoundary::PrepareText)?;
-            let fresh = self.joined_worker_screen(t).map_err(|_| unavailable())?;
+            // Scrollback can contain old frames preserved by a terminal redraw.
+            // Use it only to detect prior lookalikes, not as the live transcript.
+            let full = self
+                .joined_worker_screen(t, true)
+                .map_err(|_| unavailable())?;
+            let Some((history, "")) = strict_screen(&full) else {
+                return Err(unavailable());
+            };
+            let fresh = self
+                .joined_worker_screen(t, false)
+                .map_err(|_| unavailable())?;
             if let Some(message) = notices(&fresh).state {
                 return Err(refused(&message));
             }
-            let Some((history, "")) = strict_screen(&fresh) else {
+            let Some((current, "")) = strict_screen(&fresh) else {
                 return Err(unavailable());
             };
-            if history != before {
+            if current != visible || !history.ends_with(&visible) {
                 return Err(unavailable());
             }
-            Some(before)
+            Some(InputBaseline {
+                visible,
+                saw_same_input: history.iter().any(|line| user_entry(line, text)),
+                saw_refusal: history.iter().any(|line| refusal_entry(line)),
+            })
         } else {
             None
         };
@@ -360,11 +383,11 @@ impl Tmux<'_> {
         Ok(json!({"result":"accepted"}))
     }
 
-    fn joined_worker_screen(&self, t: &Target) -> Reply<String> {
-        // Keep scrollback in the comparison when an old row leaves the viewport.
+    fn joined_worker_screen(&self, t: &Target, with_history: bool) -> Reply<String> {
+        let range = if with_history { " -S -" } else { "" };
         self.worker_command(
             t,
-            &format!("capture-pane -p -J -t {} -S -", t.worker_pane()?),
+            &format!("capture-pane -p -J -t {}{range}", t.worker_pane()?),
         )
     }
 
@@ -373,7 +396,7 @@ impl Tmux<'_> {
         t: &Target,
         pane: &str,
         text: &str,
-        before: &[&str],
+        before: &InputBaseline<'_>,
         window: Duration,
         check_input: &mut dyn FnMut(InputBoundary) -> Reply<()>,
     ) -> Reply<Value> {
@@ -383,15 +406,18 @@ impl Tmux<'_> {
                 sleep(Duration::from_millis(300));
                 check_input(InputBoundary::PrepareEnter)?;
             }
-            let screen = self.joined_worker_screen(t).map_err(after_text)?;
+            let screen = self.joined_worker_screen(t, false).map_err(after_text)?;
+            let draft_mismatch =
+                || uncertain("Codex draft does not match the complete input; Enter was not sent");
+            let (visible, shown) = strict_screen(&screen).ok_or_else(draft_mismatch)?;
             if notices(&screen).state.is_some()
-                || !strict_screen(&screen).is_some_and(|(history, shown)| {
-                    history.as_slice() == before
-                        && wfc_herdr::matches_single_line_draft(shown, text)
-                })
+                || !wfc_herdr::matches_single_line_draft(shown, text)
             {
+                return Err(draft_mismatch());
+            }
+            if visible != before.visible {
                 return Err(uncertain(
-                    "Codex draft does not match the complete input; Enter was not sent",
+                    "Codex visible transcript changed; Enter was not sent",
                 ));
             }
         }
@@ -405,7 +431,7 @@ impl Tmux<'_> {
                     .saturating_sub(start.elapsed())
                     .min(Duration::from_millis(250)),
             );
-            let screen = self.joined_worker_screen(t).map_err(after_text)?;
+            let screen = self.joined_worker_screen(t, false).map_err(after_text)?;
             if notices(&screen).state.is_some() {
                 return Err(uncertain(
                     "Codex changed state before submission was confirmed",
