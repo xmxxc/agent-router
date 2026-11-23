@@ -60,6 +60,7 @@ run_startup_units() {
         workflow::backend::tests::startup_terminal_notice_requires_the_selected_launch_and_outcome \
         workflow::messages::recovery::tests::startup_recovery_advances_past_history_in_small_slices \
         workflow::messages::startup_recovery_tests::startup_recovery_rejects_replaced_assignment_and_preserves_existing_question \
+        workflow::messages::relay::tests::startup_relay_rechecks_legacy_owner_proof_under_transport_lock \
         workflow::messages::tests::startup_receipt_with_report_does_not_count_as_done \
         workflow::startup::tests::startup_publication_uses_the_current_attempt_and_one_durable_key \
         workflow::startup::tests::unreaped_exit_keeps_creation_identity_across_a_slow_started_receipt \
@@ -69,14 +70,14 @@ run_startup_units() {
             checked=$((checked + 1))
         fi
     done
-    if (( status != 0 || checked != 7 )) ||
+    if (( status != 0 || checked != 8 )) ||
         ! grep -Fxq 'Own descendants reaped: ECHILD, extra cleanup signals: 0' "$log"; then
         verdict=fail
         if [[ "$first_failure" == none ]]; then
             first_failure=startup-unit
         fi
     fi
-    printf 'startup-unit exit=%s expected=7 confirmed=%s verdict=%s\n' "$status" "$checked" "$verdict" |
+    printf 'startup-unit exit=%s expected=8 confirmed=%s verdict=%s\n' "$status" "$checked" "$verdict" |
         tee -a "$EVIDENCE/results.log"
 }
 
@@ -118,6 +119,35 @@ run_relay_retry_suites() {
     sha256sum --check --strict "$EVIDENCE/binary.sha256"
 }
 
+run_resume_owner_suites() {
+    local copy overlay
+    copy=$(mktemp -d "$RUNNER_TEMP/wfc-approved-resume.XXXXXXXX")
+    overlay=$(realpath "$ci_dir/../resume/callback-fixture.patch")
+    mkdir "$copy/tools"
+    cp -- tools/check_tmux.py "$copy/tools/check_tmux.py"
+    {
+        printf '%s  %s\n' 3352bcc9d9784cb99adb975f0c04d7a5a21bd6d9570cf8f9f3e8f706771af6d8 "$overlay" | sha256sum --check --strict
+        git -C "$copy" apply --no-index --unidiff-zero "$overlay"
+        printf '%s  %s\n' 4c4e46cd7afdea99641454eb316400ba23bbddf464f7c3dcb57af7312a6f1116 "$copy/tools/check_tmux.py" | sha256sum --check --strict
+        sha256sum "$overlay" "$copy/tools/check_tmux.py"
+    } | tee "$EVIDENCE/resume-fixture.log"
+
+    run_relay_retry_suites
+    run_suite startup-blocked-progress tests/startup_failure.py StartupFailure.test_long_wait_advances_when_checkpoint_stays_blocked 1
+    run_suite startup-confirmation tests/startup_failure.py StartupFailure.test_tmux_exit_follows_the_create_confirmation 1
+    run_suite startup-managed tests/startup_failure.py StartupFailure.test_managed_startup_recovery_rechecks_owner 1
+    run_suite startup-generations tests/startup_failure.py StartupFailure.test_startup_recovery_ignores_conflicting_reservations_and_keeps_neighbors 1
+    run_suite startup-readonly-close tests/startup_failure.py StartupFailure.test_script_preflight_close_replays_from_read_only_history 1
+    run_suite resume-pending "$copy/tools/check_tmux.py" Backend.test_public_resume_fences_pending_and_lost_launch_responses 1
+    run_suite resume-spawn "$copy/tools/check_tmux.py" Backend.test_public_resume_records_definite_spawn_failure 1
+    run_suite resume-owner "$copy/tools/check_tmux.py" Backend.test_public_resume_preserves_conversation_rounds_and_callback_fences 1
+    run_suite resume-reclaim "$copy/tools/check_tmux.py" Backend.test_public_resume_after_reclaim_preserves_history 1
+    run_suite reclaim-owner tools/check_tmux.py Backend.test_public_reclaim_rechecks_selected_execution_under_scope_lock 1
+    rm -r -- "$copy"
+    run_startup_units
+    sha256sum --check --strict "$EVIDENCE/binary.sha256"
+}
+
 case "${1:-all}" in
   all)
     run_opencode_suites
@@ -137,8 +167,11 @@ case "${1:-all}" in
   relay-retry)
     run_relay_retry_suites
     ;;
+  resume-owner)
+    run_resume_owner_suites
+    ;;
   *)
-    printf 'expected all, owner-only, target-validation, startup-opencode or relay-retry\n' >&2
+    printf 'expected all, owner-only, target-validation, startup-opencode, relay-retry or resume-owner\n' >&2
     exit 2
     ;;
 esac

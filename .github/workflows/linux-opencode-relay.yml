@@ -1,7 +1,7 @@
-name: Linux scoped relay retry and startup recovery
+name: Linux startup progress, owner proof and resume integration
 on:
   push:
-    branches: [rust-router/linux-ci-startup-relay-retry]
+    branches: [rust-router/linux-ci-startup-resume-owner]
 
 permissions:
   contents: read
@@ -14,12 +14,12 @@ jobs:
       run:
         shell: bash
     env:
-      PRODUCT_SHA: e316d9aa6bc9d59c73767ff861c843cfa82a3642
-      PRODUCT_TREE: e8d328902e28fa17c6f9b8d51cbe1d7a0cdeaec9
-      PRODUCT_PARENTS: 87671c1f68993dc993a715f2e85e578cff42d85d
-      INPUTS_SHA256: 1444aea79fa5f1e1831275cc71d64fd6533606f0f2f89ff9dced2b27f999cc41
+      PRODUCT_SHA: 5ff93d92d980785a85363b92771597b04fd24b5e
+      PRODUCT_TREE: 95cdc5cfcdc11cffafec0e32a528d379681753b3
+      PRODUCT_PARENTS: 'cc98f8a65b438a8eab65b7eefd5f1ecad6b9758e e316d9aa6bc9d59c73767ff861c843cfa82a3642'
+      INPUTS_SHA256: 420d990f635d53fc2bcb46f6f6ab02990d665c7f5e72cf3cd5b7aef8972c033f
       LOCK_SHA256: 759d7553d4023d05406dfaa81984fe2819ee88ceb982b35468dd2f78ce748709
-      PRIOR_RELAY_RUN: '45255538061'
+      PRIOR_RELAY_RUN: '45258027015'
       PRIOR_STARTUP_RUN: '45242439722'
       PRIOR_OPENCODE_RUN: '45240722301'
       NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
@@ -186,7 +186,7 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: product
         run: |
-          bash ../ci/tools/ci/opencode-relay/verify.sh relay-retry 2>&1 | tee "$EVIDENCE/suites-step.log"
+          bash ../ci/tools/ci/opencode-relay/verify.sh resume-owner 2>&1 | tee "$EVIDENCE/suites-step.log"
       - name: Record step outcomes and checksum the evidence
         if: ${{ always() }}
         env:
@@ -224,7 +224,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: linux-relay-retry-jammy-${{ github.run_id }}-${{ github.run_attempt }}
+          name: linux-startup-resume-owner-jammy-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14
