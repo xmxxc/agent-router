@@ -51,6 +51,54 @@ run_owner_suites() {
     run_suite owner-expiry tests/owner.py Owner.test_relay_settles_its_claim_after_lease_expires 1
 }
 
+run_startup_units() {
+    local log="$EVIDENCE/startup-unit.log" status=0 checked=0 verdict=pass selector
+    WFC_BUILD_ID="$PRODUCT_SHA" "$python" -Bu "$ci_dir/reap.py" timeout --kill-after=5s 300s \
+        cargo test --release --locked --target "$TARGET" --bin wfc startup -- --test-threads=1 \
+        2>&1 | tee "$log" || status=$?
+    for selector in \
+        workflow::backend::tests::startup_terminal_notice_requires_the_selected_launch_and_outcome \
+        workflow::messages::startup_recovery_tests::startup_recovery_rejects_replaced_assignment_and_preserves_existing_question \
+        workflow::messages::tests::startup_receipt_with_report_does_not_count_as_done \
+        workflow::startup::tests::startup_publication_uses_the_current_attempt_and_one_durable_key \
+        workflow::startup::tests::unreaped_exit_keeps_creation_identity_across_a_slow_started_receipt \
+        workflow::worker_owner::tests::startup_observes_natural_exit_during_controlled_publication
+    do
+        if grep -Fxq "test $selector ... ok" "$log"; then
+            checked=$((checked + 1))
+        fi
+    done
+    if (( status != 0 || checked != 6 )) ||
+        ! grep -Fxq 'Own descendants reaped: ECHILD, extra cleanup signals: 0' "$log"; then
+        verdict=fail
+        if [[ "$first_failure" == none ]]; then
+            first_failure=startup-unit
+        fi
+    fi
+    printf 'startup-unit exit=%s expected=6 confirmed=%s verdict=%s\n' "$status" "$checked" "$verdict" |
+        tee -a "$EVIDENCE/results.log"
+}
+
+run_startup_opencode_suites() {
+    run_suite startup-interruption tests/startup_failure.py StartupFailure.test_startup_notice_recovers_after_dispatch_interruption 1
+    run_suite startup-ledger-write tests/startup_failure.py StartupFailure.test_startup_notice_recovers_after_ledger_write_failure 1
+    run_suite startup-confirmation tests/startup_failure.py StartupFailure.test_tmux_exit_follows_the_create_confirmation 1
+    run_suite startup-managed tests/startup_failure.py StartupFailure.test_managed_startup_recovery_rechecks_owner 1
+    run_startup_units
+    sha256sum --check --strict "$EVIDENCE/binary.sha256"
+    run_suite receipt-legacy tests/receipts.py Receipts.test_mixed_legacy_inbox 1
+    run_suite receipt-scoped tests/receipts.py Receipts.test_scoped_snapshot_survives_confirmation 1
+    run_suite codex-envelope tests/relay.py Relay.test_question_envelope_matches_python_json_separators 1
+    run_suite codex-budget tests/relay.py Relay.test_escaped_single_over_limit_leaves_legal_messages_available 1
+    run_suite opencode-order tests/opencode_relay.py OpenCodeRelay.test_204_detached_preserves_batch_order_scope_and_session 1
+    run_suite opencode-target tests/opencode_relay.py OpenCodeRelay.test_invalid_host_or_port_is_rejected_before_claiming 1
+    run_suite opencode-refused tests/opencode_relay.py OpenCodeRelay.test_connection_refused_is_unsent_and_can_retry_original_id 1
+    run_suite opencode-uncertain tests/opencode_relay.py OpenCodeRelay.test_errors_redirects_timeouts_and_eof_never_replay 1
+    run_suite managed-opencode "$ci_dir/managed_owner.py" ManagedOpenCode.test_current_owner_delivers_and_old_owner_cannot_claim 1
+    run_suite startup-opencode "$ci_dir/startup_recovery.py" StartupOpenCode.test_recovers_interrupted_notice_through_scoped_http 1
+    sha256sum --check --strict "$EVIDENCE/binary.sha256"
+}
+
 case "${1:-all}" in
   all)
     run_opencode_suites
@@ -64,8 +112,11 @@ case "${1:-all}" in
     run_opencode_suites
     run_suite codex-envelope tests/relay.py Relay.test_question_envelope_matches_python_json_separators 1
     ;;
+  startup-opencode)
+    run_startup_opencode_suites
+    ;;
   *)
-    printf 'expected all, owner-only or target-validation\n' >&2
+    printf 'expected all, owner-only, target-validation or startup-opencode\n' >&2
     exit 2
     ;;
 esac
