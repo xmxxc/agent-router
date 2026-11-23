@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 
@@ -132,13 +133,48 @@ class StartupFailure(unittest.TestCase):
                 self.assertEqual(message["fault"]["category"], "executable_missing")
                 self.assertRegex(message["fault"]["launchId"], r"^[a-f0-9]{32}$")
                 self.check_ack(message)
-        self.deploy("host-exits", [sys.executable, "-c",
-                                  f"import sys; print('{SECRET}', file=sys.stderr); sys.exit(23)"],
-                    host="codex", code=1)
+        probe = textwrap.dedent("""\
+            import json
+            import os
+            from pathlib import Path
+            import sys
+            import time
+
+            deadline = time.monotonic() + .15
+            pid = os.getpid()
+            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+            # Field 22 follows the parenthesized command, with field 3 at index 0.
+            stat_fields = Path("/proc/self/stat").read_bytes().rsplit(b")", 1)[1].split()
+            start_ticks = int(stat_fields[19])
+            Path("host-exits-identity.json").write_text(json.dumps({
+                "pid": pid, "processStart": f"linux:{boot_id}:{start_ticks}",
+            }))
+
+            # tmux writes the started receipt after observing the child's identity.
+            launches = Path(os.environ["WFC_STATE"]) / "launches"
+            while time.monotonic() < deadline:
+                for path in launches.glob("*.json"):
+                    receipt = json.loads(path.read_text())
+                    if receipt.get("category") == "started" and receipt.get("pid") == pid:
+                        print(sys.argv[1], file=sys.stderr)
+                        sys.exit(23)
+                time.sleep(.005)
+            sys.exit("fixture did not observe its started receipt within 150 ms")
+        """)
+        self.deploy("host-exits", [sys.executable, "-c", probe, SECRET], host="codex", code=1)
         message = self.wait("host-exits")
         self.assertEqual((message["type"], message["fault"]["exitCode"]), ("exited", 23))
         self.assertGreater(message["fault"]["pid"], 0)
+        child = json.loads((self.cwd / "host-exits-identity.json").read_text())
+        observed = {key: message["fault"][key] for key in ("pid", "processStart")}
+        self.assertEqual(observed, child)
         self.check_ack(message)
+        print(json.dumps({
+            "case": "host-exits", "dispatch": message["dispatch"], "attempt": message["attempt"],
+            "scope": message["scope"], "messageId": message["messageId"],
+            "exitCode": message["fault"]["exitCode"], "child": child, "reported": observed,
+            "ackVerified": True,
+        }), flush=True)
 
 
 if __name__ == "__main__":
