@@ -43,6 +43,10 @@ case "${1:-}" in
             Relay.test_runtime_notice_through_the_private_queue \
             Relay.test_timer_redraw_does_not_delay_stall
         # Import the fixture so unittest receives the method selectors.
+        run_group startup-recovery 1 python3 -Bu tests/startup_failure.py "$binary" -v \
+            StartupFailure.test_startup_notice_recovers_after_dispatch_interruption
+        run_group startup-codex 1 python3 -Bu tests/relay.py "$binary" -v \
+            Relay.test_startup_failure_uses_the_existing_scope_and_ack
         run_group owner 2 env PYTHONPATH=tests python3 -Bu -c '
 import unittest
 import owner
