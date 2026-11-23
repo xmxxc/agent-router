@@ -65,6 +65,10 @@ fn main() -> anyhow::Result<ExitCode> {
             )?;
         }
         #[cfg(target_os = "linux")]
+        Some("--tmux-record-session") if args.len() == 8 => {
+            tmux::record_created_session(&args)?;
+        }
+        #[cfg(target_os = "linux")]
         Some("--tmux-host") if args.len() == 1 => {
             return tmux::launch::run_host(Path::new(&args[0]));
         }

@@ -1,7 +1,7 @@
 //! A missing socket is not evidence that an earlier tmux server stopped.
 //! Reserve the dispatch before new-session. The host records the server it
 //! actually runs under before spawning the worker, even if the client reply is lost.
-use super::{failure, Reply, Target, Tmux};
+use super::{failure, Reply, Target, Tmux, EXCLUSIVE_WINDOW};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -355,7 +355,15 @@ impl ServerSession {
         }
     }
 
-    fn server_alive(&self) -> Result<bool> {
+    fn same_server(&self, other: &Self) -> bool {
+        self.socket == other.socket
+            && self.boot == other.boot
+            && self.namespace == other.namespace
+            && self.pid == other.pid
+            && self.start_ticks == other.start_ticks
+    }
+
+    pub(super) fn server_alive(&self) -> Result<bool> {
         if self.boot != boot_id()? {
             return Ok(false);
         }
@@ -438,6 +446,56 @@ pub(super) fn record_server(dir: &Path, id: &str) -> Result<()> {
         ServerSession::capture(pid, format!("${session}"), Some(pane), socket.into())?;
     binding.launch_id = Some(id.to_owned());
     save(&dir.join(format!("{id}.server")), &binding)
+}
+
+// tmux calls this in its new-session command queue, independently of
+// both the launch client receiving its response and the worker consuming the spec.
+pub(crate) fn record_created_session(args: &[std::ffi::OsString]) -> Result<()> {
+    let state = Path::new(&args[0]);
+    let id = args[1].to_str().context("missing launch ID")?;
+    let pid = args[2].to_str().context("missing server PID")?.parse()?;
+    let session = args[3].to_str().context("missing session ID")?;
+    let pane = args[4].to_str().context("missing pane ID")?;
+    let socket = PathBuf::from(&args[5]);
+    ensure!(
+        valid_launch_id(id)
+            && valid_session(session)
+            && valid_pane(pane)
+            && socket.is_absolute()
+            && args[6] == "1"
+            && args[7] == id,
+        "invalid tmux creation identity"
+    );
+    let prefix = state.join("launches").join(id);
+    let value = super::launch::read_receipt(&prefix.with_extension("submission"))
+        .context("missing launch submission")?;
+    let submission: super::launch::Submission = serde_json::from_value(value)?;
+    ensure!(
+        submission.launch_id == id
+            && submission.phase == super::launch::SubmissionPhase::InFlight
+            && submission
+                .socket
+                .as_ref()
+                .is_none_or(|expected| *expected == socket),
+        "unverified tmux creation"
+    );
+    pin_socket(&socket, pid)?;
+    let mut binding =
+        ServerSession::capture(pid, session.to_owned(), Some(pane.to_owned()), socket)?;
+    ensure!(
+        submission
+            .origin
+            .as_ref()
+            .is_none_or(|origin| origin.same_server(&binding)),
+        "tmux creation selected another server"
+    );
+    binding.launch_id = Some(id.to_owned());
+    save(&prefix.with_extension("session"), &binding)
+}
+
+fn valid_session(id: &str) -> bool {
+    id.strip_prefix('$')
+        .is_some_and(|id| id.parse::<u32>().is_ok())
 }
 
 impl Tmux<'_> {
@@ -711,16 +769,230 @@ impl Tmux<'_> {
         }
     }
 
+    pub(super) fn has_original_server_record(&self, id: &str) -> bool {
+        self.binding(Claim::Launch(id.to_owned()))
+            .is_ok_and(|server| {
+                valid_session(&server.session)
+                    && server.pane.as_deref().is_some_and(valid_pane)
+                    && server.socket.is_absolute()
+                    && self
+                        .socket
+                        .as_ref()
+                        .is_none_or(|socket| *socket == server.socket)
+                    && server.pid != 0
+                    && server.start_ticks != 0
+                    && !server.boot.trim().is_empty()
+            })
+    }
+
+    pub(super) fn launch_server(&self) -> Option<ServerSession> {
+        let out = self
+            .run(&["-N", "display-message", "-p", "#{pid}\n#{socket_path}"])
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let (pid, socket) = std::str::from_utf8(&out.stdout)
+            .ok()?
+            .strip_suffix('\n')?
+            .split_once('\n')?;
+        let pid = pid.parse().ok()?;
+        let socket = self.socket.clone().unwrap_or_else(|| PathBuf::from(socket));
+        pin_socket(&socket, pid).ok()?;
+        ServerSession::capture(pid, String::new(), None, socket).ok()
+    }
+
+    pub(super) fn pin_submission(&self, origin: &ServerSession) -> Reply<File> {
+        if !origin.server_alive().map_err(|_| unknown())? {
+            return Err(unknown());
+        }
+        pin_socket(&origin.socket, origin.pid).map_err(|_| unknown())
+    }
+
+    fn created_session(&self, id: &str) -> Reply<Option<ServerSession>> {
+        let path = self.launch_path(id, "session");
+        if super::launch::missing(&path) {
+            return Ok(None);
+        }
+        let value = super::launch::read_receipt(&path).ok_or_else(unknown)?;
+        let server: ServerSession = serde_json::from_value(value).map_err(|_| unknown())?;
+        if server.launch_id.as_deref() != Some(id)
+            || !valid_session(&server.session)
+            || !server.pane.as_deref().is_some_and(valid_pane)
+        {
+            return Err(unknown());
+        }
+        Ok(Some(server))
+    }
+
+    fn verify_cancelled_target(&self, id: &str, execution: Option<&str>, t: &Target) -> Reply<()> {
+        let submission = self.submission(id, execution)?;
+        if !t.owned || t.token != id || submission.phase == super::launch::SubmissionPhase::Prepared
+        {
+            return Err(unknown());
+        }
+        if let Some(origin) = submission.origin {
+            if origin.pid.to_string() != t.server_pid
+                || origin.socket != Path::new(&t.socket)
+                || !origin.server_alive().map_err(|_| unknown())?
+            {
+                return Err(unknown());
+            }
+        }
+        let binding = self.created_session(id)?.ok_or_else(unknown)?;
+        binding.verify(t)?;
+        if binding.pane.as_deref() != Some(&t.pane) || binding.socket != Path::new(&t.socket) {
+            return Err(unknown());
+        }
+        // Check the session-local launch flag and the original startup command.
+        // A retained dead pane keeps that command, but a replacement usually has another.
+        let shown = self.run(&[
+            "-S",
+            &fd_path(&t.socket_fd),
+            "show-environment",
+            "-t",
+            &t.session,
+            "WFC_TMUX_LAUNCH",
+        ])?;
+        let start = format!("#{{m:*--tmux-host {id},#{{pane_start_command}}}}");
+        if !shown.status.success()
+            || shown.stdout != format!("WFC_TMUX_LAUNCH={id}\n").as_bytes()
+            || !self
+                .guarded(
+                    t,
+                    &t.pane,
+                    "display-message -p verified",
+                    &format!("#{{&&:{EXCLUSIVE_WINDOW},{start}}}"),
+                )
+                .is_ok_and(|answer| answer == "verified\n")
+        {
+            return Err(unknown());
+        }
+        Ok(())
+    }
+
+    pub(super) fn close_cancelled_session(&self, id: &str, t: &Target) -> Reply<()> {
+        // If the reply is lost, the presence of this marker prevents
+        // retrying the same ambiguous action as a confirmed already-absent.
+        let pending = self.launch_path(id, "cleanup");
+        let start = format!("#{{m:*--tmux-host {id},#{{pane_start_command}}}}");
+        // An unrelated pane or window may have been attached since new-session.
+        let condition = format!("#{{&&:{start},#{{&&:{EXCLUSIVE_WINDOW},#{{&&:#{{pane_dead}},#{{&&:#{{==:#{{session_windows}},1}},#{{==:#{{window_panes}},1}}}}}}}}}}");
+        let action = format!("kill-session -t '{}'", t.session);
+        save(&pending, &self.close_operation_id).map_err(|_| unknown())?;
+        match self.guarded(t, &t.pane, &action, &condition) {
+            Err(error)
+                if error["result"] == "refused" || error["result"] == "definitely-not-sent" =>
+            {
+                fs::remove_file(pending).map_err(|_| unknown())?;
+                Err(error)
+            }
+            outcome => outcome.map(|_| ()),
+        }
+    }
+
+    pub(super) fn confirm_cancelled_absence(
+        &self,
+        id: &str,
+        execution: Option<&str>,
+        reachable: bool,
+    ) -> Reply<()> {
+        use super::launch::SubmissionPhase;
+        let submission = self.submission(id, execution)?;
+        let binding = self.created_session(id)?;
+        if submission.phase == SubmissionPhase::Prepared {
+            return if binding.is_none() {
+                Ok(())
+            } else {
+                Err(unknown())
+            };
+        }
+        let server = match &binding {
+            Some(server) => {
+                if submission
+                    .origin
+                    .as_ref()
+                    .is_some_and(|origin| !origin.same_server(server))
+                    || self
+                        .socket
+                        .as_ref()
+                        .is_some_and(|socket| *socket != server.socket)
+                {
+                    return Err(unknown());
+                }
+                server
+            }
+            None => {
+                let origin = submission.origin.as_ref().ok_or_else(unknown)?;
+                return if origin.server_alive().map_err(|_| unknown())? {
+                    Err(unknown())
+                } else {
+                    Ok(())
+                };
+            }
+        };
+        if !server.server_alive().map_err(|_| unknown())? {
+            return Ok(());
+        }
+        if !reachable {
+            return Err(unknown());
+        }
+        let socket = pin_socket(&server.socket, server.pid).map_err(|_| unknown())?;
+        let format = "#{session_id} #{pane_id} #{session_name} :#{WFC_TMUX_LAUNCH}";
+        let list = self.run(&["-S", &fd_path(&socket), "list-panes", "-a", "-F", format])?;
+        let listing = std::str::from_utf8(&list.stdout).map_err(|_| unknown())?;
+        if list.status.success()
+            && !listing.is_empty()
+            && listing.lines().all(|line| {
+                let mut fields = line.splitn(3, ' ');
+                let (Some(session), Some(pane), Some(rest)) =
+                    (fields.next(), fields.next(), fields.next())
+                else {
+                    return false;
+                };
+                let Some((name, launch)) = rest.rsplit_once(" :") else {
+                    return false;
+                };
+                valid_session(session)
+                    && valid_pane(pane)
+                    && name != self.session
+                    && launch != id
+                    && binding.as_ref().is_none_or(|saved| {
+                        session != saved.session && Some(pane) != saved.pane.as_deref()
+                    })
+            })
+        {
+            Ok(())
+        } else {
+            Err(unknown())
+        }
+    }
+
     pub(super) fn confirm_absence(&self, claim: Option<Claim>, reachable: bool) -> Reply<()> {
         let claim = match claim {
             None if self.protect_offline && !reachable => {
                 return Err(unknown());
             }
-            None | Some(Claim::Released(_)) => return Ok(()),
-            Some(Claim::Launch(ref id) | Claim::Registered { ref id, .. })
-                if super::launch::cancelled(self.state, id) =>
-            {
-                return Ok(())
+            Some(Claim::Released(Some(id))) => {
+                let execution = self.archived_execution(&id)?;
+                if self
+                    .unverified_released_cancellation(&id, execution.as_deref())?
+                    .is_some()
+                {
+                    return Err(unknown());
+                }
+                return Ok(());
+            }
+            None | Some(Claim::Released(None)) => return Ok(()),
+            Some(Claim::Launch(ref id) | Claim::Registered { ref id, .. }) => {
+                let execution = match &claim {
+                    Some(Claim::Registered { execution, .. }) => Some(execution.as_str()),
+                    _ => None,
+                };
+                if self.cancellation(id, execution)?.is_some() {
+                    return self.confirm_cancelled_absence(id, execution, reachable);
+                }
+                claim.expect("matched launch claim")
             }
             Some(claim) => claim,
         };
@@ -825,9 +1097,17 @@ impl Tmux<'_> {
 
     pub(super) fn verify_claim(&self, claim: Option<Claim>, t: &mut Target) -> Reply<()> {
         let (execution, mut hints, receipt, server, adopting) = match claim {
-            Some(Claim::Launch(id) | Claim::Registered { id, .. }) => {
+            Some(claim @ (Claim::Launch(_) | Claim::Registered { .. })) => {
+                let (id, execution) = match claim {
+                    Claim::Launch(id) => (id, None),
+                    Claim::Registered { id, execution } => (id, Some(execution)),
+                    _ => unreachable!(),
+                };
                 if t.token != id {
                     return Err(unknown());
+                }
+                if self.cancellation(&id, execution.as_deref())?.is_some() {
+                    return self.verify_cancelled_target(&id, execution.as_deref(), t);
                 }
                 let server = self.binding(Claim::Launch(id.clone()))?;
                 server.verify(t)?;
@@ -868,9 +1148,20 @@ impl Tmux<'_> {
                 return Err(unknown())
             }
             Some(Claim::Released(Some(closed)))
-                if Some(closed.as_str()) == self.legacy_execution_id =>
+                if t.token == closed
+                    && self
+                        .unverified_released_cancellation(
+                            &closed,
+                            self.archived_execution(&closed)?.as_deref(),
+                        )?
+                        .is_some() =>
             {
                 return Err(unknown())
+            }
+            Some(Claim::Released(Some(closed)))
+                if Some(closed.as_str()) == self.legacy_execution_id =>
+            {
+                return Err(unknown());
             }
             _ if !t.owned => return Ok(()),
             other => {

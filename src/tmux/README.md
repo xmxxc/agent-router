@@ -11,11 +11,13 @@
 | interrupt | 向登记且仍归该会话独占的 worker pane 发送 C-c。 |
 | resume | 接收与 create 相同的启动数据。调用方提供恢复原宿主会话的 argv。OpenCode 另取 `text`，在画面稳定后提交。Codex 可传 `probe_read_only: true` 检查恢复后的只读提示。 |
 | close | 关闭前核对会话归属和全部窗口独占性。原 worker pane 应在其中，或同次启动已有进程退出回执且原 pane 已从整个服务消失。原会话消失后，已登记的 pane 仍在相邻会话中时保留未决。已确认关闭时返回 `result=completed`，可选字段 `closeEffect` 说明本次调用做了什么。 |
+| revoke | 要求原生 `executionId` 和 `closeOperationId`。核销尚未消费的同次预留或重放该操作的核销事实。只访问本地登记、启动描述与回执。 |
 
 | closeEffect | 本次 close 的证据 |
 | --- | --- |
 | `already_absent` | 核实原会话已不存在，本次没有关闭会话。重复 close 也可得到此值。worker 的退出状态须另查同次启动的回执。 |
 | `session_closed` | 在原服务端复核会话归属、窗口独占、原 pane 仍活动，随后确认 kill-session 成功。该值说明本次主动关闭了活动会话。 |
+| `unstarted_session_closed` | 普通 close 核实并关闭了同次启动留下的单一已退出监督窗格。已验证的同次 `not_started` 回执仍记录 worker 从未启动。 |
 | `worker_exited` | 在关闭前已取得同次启动的 `process_exited` 及有效退出码，随后确认关闭其剩余会话。调用方从原启动回执读取退出码。 |
 
 #42 在归档前应同时核对 dispatch、attempt 和轮次。`already_absent` 和 `worker_exited` 应保留同次执行的退出记录；缺少退出证据时保留未决。`session_closed` 记录本次主动关闭会话的动作。worker 自然退出与关闭动作可能重叠，单凭此值无法断定进程的死因。归档时应保留同次执行已确认的退出结果，并让随后取得的可靠退出证据可以对账。旧后端可能只返回 `result=completed`。遇到缺失或未知的 `closeEffect`，以及 `result=uncertain` 时，应保留已有执行证据，将未查明的退出原因留待对账。单凭 completed 或关闭前的 running 状态推断取消，会丢失恰在此时产生的真实退出码。
@@ -37,10 +39,11 @@ printf '%s\n' '{"op":"read","dispatch":"d-abc12345"}' | WFC_STATE=/path/to/state
 - **只凭窗格接管。** 传 `legacyWorkerPane` 时，调用方须能确认这个窗格运行的是当前要接管的执行。后端把首次可信观测的原 pane 直属进程 PID 和 Linux 启动时刻与已核验的服务、会话一并保存。之后的输入、业务读屏和主动关闭核对进程是否仍是同一次启动，并在实际 tmux 命令中核对 pane PID。首次收到提示时服务离线，恢复后还要确认服务持有首次提示时的原监听套接字，且进程启动时刻严格早于提示。无法区分的同一时钟刻度保留未决。旧登记只有 pane 编号且没有进程证据时，仍可观察，恢复业务绑定需要独立启动证据。
 - **观察与业务输入。** `owned` 表示会话归属，已知原 worker 窗格时 inspect 同时返回 `workerBound: true`。原生执行在每次业务发键前核对原监督进程及仍在运行的 worker，并在 tmux 发键时核对 pane 的实时进程。原窗格被重用时，inspect 报告 workerBound=false。首次接管时即使只剩一个 pane，也须有可信原 pane 或可核验的原启动关联才能发送文字、Enter 或 C-c。未建立绑定的会话仍可 inspect/read；业务输入和关闭保留未决。旧 Observed 记录中可能猜测出来的窗格也需要补证。只有会话名和 state 时，调用方须先定位原服务。
 - **按执行重放。** 普通 close 延续“本次动作”的语义。需要重放时，#42 在首次 close 前保存稳定的 `closeOperationId`（例如 `close:<attempt>`），与 `executionId` 或已核验的 `legacyExecutionId` 一起发送。公开归档失败后用同一对 ID 重试，返回首次已确认的 `closeEffect` 及 `closeOperationId`，不会再次关闭会话。保护检查明确拒绝关闭时，同一操作号可安全重试。若后端只保存了操作意图且无法证实动作，返回 uncertain。其他执行或操作的事实不能为它补证。历史执行的 inspect/close 从本方核销记录作答，同名后继会话保留自己的登记。最近一次已核销执行仍可按现有约定 resume。
-- **启动前核销。** 对已登记的原生执行，关闭方与宿主竞争取走同一份一次性启动描述。关闭方在同一目录内原子改名取回描述，若随后中断，同号重试可凭保留的描述与操作登记恢复核销并清理含工作环境的临时文件。关闭方成功取回时，带 `executionId` 和 `closeOperationId` 的 close 返回 `result=completed`、`closeEffect=already_absent`、`category=not_started`、`dispatch`、两个请求 ID、`launchId` 和 `cancellationEvidence`。#42 核对返回的标识及当前 state 下的 `launches/<launchId>.json`（备用文件为 `.revoked`），文件中的 category 和四个标识必须与响应一致。用同一对 ID 重试可在新 CLI 进程、服务离线或下轮执行开始后读回证据。仅有 `already_absent`、未登记、操作号错配或宿主可能已取走启动描述时，均无此证明。
+- **启动前核销。** 公开层在启动待核对时发送 `op=revoke`。只有登记的原生执行可用 `executionId` 与 `closeOperationId` 取得同次证据。关闭方在同目录原子改名取走一次性描述，用同号重试可恢复核销。证据包含 `category=not_started`、`dispatch`、两个请求 ID、`launchId` 和 `cancellationEvidence`。调用方按同一 state 下的 `launches/<launchId>.json` 或 `.revoked` 核对类别和全部标识。另一操作号、只有普通 `already_absent` 或启动描述可能已被宿主消费时，无法取得该证据。
+- **启动前核销后的会话。** 后端在提交 tmux 创建命令前持久记录阶段、原 socket 和已知原服务。tmux 创建命令队列独立记录本次实际创建的服务、会话和监督窗格，以便创建方中断或会话改名后重新核对。仅核销在可证实创建命令未提交时返回 `completed / already_absent` 并释放登记。可能已提交时返回 `uncertain`，可同时带已核验的 worker 核销事实。登记在会话仍存在或无法核实时保留。普通 close 可按原操作号另外核对并清理同次会话，要求核验原服务、身份一致且只有一个归属独占的原始已退出监督窗格。成功时返回 `completed / unstarted_session_closed`。会话已核实缺席时返回 `completed / already_absent`。重试可重放已确认的结果。已执行清理但丢失确认时，同号保留 `uncertain` 并继续返回原 worker 启动事实。普通 inspect、close 和创建预检共用原执行、启动、服务和回执检查。旧版类别、空标记或 R7 仅凭 worker 核销归档的记录缺少可核验的会话证据，旧回执中身份匹配的 worker 事实仍可重放。
 - **输入未送达。** 已登记执行的 submit 或 interrupt 无法启动首个只读 tmux 客户端时，返回 `definitely-not-sent / input_not_delivered`，并带 `inspectionResult=uncertain`。当前请求没有发送按键，原 worker 的生存状态仍需核实。文字已经送达后丢失响应继续按未决输入处理。
 
-创建前，后端在 state 下为该 dispatch 预留启动编号。宿主必须先成功取走一次性启动文件，再登记服务的 Linux 启动标识、PID 命名空间、进程启动时间、会话和 pane 编号，然后启动 worker。创建失败或明确请求 close 时，如果后端先取回该文件，会记录 `not_started`，可以用同一 dispatch 重试。若写入启动回执失败，会尝试留下独立的无凭据撤销标记，并在创建结果的 `cancellationEvidence` 中返回路径。两种证据均无法落盘时，后续核验保留未决。若文件已被取走、服务身份及回执均缺失，则保留 `uncertain`。已登记的服务失联后，恢复原服务可重新核验；确认原服务已退出，或在原服务确认原会话和原 pane 均已消失后，才能按缺席处理。核验使用 Linux procfs 和可写的 state。
+创建前，后端在 state 下为该 dispatch 预留启动编号。宿主必须先成功取走一次性启动文件，再登记服务的 Linux 启动标识、PID 命名空间、进程启动时间、会话和 pane 编号，然后启动 worker。创建失败或明确请求核销时，如果后端先取回该文件，会记录 `not_started`。待同次会话已关闭或核实缺席后，可以用同一 dispatch 重试。若写入启动回执失败，会尝试留下独立的无凭据撤销标记，并在创建结果的 `cancellationEvidence` 中返回路径。两种证据均无法落盘时，后续核验保留未决。若文件已被取走、服务身份及回执均缺失，则保留 `uncertain`。已登记的服务失联后，恢复原服务可重新核验；确认原服务已退出，或在原服务确认原会话和原 pane 均已消失后，才能按缺席处理。核验使用 Linux procfs 和可写的 state。
 
 resume 创建成功后，`launchResult` 为 `accepted`，`receipt` 指向启动回执。需要投递或检查 brief 时，`inputResult` 单独记录 brief 的结果。例如，OpenCode 已启动、读取提示框时失联，整次 resume 返回 `uncertain`，brief 为 `definitely-not-sent`。调用方可对账已启动的执行，避免重走启动流程。
 

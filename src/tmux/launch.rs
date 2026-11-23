@@ -53,7 +53,7 @@ fn private_file(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn read_receipt(path: &Path) -> Option<Value> {
+fn read_private_json(path: &Path) -> Option<Value> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -62,7 +62,11 @@ pub(super) fn read_receipt(path: &Path) -> Option<Value> {
     if !file.metadata().ok()?.is_file() {
         return None;
     }
-    let record: Value = serde_json::from_reader(file).ok()?;
+    serde_json::from_reader(file).ok()
+}
+
+pub(super) fn read_receipt(path: &Path) -> Option<Value> {
+    let record = read_private_json(path)?;
     if record
         .get("launchId")
         .is_some_and(|value| value.as_str() != path.file_stem().and_then(|s| s.to_str()))
@@ -72,42 +76,53 @@ pub(super) fn read_receipt(path: &Path) -> Option<Value> {
     Some(record)
 }
 
-// Both parties must unlink the same one-shot spec before proceeding. Only
-// the winner can start or cancel. A recovery marker never contains the spec.
-fn revoke_spec(spec: &Path, receipt: &Path) -> Option<Value> {
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq)]
+pub(super) enum SubmissionPhase {
+    Prepared,
+    InFlight,
+    Returned,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct Submission {
+    pub(super) launch_id: String,
+    dispatch: String,
+    execution_id: Option<String>,
+    pub(super) socket: Option<PathBuf>,
+    pub(super) origin: Option<super::binding::ServerSession>,
+    pub(super) phase: SubmissionPhase,
+}
+
+fn save_cancellation(spec: &Path, receipt: &Path, proof: &Value) -> Reply<PathBuf> {
+    if super::binding::save(receipt, proof).is_ok() {
+        return Ok(receipt.to_owned());
+    }
+    let marker = spec.with_extension("revoked");
+    super::binding::save(&marker, proof).map_err(|_| super::binding::unknown())?;
+    Ok(marker)
+}
+
+// Only the winner of removing the one-shot descriptor can start or cancel.
+fn revoke_spec(spec: &Path, receipt: &Path, proof: &Value) -> Option<Value> {
     fs::remove_file(spec).ok()?;
     let mut reply = failure(
         "definitely-not-sent",
         "worker launch was cancelled before startup",
     );
     reply["category"] = json!("not_started");
-    if super::binding::save(receipt, &json!({"category":"not_started"})).is_ok() {
-        reply["receipt"] = json!(receipt);
-    } else {
-        reply["diagnostic"] =
-            json!("worker launch was cancelled but the receipt could not be written");
-        let marker = spec.with_extension("revoked");
-        if private_file(&marker, &()).is_ok() {
-            reply["cancellationEvidence"] = json!(marker);
+    match save_cancellation(spec, receipt, proof) {
+        Ok(path) if path == receipt => reply["receipt"] = json!(path),
+        Ok(path) => reply["cancellationEvidence"] = json!(path),
+        Err(_) => {
+            reply["diagnostic"] =
+                json!("worker launch was cancelled but its proof could not be written");
         }
     }
     Some(reply)
 }
 
-pub(super) fn cancelled(state: &Path, id: &str) -> bool {
-    let Ok(id) = Uuid::parse_str(id) else {
-        return false;
-    };
-    let prefix = state.join("launches").join(id.simple().to_string());
-    if !missing(&prefix.with_extension("held")) {
-        return false;
-    }
-    prefix.with_extension("revoked").is_file()
-        || read_receipt(&prefix.with_extension("json"))
-            .is_some_and(|r| r["category"] == "not_started")
-}
-
-fn missing(path: &Path) -> bool {
+pub(super) fn missing(path: &Path) -> bool {
     fs::symlink_metadata(path).is_err_and(|e| e.kind() == ErrorKind::NotFound)
 }
 
@@ -124,71 +139,172 @@ fn pending_spec(path: &Path, receipt: &Value, state: &Path, dispatch: &str) -> O
 }
 
 impl Tmux<'_> {
-    fn cancellation_record(&self, id: &str) -> Option<Value> {
-        Some(
-            json!({"category":"not_started","dispatch":self.dispatch,"executionId":self.close_execution?,
-            "closeOperationId":self.close_operation_id?, "launchId":id}),
-        )
+    pub(super) fn launch_path(&self, id: &str, extension: &str) -> PathBuf {
+        self.state
+            .join("launches")
+            .join(id)
+            .with_extension(extension)
     }
 
-    pub(super) fn cancellation_proof(&self, id: &str) -> Option<(Value, PathBuf)> {
-        let record = self.cancellation_record(id)?;
-        let prefix = self.state.join("launches").join(id);
-        if !missing(&prefix.with_extension("spec")) || !missing(&prefix.with_extension("server")) {
-            return None;
+    pub(super) fn submission(&self, id: &str, execution: Option<&str>) -> Reply<Submission> {
+        let unknown = super::binding::unknown;
+        let value = read_receipt(&self.launch_path(id, "submission")).ok_or_else(unknown)?;
+        let submission: Submission = serde_json::from_value(value).map_err(|_| unknown())?;
+        if submission.launch_id != id
+            || submission.dispatch != self.dispatch
+            || submission.execution_id.as_deref() != execution
+            || submission.socket != self.socket
+        {
+            return Err(unknown());
         }
-        let path = prefix.with_extension("json");
-        match read_receipt(&path) {
-            Some(receipt) if receipt == record => return Some((record, path)),
-            Some(receipt) if receipt["category"] == "unknown" => (),
-            None if missing(&path) => (),
-            _ => return None,
+        Ok(submission)
+    }
+
+    fn cancellation_record(
+        &self,
+        id: &str,
+        execution: Option<&str>,
+        operation: Option<&str>,
+    ) -> Value {
+        json!({"category":"not_started", "dispatch":self.dispatch, "executionId":execution,
+            "closeOperationId":operation, "launchId":id})
+    }
+
+    // A host server record means it acquired the descriptor. It can never
+    // coexist with a valid pre-start cancellation for that launch.
+    pub(super) fn cancellation(
+        &self,
+        id: &str,
+        execution: Option<&str>,
+    ) -> Reply<Option<(Value, PathBuf)>> {
+        if !super::binding::valid_launch_id(id) {
+            return Err(super::binding::unknown());
         }
-        let marker = prefix.with_extension("revoked");
-        (read_receipt(&marker).as_ref() == Some(&record)).then_some((record, marker))
+        let receipt_path = self.launch_path(id, "json");
+        let marker_path = self.launch_path(id, "revoked");
+        let receipt = read_private_json(&receipt_path);
+        let marker = read_receipt(&marker_path);
+        let unknown = super::binding::unknown;
+        let (record, path) = match receipt {
+            Some(record) if record["category"] == "not_started" && missing(&marker_path) => {
+                (record, receipt_path)
+            }
+            Some(record)
+                if record["category"] == "unknown"
+                    && !missing(&marker_path)
+                    && record.get("launchId").is_none_or(|tag| tag == id) =>
+            {
+                (marker.ok_or_else(unknown)?, marker_path)
+            }
+            None if !missing(&marker_path)
+                && (missing(&receipt_path)
+                    || fs::symlink_metadata(&receipt_path).is_ok_and(|m| m.is_dir())) =>
+            {
+                (marker.ok_or_else(unknown)?, marker_path)
+            }
+            Some(record) if record["category"] == "not_started" || !missing(&marker_path) => {
+                return Err(unknown())
+            }
+            None if !missing(&marker_path) => return Err(unknown()),
+            _ => return Ok(None),
+        };
+        let operation = record["closeOperationId"].as_str();
+        if !missing(&self.launch_path(id, "spec"))
+            || !missing(&self.launch_path(id, "server"))
+            || record != self.cancellation_record(id, execution, operation)
+        {
+            return Err(unknown());
+        }
+        if let Some(operation) = operation {
+            if execution.is_none()
+                || !matches!(
+                    self.previous_close(id, operation)?,
+                    Some(super::CloseOperation::Pending | super::CloseOperation::Confirmed(_))
+                )
+            {
+                return Err(unknown());
+            }
+        }
+        Ok(Some((record, path)))
+    }
+
+    pub(super) fn unverified_released_cancellation(
+        &self,
+        id: &str,
+        execution: Option<&str>,
+    ) -> Reply<Option<(Value, PathBuf)>> {
+        // R7 could release solely on worker cancellation, before recording
+        // any evidence about the session. Its worker fact is still valid.
+        if !super::binding::valid_launch_id(id) || self.submission(id, execution).is_ok() {
+            return Ok(None);
+        }
+        let fact = self.cancellation(id, execution)?;
+        // A closed native R7 row with neither its worker fact nor its server
+        // record has no independent proof of how its session ended.
+        if fact.is_none() && execution.is_some() && !self.has_original_server_record(id) {
+            return Err(super::binding::unknown());
+        }
+        Ok(fact)
+    }
+
+    pub(super) fn cancellation_proof(&self, id: &str) -> Reply<Option<(Value, PathBuf)>> {
+        let (Some(execution), Some(operation)) = (self.close_execution, self.close_operation_id)
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .cancellation(id, Some(execution))?
+            .filter(|(record, _)| record["closeOperationId"] == operation))
     }
 
     pub(super) fn revoke_pending_launch(&self) -> Reply<()> {
         use super::binding::Claim;
-        let (id, proof) = match self.claim()? {
-            Some(Claim::Registered { id, execution }) => {
-                let proof = if self.close_execution == Some(&execution)
-                    && self.legacy_execution_id == Some(&id)
-                {
-                    self.cancellation_record(&id)
-                } else {
-                    None
-                };
-                (id, proof)
-            }
+        let (id, execution) = match self.claim()? {
+            Some(Claim::Registered { id, execution }) => (id, Some(execution)),
             Some(Claim::Launch(id)) => (id, None),
             _ => return Ok(()),
         };
-        if !super::binding::valid_launch_id(&id) {
-            return Err(super::binding::unknown());
-        }
-        let prefix = self.state.join("launches").join(&id);
-        let spec = prefix.with_extension("spec");
-        let receipt = prefix.with_extension("json");
-        let held = prefix.with_extension("held");
-        let Some(record) = proof else {
-            if !missing(&held) {
-                return Err(super::binding::unknown());
-            }
-            revoke_spec(&spec, &receipt);
-            return Ok(());
-        };
-        let intent = prefix.with_extension("intent");
-        let marker = prefix.with_extension("revoked");
-        let owner = json!({"launchId":id,"executionId":self.close_execution,
-            "closeOperationId":self.close_operation_id,"dispatch": self.dispatch});
         let unknown = super::binding::unknown;
+        if !super::binding::valid_launch_id(&id) {
+            return Err(unknown());
+        }
+        let execution = execution.as_deref();
+        let operation = if self.close_execution.is_some() {
+            if self.close_execution != execution || self.legacy_execution_id != Some(&id) {
+                return Ok(());
+            }
+            self.close_operation_id
+        } else {
+            None
+        };
+        let spec = self.launch_path(&id, "spec");
+        let receipt = self.launch_path(&id, "json");
+        let held = self.launch_path(&id, "held");
+        let intent = self.launch_path(&id, "intent");
+        let record = self.cancellation_record(&id, execution, operation);
+        if operation.is_none() {
+            if !missing(&held) {
+                return Err(unknown());
+            }
+            if !missing(&spec) {
+                let initial = read_receipt(&receipt).ok_or_else(unknown)?;
+                if !missing(&self.launch_path(&id, "server"))
+                    || pending_spec(&spec, &initial, self.state, self.dispatch).is_none()
+                {
+                    return Err(unknown());
+                }
+                revoke_spec(&spec, &receipt, &record);
+            }
+            return Ok(());
+        }
+        let owner = json!({"launchId":id,"executionId":execution,
+            "closeOperationId":operation,"dispatch": self.dispatch});
         if missing(&held) {
             if missing(&spec) {
                 return Ok(());
             }
             let initial = read_receipt(&receipt).ok_or_else(unknown)?;
-            if !missing(&prefix.with_extension("server"))
+            if !missing(&self.launch_path(&id, "server"))
                 || pending_spec(&spec, &initial, self.state, self.dispatch).is_none()
             {
                 return Err(unknown());
@@ -208,22 +324,31 @@ impl Tmux<'_> {
         }
         if read_receipt(&intent).as_ref() != Some(&owner)
             || !missing(&spec)
-            || !missing(&prefix.with_extension("server"))
+            || !missing(&self.launch_path(&id, "server"))
         {
             return Err(unknown());
         }
-        if self.cancellation_proof(&id).is_none() {
+        if self.cancellation_proof(&id)?.is_none() {
             let initial = read_receipt(&receipt).ok_or_else(unknown)?;
             if pending_spec(&held, &initial, self.state, self.dispatch).is_none() {
                 return Err(unknown());
             }
-            super::binding::save(&receipt, &record)
-                .or_else(|_| super::binding::save(&marker, &record))
-                .map_err(|_| unknown())?;
+            save_cancellation(&spec, &receipt, &record)?;
         }
         fs::remove_file(&held).map_err(|_| unknown())?;
         fs::remove_file(&intent).map_err(|_| unknown())?;
         Ok(())
+    }
+
+    fn creation_hook(&self, launcher: &Path, id: &str) -> Reply<String> {
+        // The two path arguments pass through tmux formats and then a shell.
+        let quote = |path: &Path| {
+            path.to_str()
+                .map(|path| format!("'{}'", path.replace('#', "##").replace('\'', "'\"'\"'")))
+                .ok_or_else(super::binding::unknown)
+        };
+        Ok(format!("{} --tmux-record-session {} {id} '#{{pid}}' '#{{session_id}}' '#{{pane_id}}' #{{q:socket_path}} '#{{m:*--tmux-host {id},#{{pane_start_command}}}}' #{{q:WFC_TMUX_LAUNCH}}",
+            quote(launcher)?, quote(self.state)?))
     }
 
     pub(super) fn create(&self, launch: Launch) -> Reply<(Target, PathBuf)> {
@@ -270,7 +395,7 @@ impl Tmux<'_> {
             env: environment,
         };
         let dir = self.state.join("launches");
-        let io_error = |_| {
+        let io_error = || {
             failure(
                 "definitely-not-sent",
                 "could not prepare private tmux launch",
@@ -280,10 +405,10 @@ impl Tmux<'_> {
             .recursive(true)
             .mode(0o700)
             .create(&dir)
-            .map_err(io_error)?;
+            .map_err(|_| io_error())?;
         let spec_path = dir.join(format!("{id}.spec"));
         let receipt = dir.join(format!("{id}.json"));
-        let launcher = env::current_exe().map_err(io_error)?;
+        let launcher = env::current_exe().map_err(|_| io_error())?;
         let state_env = format!("WFC_STATE={state}");
         let launch_env = format!("WFC_TMUX_LAUNCH={id}");
         let dispatch_env = format!("WFC_DISPATCH={}", self.dispatch);
@@ -314,6 +439,9 @@ impl Tmux<'_> {
             &id,
         ]);
         let unknown = || failure("uncertain", "tmux host startup not confirmed");
+        let hook_target = format!("={}:", self.session);
+        let hook = self.creation_hook(&launcher, &id)?;
+        let tail = ["run-shell", "-t", &hook_target, &hook];
         let started = (|| {
             private_file(&receipt, &json!({"category":"unknown","launchId":id}))
                 .and_then(|_| private_file(&spec_path, &spec))
@@ -323,8 +451,47 @@ impl Tmux<'_> {
                         "could not write private launch files",
                     )
                 })?;
+            let path = self.launch_path(&id, "submission");
+            let mut submission = Submission {
+                launch_id: id.clone(),
+                dispatch: self.dispatch.to_owned(),
+                execution_id: self.new_execution_id.map(str::to_owned),
+                socket: self.socket.clone(),
+                origin: self.launch_server(),
+                phase: SubmissionPhase::Prepared,
+            };
+            super::binding::save(&path, &submission).map_err(|_| io_error())?;
             self.reserve(&id)?;
-            let out = self.run(&args)?;
+            if self
+                .socket
+                .as_deref()
+                .and_then(Path::parent)
+                .is_some_and(missing)
+            {
+                return Err(failure(
+                    "definitely-not-sent",
+                    "tmux socket directory does not exist",
+                ));
+            }
+            submission.phase = SubmissionPhase::InFlight;
+            super::binding::save(&path, &submission).map_err(|_| io_error())?;
+            let out = if let Some(origin) = &submission.origin {
+                // A launch sent to a pinned server cannot be redirected to a replacement.
+                let socket = self.pin_submission(origin)?;
+                let pinned_path = super::binding::fd_path(&socket);
+                let mut pinned = vec!["-N", "-S", &pinned_path];
+                pinned.extend_from_slice(&args);
+                self.run_with_tail(&pinned, &tail)
+            } else {
+                self.run_with_tail(&args, &tail)
+            };
+            submission.phase = match &out {
+                Err(e) if e["result"] == "definitely-not-sent" => SubmissionPhase::Prepared,
+                Err(_) => SubmissionPhase::InFlight,
+                Ok(_) => SubmissionPhase::Returned,
+            };
+            super::binding::save(&path, &submission).map_err(|_| unknown())?;
+            let out = out?;
             if !out.status.success() {
                 return Err(unknown());
             }
@@ -374,7 +541,11 @@ impl Tmux<'_> {
             }
         })();
         started.map(|t| (t, receipt.clone())).map_err(|mut e| {
-            if let Some(cancelled) = revoke_spec(&spec_path, &receipt) {
+            if let Some(cancelled) = revoke_spec(
+                &spec_path,
+                &receipt,
+                &self.cancellation_record(&id, self.new_execution_id, None),
+            ) {
                 return cancelled;
             }
             // The worker can finish after the started check but before tmux
