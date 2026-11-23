@@ -14,11 +14,12 @@ fn main() -> anyhow::Result<ExitCode> {
     let mut args = env::args_os();
     let program = args.next().unwrap_or_default();
     let command = args.next().unwrap_or_else(|| {
-        // Python's bundled backend starts a copy named wfc-kernel with no arguments.
-        let companion = format!("wfc-kernel{}", env::consts::EXE_SUFFIX);
-        if Path::new(&program)
-            .file_name()
-            .is_some_and(|name| name.eq_ignore_ascii_case(OsStr::new(&companion)))
+        // Python launches both the bundled companion and the original kernel by path alone.
+        let name = Path::new(&program).file_name().unwrap_or_default();
+        let suffix = env::consts::EXE_SUFFIX;
+        if ["wfc-kernel", "herdr-kernel-prototype"]
+            .iter()
+            .any(|stem| name.eq_ignore_ascii_case(OsStr::new(&format!("{stem}{suffix}"))))
         {
             "--kernel".into()
         } else {
@@ -40,7 +41,9 @@ fn main() -> anyhow::Result<ExitCode> {
                 env!("CARGO_PKG_VERSION"),
                 env!("WFC_TARGET"),
                 env!("WFC_PROFILE"),
-                option_env!("WFC_BUILD_ID").unwrap_or(env!("WFC_BUILT_AT"))
+                option_env!("WFC_BUILD_ID")
+                    .filter(|id| !id.trim().is_empty())
+                    .unwrap_or(env!("WFC_BUILT_AT"))
             );
         }
         Some("--kernel") if !extra => kernel::run()?,
