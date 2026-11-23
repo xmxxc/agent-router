@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::env;
-use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::ExitStatusExt;
@@ -25,6 +25,8 @@ pub(super) struct Launch {
 
 #[derive(Serialize, Deserialize)]
 struct Spec {
+    #[serde(default, rename = "launchId")]
+    launch_id: Option<String>,
     cwd: PathBuf,
     argv: Vec<String>,
     env: BTreeMap<String, String>,
@@ -97,23 +99,130 @@ pub(super) fn cancelled(state: &Path, id: &str) -> bool {
         return false;
     };
     let prefix = state.join("launches").join(id.simple().to_string());
+    if !missing(&prefix.with_extension("held")) {
+        return false;
+    }
     prefix.with_extension("revoked").is_file()
         || read_receipt(&prefix.with_extension("json"))
             .is_some_and(|r| r["category"] == "not_started")
 }
 
+fn missing(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_err_and(|e| e.kind() == ErrorKind::NotFound)
+}
+
+// Old launches have no embedded ID on either file. New launches tag both.
+fn pending_spec(path: &Path, receipt: &Value, state: &Path, dispatch: &str) -> Option<Spec> {
+    let value = read_receipt(path)?;
+    if receipt["category"] != "unknown" || value.get("launchId") != receipt.get("launchId") {
+        return None;
+    }
+    let spec: Spec = serde_json::from_value(value).ok()?;
+    (spec.env.get("WFC_STATE")?.as_str() == state.to_str()?
+        && spec.env.get("WFC_DISPATCH")? == dispatch)
+        .then_some(spec)
+}
+
 impl Tmux<'_> {
+    fn cancellation_record(&self, id: &str) -> Option<Value> {
+        Some(
+            json!({"category":"not_started","dispatch":self.dispatch,"executionId":self.close_execution?,
+            "closeOperationId":self.close_operation_id?, "launchId":id}),
+        )
+    }
+
+    pub(super) fn cancellation_proof(&self, id: &str) -> Option<(Value, PathBuf)> {
+        let record = self.cancellation_record(id)?;
+        let prefix = self.state.join("launches").join(id);
+        if !missing(&prefix.with_extension("spec")) || !missing(&prefix.with_extension("server")) {
+            return None;
+        }
+        let path = prefix.with_extension("json");
+        match read_receipt(&path) {
+            Some(receipt) if receipt == record => return Some((record, path)),
+            Some(receipt) if receipt["category"] == "unknown" => (),
+            None if missing(&path) => (),
+            _ => return None,
+        }
+        let marker = prefix.with_extension("revoked");
+        (read_receipt(&marker).as_ref() == Some(&record)).then_some((record, marker))
+    }
+
     pub(super) fn revoke_pending_launch(&self) -> Reply<()> {
         use super::binding::Claim;
-        if let Some(Claim::Launch(id) | Claim::Registered { id, .. }) = self.claim()? {
-            let id =
-                Uuid::parse_str(&id).map_err(|_| failure("uncertain", "invalid tmux launch ID"))?;
-            let prefix = self.state.join("launches").join(id.simple().to_string());
-            revoke_spec(
-                &prefix.with_extension("spec"),
-                &prefix.with_extension("json"),
-            );
+        let (id, proof) = match self.claim()? {
+            Some(Claim::Registered { id, execution }) => {
+                let proof = if self.close_execution == Some(&execution)
+                    && self.legacy_execution_id == Some(&id)
+                {
+                    self.cancellation_record(&id)
+                } else {
+                    None
+                };
+                (id, proof)
+            }
+            Some(Claim::Launch(id)) => (id, None),
+            _ => return Ok(()),
+        };
+        if !super::binding::valid_launch_id(&id) {
+            return Err(super::binding::unknown());
         }
+        let prefix = self.state.join("launches").join(&id);
+        let spec = prefix.with_extension("spec");
+        let receipt = prefix.with_extension("json");
+        let held = prefix.with_extension("held");
+        let Some(record) = proof else {
+            if !missing(&held) {
+                return Err(super::binding::unknown());
+            }
+            revoke_spec(&spec, &receipt);
+            return Ok(());
+        };
+        let intent = prefix.with_extension("intent");
+        let marker = prefix.with_extension("revoked");
+        let owner = json!({"launchId":id,"executionId":self.close_execution,
+            "closeOperationId":self.close_operation_id,"dispatch": self.dispatch});
+        let unknown = super::binding::unknown;
+        if missing(&held) {
+            if missing(&spec) {
+                return Ok(());
+            }
+            let initial = read_receipt(&receipt).ok_or_else(unknown)?;
+            if !missing(&prefix.with_extension("server"))
+                || pending_spec(&spec, &initial, self.state, self.dispatch).is_none()
+            {
+                return Err(unknown());
+            }
+            self.record_close(super::CloseOperation::Pending)?;
+            super::binding::save(&intent, &owner).map_err(|_| unknown())?;
+            // The host must unlink spec before it can start. Winning this
+            // rename also leaves a private, recoverable witness of the win.
+            match fs::rename(&spec, &held) {
+                Ok(()) => (),
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    self.record_close(super::CloseOperation::NotExecuted)?;
+                    return Ok(());
+                }
+                Err(_) => return Err(unknown()),
+            }
+        }
+        if read_receipt(&intent).as_ref() != Some(&owner)
+            || !missing(&spec)
+            || !missing(&prefix.with_extension("server"))
+        {
+            return Err(unknown());
+        }
+        if self.cancellation_proof(&id).is_none() {
+            let initial = read_receipt(&receipt).ok_or_else(unknown)?;
+            if pending_spec(&held, &initial, self.state, self.dispatch).is_none() {
+                return Err(unknown());
+            }
+            super::binding::save(&receipt, &record)
+                .or_else(|_| super::binding::save(&marker, &record))
+                .map_err(|_| unknown())?;
+        }
+        fs::remove_file(&held).map_err(|_| unknown())?;
+        fs::remove_file(&intent).map_err(|_| unknown())?;
         Ok(())
     }
 
@@ -153,7 +262,9 @@ impl Tmux<'_> {
         let state = self.state.to_str().ok_or_else(bad)?;
         environment.insert("WFC_STATE".into(), state.into());
         environment.insert("WFC_DISPATCH".into(), self.dispatch.into());
+        let id = Uuid::new_v4().simple().to_string();
         let spec = Spec {
+            launch_id: Some(id.clone()),
             cwd: cwd.clone(),
             argv: launch.argv,
             env: environment,
@@ -170,7 +281,6 @@ impl Tmux<'_> {
             .mode(0o700)
             .create(&dir)
             .map_err(io_error)?;
-        let id = Uuid::new_v4().simple().to_string();
         let spec_path = dir.join(format!("{id}.spec"));
         let receipt = dir.join(format!("{id}.json"));
         let launcher = env::current_exe().map_err(io_error)?;
@@ -205,7 +315,7 @@ impl Tmux<'_> {
         ]);
         let unknown = || failure("uncertain", "tmux host startup not confirmed");
         let started = (|| {
-            private_file(&receipt, &json!({"category":"unknown"}))
+            private_file(&receipt, &json!({"category":"unknown","launchId":id}))
                 .and_then(|_| private_file(&spec_path, &spec))
                 .map_err(|_| {
                     failure(
@@ -315,11 +425,14 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
         id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()),
         "invalid launch ID"
     );
-    let dir =
-        PathBuf::from(env::var_os("WFC_STATE").context("missing tmux state")?).join("launches");
+    let state = PathBuf::from(env::var_os("WFC_STATE").context("missing tmux state")?);
+    let dir = state.join("launches");
     let spec_path = dir.join(format!("{id}.spec"));
     let receipt = dir.join(format!("{id}.json"));
-    let spec: Spec = serde_json::from_reader(File::open(&spec_path)?)?;
+    let initial = read_receipt(&receipt).context("missing initial launch receipt")?;
+    let dispatch = env::var("WFC_DISPATCH").context("missing dispatch")?;
+    let spec = pending_spec(&spec_path, &initial, &state, &dispatch)
+        .context("unverified launch specification")?;
     fs::remove_file(spec_path)?;
     super::binding::record_server(&dir, id)?;
     let mut cmd = Command::new(spec.argv.first().context("empty launch argv")?);

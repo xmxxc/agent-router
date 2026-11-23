@@ -70,6 +70,7 @@ struct Tmux<'a> {
     input_request: bool,
     new_execution_id: Option<&'a str>,
     close_operation_id: Option<&'a str>,
+    close_execution: Option<&'a str>,
     state: &'a Path,
     dispatch: &'a str,
     session: String,
@@ -412,10 +413,18 @@ impl Tmux<'_> {
                         return Ok(json!({"result":"completed","closeEffect":effect}))
                     }
                     Some(CloseOperation::Pending) if self.was_released(id)? => {
+                        if self.cancellation_proof(id).is_some() {
+                            self.record_close(CloseOperation::Confirmed(
+                                CloseEffect::AlreadyAbsent,
+                            ))?;
+                            return Ok(
+                                json!({"result":"completed","closeEffect":"already_absent"}),
+                            );
+                        }
                         return Err(failure(
                             "uncertain",
                             "original close action was not confirmed",
-                        ))
+                        ));
                     }
                     _ => (),
                 }
@@ -523,6 +532,14 @@ impl Tmux<'_> {
 
     fn close(&self) -> Reply<Value> {
         self.revoke_pending_launch()?;
+        if self
+            .legacy_execution_id
+            .is_some_and(|id| self.cancellation_proof(id).is_some())
+        {
+            self.release()?;
+            self.record_close(CloseOperation::Confirmed(CloseEffect::AlreadyAbsent))?;
+            return Ok(json!({"result":"completed", "closeEffect":CloseEffect::AlreadyAbsent}));
+        }
         let effect = if let Some(t) = self.target()? {
             if !t.owned {
                 return Err(failure(
@@ -617,6 +634,7 @@ pub(crate) fn attach(state: &Path, dispatch: &str, socket: &Path, token: &str) -
         input_request: false,
         new_execution_id: None,
         close_operation_id: None,
+        close_execution: None,
         session: format!("wfc-{dispatch}"),
         socket: Some(socket.to_owned()),
     };
@@ -723,6 +741,10 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
         legacy_launch_id: request.legacy_launch_id.as_deref(),
         new_execution_id: request.execution_id.as_deref().filter(|_| launching),
         close_operation_id: request.close_operation_id.as_deref(),
+        close_execution: request
+            .execution_id
+            .as_deref()
+            .filter(|_| request.close_operation_id.is_some()),
         input_request: matches!(request.op, Operation::Submit { .. } | Operation::Interrupt),
         session: format!("wfc-{}", request.dispatch),
         socket: env::var_os("WFC_TMUX_SOCKET")
@@ -783,6 +805,17 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
     if let Some(op) = &request.close_operation_id {
         if result["result"] == "completed" {
             result["closeOperationId"] = json!(op);
+            if result["closeEffect"] == "already_absent" {
+                if let Some((record, path)) = backend
+                    .legacy_execution_id
+                    .and_then(|id| backend.cancellation_proof(id))
+                {
+                    for field in ["category", "dispatch", "executionId", "launchId"] {
+                        result[field] = record[field].clone();
+                    }
+                    result["cancellationEvidence"] = json!(path);
+                }
+            }
         }
     }
     Ok(result)
