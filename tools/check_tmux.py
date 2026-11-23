@@ -1,4 +1,4 @@
-"""Exercise the private backend interface with a fresh tmux server and state roots."""
+"""Exercise the public CLI and private backend with a fresh tmux server and state roots."""
 import fcntl
 import json
 import os
@@ -1518,6 +1518,83 @@ os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
             os.rename(held, self.socket)
         self.assertEqual(self.call("inspect", executionId="A").get("receipt"), str(receipt))
         self.assertTrue(self.call("inspect", dispatch="other", executionId="B")["workerBound"])
+
+    def test_public_question_reuses_terminal_evidence(self):
+        env = {**self.env, "WFC_STATE": str(self.state)}
+        for key in ("WFC_WORKER_CALLBACK", "WFC_OWNER_TOKEN"):
+            env.pop(key)
+
+        def cli(*args, expected=0, **overrides):
+            result = subprocess.run([WFC, *args], env={**env, **overrides}, cwd=self.work,
+                                    text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, expected, (args, result.stdout, result.stderr))
+            if expected != 0:
+                self.assertFalse(result.stdout)
+                return result.stderr
+            return json.loads(result.stdout)
+
+        worker = self.work / "worker.py"
+        worker.write_text("""import os, subprocess, sys, time
+from pathlib import Path
+secret = os.environ.get("WFC_WORKER_CALLBACK")
+assert secret and all(secret not in arg for arg in sys.argv)
+first = subprocess.check_output([os.environ["WFC_BIN"], "ask", "First question?",
+                                 "--attempt", os.environ["WFC_ATTEMPT"],
+                                 "--message-id", "first"])
+Path("question.tmp").write_bytes(first)
+Path("question.tmp").rename("question.json")
+deadline = time.monotonic() + 20
+while not Path("exit-now").exists():
+    if time.monotonic() >= deadline:
+        sys.exit(2)
+    time.sleep(.02)
+sys.exit(41)
+""")
+        (self.work / "task").write_text("ask the controller")
+        config = self.work / "launch.json"
+        config.write_text(json.dumps({"hosts": {"codex": {"command": [sys.executable, str(worker)]}}}))
+        record = cli("dispatch", "--host", "codex", "--task", "task", "--cwd", ".",
+                     "--report", "report", "--scope", "approval", "--launch-config", str(config))
+        dispatch, attempt = record["dispatch"], record["attempt"]
+        self.assertNotIn("workerCallbackHash", record)
+
+        def status():
+            return cli("status", "--dispatch", dispatch)["dispatches"][0]
+
+        def ask(text, key, expected=0):
+            return cli("ask", text, "--attempt", attempt, "--message-id", key,
+                       expected=expected, WFC_DISPATCH=dispatch)
+
+        question = self.work / "question.json"
+        deadline = time.monotonic() + 5
+        while not question.exists():
+            self.assertLess(time.monotonic(), deadline, "public worker did not publish its question")
+            time.sleep(.025)
+        first = json.loads(question.read_bytes())
+        self.assertEqual(first["state"], "unsent")
+        live = status()
+        self.assertNotIn("workerCallbackHash", live)
+        self.assertEqual(live["status"], "waiting-human")
+        archive = self.state / "dispatches" / f"{dispatch}.{attempt}.closed"
+        archive.write_text(json.dumps({"dispatch": dispatch, "attempt": attempt, "round": 1,
+                                       "worker": {"state": "cancelled", "exit_code": None, "signal": None}}))
+        self.assertEqual(status()["worker"]["state"], "running")
+        second = ask("Question while online?", "second")
+        self.assertNotEqual(second["messageId"], first["messageId"])
+        archive.unlink()
+
+        (self.work / "exit-now").touch()
+        deadline = time.monotonic() + 5
+        while status()["worker"].get("exit_code") != 41:
+            self.assertLess(time.monotonic(), deadline, "same-launch exit receipt was not observed")
+            time.sleep(.025)
+        self.assertFalse(archive.exists())
+        self.assertIn("round is not running", ask("Too late?", "late", expected=1))
+        messages = cli("wait", "--scope", "approval", "--timeout", "0")["messages"]
+        self.assertEqual([m["messageId"] for m in messages], [first["messageId"], second["messageId"]])
+        confirmed = cli("ack", first["messageId"])
+        self.assertEqual(ask("First question?", "first"), {**confirmed, "duplicate": True})
+        self.assertEqual(status()["state"], "exited")
 
     def test_lifecycle(self):
         # Keep the worker alive across Ctrl-C so close tests the active-session path.

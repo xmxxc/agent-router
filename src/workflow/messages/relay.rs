@@ -83,10 +83,6 @@ impl<'a> Relay<'a> {
     }
 
     pub fn run(self) -> Result<()> {
-        ensure!(
-            env::var_os("WFC_WORKER_CALLBACK").is_none_or(|v| v.is_empty()),
-            "worker_callback_only: relay"
-        );
         let state = state_dir()?;
         scope_assignments(&state, self.scope)?;
         let current = env::var("CODEX_THREAD_ID").ok();

@@ -31,6 +31,9 @@ fn options<'a, const N: usize>(
 ) -> Result<[Option<&'a str>; N]> {
     let mut values = [None; N];
     let mut tokens = args.iter();
+    let question = positional
+        .as_ref()
+        .is_some_and(|(_, name)| *name == "question");
     let mut positional_only = false;
     while let Some(token) = tokens.next() {
         let flag = token.to_str().context("expected UTF-8 argument")?;
@@ -39,9 +42,9 @@ fn options<'a, const N: usize>(
                 positional_only = true;
                 continue;
             }
-            if positional_only || !flag.starts_with('-') {
+            if positional_only || !flag.starts_with('-') || (question && short_question(flag)) {
                 ensure!(
-                    (!flag.is_empty() || *name == "question") && slot.replace(flag).is_none(),
+                    (!flag.is_empty() || question) && slot.replace(flag).is_none(),
                     "expected one {name}"
                 );
                 continue;
@@ -63,7 +66,9 @@ fn options<'a, const N: usize>(
                 .context("expected UTF-8 option value")?,
         };
         ensure!(
-            !value.is_empty() || matches!(flag, "--body" | "--options"),
+            !value.is_empty()
+                || matches!(flag, "--body" | "--options")
+                || (question && matches!(flag, "--attempt" | "--message-id" | "--callback-ref")),
             "empty option value"
         );
         ensure!(
@@ -78,7 +83,19 @@ fn options<'a, const N: usize>(
     Ok(values)
 }
 
-#[derive(Serialize, Deserialize)]
+// Argparse accepts "-" and negative integer or decimal text as positionals.
+fn short_question(text: &str) -> bool {
+    let Some(number) = text.strip_prefix('-') else {
+        return false;
+    };
+    let digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    match number.split_once('.') {
+        Some((whole, fraction)) => digits(whole) && !fraction.is_empty() && digits(fraction),
+        None => digits(number),
+    }
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
 struct Identity {
     dispatch: String,
     round: u64,
@@ -113,35 +130,22 @@ struct Assignment {
     controller_owner: Option<Value>,
     #[serde(rename = "workerCallbackHash")]
     callback_hash: Option<String>,
-    #[serde(default)]
-    host: Value,
-    #[cfg(target_os = "linux")]
-    #[serde(rename = "worker")]
-    process: Option<Value>,
-    #[serde(default)]
-    rounds: Value,
-    #[serde(default)]
-    messages: Value,
+    #[serde(skip)]
+    row: Value,
 }
 
 impl Assignment {
     fn current(state: &Path, dispatch: &str, expected_attempt: Option<&str>) -> Result<Self> {
         let dir = state.join("dispatches");
-        // Foreground dispatch writes and syncs .pending before launching us,
-        // then renames it to .json. This order of opens also covers the rename.
-        let file = match File::open(dir.join(format!("{dispatch}.pending"))) {
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                File::open(dir.join(format!("{dispatch}.json")))
-            }
-            result => result,
+        let (file, path) = super::assignment::open_assignment(&dir, dispatch)
+            .with_context(|| format!("open dispatch {dispatch}"))?;
+        let mut row = super::decode_record(file, &path)?;
+        if path.extension().is_some_and(|ext| ext == "pending") {
+            row["createPending"] = json!(true);
         }
-        .with_context(|| format!("open dispatch {dispatch}"))?;
-        let assignment: Self = serde_json::from_reader(file).context("read worker assignment")?;
+        let mut assignment = Self::deserialize(&row).context("read worker assignment")?;
+        assignment.row = row;
         let worker = &assignment.worker;
-        ensure!(
-            worker.dispatch == dispatch,
-            "dispatch mismatch for {dispatch}"
-        );
         ensure!(
             assignment.controller_owner.is_none(),
             "controller owner authorization required for {dispatch}"
@@ -160,13 +164,14 @@ impl Assignment {
         Ok(assignment)
     }
 
-    fn verify_callback(&self, reference: Option<&str>) -> Result<()> {
+    fn verify_callback(&self, reference: Option<&str>, attempt: Option<&str>) -> Result<()> {
         let secret = env::var_os("WFC_WORKER_CALLBACK").filter(|value| !value.is_empty());
         if secret.is_some() || reference.is_some() {
             // First-launch credentials bind directly to the assignment. A
             // reference is for a later assignment in the same live session.
             ensure!(
-                reference.is_none()
+                attempt != Some("")
+                    && reference.is_none()
                     && secret.as_deref().and_then(|v| v.to_str()).is_some_and(|v| {
                         self.callback_hash.as_deref() == Some(body_hash(v).as_str())
                     }),
@@ -176,17 +181,11 @@ impl Assignment {
         Ok(())
     }
 
-    fn execution_finished(&self, state: &Path) -> Result<bool> {
-        if self.host.is_string() {
-            return Ok(super::backend::archive(state, &json!(self.worker))?.is_some());
-        }
-        #[cfg(target_os = "linux")]
-        if self.process.is_some() {
-            let outcome =
-                super::worker_owner::status(&state.join("dispatches"), &json!(self.worker))?;
-            return Ok(outcome["state"] != "running");
-        }
-        Ok(false)
+    fn same_execution(&self, current: &Self) -> bool {
+        self.worker == current.worker
+            && ["host", "backend", "tmuxSocket", "executionId"]
+                .iter()
+                .all(|key| self.row[*key] == current.row[*key])
     }
 }
 
@@ -226,22 +225,38 @@ pub(super) fn body_hash(body: &str) -> String {
 }
 
 fn canonical_body(body: Map<String, Value>) -> String {
-    // Python #40 uses sorted keys, UTF-8, and a space after each separator.
-    // Map iterates in sorted key order, and question options are strings.
-    let fields: Vec<_> = body
-        .into_iter()
-        .map(|(key, value)| {
-            let value = match value {
-                Value::Array(items) => {
-                    let strings: Vec<_> = items.iter().map(Value::to_string).collect();
-                    format!("[{}]", strings.join(", "))
-                }
-                value => value.to_string(),
-            };
-            format!("{}: {value}", json!(key))
-        })
-        .collect();
-    format!("{{{}}}", fields.join(", "))
+    // Map iterates in sorted key order, as required when hashing a body.
+    spaced_json(&Value::Object(body))
+}
+
+fn spaced_json(value: &Value) -> String {
+    use serde_json::ser::Formatter;
+    use std::io::Result as IoResult;
+
+    struct PythonSeparators;
+    impl Formatter for PythonSeparators {
+        fn begin_array_value<W: Write + ?Sized>(&mut self, w: &mut W, first: bool) -> IoResult<()> {
+            if !first {
+                w.write_all(b", ")?;
+            }
+            Ok(())
+        }
+
+        fn begin_object_key<W: Write + ?Sized>(&mut self, w: &mut W, first: bool) -> IoResult<()> {
+            self.begin_array_value(w, first)
+        }
+
+        fn begin_object_value<W: Write + ?Sized>(&mut self, w: &mut W) -> IoResult<()> {
+            w.write_all(b": ")
+        }
+    }
+
+    let mut bytes = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut bytes, PythonSeparators);
+    value
+        .serialize(&mut serializer)
+        .expect("serialize JSON value");
+    String::from_utf8(bytes).expect("JSON is UTF-8")
 }
 
 impl Question {
@@ -438,7 +453,7 @@ fn lock_file(dir: &Path) -> Result<File> {
 }
 
 impl Inbox {
-    fn snapshot(dir: &Path) -> Result<Vec<Completion>> {
+    fn snapshot(dir: &Path) -> Result<Vec<Message>> {
         let path = dir.join("messages.json");
         match File::open(&path) {
             Ok(file) => {
@@ -592,6 +607,51 @@ impl Inbox {
             .find(|m| m.worker.dispatch == dispatch && m.request_key.as_deref() == Some(key))
     }
 
+    fn require_question_round(&self, assignment: &Assignment, attempt: Option<&str>) -> Result<()> {
+        let worker = &assignment.worker;
+        let dispatch = worker.dispatch.as_str();
+        let messages = || {
+            self.messages
+                .iter()
+                .filter(|m| m.worker.dispatch == dispatch)
+        };
+        let rounds = assignment.row["rounds"].as_array().into_iter().flatten();
+        ensure!(
+            attempt.is_some()
+                || (worker.round == 1
+                    && !rounds.clone().any(|r| {
+                        !r["attempt"].is_null()
+                            && r["attempt"] != worker.attempt
+                            && r["report"] == json!(assignment.report)
+                    })
+                    && !messages()
+                        .any(|m| { m.worker.round == 1 && m.worker.attempt != worker.attempt })),
+            "attempt is no longer accepted for {dispatch}; supply --attempt"
+        );
+        let current_round = rounds
+            .filter(|r| r["round"] == worker.round && r["attempt"] == worker.attempt)
+            .last();
+        let confirmed_done = messages().any(|m| {
+            m.worker.round == worker.round
+                && m.worker.attempt == worker.attempt
+                && m.report.is_some()
+        }) || assignment.row["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|m| {
+                m["type"] == "done"
+                    && m["dispatch"] == dispatch
+                    && m["round"] == worker.round
+                    && m["attempt"] == worker.attempt
+            });
+        ensure!(
+            !confirmed_done && current_round.map_or(worker.round == 1, |r| r["state"] == "running"),
+            "attempt is no longer accepted for {dispatch}; its round is not running"
+        );
+        Ok(())
+    }
+
     fn publish(&mut self, mut message: Message) -> Result<Value> {
         message.body_hash = Some(message.computed_hash());
         let receipt = message.receipt(false);
@@ -675,7 +735,7 @@ impl<'a> Done<'a> {
         let check = || {
             let inbox = Inbox::open(&state)?;
             let assignment = Assignment::current(&state, &dispatch, self.attempt)?;
-            assignment.verify_callback(None)?;
+            assignment.verify_callback(None, self.attempt)?;
             // R1 dispatches had neither field and derived the default key from
             // the worker's launch environment. Assignment::current checked it.
             let r1_worker = assignment.report.is_none()
@@ -741,8 +801,8 @@ impl<'a> Ask<'a> {
             question: question.context("missing question")?,
             csv,
             attempt,
-            reference,
-            key,
+            reference: reference.filter(|reference| !reference.is_empty()),
+            key: key.filter(|key| !key.is_empty()),
         })
     }
 
@@ -751,14 +811,6 @@ impl<'a> Ask<'a> {
         let dispatch = env::var("WFC_DISPATCH")
             .context("run ask inside a dispatched worker (WFC_DISPATCH)")?;
         ensure!(valid_id(&dispatch), "invalid dispatch ID");
-        let mut inbox = Inbox::open(&state)?;
-        let assignment = Assignment::current(&state, &dispatch, self.attempt)?;
-        assignment.verify_callback(self.reference)?;
-        let worker = &assignment.worker;
-        ensure!(
-            env::var_os("WFC_SCOPE").is_none_or(|v| v.to_str() == Some(worker.scope())),
-            "scope mismatch for {dispatch}"
-        );
         let payload = Question {
             text: self.question.to_owned(),
             options: self
@@ -769,61 +821,75 @@ impl<'a> Ask<'a> {
                 .map(str::to_owned)
                 .collect(),
         };
-        let key = self.key.map(str::to_owned).or_else(|| {
-            self.attempt
-                .map(|id| format!("ask:{dispatch}:{id}:{}", payload.key_suffix()))
-        });
-        if let Some((key, prior)) = key
-            .as_deref()
-            .and_then(|key| inbox.prior(&dispatch, key).map(|prior| (key, prior)))
-        {
+        let attempt = self.attempt.filter(|id| !id.is_empty());
+        let key = self
+            .key
+            .map(str::to_owned)
+            .or_else(|| attempt.map(|id| format!("ask:{dispatch}:{id}:{}", payload.key_suffix())));
+        let check = || -> Result<_> {
+            let inbox = Inbox::open(&state)?;
+            let assignment = Assignment::current(&state, &dispatch, attempt)?;
+            assignment.verify_callback(self.reference, self.attempt)?;
             ensure!(
-                prior.question_payload.is_some()
-                    && prior.matches_hash(&body_hash(&canonical_body(payload.body(worker)))),
-                "message request {key} conflicts with an existing receipt"
+                env::var_os("WFC_SCOPE")
+                    .is_none_or(|v| v.to_str() == Some(assignment.worker.scope())),
+                "scope mismatch for {dispatch}"
             );
-            inbox.sync_directory().context("sync question receipt")?;
-            return Ok(prior.receipt(true));
+            let replay = if let Some((key, prior)) = key
+                .as_deref()
+                .and_then(|key| inbox.prior(&dispatch, key).map(|prior| (key, prior)))
+            {
+                ensure!(
+                    prior.question_payload.is_some()
+                        && prior.matches_hash(&body_hash(&canonical_body(
+                            payload.body(&assignment.worker)
+                        ))),
+                    "message request {key} conflicts with an existing receipt"
+                );
+                inbox.sync_directory().context("sync question receipt")?;
+                Some(prior.receipt(true))
+            } else {
+                inbox.require_question_round(&assignment, attempt)?;
+                None
+            };
+            Ok((inbox, assignment, replay))
+        };
+        let (mut inbox, mut assignment, replay) = check()?;
+        if let Some(replay) = replay {
+            return Ok(replay);
         }
-        let rounds = assignment.rounds.as_array().into_iter().flatten();
+        let observed = if assignment.row["host"].is_string() {
+            // The tmux inspection can wait on the backend. Recheck the
+            // assignment and ledger after it, including a concurrent retry.
+            drop(inbox);
+            let initial = assignment;
+            let observation = super::backend::observe(&state, &initial.row);
+            let replay;
+            (inbox, assignment, replay) = check()?;
+            if let Some(replay) = replay {
+                return Ok(replay);
+            }
+            ensure!(
+                initial.same_execution(&assignment),
+                "assignment changed while inspecting {dispatch}"
+            );
+            observation?.0
+        } else {
+            #[cfg(target_os = "linux")]
+            let outcome = if assignment.row["worker"].is_object() {
+                super::worker_owner::status(&state.join("dispatches"), &assignment.row)?
+            } else {
+                Value::Null
+            };
+            #[cfg(not(target_os = "linux"))]
+            let outcome = Value::Null;
+            outcome
+        };
         ensure!(
-            self.attempt.is_some()
-                || (worker.round == 1
-                    && !rounds.clone().any(|r| {
-                        !r["attempt"].is_null()
-                            && r["attempt"] != worker.attempt
-                            && r["report"] == json!(assignment.report)
-                    })
-                    && !inbox.messages.iter().any(|m| {
-                        m.worker.dispatch == dispatch
-                            && m.worker.round == 1
-                            && m.worker.attempt != worker.attempt
-                    })),
-            "attempt is no longer accepted for {dispatch}; supply --attempt"
-        );
-        let current_round = rounds
-            .filter(|r| r["round"] == worker.round && r["attempt"] == worker.attempt)
-            .last();
-        let confirmed_done = inbox.messages.iter().any(|m| {
-            m.worker.dispatch == dispatch
-                && m.worker.round == worker.round
-                && m.worker.attempt == worker.attempt
-                && m.report.is_some()
-        }) || assignment
-            .messages
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|m| {
-                m["type"] == "done"
-                    && m["dispatch"] == dispatch
-                    && m["round"] == worker.round
-                    && m["attempt"] == worker.attempt
-            });
-        ensure!(
-            !confirmed_done
-                && current_round.map_or(worker.round == 1, |r| r["state"] == "running")
-                && !assignment.execution_finished(&state)?,
+            !matches!(
+                observed["state"].as_str(),
+                Some("exited" | "cancelled" | "not_started")
+            ),
             "attempt is no longer accepted for {dispatch}; its round is not running"
         );
         let mut message = Message::new(inbox.messages.len() as u64 + 1, assignment.worker, key);

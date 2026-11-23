@@ -1,3 +1,4 @@
+use super::super::spaced_json;
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
@@ -103,7 +104,7 @@ pub(super) fn envelope(m: &Value) -> String {
         "statusVersion",
     ];
     let mut fields = Vec::new();
-    let mut field = |k: &str, v: &Value| fields.push(format!("{}: {v}", json!(k)));
+    let mut field = |k: &str, v: &Value| fields.push(format!("{}: {}", json!(k), spaced_json(v)));
     for k in header {
         field(k, &m[k]);
     }

@@ -776,6 +776,16 @@ fn question_callback_checks_ownership_and_shares_the_completion_ledger() {
     let replay = run(ask().args(["--message-id", &key]));
     assert_eq!(replay["messageId"], first["messageId"]);
     assert_eq!(replay["duplicate"], true);
+    assert_eq!(
+        run(ask().args(["--message-id=", "--callback-ref="]))["messageId"],
+        first["messageId"]
+    );
+    let empty_attempt = callback()
+        .args(["ask", "need an answer", "--attempt", ""])
+        .output()
+        .unwrap();
+    assert_eq!(empty_attempt.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&empty_attempt.stderr).contains("invalid_worker_callback"));
 
     let done = |key| {
         let mut command = callback();
@@ -819,6 +829,46 @@ fn question_callback_checks_ownership_and_shares_the_completion_ledger() {
         run(f.wfc().args(["status", "--dispatch", id]))["dispatches"][0]["state"],
         "done"
     );
+}
+
+#[test]
+fn question_shorthand_accepts_frozen_unowned_argument_shapes() {
+    let f = Fixture::new();
+    let id = "d-12345678";
+    let dir = f.0.join("state/dispatches");
+    fs::create_dir_all(&dir).unwrap();
+    let row = json!({
+        "dispatch": id, "attempt": "a-0123456789ab", "round": 1, "scope": "test", "role": "tester",
+        "cwd": f.0,
+    });
+    fs::write(dir.join(format!("{id}.json")), row.to_string()).unwrap();
+    let questions = ["-", "-1", "-.1", ""];
+    for text in questions {
+        let fresh = run(f
+            .wfc()
+            .env("WFC_DISPATCH", id)
+            .env_remove("WFC_ATTEMPT")
+            .env_remove("WFC_ROUND")
+            .env_remove("WFC_SCOPE")
+            .env_remove("WFC_WORKER_CALLBACK")
+            .args([
+                "ask",
+                text,
+                "--attempt",
+                "",
+                "--message-id=",
+                "--options",
+                "",
+            ]));
+        assert_eq!(fresh["duplicate"], false);
+    }
+    let batch = run(f.wfc().args(["wait", "--scope", "test", "--timeout", "0"]));
+    let messages = batch["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), questions.len());
+    for (message, question) in messages.iter().zip(questions) {
+        assert_eq!(message["question"], question);
+        assert_eq!(message["options"], json!([]));
+    }
 }
 
 #[test]
