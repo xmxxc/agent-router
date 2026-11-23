@@ -3088,5 +3088,82 @@ time.sleep(45)
         subprocess.run(self.tmux + ["has-session", "-t", "=sibling"], check=True)
 
 
+    def test_runtime_deadline_restarts_for_each_resumed_attempt(self):
+        original, first = self.resume_fixture()
+        dispatch, attempt = original["dispatch"], original["attempt"]
+        session = "11111111-2222-4333-8444-555555555555"
+        owner = {"WFC_OWNER_TOKEN": "owner-one", "WFC_MAX_TURN_SECONDS": "5"}
+        wait = ("wait", "--scope", "resume", "--dispatch", dispatch, "--stall-after", "0")
+        path = self.state / "dispatches" / f"{dispatch}.json"
+        self.rollout(session, first["argv"][-1])
+        initial = json.loads(path.read_bytes())
+        expired = time.time() - 60
+        initial["created"] = expired
+        initial["rounds"][0].pop("created", None)
+        path.write_text(json.dumps(initial))
+        legacy, = self.resume_cli(*wait, "--timeout", "3", **owner)["messages"]
+        self.assertEqual((legacy["fault"]["evidence"], legacy["round"], legacy["attempt"]),
+                         ("turn_deadline", 1, attempt))
+        self.assertGreaterEqual(legacy["fault"]["elapsedSeconds"], 55)
+        self.assertEqual(self.resume_cli("ack", legacy["messageId"], **owner)["state"], "processed")
+        self.end_resume_host(dispatch, attempt)
+
+        def check_budget(resumed, number):
+            current = self.resumed_host(resumed["attempt"])
+            self.assertEqual((resumed["session"], resumed["round"], current["argv"][-2]),
+                             (session, number, session))
+            row = json.loads(path.read_bytes())
+            self.assertEqual(row["created"], expired)
+            start, = [r["created"] for r in row["rounds"]
+                      if (r["round"], r["attempt"]) == (number, resumed["attempt"])]
+            self.assertGreater(start, expired + 55)
+            quiet = self.resume_cli(*wait, "--timeout", ".75", code=None, **owner)
+            self.assertEqual(quiet.returncode, 3, (quiet.stdout, quiet.stderr))
+            self.assertEqual(json.loads(quiet.stdout)["messages"], [])
+            notice, = self.resume_cli(*wait, "--timeout", "8", **owner)["messages"]
+            self.assertEqual((notice["fault"]["evidence"], notice["round"], notice["attempt"]),
+                             ("turn_deadline", number, resumed["attempt"]))
+            self.assertEqual((notice["dispatch"], notice["scope"]), (dispatch, "resume"))
+            self.assertGreaterEqual(notice["fault"]["elapsedSeconds"], 5)
+            self.assertLess(notice["fault"]["elapsedSeconds"], 10)
+            self.assertEqual(self.resume_cli("ack", notice["messageId"], **owner)["state"], "processed")
+            return current, notice["messageId"]
+
+        same = self.resume_cli("resume", dispatch, **owner)
+        self.assertNotEqual(same["attempt"], attempt)
+        worker, same_notice = check_budget(same, 1)
+        report = Path(worker["WFC_REPORT"])
+        report.write_text("first round completion")
+        done = self.resume_callback(worker, "done", "--report", str(report))
+        self.assertEqual(self.resume_cli(*wait, "--timeout", "0", **owner)["messages"][0]["messageId"],
+                         done["messageId"])
+        self.assertEqual(self.resume_cli("ack", done["messageId"], **owner)["state"], "processed")
+
+        pane = self.active_pane(dispatch)
+        subprocess.run(self.tmux + ["new-window", "-dt", f"=wfc-{dispatch}:", "/bin/cat"],
+                       env=self.env, check=True, timeout=5)
+        (self.work / f'{same["attempt"]}.quit').touch()
+        deadline = time.monotonic() + 5
+        while True:
+            row = self.resume_status(dispatch)
+            panes = subprocess.check_output(self.tmux + ["list-panes", "-a", "-F", "#{pane_id}"],
+                                            env=self.env, text=True, timeout=5).splitlines()
+            if row["backendAlive"] and row["worker"]["state"] == "exited" and pane not in panes:
+                break
+            self.assertLess(time.monotonic(), deadline, row)
+            time.sleep(.025)
+        item, = self.resume_cli("reclaim", "--dispatch", dispatch, "--yes", **owner)["sessions"]
+        self.assertEqual(item["result"], "reclaimed")
+        later = self.resume_cli("resume", dispatch, "--task", "task2", "--report", "reports/r2.md", **owner)
+        self.assertNotEqual(later["attempt"], same["attempt"])
+        _, later_notice = check_budget(later, 2)
+        self.assertNotEqual(same_notice, later_notice)
+        self.assertEqual(report.read_text(), "first round completion")
+        print(json.dumps({"case": "runtime-attempt-budget", "dispatch": dispatch,
+                          "legacyDeadline": legacy["messageId"],
+                          "sameRound": {"attempt": same["attempt"], "notice": same_notice},
+                          "afterReclaim": {"attempt": later["attempt"], "notice": later_notice}}), flush=True)
+
+
 if __name__ == "__main__":
     unittest.main()

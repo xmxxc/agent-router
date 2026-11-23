@@ -3,7 +3,7 @@
 use super::super::private_file;
 use super::codex::{codex_home, missing_rollout};
 use super::Outcome;
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use std::{
     env,
     ffi::OsStr,
@@ -17,7 +17,7 @@ use uuid::Uuid;
 // Install a sibling in the queue's new process group before exec. Its own group
 // membership pins the target even if the supervisor and queue leader both die.
 // The supervisor is a subreaper, so codex does not inherit a child to manage.
-fn guard_group(cmd: &mut Command) -> io::Result<io::PipeWriter> {
+pub(in crate::workflow::messages) fn guard_group(cmd: &mut Command) -> io::Result<io::PipeWriter> {
     let (reader, writer) = io::pipe()?;
     let fd_limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
     if fd_limit < 0 {
@@ -92,7 +92,7 @@ fn launch(thread: &OsStr, message: &OsStr) -> io::Result<(Child, fs::File, io::P
     Ok((cmd.spawn()?, output, lifetime))
 }
 
-fn completed(pid: libc::pid_t) -> io::Result<bool> {
+pub(in crate::workflow::messages) fn completed(pid: libc::pid_t) -> io::Result<bool> {
     // WNOWAIT pins the leader's PID even when the command finishes before its
     // helpers. It is still safe to signal this PGID at cleanup.
     unsafe {
@@ -110,7 +110,7 @@ fn completed(pid: libc::pid_t) -> io::Result<bool> {
     }
 }
 
-fn stop_group(child: &mut Child) -> io::Result<ExitStatus> {
+pub(in crate::workflow::messages) fn stop_group(child: &mut Child) -> io::Result<ExitStatus> {
     let group = -(child.id() as libc::pid_t);
     // SAFETY: the unreaped queue leader pins this process group. The supervisor
     // runs in a separate session from the relay, and outside the queue group.
@@ -135,19 +135,23 @@ fn stop_group(child: &mut Child) -> io::Result<ExitStatus> {
     }
 }
 
+pub(in crate::workflow::messages) fn become_subreaper() -> io::Result<()> {
+    // SAFETY: the private, single-threaded supervisor owns one invocation.
+    if unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) } == libc::SIG_ERR
+        || unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 pub fn run(parent: &OsStr, limit: &OsStr, thread: &OsStr, message: &OsStr) -> Result<ExitCode> {
     let parent: libc::pid_t = parent.to_string_lossy().parse()?;
     let limit = super::seconds(&limit.to_string_lossy())?;
     let start = Instant::now();
     let relay_alive = || unsafe { libc::getppid() == parent };
     ensure!(relay_alive(), "relay exited before queue launch");
-    // SAFETY: this private, single-threaded supervisor owns only one invocation.
-    ensure!(
-        unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) } != libc::SIG_ERR
-            && unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == 0,
-        "configure queue supervisor: {}",
-        io::Error::last_os_error()
-    );
+    become_subreaper().context("configure queue supervisor")?;
     let (mut child, mut output, _lifetime) = match launch(thread, message) {
         Ok(started) => started,
         Err(e) if e.raw_os_error() == Some(libc::E2BIG) => {
