@@ -1,8 +1,8 @@
 //! R1 Herdr assignments. A stable lock covers inspection, input claims, close
 //! and reconciliation while atomic replacements publish complete record generations.
 use super::{
-    backend, controller, host, read_record, record_scope, state_dir, valid_id, valid_identity,
-    write_json,
+    backend, controller, ensure_no_legacy_db, ensure_state_writable, host, read_record,
+    record_scope, valid_id, valid_identity, writable_state_dir, write_json,
 };
 use crate::host_launch;
 use anyhow::{ensure, Context, Result};
@@ -18,14 +18,6 @@ use std::time::{Duration, Instant};
 use wfc_herdr::{FailureKind, Handle, Launch, Mapping, Process};
 
 pub const USAGE: &str = "wfc herdr-reconcile DISPATCH --pane P --terminal T --actor NAME --evidence TEXT [--workspace W] [--old-writer-evidence TEXT] [--owner-token TOKEN]";
-
-pub(super) fn native_state(state: &Path) -> Result<()> {
-    ensure!(
-        !state.join("router.db").try_exists()?,
-        "legacy router database requires owner and assignment migration"
-    );
-    Ok(())
-}
 
 fn launch_receipt(state: &Path, create: &Value) -> Result<Value> {
     let launch = backend::herdr_receipt(state, create)?;
@@ -52,14 +44,14 @@ struct Assignment<'a> {
 impl<'a> Assignment<'a> {
     fn lock_unowned(state: &'a Path, id: &str, operation: &str) -> Result<(Self, File)> {
         ensure!(valid_id(id), "invalid dispatch ID");
-        native_state(state)?;
+        ensure_no_legacy_db(state)?;
         let row = read_record(&state.join("dispatches").join(format!("{id}.json")))?;
         let scope = record_scope(&row).context("invalid dispatch scope")?;
         let authorize = || controller::Owners::read(state)?.require(scope, None, operation);
         authorize()?;
         let scope_lock = controller::lock_scope(state, scope)?;
         authorize()?;
-        let unit = Self::lock(state, id, None)?;
+        let unit = Self::lock(state, id, None, false)?;
         ensure!(
             record_scope(&unit.row) == Some(scope),
             "Herdr scope changed"
@@ -67,8 +59,8 @@ impl<'a> Assignment<'a> {
         Ok((unit, scope_lock))
     }
 
-    fn lock(state: &'a Path, id: &str, new: Option<Value>) -> Result<Self> {
-        Self::lock_with(state, id, new, |file| {
+    fn lock(state: &'a Path, id: &str, new: Option<Value>, read_only: bool) -> Result<Self> {
+        Self::lock_with(state, id, new, read_only, |file| {
             file.lock()?;
             Ok(true)
         })?
@@ -79,10 +71,15 @@ impl<'a> Assignment<'a> {
         state: &'a Path,
         id: &str,
         new: Option<Value>,
+        read_only: bool,
         take_lock: impl FnOnce(&File) -> Result<bool>,
     ) -> Result<Option<Self>> {
         ensure!(valid_id(id), "invalid dispatch ID");
-        native_state(state)?;
+        if read_only {
+            ensure_no_legacy_db(state)?;
+        } else {
+            ensure_state_writable(state)?;
+        }
         let path = state.join("dispatches").join(format!("{id}.json"));
         let lock_path = path.with_extension("herdr-lock");
         let lock = if new.is_some() {
@@ -96,6 +93,9 @@ impl<'a> Assignment<'a> {
         };
         if !take_lock(&lock)? {
             return Ok(None);
+        }
+        if !read_only {
+            ensure_state_writable(state)?;
         }
         let row = match new {
             Some(row) => {
@@ -142,7 +142,7 @@ impl<'a> Assignment<'a> {
     }
 
     fn current(&self) -> Result<()> {
-        native_state(self.state)?;
+        ensure_state_writable(self.state)?;
         ensure!(
             read_record(&self.path)? == self.row,
             "Herdr assignment changed during operation"
@@ -321,7 +321,7 @@ pub(super) fn create(state: &Path, row: &Value, launch: host::Launch) -> Result<
         [.., flag, brief] if row["host"] == "opencode" && flag == "--prompt" => Some(brief.clone()),
         _ => None,
     };
-    let mut unit = Assignment::lock(state, id, Some(row.clone()))?;
+    let mut unit = Assignment::lock(state, id, Some(row.clone()), false)?;
     let files = host_launch::prepare(
         state,
         id,
@@ -403,7 +403,7 @@ pub(super) fn create(state: &Path, row: &Value, launch: host::Launch) -> Result<
 pub(super) fn observe(state: &Path, row: &mut Value, read_only: bool) -> Result<(Value, Value)> {
     let observed = (|| -> Result<_> {
         let id = row["dispatch"].as_str().context("missing dispatch")?;
-        let mut unit = Assignment::lock(state, id, None)?;
+        let mut unit = Assignment::lock(state, id, None, read_only)?;
         let bound = unit.bound_record().is_ok();
         let mut close_pending = unit.pending_close();
         let mut invalid_close_worker = false;
@@ -535,11 +535,12 @@ impl Assignment<'_> {
     }
 }
 
-fn lock_close<'a>(state: &'a Path, row: &Value) -> Result<Assignment<'a>> {
+fn lock_close<'a>(state: &'a Path, row: &Value, read_only: bool) -> Result<Assignment<'a>> {
     let unit = Assignment::lock(
         state,
         row["dispatch"].as_str().context("missing dispatch")?,
         None,
+        read_only,
     )?;
     ensure!(
         unit.row["attempt"] == row["attempt"] && record_scope(&unit.row) == record_scope(row),
@@ -549,12 +550,12 @@ fn lock_close<'a>(state: &'a Path, row: &Value) -> Result<Assignment<'a>> {
 }
 
 pub(super) fn read_only_close(state: &Path, row: &Value) -> Result<Option<Value>> {
-    let unit = lock_close(state, row)?;
+    let unit = lock_close(state, row, true)?;
     unit.replay_close(&unit.handle()?)
 }
 
 pub(super) fn close(state: &Path, row: &Value) -> Result<Value> {
-    let mut unit = lock_close(state, row)?;
+    let mut unit = lock_close(state, row, false)?;
     let mut handle = unit.handle()?;
     if let Some(receipt) = unit.replay_close(&handle)? {
         return Ok(receipt);
@@ -646,7 +647,7 @@ pub struct Input {
 pub fn submit(input: Input) -> Result<Value> {
     ensure!(input.op == "submit", "unsupported Herdr operation");
     controller::require_controller("submit")?;
-    let state = state_dir()?;
+    let state = writable_state_dir()?;
     let (mut unit, _scope) = Assignment::lock_unowned(&state, &input.dispatch, "submit")?;
     writable_input(&unit, input.round, &input.attempt)?;
     let mut response = unit.input(InputAction::Submit(&input.text), || Ok(()))?;
@@ -686,6 +687,7 @@ pub(super) fn try_submit_reply(
         state,
         row["dispatch"].as_str().context("missing dispatch")?,
         None,
+        false,
         super::assignment::try_input_lock,
     )?
     else {
@@ -770,7 +772,7 @@ impl Reconcile {
             !self.owner_token,
             "controller owner authorization is unavailable"
         );
-        let state = state_dir()?;
+        let state = writable_state_dir()?;
         let (mut unit, _scope) =
             Assignment::lock_unowned(&state, &self.dispatch, "herdr-reconcile")?;
         ensure!(

@@ -1,20 +1,39 @@
 //! Offline access to workflow-core's Python router.db. See the crate README for cutover.
 mod completion;
+mod import;
 mod migrate;
 mod preview;
 mod recovery;
 mod schema;
 
+pub use completion::{check_final_done_result, keeps_earlier_done};
+pub use import::{import_scratch, stopped_ledger};
 pub use migrate::open_offline_copy;
 pub use preview::{can_preview_router_db, reclaim_preview, status, verify_router_db};
 
 use anyhow::{ensure, Context, Result};
 use rusqlite::{Connection, OpenFlags};
+#[cfg(unix)]
+use std::fmt;
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
     time::Duration,
 };
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct UnknownHomeAccount(String);
+
+#[cfg(unix)]
+impl fmt::Display for UnknownHomeAccount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "cannot determine home directory for {}", self.0)
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for UnknownHomeAccount {}
 
 /// Resolve links in the existing prefix without creating a missing state directory.
 fn resolve(path: &Path) -> Result<PathBuf> {
@@ -69,7 +88,7 @@ fn expand_home(path: PathBuf) -> Result<PathBuf> {
             let why = || format!("cannot determine home directory for {name}");
             nix::unistd::User::from_name(&name[1..])
                 .with_context(why)?
-                .with_context(why)?
+                .ok_or_else(|| UnknownHomeAccount(name.to_owned()))?
                 .dir
         }
         #[cfg(not(unix))]

@@ -1,7 +1,7 @@
 //! Receipt transitions and operator evidence. The caller holds the inbox lock
 //! from lookup until the updated receipt and its evidence are published.
 use super::{options, Inbox, Message};
-use crate::workflow::{controller, state_dir};
+use crate::workflow::{controller, writable_state_dir};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -164,7 +164,7 @@ impl<'a> Confirm<'a> {
     }
 
     pub fn run(self) -> Result<Value> {
-        let state = state_dir()?;
+        let state = writable_state_dir()?;
         let mut inbox = Inbox::open(&state)?;
         let numeric = self.id.parse::<u64>().ok();
         let index = inbox

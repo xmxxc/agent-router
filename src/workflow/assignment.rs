@@ -139,13 +139,18 @@ pub(super) fn ids(dir: &Path) -> Result<BTreeSet<String>> {
 pub(super) fn close_lock(state: &Path, row: &Value) -> Result<File> {
     let file = attempt_lock_file(state, row)?;
     file.lock()?;
+    super::ensure_state_writable(state)?;
     Ok(file)
 }
 
 #[cfg(target_os = "linux")]
 pub(super) fn try_reply_lock(state: &Path, row: &Value) -> Result<Option<File>> {
     let file = attempt_lock_file(state, row)?;
-    Ok(try_input_lock(&file)?.then_some(file))
+    if !try_input_lock(&file)? {
+        return Ok(None);
+    }
+    super::ensure_state_writable(state)?;
+    Ok(Some(file))
 }
 
 #[cfg(target_os = "linux")]
@@ -160,6 +165,7 @@ pub(super) fn try_input_lock(file: &File) -> Result<bool> {
 }
 
 fn attempt_lock_file(state: &Path, row: &Value) -> Result<File> {
+    super::ensure_state_writable(state)?;
     let dir = state.join("close-locks");
     let id = row["dispatch"]
         .as_str()
