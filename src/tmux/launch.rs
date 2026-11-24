@@ -659,6 +659,7 @@ impl Tmux<'_> {
     }
 
     pub(super) fn create(&self, launch: Launch) -> Reply<(Target, PathBuf)> {
+        use crate::workflow::handoff::TmuxTarget;
         if self.target()?.is_some() {
             return Err(failure("refused", "named tmux session already exists"));
         }
@@ -668,6 +669,19 @@ impl Tmux<'_> {
                 "invalid worker cwd, argv or environment",
             )
         };
+        let handoff_target = self
+            .handoff_audit
+            .map(|audit| {
+                let execution = self.new_execution_id.ok_or_else(bad)?;
+                crate::workflow::handoff::require_launch(
+                    self.state,
+                    self.dispatch,
+                    execution,
+                    audit,
+                )
+                .map_err(|error| failure("definitely-not-sent", &format!("{error:#}")))
+            })
+            .transpose()?;
         let cwd = fs::canonicalize(launch.cwd).map_err(|_| bad())?;
         if !cwd.is_dir()
             || launch.argv.first().is_none_or(String::is_empty)
@@ -689,6 +703,16 @@ impl Tmux<'_> {
         for (k, v) in launch.env {
             if !crate::workflow::controller::is_credential(&k) || k == "WFC_WORKER_CALLBACK" {
                 environment.insert(k, v);
+            }
+        }
+        if matches!(&handoff_target, Some(TmuxTarget::Pinned { .. })) {
+            for key in [
+                "HERDR_SOCKET_PATH",
+                "HERDR_WORKSPACE_ID",
+                "HERDR_TAB_ID",
+                "HERDR_PANE_ID",
+            ] {
+                environment.remove(key);
             }
         }
         let state = self.state.to_str().ok_or_else(bad)?;
@@ -806,16 +830,25 @@ impl Tmux<'_> {
                 .as_ref()
                 .map(|origin| self.pin_submission(origin))
                 .transpose()?;
-            if let Some(audit) = self.handoff_audit {
-                let execution = self.new_execution_id.ok_or_else(bad)?;
-                let previous = crate::workflow::handoff::require_launch(
-                    self.state,
-                    self.dispatch,
-                    execution,
-                    audit,
-                )
-                .map_err(|error| failure("definitely-not-sent", &format!("{error:#}")))?;
-                self.require_handoff_server(&previous, submission.origin.as_ref())?;
+            if let Some(target) = handoff_target {
+                match target {
+                    TmuxTarget::OriginalServer(previous) => {
+                        self.require_handoff_server(&previous, submission.origin.as_ref())?;
+                    }
+                    TmuxTarget::Pinned { socket, service } => {
+                        if self.socket.as_ref() != Some(&socket)
+                            || submission
+                                .origin
+                                .as_ref()
+                                .is_none_or(|origin| json!(origin) != service)
+                        {
+                            return Err(failure(
+                                "definitely-not-sent",
+                                "target tmux server changed",
+                            ));
+                        }
+                    }
+                }
             }
             submission.phase = SubmissionPhase::InFlight;
             super::binding::save(&path, &submission).map_err(|_| io_error())?;
@@ -969,13 +1002,7 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
     fs::remove_file(spec_path)?;
     super::binding::record_server(&dir, id)?;
     let mut cmd = Command::new(spec.argv.first().context("empty launch argv")?);
-    // Track orphans before starting the worker. A direct child's exit alone
-    // cannot authorize a cross-host replacement.
-    ensure!(
-        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == 0
-            && unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) } != libc::SIG_ERR,
-        "cannot supervise the tmux worker process tree"
-    );
+    crate::host_launch::track_worker_tree()?;
     cmd.args(&spec.argv[1..])
         .current_dir(spec.cwd)
         .env_clear()
@@ -1039,25 +1066,11 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
     }
     super::binding::save(&receipt, &terminal)?;
     started?;
-    wait_for_worker_tree()?;
+    crate::host_launch::wait_for_worker_tree(None)?;
     super::binding::save(
         &dir.join(format!("{id}.stopped")),
         &json!({"launchId":id,"dispatch":dispatch,"attempt":spec.env.get("WFC_ATTEMPT"),
             "round":spec.env.get("WFC_ROUND"),"writerTreeStopped":true}),
     )?;
     Ok(ExitCode::from(code as u8))
-}
-
-fn wait_for_worker_tree() -> Result<()> {
-    loop {
-        if unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::__WALL) } > 0 {
-            continue;
-        }
-        let error = std::io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::ECHILD) => return Ok(()),
-            Some(libc::EINTR) => (),
-            _ => return Err(error).context("wait for tmux worker descendants"),
-        }
-    }
 }

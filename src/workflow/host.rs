@@ -432,7 +432,8 @@ impl Options<'_> {
             "opencode" => {
                 #[cfg(target_os = "linux")]
                 ensure!(
-                    !matches!(start, WorkerStart::Handoff)
+                    self.backend != "tmux"
+                        || !matches!(start, WorkerStart::Handoff)
                         || !opencode::effective_setting(&launch.env, "WFC_OPENCODE_ISOLATED_STORE")
                             .is_some_and(|value| value == Path::new("1")),
                     "handoff does not support a private OpenCode opening"
@@ -521,11 +522,11 @@ impl Options<'_> {
             record["launchConfig"] = json!(path);
         }
         #[cfg(target_os = "linux")]
-        if self.name == "codex" && self.backend == "tmux" {
+        if self.name == "codex" && matches!(self.backend, "tmux" | "herdr") {
             match codex_home(&cwd, &launch.env) {
                 Ok(home) => {
                     record["codexHome"] = json!(home);
-                    if resume {
+                    if resume || self.backend == "herdr" {
                         launch.env.insert("CODEX_HOME".into(), json!(home));
                     }
                 }
