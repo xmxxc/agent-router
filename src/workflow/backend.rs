@@ -849,19 +849,109 @@ pub(super) fn herdr_receipt(state: &Path, create: &Value) -> Result<Value> {
     )
 }
 
+fn replaced_herdr_execution(row: &Value) -> Option<&Value> {
+    if row["backend"] != "herdr" {
+        return None;
+    }
+    let execution = row["executionId"]
+        .as_str()
+        .filter(|id| valid_identity(id, "a-"))?;
+    let resume = if row["attempt"] == execution {
+        // Resume records the replacement before the new pane is registered.
+        super::assignment::resume_audit(row)?
+    } else {
+        #[cfg(not(target_os = "linux"))]
+        return None;
+        #[cfg(target_os = "linux")]
+        {
+            let binding = super::herdr::bound_record(row).ok()?;
+            let create = &row["create"];
+            if create["dispatch"] != row["dispatch"]
+                || create["attempt"] != binding["attempt"]
+                || create["round"] != binding["round"]
+            {
+                return None;
+            }
+            // Continue changes the logical attempt but preserves this launch.
+            row["audit"].as_array()?.iter().rev().find(|event| {
+                event["operation"] == "resume"
+                    && event["result"] == "accepted"
+                    && event["attempt"] == execution
+                    && event["round"] == binding["round"]
+            })?
+        }
+    };
+    let previous = &resume["priorBackendHandle"];
+    let previous_launch = &resume["priorCreate"];
+    let service = &previous["service"];
+    (resume["dispatch"] == row["dispatch"]
+        && resume["toAttempt"] == execution
+        && matches!(
+            resume["result"].as_str(),
+            Some("pending" | "uncertain" | "accepted")
+        )
+        && previous["dispatch"] == row["dispatch"]
+        && previous["round"] == resume["round"]
+        && previous["attempt"] == resume["fromAttempt"]
+        && previous["attempt"] != execution
+        && previous["attempt"]
+            .as_str()
+            .is_some_and(|id| valid_identity(id, "a-"))
+        && HERDR_BINDING_TEXT.iter().all(|&key| {
+            previous[key]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        })
+        && service["pid"].as_u64().is_some_and(|pid| pid > 0)
+        && service["creation"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+        && previous["receipt"] == previous_launch["receipt"]
+        && (previous_launch["herdrBinding"].is_null()
+            || HERDR_BINDING_TEXT
+                .iter()
+                .chain([&"service"])
+                .all(|&key| previous[key] == previous_launch["herdrBinding"][key])))
+    .then_some(previous)
+}
+
+const HERDR_BINDING_TEXT: [&str; 6] = [
+    "endpoint",
+    "workspace",
+    "pane",
+    "terminal",
+    "nonce",
+    "receipt",
+];
+const HERDR_CLOSE_TARGET: [&str; 9] = [
+    "dispatch",
+    "round",
+    "attempt",
+    "endpoint",
+    "service",
+    "workspace",
+    "pane",
+    "terminal",
+    "nonce",
+];
+
 pub(super) fn herdr_closes(row: &Value) -> impl DoubleEndedIterator<Item = &Value> {
-    let resumed_from = super::assignment::resume_audit(row).map(|event| &event["fromAttempt"]);
+    let replaced = replaced_herdr_execution(row);
     row["audit"]
         .as_array()
         .into_iter()
         .flatten()
         .filter(move |event| {
             event["operation"] == "close"
-                && !resumed_from.is_some_and(|old| {
-                    old.is_string()
-                        && event["attempt"] == *old
-                        && event["dispatch"] == row["dispatch"]
-                        && event["round"] == row["round"]
+                && !replaced.is_some_and(|old| {
+                    event["result"] == "completed"
+                        && (event["executionId"].is_null()
+                            || event["executionId"] == old["attempt"])
+                        && same_execution(old, event)
+                        && event["target"]["receipt"] == old["receipt"]
+                        && HERDR_CLOSE_TARGET
+                            .iter()
+                            .all(|&key| event["target"][key] == old[key])
                 })
         })
 }
@@ -896,19 +986,9 @@ pub(super) fn verify_herdr_close_target(row: &Value, event: &Value) -> Result<()
     let current = super::herdr::bound_record(row).context("close intent target changed")?;
     let target = &event["target"];
     ensure!(
-        [
-            "dispatch",
-            "round",
-            "attempt",
-            "endpoint",
-            "service",
-            "workspace",
-            "pane",
-            "terminal",
-            "nonce"
-        ]
-        .iter()
-        .all(|&k| target[k] == current[k])
+        HERDR_CLOSE_TARGET
+            .iter()
+            .all(|&key| target[key] == current[key])
             && same_execution(row, event),
         "close intent target changed"
     );
