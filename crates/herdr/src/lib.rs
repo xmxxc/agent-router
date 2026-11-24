@@ -129,6 +129,14 @@ pub struct Screen {
 
 const INVALID: Failure = Failure::unknown("incomplete Herdr observation");
 
+fn observe_after_input_check<T>(
+    check: impl FnOnce() -> std::io::Result<()>,
+    observe: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    check().map_err(|_| Failure::unsent("Herdr input precondition changed"))?;
+    observe()
+}
+
 fn field<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value[key].as_str().filter(|s| !s.is_empty()).ok_or(INVALID)
 }
@@ -546,27 +554,28 @@ impl Handle {
         save: &mut impl FnMut(&Self) -> std::io::Result<()>,
         before_write: impl FnOnce() -> std::io::Result<()>,
     ) -> Result<Screen> {
-        let before = self.read().map_err(Failure::before_effect)?;
-        if screen::read_only(&before.text) {
-            return Err(Failure::refused("worker input is paused"));
-        }
-        screen::require_empty_reply_box(self, &before, host).map_err(Failure::before_effect)?;
-        if writer.is_some() && screen::matching_user_entries(&before, text) != 0 {
-            return Err(Failure::unsent("new task already appeared before input"));
-        }
-        // Preparation performs only observation and local checkpoints. An
-        // incomplete response to the subsequent input call may be post-effect.
-        let rpc = (|| {
-            if let Some(writer) = writer {
+        // The caller may wait for the ledger. Observe the pane only after that
+        // check, with the original scope and execution locks still held.
+        let (before, rpc) = observe_after_input_check(before_write, || {
+            let before = self.read()?;
+            if screen::read_only(&before.text) {
+                return Err(Failure::refused("worker input is paused"));
+            }
+            screen::require_empty_reply_box(self, &before, host)?;
+            if writer.is_some() && screen::matching_user_entries(&before, text) != 0 {
+                return Err(Failure::unsent("new task already appeared before input"));
+            }
+            let rpc = if let Some(writer) = writer {
                 let rpc = self.session()?;
                 self.require_foreground_writer(&rpc, writer, save)?;
-                Ok(rpc)
+                rpc
             } else {
-                self.prepare_send(true, save)
-            }
-        })()
+                self.prepare_send(true, save)?
+            };
+            Ok((before, rpc))
+        })
         .map_err(Failure::before_effect)?;
-        before_write().map_err(|_| Failure::unsent("Herdr input precondition changed"))?;
+        // An incomplete response to the input call may be post-effect.
         let params = json!({"pane_id":self.pane,"text":text,"keys":["Enter"]});
         rpc.send_reply(params)?;
         Ok(before)
@@ -728,6 +737,29 @@ impl Handle {
             handle: next,
             audit,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    #[test]
+    fn input_authorization_precedes_final_observation() {
+        let order = RefCell::new(Vec::new());
+        let observed = super::observe_after_input_check(
+            || {
+                order.borrow_mut().push("ledger and owner");
+                Ok(())
+            },
+            || {
+                order.borrow_mut().push("pane and foreground");
+                Ok("fresh observation")
+            },
+        )
+        .unwrap();
+        assert_eq!(observed, "fresh observation");
+        assert_eq!(*order.borrow(), ["ledger and owner", "pane and foreground"]);
     }
 }
 
