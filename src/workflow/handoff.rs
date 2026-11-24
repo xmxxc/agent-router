@@ -1,5 +1,5 @@
-//! Close one verified native tmux writer before assigning a fresh host.
-use super::{assignment, backend, controller, host, messages, view, worker_owner};
+//! Close a verified native tmux writer before assigning a fresh execution.
+use super::{assignment, backend, controller, herdr, host, messages, view, worker_owner};
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
@@ -12,13 +12,16 @@ use std::{
     time::{Duration, Instant},
 };
 use uuid::Uuid;
+use wfc_herdr::Process;
 
-pub const USAGE: &str = "wfc handoff DISPATCH --host HOST [--task PATH --report PATH] [--model MODEL] [--owner-token TOKEN]";
+pub const USAGE: &str = "wfc handoff DISPATCH --host HOST [--backend tmux|herdr] [--herdr-endpoint PATH] [--task PATH --report PATH] [--model MODEL] [--owner-token TOKEN]";
 pub(super) const PENDING_CALLBACK_HASH: &str = "handoffCallbackHash";
 
 pub struct Handoff<'a> {
     dispatch: &'a str,
     host: &'a str,
+    backend: &'a str,
+    endpoint: Option<&'a str>,
     next: Option<(&'a Path, &'a Path)>,
     model: Option<&'a str>,
     owner_token: Option<&'a str>,
@@ -27,14 +30,35 @@ pub struct Handoff<'a> {
 impl<'a> Handoff<'a> {
     pub fn parse(args: &'a [OsString]) -> Result<Self> {
         let mut dispatch = None;
-        let [host, task, report, model, owner_token] = messages::options(
+        let [host, backend, endpoint, task, report, model, owner_token] = messages::options(
             args,
-            ["--host", "--task", "--report", "--model", "--owner-token"],
+            [
+                "--host",
+                "--backend",
+                "--herdr-endpoint",
+                "--task",
+                "--report",
+                "--model",
+                "--owner-token",
+            ],
             Some((&mut dispatch, "dispatch ID")),
         )?;
         ensure!(
             task.is_some() == report.is_some(),
             "give both --task and --report, or neither"
+        );
+        let backend = backend.unwrap_or("tmux");
+        ensure!(
+            matches!(backend, "tmux" | "herdr"),
+            "--backend must be tmux or herdr"
+        );
+        ensure!(
+            if backend == "herdr" {
+                endpoint.is_some_and(|socket| Path::new(socket).is_absolute())
+            } else {
+                endpoint.is_none()
+            },
+            "an absolute --herdr-endpoint is required for a Herdr target only"
         );
         Ok(Self {
             dispatch: dispatch
@@ -43,6 +67,8 @@ impl<'a> Handoff<'a> {
             host: host
                 .filter(|name| matches!(*name, "codex" | "opencode" | "claude"))
                 .context("--host must be codex, opencode or claude")?,
+            backend,
+            endpoint,
             next: task
                 .zip(report)
                 .map(|(task, report)| (Path::new(task), Path::new(report))),
@@ -84,6 +110,15 @@ impl<'a> Handoff<'a> {
                 "previous lifecycle operation is unresolved",
             ));
         }
+        if let Some(event) = self.duplicate(&row)? {
+            let mut result = response(&row, event, "accepted");
+            result["duplicate"] = json!(true);
+            return Ok(result);
+        }
+        ensure!(
+            row["backend"] != "herdr",
+            "Herdr source handoff requires verified stopping of the original worker tree"
+        );
         ensure!(
             row["backend"] == "tmux"
                 && row["host"].is_string()
@@ -95,14 +130,9 @@ impl<'a> Handoff<'a> {
                     .is_some_and(|socket| Path::new(socket).is_absolute()),
             "handoff requires an original native tmux execution with a confirmed launch"
         );
-        if let Some(event) = self.duplicate(&row)? {
-            let mut result = response(&row, event, "accepted");
-            result["duplicate"] = json!(true);
-            return Ok(result);
-        }
         ensure!(
-            row["host"] != self.host,
-            "handoff requires a different host"
+            row["host"] != self.host || row["backend"] != self.backend,
+            "handoff requires a different host or backend"
         );
         require_scope_settled(&state, scope)?;
 
@@ -194,9 +224,22 @@ impl<'a> Handoff<'a> {
         );
 
         let mut next = self.prepare_record(&row, scope, model)?;
+        let target_service = if let Some(socket) = self.endpoint {
+            ensure!(
+                generation.is_null() && next["round"] == 1,
+                "Herdr handoff requires an unowned scope and a first-round target"
+            );
+            Some(herdr::handoff_target(
+                &state,
+                self.dispatch,
+                Path::new(socket),
+            )?)
+        } else {
+            None
+        };
         let options = host::Options {
             name: self.host,
-            backend: "tmux",
+            backend: self.backend,
             config: row["launchConfig"].as_str(),
             model,
             effort: row["effort"].as_str(),
@@ -257,7 +300,7 @@ impl<'a> Handoff<'a> {
                 .as_array_mut()
                 .context("invalid lifecycle audit")?;
             let index = audit.len();
-            audit.push(json!({
+            let mut event = json!({
                 "id":index + 1,"operation":"handoff","dispatch":self.dispatch,
                 "round":next["round"],"attempt":next["attempt"],"fromRound":row["round"],
                 "fromAttempt":row["attempt"],"toAttempt":next["attempt"],
@@ -265,7 +308,13 @@ impl<'a> Handoff<'a> {
                 "fromTask":row["task"],"fromReport":row["report"],"toTask":next["task"],"toReport":next["report"],
                 "ownerGeneration":generation,"at":now.to_rfc3339(),"result":"pending","phase":"closing",
                 "priorCreate":row["create"],"oldWriter":old_writer
-            }));
+            });
+            if let Some(service) = &target_service {
+                event["fromBackend"] = json!("tmux");
+                event["target"] =
+                    json!({"backend":"herdr","endpoint":self.endpoint,"service":service});
+            }
+            audit.push(event);
             super::write_json(
                 &scope_path(&state, scope),
                 &scope_binding(&closing, &closing["audit"][index]),
@@ -341,30 +390,26 @@ impl<'a> Handoff<'a> {
             authorize()? == generation,
             "handoff owner changed before launch"
         );
-        let mut reply = backend::create_for_handoff(&state, &next, index + 1, launch).unwrap_or_else(|error| {
+        if let Some(service) = target_service {
+            return match herdr::create_for_handoff(&state, &next, index + 1, launch, &service) {
+                Ok(settled) => Ok(launch_response(&settled, index)),
+                Err(error) => Ok(unresolved(
+                    &next,
+                    &next["audit"][index],
+                    &format!("could not confirm Herdr handoff launch: {error:#}"),
+                )),
+            };
+        }
+        let reply = backend::create_for_handoff(&state, &next, index + 1, launch).unwrap_or_else(|error| {
             json!({"result":"uncertain","diagnostic":format!("could not confirm handoff launch: {error:#}")})
         });
-        let accepted = reply["result"] == "accepted" && reply["receipt"].is_string();
-        let disposition = if accepted { "accepted" } else { "uncertain" };
         {
             let inbox = messages::lock_for_publish(&state)?;
             ensure!(
                 authorize()? == generation && read()? == next,
                 "assignment or owner changed before handoff settlement"
             );
-            for key in ["dispatch", "round", "attempt"] {
-                reply[key] = next[key].clone();
-            }
-            next["create"] = reply.clone();
-            let audit = &mut next["audit"][index];
-            audit["result"] = json!(disposition);
-            audit["launch"] = reply;
-            audit["settledAt"] = json!(chrono::Utc::now().to_rfc3339());
-            if accepted {
-                audit["phase"] = json!("complete");
-                next["rounds"].as_array_mut().unwrap().last_mut().unwrap()["state"] =
-                    json!("running");
-            }
+            settle_launch(&mut next, index, reply);
             super::write_json(&path, &next, None)?;
             messages::sync_directory(&dir)?;
             // The verified receipt can report a startup fault for this attempt
@@ -373,16 +418,18 @@ impl<'a> Handoff<'a> {
                 eprintln!("wfc: could not publish confirmed startup failure");
             }
         }
-        let event = &next["audit"][index];
-        let mut result = response(&next, event, disposition);
-        if !accepted {
-            result["diagnostic"] = event["launch"]["diagnostic"].clone();
-        }
-        Ok(result)
+        Ok(launch_response(&next, index))
     }
 
     fn duplicate<'r>(&self, row: &'r Value) -> Result<Option<&'r Value>> {
-        if row["host"] != self.host || self.model.is_some_and(|model| row["model"] != model) {
+        if row["host"] != self.host
+            || row["backend"] != self.backend
+            || row["create"]["result"] != "accepted"
+            || self
+                .endpoint
+                .is_some_and(|endpoint| row["endpoint"] != endpoint)
+            || self.model.is_some_and(|model| row["model"] != model)
+        {
             return Ok(None);
         }
         if let Some((task, report)) = self.next {
@@ -402,8 +449,18 @@ impl<'a> Handoff<'a> {
             .find(|event| {
                 event["operation"] == "handoff"
                     && event["result"] == "accepted"
+                    && event["phase"] == "complete"
                     && event["toAttempt"] == row["attempt"]
                     && event["toHost"] == self.host
+                    && event["launch"]["receipt"].is_string()
+                    && event["launch"]["receipt"] == row["create"]["receipt"]
+                    && match self.endpoint {
+                        Some(endpoint) => {
+                            event["target"]["backend"] == "herdr"
+                                && event["target"]["endpoint"] == endpoint
+                        }
+                        None => event["target"].is_null(),
+                    }
             }))
     }
 
@@ -447,8 +504,8 @@ impl<'a> Handoff<'a> {
         next["attempt"] = json!(attempt);
         next["executionId"] = json!(attempt);
         next["host"] = json!(self.host);
+        next["backend"] = json!(self.backend);
         next["model"] = json!(model);
-        next["tmuxLaunchProtocol"] = json!(backend::LAUNCH_PROTOCOL);
         for field in [
             "create",
             "worker",
@@ -462,18 +519,62 @@ impl<'a> Handoff<'a> {
             "legacyExecutionId",
             "legacyLaunchId",
             "legacyWorkerPane",
+            "endpoint",
+            "backendHandle",
+            "pendingInput",
+            "pendingReplyMessageId",
         ] {
             next.as_object_mut().unwrap().remove(field);
+        }
+        if let Some(endpoint) = self.endpoint {
+            next["endpoint"] = json!(endpoint);
+            let record = next.as_object_mut().unwrap();
+            record.remove("tmuxSocket");
+            record.remove("tmuxLaunchProtocol");
+            record.remove("tmux");
+        } else {
+            next["tmuxLaunchProtocol"] = json!(backend::LAUNCH_PROTOCOL);
         }
         Ok(next)
     }
 }
 
+pub(super) fn settle_launch(row: &mut Value, index: usize, mut reply: Value) {
+    let accepted = reply["result"] == "accepted" && reply["receipt"].is_string();
+    for key in ["dispatch", "round", "attempt"] {
+        reply[key] = row[key].clone();
+    }
+    row["create"] = reply.clone();
+    let audit = &mut row["audit"][index];
+    audit["result"] = json!(if accepted { "accepted" } else { "uncertain" });
+    audit["launch"] = reply;
+    audit["settledAt"] = json!(chrono::Utc::now().to_rfc3339());
+    if accepted {
+        audit["phase"] = json!("complete");
+        row["rounds"].as_array_mut().unwrap().last_mut().unwrap()["state"] = json!("running");
+    }
+}
+
+fn launch_response(row: &Value, index: usize) -> Value {
+    let event = &row["audit"][index];
+    let result = event["result"].as_str().unwrap_or("uncertain");
+    let mut reply = response(row, event, result);
+    if result != "accepted" {
+        reply["diagnostic"] = event["launch"]["diagnostic"].clone();
+    }
+    reply
+}
+
 fn response(row: &Value, event: &Value, result: &str) -> Value {
     let attempt = event.get("toAttempt").unwrap_or(&row["attempt"]);
-    json!({"dispatch":row["dispatch"],"operation":"handoff","result":result,
+    let mut reply = json!({"dispatch":row["dispatch"],"operation":"handoff","result":result,
         "audit":event["id"],"fromAttempt":event["fromAttempt"],"attempt":attempt,
-        "host":event["toHost"],"round":event["round"]})
+        "host":event["toHost"],"round":event["round"]});
+    if event["target"]["backend"] == "herdr" {
+        reply["backend"] = json!("herdr");
+        reply["endpoint"] = event["target"]["endpoint"].clone();
+    }
+    reply
 }
 
 fn unresolved(row: &Value, event: &Value, diagnostic: &str) -> Value {
@@ -525,8 +626,12 @@ fn scope_path(state: &Path, scope: &str) -> PathBuf {
 }
 
 fn scope_binding(row: &Value, audit: &Value) -> Value {
-    json!({"scope":super::record_scope(row),"dispatch":row["dispatch"],"audit":audit["id"],
-        "fromAttempt":audit["fromAttempt"],"toAttempt":audit["toAttempt"],"ownerGeneration":audit["ownerGeneration"]})
+    let mut binding = json!({"scope":super::record_scope(row),"dispatch":row["dispatch"],"audit":audit["id"],
+        "fromAttempt":audit["fromAttempt"],"toAttempt":audit["toAttempt"],"ownerGeneration":audit["ownerGeneration"]});
+    if let Some(target) = audit.get("target") {
+        binding["target"] = target.clone();
+    }
+    binding
 }
 
 pub(crate) fn require_launch(
@@ -535,6 +640,36 @@ pub(crate) fn require_launch(
     attempt: &str,
     audit: usize,
 ) -> Result<String> {
+    let (event, previous) = verify_launch(state, dispatch, attempt, audit, "tmux")?;
+    ensure!(event["target"].is_null(), "tmux handoff target changed");
+    Ok(previous)
+}
+
+pub(super) fn require_herdr_launch(
+    state: &Path,
+    row: &Value,
+    audit: usize,
+    service: &Process,
+) -> Result<()> {
+    let dispatch = row["dispatch"].as_str().context("missing dispatch")?;
+    let attempt = row["attempt"].as_str().context("missing attempt")?;
+    let (event, _) = verify_launch(state, dispatch, attempt, audit, "herdr")?;
+    ensure!(
+        event["ownerGeneration"].is_null()
+            && event["target"]
+                == json!({"backend":"herdr","endpoint":row["endpoint"],"service":service}),
+        "Herdr handoff target changed"
+    );
+    Ok(())
+}
+
+fn verify_launch(
+    state: &Path,
+    dispatch: &str,
+    attempt: &str,
+    audit: usize,
+    target: &str,
+) -> Result<(Value, String)> {
     ensure!(super::valid_id(dispatch), "invalid handoff dispatch");
     let row = assignment::public_record(&state.join("dispatches"), dispatch)?
         .context("missing handoff launch assignment")?;
@@ -542,7 +677,7 @@ pub(crate) fn require_launch(
     let scope = super::record_scope(&row).context("invalid handoff scope")?;
     let binding = read_scope_binding(state, scope)?;
     ensure!(
-        row["backend"] == "tmux"
+        row["backend"] == target
             && row["executionId"] == attempt
             && row["attempt"] == attempt
             && event["phase"] == "starting"
@@ -552,6 +687,7 @@ pub(crate) fn require_launch(
             && event["oldWriterStopped"] == true
             && event["writerStopEvidence"]["writerTreeStopped"] == true
             && event["writerStopEvidence"]["attempt"] == event["fromAttempt"]
+            && event["writerStopEvidence"]["dispatch"] == dispatch
             && event["close"]["result"] == "completed"
             && event["close"]["resourceCleanup"] == "confirmed"
             && event["close"]["attempt"] == event["fromAttempt"]
@@ -570,9 +706,16 @@ pub(crate) fn require_launch(
     );
     let previous = json!({"dispatch":dispatch,"attempt":event["fromAttempt"],
         "round":event["fromRound"],"executionId":event["fromAttempt"],"create":event["priorCreate"]});
-    Ok(backend::receipt_id(&previous)?
-        .context("missing original handoff launch")?
-        .to_owned())
+    let launch = backend::receipt_id(&previous)?.context("missing original handoff launch")?;
+    ensure!(
+        event["writerStopEvidence"]["launchId"] == launch
+            && event["fromRound"]
+                .as_u64()
+                .is_some_and(|round| { event["writerStopEvidence"]["round"] == round.to_string() })
+            && verified_close(&previous, &event["close"]),
+        "original handoff stop or close does not identify this launch"
+    );
+    Ok((event.clone(), launch.to_owned()))
 }
 
 fn read_scope_binding(state: &Path, scope: &str) -> Result<Option<Value>> {

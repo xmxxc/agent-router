@@ -47,6 +47,7 @@ struct Assignment<'a> {
     _lock: File,
     path: PathBuf,
     row: Value,
+    published: bool,
 }
 
 impl<'a> Assignment<'a> {
@@ -68,7 +69,8 @@ impl<'a> Assignment<'a> {
     }
 
     fn lock(state: &'a Path, id: &str, new: Option<Value>) -> Result<Self> {
-        Self::lock_with(state, id, new, |file| {
+        let create_lock = new.is_some();
+        Self::lock_with(state, id, new, create_lock, |file| {
             file.lock()?;
             Ok(true)
         })?
@@ -79,13 +81,14 @@ impl<'a> Assignment<'a> {
         state: &'a Path,
         id: &str,
         new: Option<Value>,
+        create_lock: bool,
         take_lock: impl FnOnce(&File) -> Result<bool>,
     ) -> Result<Option<Self>> {
         ensure!(valid_id(id), "invalid dispatch ID");
         native_state(state)?;
         let path = state.join("dispatches").join(format!("{id}.json"));
         let lock_path = path.with_extension("herdr-lock");
-        let lock = if new.is_some() {
+        let lock = if create_lock {
             OpenOptions::new()
                 .create_new(true)
                 .write(true)
@@ -97,6 +100,7 @@ impl<'a> Assignment<'a> {
         if !take_lock(&lock)? {
             return Ok(None);
         }
+        let published = new.is_none();
         let row = match new {
             Some(row) => {
                 ensure!(!path.try_exists()?, "dispatch already published");
@@ -121,6 +125,7 @@ impl<'a> Assignment<'a> {
             state,
             path,
             row,
+            published,
         }))
     }
 
@@ -151,7 +156,7 @@ impl<'a> Assignment<'a> {
     }
 
     fn save(&mut self, next: Value) -> Result<()> {
-        if self.row["backendHandle"].is_null() {
+        if !self.published {
             ensure!(
                 !self.path.try_exists()?,
                 "Herdr assignment already published"
@@ -162,6 +167,7 @@ impl<'a> Assignment<'a> {
         write_json(&self.path, &next, None)?;
         File::open(self.path.parent().unwrap())?.sync_all()?;
         self.row = next;
+        self.published = true;
         Ok(())
     }
 
@@ -316,12 +322,73 @@ impl Assignment<'_> {
 
 pub(super) fn create(state: &Path, row: &Value, launch: host::Launch) -> Result<Value> {
     let id = row["dispatch"].as_str().context("missing dispatch")?;
+    let unit = Assignment::lock(state, id, Some(row.clone()))?;
+    let (unit, answer) = launch_assignment(unit, launch, None)?;
+    ensure!(
+        answer["result"] == "accepted",
+        "backend create {} for {id}: {}",
+        answer["result"],
+        answer["diagnostic"]
+    );
+    Ok(unit.row)
+}
+
+pub(super) fn handoff_target(state: &Path, dispatch: &str, endpoint: &Path) -> Result<Process> {
+    native_state(state)?;
+    let lock = state
+        .join("dispatches")
+        .join(format!("{dispatch}.herdr-lock"));
+    ensure!(
+        std::fs::symlink_metadata(lock).is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+        "Herdr assignment lock is already present or inaccessible"
+    );
+    Handle::probe_service(endpoint).context("cannot verify the target Herdr service")
+}
+
+pub(super) fn create_for_handoff(
+    state: &Path,
+    row: &Value,
+    audit: usize,
+    launch: host::Launch,
+    service: &Process,
+) -> Result<Value> {
+    let id = row["dispatch"].as_str().context("missing dispatch")?;
+    super::handoff::require_herdr_launch(state, row, audit, service)?;
+    let unit = Assignment::lock_with(state, id, None, true, |file| {
+        file.lock()?;
+        Ok(true)
+    })?
+    .context("missing Herdr handoff assignment")?;
+    ensure!(
+        unit.row == *row,
+        "Herdr handoff assignment changed before launch"
+    );
+    let (mut unit, answer) = launch_assignment(unit, launch, Some(service))?;
+    let _inbox = super::messages::lock_for_publish(state)?;
+    let mut next = unit.row.clone();
+    super::handoff::settle_launch(&mut next, audit - 1, answer);
+    unit.save(next)?;
+    Ok(unit.row)
+}
+
+fn launch_assignment<'a>(
+    mut unit: Assignment<'a>,
+    launch: host::Launch,
+    service: Option<&Process>,
+) -> Result<(Assignment<'a>, Value)> {
+    let state = unit.state;
+    let row = &unit.row;
+    let id = row["dispatch"].as_str().context("missing dispatch")?;
     let cwd = Path::new(row["cwd"].as_str().context("missing cwd")?);
+    let endpoint = PathBuf::from(row["endpoint"].as_str().context("missing endpoint")?);
+    let attempt = row["attempt"]
+        .as_str()
+        .context("missing attempt")?
+        .to_owned();
     let prefill = match launch.argv.as_slice() {
         [.., flag, brief] if row["host"] == "opencode" && flag == "--prompt" => Some(brief.clone()),
         _ => None,
     };
-    let mut unit = Assignment::lock(state, id, Some(row.clone()))?;
     let files = host_launch::prepare(
         state,
         id,
@@ -342,16 +409,19 @@ pub(super) fn create(state: &Path, row: &Value, launch: host::Launch) -> Result<
             files.id.clone(),
         ],
     };
-    unit.row["create"] = json!({"result":"uncertain","receipt":files.receipt});
-    unit.row["pendingInput"] = json!(false);
-    unit.row["audit"] = json!([]);
+    let mut prepared = unit.row.clone();
+    prepared["create"] = json!({"result":"uncertain","receipt":files.receipt});
+    prepared["pendingInput"] = json!(false);
+    if unit.published {
+        unit.save(prepared)?;
+    } else {
+        prepared["audit"] = json!([]);
+        unit.row = prepared;
+    }
     // The provider checkpoints the nonce and service before its first external effect.
-    let created = Handle::create(
-        Path::new(row["endpoint"].as_str().context("missing endpoint")?),
-        row["attempt"].as_str().context("missing attempt")?,
-        &launch,
-        |h| unit.checkpoint(h),
-    );
+    let created = Handle::create_with_service(&endpoint, service, &attempt, &launch, |h| {
+        unit.checkpoint(h)
+    });
     let mut answer = match created {
         Ok(_) => {
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -391,13 +461,7 @@ pub(super) fn create(state: &Path, row: &Value, launch: host::Launch) -> Result<
         std::fs::remove_file(&files.receipt)?;
         std::fs::remove_file(unit.path.with_extension("herdr-lock"))?;
     }
-    ensure!(
-        answer["result"] == "accepted",
-        "backend create {} for {id}: {}",
-        answer["result"],
-        answer["diagnostic"]
-    );
-    Ok(unit.row)
+    Ok((unit, answer))
 }
 
 pub(super) fn observe(state: &Path, row: &mut Value, read_only: bool) -> Result<(Value, Value)> {
@@ -667,6 +731,10 @@ fn writable_input(unit: &Assignment<'_>, round: u64, attempt: &str) -> Result<()
     );
     ensure!(!unit.pending_close(), "Herdr close still pending");
     ensure!(
+        super::assignment::unresolved_handoff(&unit.row).is_none(),
+        "Herdr handoff still pending"
+    );
+    ensure!(
         unit.row["create"]["result"] == "accepted",
         "Herdr launch is not active"
     );
@@ -686,6 +754,7 @@ pub(super) fn try_submit_reply(
         state,
         row["dispatch"].as_str().context("missing dispatch")?,
         None,
+        false,
         super::assignment::try_input_lock,
     )?
     else {
@@ -773,6 +842,10 @@ impl Reconcile {
         let state = state_dir()?;
         let (mut unit, _scope) =
             Assignment::lock_unowned(&state, &self.dispatch, "herdr-reconcile")?;
+        ensure!(
+            super::assignment::unresolved_handoff(&unit.row).is_none(),
+            "Herdr handoff still pending"
+        );
         ensure!(
             unit.verified_archive(&unit.handle()?)?.is_none(),
             "Herdr dispatch closed"

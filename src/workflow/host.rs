@@ -432,7 +432,8 @@ impl Options<'_> {
             "opencode" => {
                 #[cfg(target_os = "linux")]
                 ensure!(
-                    !matches!(start, WorkerStart::Handoff)
+                    self.backend != "tmux"
+                        || !matches!(start, WorkerStart::Handoff)
                         || !opencode::effective_setting(&launch.env, "WFC_OPENCODE_ISOLATED_STORE")
                             .is_some_and(|value| value == Path::new("1")),
                     "handoff does not support a private OpenCode opening"
