@@ -534,8 +534,8 @@ fn appended_history<'a, 'row>(
     if base.is_empty() && truncated {
         return None;
     }
-    if let Some(added) = history.strip_prefix(base) {
-        return Some(added);
+    if history.starts_with(base) {
+        return Some(&history[base.len()..]);
     }
     if !truncated {
         return None;
