@@ -1,0 +1,270 @@
+name: Linux Jammy legacy managed Herdr combination
+on:
+  push:
+    branches: [rust-router/30-legacy-managed-herdr-combination-ci]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  legacy-managed-herdr:
+    name: '#30 stopped Herdr history and shared callback regressions'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      PRODUCT_SHA: a20990d103c5032bc6f2ad4afa45f590c4cac222
+      PRODUCT_TREE: 4a1692818376717f055e0f5013afba1eb0dd5637
+      PRODUCT_PARENTS: 15dd5a9dcd241b050b2e090b1e4b3e4973a70e99 313f4fc22251f8d05861c560275e843aa044c384
+      NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+      NATIVE_INPUT_TREE: 7480986f4468ffafc76b95012562945ee586b52a
+      LEGACY_TREE: e0e4eb210aeccf3699288686e4741fa901804917
+      REAPER_SHA: fe7af38cb24796c82e52108adbc6b5ade2c1d18c
+      REAPER_TREE: dd18a02b2e9bbb78e1c8aa33a5e859d8a727a22b
+      TARGET: x86_64-unknown-linux-gnu
+      CARGO_BUILD_JOBS: '2'
+      EVIDENCE: ${{ github.workspace }}/linux-legacy-managed-herdr-evidence
+    steps:
+      - name: Record workflow and run identity
+        run: |
+          mkdir -p "$EVIDENCE"
+          printf '%s\n' "workflow=$GITHUB_WORKFLOW_SHA" "head=$GITHUB_SHA" \
+            "ref=$GITHUB_REF" "run=$GITHUB_RUN_ID" "attempt=$GITHUB_RUN_ATTEMPT" \
+            "expectedProduct=$PRODUCT_SHA" "expectedTree=$PRODUCT_TREE" \
+            "expectedParents=$PRODUCT_PARENTS" | tee "$EVIDENCE/run.log"
+      - name: Check out the fixed workflow and test runner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: ci
+          persist-credentials: false
+      - name: Check out the fixed combination candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          persist-credentials: false
+      - name: Check out the approved zlib archive
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.NATIVE_INPUT_SHA }}
+          path: native-input
+          sparse-checkout: vendor/zlib-1.3.1.tar.gz
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Check out the approved child process reaper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.REAPER_SHA }}
+          path: reaper
+          sparse-checkout: tools/ci/tmux-r9/reap.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Check the approved sources and both input manifests
+        working-directory: product
+        run: |
+          {
+            test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
+            test "$GITHUB_REF" = refs/heads/rust-router/30-legacy-managed-herdr-combination-ci
+            test "$(git -C ../ci rev-parse HEAD)" = "$GITHUB_WORKFLOW_SHA"
+            git -C ../ci show -s --format='ci=%H tree=%T parents=%P'
+            test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+            test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+            parents=$(git cat-file -p HEAD | sed -n '/^$/q; s/^parent //p' | paste -sd' ' -)
+            test "$parents" = "$PRODUCT_PARENTS"
+            printf 'product=%s tree=%s parents=%s\n' "$PRODUCT_SHA" "$PRODUCT_TREE" "$parents"
+            test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
+            test "$(git -C ../native-input rev-parse 'HEAD^{tree}')" = "$NATIVE_INPUT_TREE"
+            git -C ../native-input show -s --format='nativeInput=%H tree=%T'
+            test "$(git -C ../reaper rev-parse HEAD)" = "$REAPER_SHA"
+            test "$(git -C ../reaper rev-parse 'HEAD^{tree}')" = "$REAPER_TREE"
+            git -C ../reaper show -s --format='reaper=%H tree=%T'
+            legacy_tree=$(git rev-parse HEAD:crates/legacy-state)
+            test "$legacy_tree" = "$LEGACY_TREE"
+            printf 'legacyComponentTree=%s\n' "$legacy_tree"
+            for checkout in . ../ci ../native-input ../reaper; do
+              test -z "$(git -C "$checkout" status --porcelain)"
+            done
+            approved=../ci/tools/ci/legacy-managed-herdr/APPROVED.sha256
+            sha256sum "$approved" vendor/INPUTS.sha256 ../ci/.github/workflows/linux-legacy-managed-herdr.yml
+            sha256sum --check --strict "$approved"
+            sha256sum --check --strict vendor/INPUTS.sha256
+            wc -l "$approved" vendor/INPUTS.sha256
+          } 2>&1 | tee "$EVIDENCE/sources.log"
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - name: Install the approved Zig archive
+        run: |
+          {
+            package=zig-x86_64-linux-0.16.0
+            archive="$RUNNER_TEMP/$package.tar.xz"
+            digest=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+            verified=0
+            for base in https://ziglang.org/download/0.16.0 https://zig.bcr.ist; do
+              url="$base/$package.tar.xz"
+              printf 'Downloading %s\n' "$url"
+              if curl --fail --silent --show-error --location --retry 2 --retry-max-time 180 \
+                --connect-timeout 15 --max-time 120 --output "$archive" "$url" &&
+                printf '%s  %s\n' "$digest" "$archive" | sha256sum --check --strict; then
+                verified=1
+                break
+              fi
+            done
+            test "$verified" = 1
+            tar -xJf "$archive" -C "$RUNNER_TEMP"
+            zig_dir="$RUNNER_TEMP/$package"
+            version=$("$zig_dir/zig" version)
+            printf 'Zig %s\n' "$version"
+            test "$version" = 0.16.0
+            printf '%s\n' "$zig_dir" >> "$GITHUB_PATH"
+          } 2>&1 | tee "$EVIDENCE/zig-install.log"
+      - name: Prepare the fixed build toolchain
+        run: |
+          {
+            rustup toolchain install 1.96.1 --profile minimal
+            test "$(id -u)" -ne 0
+            id -u
+            uname -srm
+            . /etc/os-release
+            printf '%s %s\n' "$ID" "$VERSION_ID"
+            test "$ID:$VERSION_ID" = ubuntu:22.04
+            test "$(uname -m)" = x86_64
+            rustc +1.96.1 -vV
+            cargo +1.96.1 --version
+            zig version
+            python3 --version
+            python3 -c 'import sqlite3; print("Fixture SQLite", sqlite3.sqlite_version)'
+            cc --version
+          } 2>&1 | tee "$EVIDENCE/toolchain.log"
+      - name: Materialize verified Ghostty and zlib sources
+        working-directory: product
+        run: |
+          python3 tools/prepare.py --zlib-archive ../native-input/vendor/zlib-1.3.1.tar.gz \
+            2>&1 | tee "$EVIDENCE/native-prepare.log"
+      - name: Prime the pinned Wuffs package
+        working-directory: product/vendor/libghostty-vt
+        run: |
+          {
+            url=https://deps.files.ghostty.org/wuffs-7411f488fe2e2c205c3d3b3d28638b7356522930.tar.gz
+            archive="$RUNNER_TEMP/wuffs.tar.gz"
+            printf 'Wuffs source %s\n' "$url"
+            curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+              --retry-max-time 120 --connect-timeout 15 --max-time 60 "$url" -o "$archive"
+            printf '%s  %s\n' 17877d346f7988651d6c62e45b2e3b05c86809a6442c5e34612374b2a9719a1c "$archive" |
+              sha256sum --check --strict
+            package=$(zig fetch "$archive")
+            printf 'Wuffs Zig package %s\n' "$package"
+            test "$package" = 'N-V-__8AAP5JWgCGP_AD0teWpa4krRvE9VPZzvviGdbmN4jI'
+          } 2>&1 | tee "$EVIDENCE/wuffs.log"
+      - name: Build and identify the fixed public CLI
+        id: build
+        working-directory: product
+        env:
+          WFC_BUILD_ID: ${{ env.PRODUCT_SHA }}
+        run: |
+          {
+            cargo +1.96.1 build --release --locked --target "$TARGET" --bin wfc
+            binary="target/$TARGET/release/wfc"
+            version=$("$binary" --version)
+            printf '%s\n' "$version"
+            [[ "$version" == *"(Rust, $TARGET, release, build $PRODUCT_SHA)" ]]
+            sha256sum "$binary" | tee "$EVIDENCE/elf.sha256"
+            readelf -hW "$binary"
+          } 2>&1 | tee "$EVIDENCE/build.log"
+      - name: Record tmux used by the private reply fixture
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          {
+            if ! PATH=/bin:/usr/bin command -v tmux >/dev/null; then
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends tmux
+            fi
+            PATH=/bin:/usr/bin tmux -V
+          } 2>&1 | tee "$EVIDENCE/tmux.log"
+      - name: Verify both histories, stopped import, locks and shared paths on the same ELF
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: |
+          {
+            sha256sum --check --strict "$EVIDENCE/elf.sha256"
+            scratch=$(mktemp -d /tmp/wfc-legacy-herdr-XXXXXXXX)
+            cleanup() {
+              status=$?
+              trap - EXIT
+              rm -rf -- "$scratch" || status=1
+              test ! -e "$scratch" || status=1
+              printf 'suites exit=%s scratchRemoved=%s\n' "$status" "$([[ ! -e "$scratch" ]] && echo yes || echo no)"
+              exit "$status"
+            }
+            trap cleanup EXIT
+            mkdir -p "$scratch/home" "$scratch/tmp"
+            binary="target/$TARGET/release/wfc"
+            failed=0
+            run_suite() {
+              local label="$1" status=0
+              shift
+              env -i PATH="$PATH" HOME="$scratch/home" TMPDIR="$scratch/tmp" LC_ALL=C.UTF-8 \
+                python3 -Bu ../reaper/tools/ci/tmux-r9/reap.py timeout --kill-after=10s 4m \
+                python3 -Bu "$@" || status=$?
+              printf 'suite=%s exit=%s\n' "$label" "$status"
+              if [[ "$status" != 0 ]]; then failed=1; fi
+            }
+            for suite in tests/legacy_history.py tests/legacy_offline_import.py tests/legacy_write_lock_fence.py; do
+              run_suite "$suite" "$suite" "$binary"
+            done
+            run_suite startup-notices tests/startup_failure.py "$binary" -v \
+              StartupFailure.test_private_opencode_startup_failure_and_retry \
+              StartupFailure.test_managed_startup_recovery_rechecks_owner
+            run_suite host-callbacks tests/public_host_resume.py "$binary" -v \
+              PublicHostResume.test_claude_adopted_uuid_resumes_next_task_once_and_fences_old_callback \
+              PublicHostResume.test_opencode_adopts_original_session_and_commits_one_next_task
+            run_suite tmux-reply-reclaim tools/check_tmux.py "$binary" -v \
+              Backend.test_public_reply_once_and_original_done \
+              Backend.test_public_reply_and_reclaim_preserve_controller_receipts
+            sha256sum --check --strict "$EVIDENCE/elf.sha256"
+            test "$failed" = 0
+          } 2>&1 | tee "$EVIDENCE/legacy-managed-herdr.log"
+      - name: Require each history assertion group for both synthetic schemas
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          {
+            log="$EVIDENCE/legacy-managed-herdr.log"
+            test -f "$log"
+            missing=0
+            for version in 39 40; do
+              for group in identity-rejections consistency-head consistency-dirty consistency-duplicate-numeric-id \
+                owner-confirmations receipt-confirmations managed-herdr-binding reclaim-history publish-and-backup \
+                resolution-history archive-direction controller-ack-and-high-water combined-numbering source-integrity; do
+                for outcome in started passed; do
+                  marker="history schema=$version group=$group outcome=$outcome"
+                  if [[ "$(grep -Fxc -- "$marker" "$log" || true)" == 1 ]]; then
+                    printf 'confirmed %s\n' "$marker"
+                  else
+                    printf 'missing or repeated %s\n' "$marker"
+                    missing=1
+                  fi
+                done
+              done
+            done
+            test "$missing" = 0
+          } 2>&1 | tee "$EVIDENCE/history-groups.log"
+      - name: Checksum the available evidence
+        if: ${{ always() }}
+        run: |
+          cd "$EVIDENCE"
+          shopt -s nullglob
+          files=( *.log *.sha256 )
+          sha256sum -- "${files[@]}" > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+      - name: Upload Linux Jammy managed Herdr combination evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-legacy-managed-herdr-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 14
