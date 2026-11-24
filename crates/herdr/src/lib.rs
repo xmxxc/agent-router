@@ -304,11 +304,43 @@ impl Handle {
         Ok(())
     }
 
-    fn observe_writers(&self, rpc: &Session) -> Result<process::Writers> {
-        self.guarded(rpc, false)?;
+    fn process_info(&self, rpc: &Session, require_writable: bool) -> Result<Value> {
+        self.guarded(rpc, require_writable)?;
         let pane = self.pane.as_deref().ok_or(INVALID)?;
-        let data = rpc.call("pane.process_info", json!({"pane_id":pane}))?;
-        process::writers(&data["process_info"], pane)
+        Ok(rpc.call("pane.process_info", json!({"pane_id":pane}))?["process_info"].take())
+    }
+
+    fn observe_writers(&self, rpc: &Session) -> Result<process::Writers> {
+        process::writers(
+            &self.process_info(rpc, false)?,
+            self.pane.as_deref().ok_or(INVALID)?,
+        )
+    }
+
+    fn require_foreground_writer(
+        &mut self,
+        rpc: &Session,
+        expected: &Process,
+        save: &mut impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<()> {
+        let info = self.process_info(rpc, true)?;
+        let writers = process::writers(&info, self.pane.as_deref().ok_or(INVALID)?)?;
+        self.remember_writers(&writers.known, save)?;
+        writers.completeness?;
+        if !writers.known.contains(expected)
+            || !info["foreground_processes"]
+                .as_array()
+                .is_some_and(|processes| {
+                    processes
+                        .iter()
+                        .any(|process| process["pid"] == expected.pid)
+                })
+        {
+            return Err(Failure::unsent(
+                "original Herdr worker is not in the pane foreground",
+            ));
+        }
+        Ok(())
     }
 
     fn checkpoint_writers(
@@ -488,19 +520,56 @@ impl Handle {
         host: &str,
         mut save: impl FnMut(&Self) -> std::io::Result<()>,
     ) -> Result<()> {
+        let before = self.send_to_empty_box(text, host, None, &mut save, || Ok(()))?;
+        screen::confirm_reply(self, text, &before, host, &mut save).map_err(Failure::after_effect)
+    }
+
+    /// Submit one text/Enter request to a confirmed empty composer. After
+    /// submission, observe only, even if the entire draft is visible.
+    pub fn continue_codex(
+        &mut self,
+        text: &str,
+        writer: &Process,
+        mut save: impl FnMut(&Self) -> std::io::Result<()>,
+        before_write: impl FnOnce() -> std::io::Result<()>,
+    ) -> Result<()> {
+        let before =
+            self.send_to_empty_box(text, "codex", Some(writer), &mut save, before_write)?;
+        screen::confirm_continue(self, text, &before).map_err(Failure::after_effect)
+    }
+
+    fn send_to_empty_box(
+        &mut self,
+        text: &str,
+        host: &str,
+        writer: Option<&Process>,
+        save: &mut impl FnMut(&Self) -> std::io::Result<()>,
+        before_write: impl FnOnce() -> std::io::Result<()>,
+    ) -> Result<Screen> {
         let before = self.read().map_err(Failure::before_effect)?;
         if screen::read_only(&before.text) {
             return Err(Failure::refused("worker input is paused"));
         }
         screen::require_empty_reply_box(self, &before, host).map_err(Failure::before_effect)?;
+        if writer.is_some() && screen::matching_user_entries(&before, text) != 0 {
+            return Err(Failure::unsent("new task already appeared before input"));
+        }
         // Preparation performs only observation and local checkpoints. An
         // incomplete response to the subsequent input call may be post-effect.
-        let rpc = self
-            .prepare_send(true, &mut save)
-            .map_err(Failure::before_effect)?;
+        let rpc = (|| {
+            if let Some(writer) = writer {
+                let rpc = self.session()?;
+                self.require_foreground_writer(&rpc, writer, save)?;
+                Ok(rpc)
+            } else {
+                self.prepare_send(true, save)
+            }
+        })()
+        .map_err(Failure::before_effect)?;
+        before_write().map_err(|_| Failure::unsent("Herdr input precondition changed"))?;
         let params = json!({"pane_id":self.pane,"text":text,"keys":["Enter"]});
         rpc.send_reply(params)?;
-        screen::confirm_reply(self, text, &before, host, &mut save).map_err(Failure::after_effect)
+        Ok(before)
     }
 
     /// Close only the bound pane. Persist all observed writers before closing,

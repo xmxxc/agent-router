@@ -1,5 +1,7 @@
 //! Public input to the existing worker, with round changes committed before typing.
-use super::{assignment, backend, controller, messages, record_scope, state_dir, view, write_json};
+use super::{
+    assignment, backend, controller, herdr, messages, record_scope, state_dir, view, write_json,
+};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
@@ -93,9 +95,10 @@ impl<'a> Request<'a> {
         let path = dir.join(format!("{}.json", self.dispatch));
         let original = assignment::public_record(&dir, self.dispatch)?
             .with_context(|| format!("unknown dispatch {}", self.dispatch))?;
+        let herdr_continue = operation == "continue" && original["backend"] == "herdr";
         ensure!(
-            original["backend"] == "tmux" && original["host"] == "codex",
-            "{operation} requires a supported live Codex/tmux assignment"
+            (original["backend"] == "tmux" || herdr_continue) && original["host"] == "codex",
+            "{operation} requires a supported live Codex assignment"
         );
         let scope = record_scope(&original).context("invalid dispatch scope")?;
         let token = controller::token(self.token);
@@ -119,9 +122,15 @@ impl<'a> Request<'a> {
         );
         controller::Owners::read(&state)?.require(scope, token.as_deref(), operation)?;
         ensure!(
-            ["host", "backend", "executionId", "tmuxSocket", "create"]
+            ["host", "backend", "create"]
                 .iter()
-                .all(|key| current[*key] == original[*key]),
+                .all(|key| current[*key] == original[*key])
+                && if herdr_continue {
+                    herdr::same_binding(&original, &current)
+                } else {
+                    current["executionId"] == original["executionId"]
+                        && current["tmuxSocket"] == original["tmuxSocket"]
+                },
             "execution changed while waiting for input"
         );
         let same_round =
@@ -184,8 +193,11 @@ impl<'a> Request<'a> {
         ensure!(
             current["controllerOwner"].is_null()
                 && assignment::identified(&current)
-                && current["executionId"].is_string()
-                && current["tmuxSocket"].as_str().is_some_and(|socket| Path::new(socket).is_absolute())
+                && (herdr_continue
+                    || (current["executionId"].is_string()
+                        && current["tmuxSocket"]
+                            .as_str()
+                            .is_some_and(|socket| Path::new(socket).is_absolute())))
                 && current["create"]["result"] == "accepted"
                 && current["create"]["receipt"].is_string(),
             "input requires a confirmed native launch; verify the original execution before retrying"
@@ -194,44 +206,57 @@ impl<'a> Request<'a> {
             backend::archive(&state, &current)?.is_none(),
             "execution resources are closing or closed; use resume for an exited worker"
         );
-        let (worker, observed) = backend::observe(&state, &mut current.clone())?;
-        ensure!(
-            observed["result"] == "accepted",
-            "could not verify the live execution: {}",
-            observed["diagnostic"]
-        );
-        ensure!(
-            observed["alive"] == true,
-            "execution backend reports the worker is not running; use resume instead"
-        );
-        ensure!(
-            observed["owned"] == true
-                && observed["workerBound"] == true
-                && observed["executionId"] == current["executionId"]
-                && observed["receipt"] == current["create"]["receipt"]
-                && worker["state"] == "running",
-            "execution is not a verified writable worker"
-        );
+        let mut herdr_target = herdr_continue
+            .then(|| herdr::ContinueTarget::verify(&state, &current))
+            .transpose()?;
         let legacy_callback = operation == "continue"
+            && !herdr_continue
             && current[controller::CALLBACK_HASH].is_null()
             && current[controller::CALLBACK_REF_HASH].is_null();
-        if legacy_callback {
-            backend::verify_legacy_worker_callback(&state, self.dispatch, &observed)?;
-        }
+        let worker = if herdr_target.is_some() {
+            json!({"state":"running"})
+        } else {
+            let (worker, observed) = backend::observe(&state, &mut current.clone())?;
+            ensure!(
+                observed["result"] == "accepted",
+                "could not verify the live execution: {}",
+                observed["diagnostic"]
+            );
+            ensure!(
+                observed["alive"] == true,
+                "execution backend reports the worker is not running; use resume instead"
+            );
+            ensure!(
+                observed["owned"] == true
+                    && observed["workerBound"] == true
+                    && observed["executionId"] == current["executionId"]
+                    && observed["receipt"] == current["create"]["receipt"]
+                    && worker["state"] == "running",
+                "execution is not a verified writable worker"
+            );
+            if legacy_callback {
+                backend::verify_legacy_worker_callback(&state, self.dispatch, &observed)?;
+            }
+            worker
+        };
 
         let (mut next, index, text, generation) = {
             let inbox = messages::Inbox::open(&state)?;
             let generation = authorized_generation(&state, scope, token.as_deref(), operation)?;
-            ensure!(
-                !inbox.unresolved_reply(&current, None)?,
-                "reply is pending or uncertain on this execution; verify it before input"
-            );
             let history =
                 view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
+            ensure!(
+                !inbox.unresolved_reply(&current, None)?
+                    && (!herdr_continue || !herdr::unsettled_continue_reply(&current, &history)),
+                "reply is pending or uncertain on this execution; verify it before input"
+            );
             let mut projected = current.clone();
             projected["worker"] = worker.clone();
             view::project(&mut projected, &history, Some(true), false)?;
             let mut next = current.clone();
+            if let Some(target) = &herdr_target {
+                target.stage(&mut next);
+            }
             let mut event = json!({"id":format!("i-{}", Uuid::new_v4().simple()),
                 "operation":operation, "result":"pending", "ownerGeneration":generation,
                 "fromRound":current["round"], "fromAttempt":current["attempt"]});
@@ -243,9 +268,11 @@ impl<'a> Request<'a> {
                     );
                     let (task, report) = next_paths(&current, &projected, &history, task, report)?;
                     ensure!(
-                        legacy_callback || current[controller::CALLBACK_HASH]
-                            .as_str()
-                            .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())),
+                        legacy_callback
+                            || current[controller::CALLBACK_HASH]
+                                .as_str()
+                                .is_some_and(|hash| hash.len() == 64
+                                    && hash.bytes().all(|b| b.is_ascii_hexdigit())),
                         "original worker has no independent callback credential; verify its launch before continuing"
                     );
                     let round = current["round"]
@@ -312,21 +339,23 @@ impl<'a> Request<'a> {
         };
 
         let mut first_write_error = None;
-        let answer = backend::submit_checked(&state, &current, &text, true, &mut |boundary| {
-            use crate::tmux::InputBoundary::{Enter, PrepareEnter, PrepareText, Text};
+        use crate::tmux::InputBoundary::{Enter, PrepareEnter, PrepareText, Text};
+        let mut check_boundary = |boundary| {
             let check = || -> Result<()> {
                 if matches!(boundary, PrepareText | PrepareEnter) {
                     let inbox = messages::Inbox::open(&state)?;
-                    ensure!(
-                        !inbox.unresolved_reply(&current, None)?,
-                        "reply is pending or uncertain on this execution; verify it before input"
-                    );
                     ensure!(
                         super::read_record(&path)? == next,
                         "assignment changed before input"
                     );
                     let history =
                         view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
+                    ensure!(
+                        !inbox.unresolved_reply(&current, None)?
+                            && (!herdr_continue
+                                || !herdr::unsettled_continue_reply(&current, &history)),
+                        "reply is pending or uncertain on this execution; verify it before input"
+                    );
                     let mut projected = current.clone();
                     projected["worker"] = worker.clone();
                     view::project(&mut projected, &history, Some(true), false)?;
@@ -361,8 +390,19 @@ impl<'a> Request<'a> {
                 };
                 json!({"result":result, "diagnostic":diagnostic})
             })
-        })
-        .unwrap_or_else(|error| json!({"result":"uncertain","diagnostic":format!("{error:#}")}));
+        };
+        let answer = if let Some(target) = &mut herdr_target {
+            target.submit(&text, || {
+                check_boundary(PrepareText)
+                    .and_then(|()| check_boundary(Text))
+                    .map_err(|error| std::io::Error::other(error.to_string()))
+            })
+        } else {
+            backend::submit_checked(&state, &current, &text, true, &mut check_boundary)
+                .unwrap_or_else(
+                    |error| json!({"result":"uncertain","diagnostic":format!("{error:#}")}),
+                )
+        };
         let diagnostic = answer["diagnostic"]
             .as_str()
             .unwrap_or("backend did not confirm input");
@@ -396,6 +436,9 @@ impl<'a> Request<'a> {
             } else {
                 next = current;
             }
+        }
+        if let Some(target) = &herdr_target {
+            target.save_writer_evidence(&mut next);
         }
         event["result"] = json!(outcome);
         if outcome != "accepted" && event["diagnostic"].is_null() {
@@ -546,7 +589,12 @@ fn lock_input(
         // Same scope -> execution -> inbox order as close and #12 reply.
         if let Some(scope_lock) = controller::try_scope_lock(state, scope)? {
             controller::Owners::read(state)?.require(scope, token, operation)?;
-            if let Some(execution) = assignment::try_reply_lock(state, row)? {
+            let execution = if row["backend"] == "herdr" {
+                herdr::try_continue_lock(state, row)?
+            } else {
+                assignment::try_reply_lock(state, row)?
+            };
+            if let Some(execution) = execution {
                 return Ok((scope_lock, execution));
             }
         }
