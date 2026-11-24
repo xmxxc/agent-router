@@ -188,8 +188,9 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
                 _ if unconfirmed_resume || super::assignment::unresolved_handoff(row).is_some() => {
                     "unknown"
                 }
-                Some("exited" | "not_started") if startup_failure.is_some() => "failed",
+                // An exit notice cannot settle an unconfirmed close.
                 _ if unresolved_worker => "unknown",
+                Some("exited" | "not_started") if startup_failure.is_some() => "failed",
                 _ if super::assignment::input_unresolved(row) && alive == Some(true) => "unknown",
                 _ if unconfirmed_create && row["worker"]["state"] != "cancelled" => {
                     round["result"] = row["create"].clone();

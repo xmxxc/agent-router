@@ -70,7 +70,7 @@ pub(super) fn unresolved_resume(row: &Value) -> Option<&Value> {
         .filter(|event| matches!(event["result"].as_str(), Some("pending" | "uncertain")))
 }
 
-fn handoff_preflight(event: &Value) -> bool {
+pub(super) fn handoff_preflight(event: &Value) -> bool {
     // A diagnostic from the read-only probe precedes the durable handoff intent.
     event["operation"] == "handoff"
         && event["phase"] == "preflight"

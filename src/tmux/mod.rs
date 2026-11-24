@@ -44,6 +44,7 @@ pub struct Request {
 #[serde(tag = "op", rename_all = "lowercase")]
 enum Operation {
     Create(launch::Launch),
+    HandoffTarget,
     Inspect,
     Read,
     Submit {
@@ -582,6 +583,18 @@ impl Tmux<'_> {
             }
         }
         match op {
+            Operation::HandoffTarget => {
+                let origin = self
+                    .launch_server()
+                    .ok_or_else(|| failure("refused", "cannot verify the target tmux server"))?;
+                if !matches!(self.claim()?, None | Some(binding::Claim::Released(_)))
+                    || self.target()?.is_some()
+                {
+                    return Err(failure("refused", "target tmux execution slot is occupied"));
+                }
+                self.pin_submission(&origin)?;
+                Ok(json!({"result":"accepted","service":origin}))
+            }
             Operation::Inspect => self.inspect(),
             Operation::Read => {
                 let t = self.owned()?;
@@ -1039,6 +1052,13 @@ pub(crate) fn execute_checked(
         request.legacy_recovery.is_none()
             || (matches!(request.op, Operation::Inspect) && !request.fresh_dispatch),
         "legacyRecovery requires ordinary inspect"
+    );
+    ensure!(
+        !matches!(request.op, Operation::HandoffTarget)
+            || (request.execution_id.is_none()
+                && request.legacy_execution_id.is_none()
+                && request.legacy_worker_pane.is_none()),
+        "handoff target probe cannot select an execution"
     );
     let native_id;
     let mut backend = Tmux {
