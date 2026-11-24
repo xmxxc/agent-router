@@ -36,6 +36,39 @@ fn launch_receipt(state: &Path, create: &Value) -> Result<Value> {
     Ok(launch)
 }
 
+fn receipt_writer(evidence: &Value) -> Result<Process> {
+    let writer: Process = serde_json::from_value(evidence["writerProcess"].clone())
+        .context("unconfirmed launched worker identity")?;
+    ensure!(evidence["pid"] == writer.pid, "launch receipt PID mismatch");
+    Ok(writer)
+}
+
+enum LaunchConfirmation {
+    Pending,
+    Started(Process),
+    Terminal(Value),
+}
+
+fn confirm_launch(
+    first: Value,
+    recheck: impl FnOnce() -> Result<Value>,
+) -> Result<LaunchConfirmation> {
+    // The supervisor can replace the started receipt before we confirm it.
+    let evidence = if first["category"] == "started" {
+        recheck()?
+    } else {
+        first
+    };
+    Ok(match evidence["category"].as_str() {
+        Some("unknown") => LaunchConfirmation::Pending,
+        Some("started") => LaunchConfirmation::Started(receipt_writer(&evidence)?),
+        Some("process_exited" | "executable_missing" | "permission_denied" | "spawn_failed") => {
+            LaunchConfirmation::Terminal(evidence)
+        }
+        _ => anyhow::bail!("worker startup is unconfirmed"),
+    })
+}
+
 fn launch_binding(handle: &Value) -> Value {
     json!({"endpoint":handle["endpoint"],"service":handle["service"],
         "workspace":handle["workspace"],"pane":handle["pane"],"terminal":handle["terminal"],
@@ -277,12 +310,7 @@ impl<'a> Assignment<'a> {
         }
         let evidence = launch_receipt(self.state, &self.row["create"])?;
         match evidence["category"].as_str() {
-            Some("started") => {
-                let writer: Process = serde_json::from_value(evidence["writerProcess"].clone())
-                    .context("unconfirmed launched worker identity")?;
-                ensure!(evidence["pid"] == writer.pid, "launch receipt PID mismatch");
-                Ok(Some(writer))
-            }
+            Some("started") => receipt_writer(&evidence).map(Some),
             Some(
                 "process_exited" | "executable_missing" | "permission_denied" | "spawn_failed",
             ) => Ok(None),
@@ -290,15 +318,25 @@ impl<'a> Assignment<'a> {
         }
     }
 
+    fn remember_launched_writer(
+        &mut self,
+        h: &mut Handle,
+        writer: Process,
+        read_only: bool,
+    ) -> Result<()> {
+        if !h.writers.is_empty() && !h.writers.contains(&writer) {
+            h.writers.push(writer);
+            if !read_only {
+                self.checkpoint(h)?;
+            }
+        }
+        Ok(())
+    }
+
     fn tracked_handle(&mut self, read_only: bool) -> Result<Handle> {
         let mut h = self.handle()?;
         if let Some(writer) = self.launched_writer()? {
-            if !h.writers.is_empty() && !h.writers.contains(&writer) {
-                h.writers.push(writer);
-                if !read_only {
-                    self.checkpoint(&h)?;
-                }
-            }
+            self.remember_launched_writer(&mut h, writer, read_only)?;
         }
         Ok(h)
     }
@@ -336,6 +374,7 @@ impl Assignment<'_> {
     fn input(
         &mut self,
         action: InputAction<'_>,
+        confirmed_handle: Option<Handle>,
         begin: impl FnOnce() -> Result<()>,
     ) -> Result<Value> {
         let reply_id = match &action {
@@ -352,7 +391,10 @@ impl Assignment<'_> {
             self.row["pendingInput"] == false || released,
             "input still pending"
         );
-        let mut h = self.tracked_handle(false)?;
+        let mut h = match confirmed_handle {
+            Some(handle) => handle,
+            None => self.tracked_handle(false)?,
+        };
         ensure!(h.stopped_evidence.is_none(), "Herdr writer stopped");
         let mut next = self.row.clone();
         next["pendingInput"] = json!(true);
@@ -399,8 +441,8 @@ impl Assignment<'_> {
 
 pub(super) fn create(state: &Path, row: &Value, launch: host::Launch) -> Result<Value> {
     let id = row["dispatch"].as_str().context("missing dispatch")?;
-    let unit = Assignment::lock(state, id, Some(row.clone()))?;
-    let (unit, answer) = launch_assignment(unit, launch, None)?;
+    let mut unit = Assignment::lock(state, id, Some(row.clone()))?;
+    let answer = launch_into(&mut unit, launch, None)?;
     ensure!(
         answer["result"] == "accepted",
         "backend create {} for {id}: {}",
@@ -431,7 +473,7 @@ pub(super) fn create_for_handoff(
 ) -> Result<Value> {
     let id = row["dispatch"].as_str().context("missing dispatch")?;
     super::handoff::require_herdr_launch(state, row, audit, service)?;
-    let unit = Assignment::lock_with(state, id, None, true, |file| {
+    let mut unit = Assignment::lock_with(state, id, None, true, |file| {
         file.lock()?;
         Ok(true)
     })?
@@ -440,7 +482,7 @@ pub(super) fn create_for_handoff(
         unit.row == *row,
         "Herdr handoff assignment changed before launch"
     );
-    let (mut unit, answer) = launch_assignment(unit, launch, Some(service))?;
+    let answer = launch_into(&mut unit, launch, Some(service))?;
     let _inbox = super::messages::lock_for_publish(state)?;
     let mut next = unit.row.clone();
     super::handoff::settle_launch(&mut next, audit - 1, answer);
@@ -448,11 +490,12 @@ pub(super) fn create_for_handoff(
     Ok(unit.row)
 }
 
-fn launch_assignment<'a>(
-    mut unit: Assignment<'a>,
+fn launch_into(
+    unit: &mut Assignment<'_>,
     launch: host::Launch,
     service: Option<&Process>,
-) -> Result<(Assignment<'a>, Value)> {
+) -> Result<Value> {
+    let initial = !unit.published;
     let state = unit.state;
     let row = &unit.row;
     let id = row["dispatch"].as_str().context("missing dispatch")?;
@@ -493,39 +536,83 @@ fn launch_assignment<'a>(
         prepared["create"][key] = prepared[key].clone();
     }
     prepared["pendingInput"] = json!(false);
-    if unit.published {
-        unit.save(prepared)?;
-    } else {
+    if initial {
         prepared["audit"] = json!([]);
         unit.row = prepared;
+    } else {
+        unit.save(prepared)?;
     }
     // The provider checkpoints the nonce and service before its first external effect.
     let created = Handle::create_with_service(&endpoint, service, &attempt, &launch, |h| {
         unit.checkpoint(h)
     });
-    let mut answer = match created {
+    let (mut answer, terminal) = match created {
         Ok(_) => {
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
-                let evidence = host_launch::read_receipt(&files.receipt).unwrap_or(Value::Null);
-                if evidence["category"] == "started" {
-                    break match unit.tracked_handle(false) {
-                        Ok(_) => match &prefill {
-                            Some(text) => {
-                                unit.input(InputAction::ActivatePrefill(text), || Ok(()))?
+                let first = host_launch::read_receipt(&files.receipt).unwrap_or(Value::Null);
+                let recheck =
+                    confirm_launch(first.clone(), || launch_receipt(state, &unit.row["create"]));
+                let (confirmation, activation) = match recheck {
+                    Ok(LaunchConfirmation::Started(writer)) => {
+                        let handle = match unit.handle().and_then(|mut handle| {
+                            unit.remember_launched_writer(&mut handle, writer, false)?;
+                            Ok(handle)
+                        }) {
+                            Ok(handle) => handle,
+                            Err(e) => {
+                                break (
+                                    json!({"result":"uncertain","diagnostic":e.to_string()}),
+                                    None,
+                                );
                             }
-                            None => json!({"result":"accepted"}),
-                        },
-                        Err(e) => json!({"result":"uncertain","diagnostic":e.to_string()}),
-                    };
+                        };
+                        let Some(text) = &prefill else {
+                            break (json!({"result":"accepted"}), None);
+                        };
+                        let activation =
+                            unit.input(InputAction::ActivatePrefill(text), Some(handle), || Ok(()));
+                        // Startup activation can outlive the confirmed child.
+                        // Keep its terminal evidence even if activation returned an error.
+                        (
+                            confirm_launch(first, || launch_receipt(state, &unit.row["create"])),
+                            Some(activation),
+                        )
+                    }
+                    confirmation => (confirmation, None),
+                };
+                match confirmation {
+                    Ok(LaunchConfirmation::Started(_)) => {
+                        break (
+                            activation.context("missing Herdr activation result")??,
+                            None,
+                        );
+                    }
+                    Ok(LaunchConfirmation::Terminal(evidence)) => {
+                        let answer = json!({"result":"uncertain","category":evidence["category"],"diagnostic":"worker start not confirmed"});
+                        break (answer, Some(evidence));
+                    }
+                    Ok(LaunchConfirmation::Pending)
+                        if activation.is_none() && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Ok(LaunchConfirmation::Pending) => {
+                        break (
+                            json!({"result":"uncertain","category":"unknown","diagnostic":"worker start not confirmed"}),
+                            None,
+                        );
+                    }
+                    Err(e) => {
+                        break (
+                            json!({"result":"uncertain","diagnostic":e.to_string()}),
+                            None,
+                        );
+                    }
                 }
-                if evidence["category"] != "unknown" || Instant::now() >= deadline {
-                    break json!({"result":"uncertain","category":evidence["category"],"diagnostic":"worker start not confirmed"});
-                }
-                std::thread::sleep(Duration::from_millis(20));
             }
         }
-        Err(e) => json!(e),
+        Err(e) => (json!(e), None),
     };
     answer["receipt"] = json!(files.receipt);
     for key in ["dispatch", "round", "attempt"] {
@@ -535,20 +622,74 @@ fn launch_assignment<'a>(
         answer["herdrBinding"] = launch_binding(&unit.row["backendHandle"]);
     }
     if !unit.row["backendHandle"].is_null() {
-        let mut next = unit.row.clone();
-        next["create"] = answer.clone();
-        unit.save(next)?;
+        // Both replacement paths publish the result with their own audit.
+        if initial {
+            let mut next = unit.row.clone();
+            next["create"] = answer.clone();
+            unit.save(next)?;
+        }
         if answer["result"] != "accepted" {
-            if let Some(terminal) = host_launch::read_receipt(&files.receipt) {
+            if let Some(terminal) = terminal.or_else(|| host_launch::read_receipt(&files.receipt)) {
                 super::startup::unconfirmed_zero(state, &unit.row, &files.id, &terminal);
             }
         }
-    } else if !unit.path.try_exists()? {
+    } else if initial && !unit.path.try_exists()? {
         // No checkpoint means the provider never issued workspace.create.
         std::fs::remove_file(&files.receipt)?;
         std::fs::remove_file(unit.path.with_extension("herdr-lock"))?;
     }
-    Ok((unit, answer))
+    Ok(answer)
+}
+
+pub(super) struct OfflineResume<'a> {
+    unit: Assignment<'a>,
+    service: Process,
+}
+
+impl<'a> OfflineResume<'a> {
+    pub(super) fn verify(state: &'a Path, row: &Value) -> Result<(Self, Value, Value)> {
+        let mut unit = lock_close(state, row)?;
+        ensure!(unit.row == *row, "Herdr assignment changed before resume");
+        ensure!(
+            row["create"]["result"] == "accepted" && row["pendingInput"] == false,
+            "original Herdr creation or input is unresolved"
+        );
+        let evidence = launch_receipt(state, &row["create"])?;
+        ensure!(
+            evidence["category"] == "process_exited"
+                && evidence["exitCode"]
+                    .as_u64()
+                    .is_some_and(|code| code <= 255),
+            "original Herdr worker has no confirmed exit receipt"
+        );
+        let mut handle = unit.handle()?;
+        unit.verified_archive(&handle)?;
+        ensure!(
+            handle.stopped_evidence.is_none(),
+            "expected the original Herdr binding"
+        );
+        let service = handle
+            .service
+            .clone()
+            .context("missing original Herdr service")?;
+        ensure!(
+            handle.confirm_closed(|h| unit.checkpoint(h))?,
+            "original Herdr pane or writers are still present"
+        );
+        let inspection = json!({"result":"accepted","alive":false,"owned":true});
+        let worker = backend::herdr_worker(&evidence, &inspection);
+        Ok((Self { unit, service }, worker, inspection))
+    }
+
+    pub(super) fn launch(&mut self, next: &mut Value, launch: host::Launch) -> Result<Value> {
+        // The caller wrote the new attempt under the Inbox lock. Keep the
+        // stable Herdr assignment lock through the replacement checkpoints.
+        self.unit.row = next.clone();
+        self.unit.current()?;
+        let answer = launch_into(&mut self.unit, launch, Some(&self.service))?;
+        *next = self.unit.row.clone();
+        Ok(answer)
+    }
 }
 
 pub(super) fn observe(state: &Path, row: &mut Value, read_only: bool) -> Result<(Value, Value)> {
@@ -815,7 +956,7 @@ pub fn submit(input: Input) -> Result<Value> {
     let state = state_dir()?;
     let (mut unit, _scope) = Assignment::lock_unowned(&state, &input.dispatch, "submit")?;
     writable_input(&unit, input.round, &input.attempt)?;
-    let mut response = unit.input(InputAction::Submit(&input.text), || Ok(()))?;
+    let mut response = unit.input(InputAction::Submit(&input.text), None, || Ok(()))?;
     response["dispatch"] = json!(input.dispatch);
     response["round"] = json!(input.round);
     response["attempt"] = json!(input.attempt);
@@ -869,7 +1010,7 @@ pub(super) fn try_submit_reply(
     )?;
     // The Herdr assignment lock covers the recheck and the existing input
     // checkpoint through the RPC result, just as it does for a private submit.
-    unit.input(InputAction::Reply { text, message_id }, begin)
+    unit.input(InputAction::Reply { text, message_id }, None, begin)
         .map(Some)
 }
 
@@ -1003,5 +1144,96 @@ impl Reconcile {
         Ok(
             json!({"dispatch":self.dispatch,"round":round,"attempt":attempt,"result":"accepted","audit":event,"inputReplayed":false}),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn started_receipt() -> Value {
+        json!({"category":"started","pid":42,
+            "writerProcess":{"pid":42,"creation":"linux:fixture:125"}})
+    }
+
+    #[test]
+    fn herdr_confirmation_keeps_terminal_receipt_and_one_notice() -> Result<()> {
+        let state =
+            std::env::temp_dir().join(format!("wfc-herdr-confirm-{}", uuid::Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let dispatch = "d-aabbccdd";
+            let attempt = "a-123456789abc";
+            let launch = "11111111111111111111111111111111";
+            let receipt = state.join("launches").join(format!("{launch}.json"));
+            let assignment = state.join("dispatches").join(format!("{dispatch}.json"));
+            std::fs::create_dir_all(receipt.parent().unwrap())?;
+            std::fs::create_dir_all(assignment.parent().unwrap())?;
+            let row = json!({"dispatch":dispatch,"attempt":attempt,"round":1,"role":"worker",
+                "scope":"fixture-scope","cwd":state,"report":state.join("report"),"host":"codex",
+                "create":{"result":"uncertain","receipt":receipt}});
+            write_json(&assignment, &row, None)?;
+            write_json(&receipt, &started_receipt(), None)?;
+            let first = host_launch::read_receipt(&receipt).context("missing fixture receipt")?;
+            let terminal = json!({"category":"process_exited","exitCode":0,
+                "startupZero":{"pid":42,"processStart":"linux:fixture:125"}});
+            let confirmation = confirm_launch(first.clone(), || {
+                write_json(&receipt, &terminal, None)?;
+                launch_receipt(&state, &row["create"])
+            })?;
+            let LaunchConfirmation::Terminal(observed) = confirmation else {
+                anyhow::bail!("a terminal receipt must not confirm startup");
+            };
+            assert_eq!(observed, terminal);
+            super::super::startup::unconfirmed_zero(&state, &row, launch, &observed);
+            let notices = super::super::messages::history(&state, dispatch)?;
+            let [notice] = notices.as_slice() else {
+                anyhow::bail!("expected a single notice for the current attempt");
+            };
+            assert_eq!(notice["attempt"], attempt);
+            assert_eq!(notice["type"], "exited");
+            assert_eq!(notice["state"], "unsent");
+            assert_eq!(notice["fault"]["launchId"], launch);
+            assert_eq!(notice["fault"]["exitCode"], 0);
+            assert_eq!(notice["fault"]["processStart"], "linux:fixture:125");
+            // Model an OpenCode prefill that starts with a confirmed writer
+            // and sees that same worker's terminal receipt at settlement.
+            write_json(&receipt, &started_receipt(), None)?;
+            assert!(matches!(
+                confirm_launch(first.clone(), || launch_receipt(&state, &row["create"]))?,
+                LaunchConfirmation::Started(_)
+            ));
+            write_json(&receipt, &terminal, None)?;
+            let LaunchConfirmation::Terminal(after_prefill) =
+                confirm_launch(first, || launch_receipt(&state, &row["create"]))?
+            else {
+                anyhow::bail!("activation cannot settle a terminal launch");
+            };
+            assert_eq!(after_prefill, observed);
+            super::super::startup::unconfirmed_zero(&state, &row, launch, &after_prefill);
+            assert_eq!(super::super::messages::history(&state, dispatch)?, notices);
+            assert_eq!(read_record(&assignment)?, row);
+            assert_eq!(host_launch::read_receipt(&receipt), Some(terminal));
+            Ok(())
+        })();
+        let _ = std::fs::remove_dir_all(state);
+        result
+    }
+
+    #[test]
+    fn herdr_confirmation_requires_the_verified_started_writer() -> Result<()> {
+        let reading = confirm_launch(started_receipt(), || Ok(started_receipt()))?;
+        let LaunchConfirmation::Started(writer) = reading else {
+            anyhow::bail!("expected a verified started writer");
+        };
+        assert_eq!(writer.pid, 42);
+        assert_eq!(writer.creation, "linux:fixture:125");
+        let mut wrong = started_receipt();
+        wrong["pid"] = json!(17);
+        assert!(confirm_launch(started_receipt(), || Ok(wrong)).is_err());
+        assert!(matches!(
+            confirm_launch(started_receipt(), || Ok(json!({"category":"unknown"})))?,
+            LaunchConfirmation::Pending
+        ));
+        Ok(())
     }
 }

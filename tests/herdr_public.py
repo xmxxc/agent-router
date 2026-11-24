@@ -86,7 +86,7 @@ for line in sys.stdin:
         return other, pid
 
     def tmux_handoff_fixture(self, *, hold=False, scope=None, backend='tmux',
-                             endpoint=None, detached=False):
+                             endpoint=None, detached=False, exit_zero=False):
         socket = self.root / 'handoff-tmux.sock'
         self.env['WFC_TMUX_SOCKET'] = str(socket)
         tmux = ['tmux', '-f', '/dev/null', '-S', str(socket)]
@@ -136,6 +136,8 @@ if trace["tmuxPane"] and check.exists():
 tmp = directory / (attempt + ".tmp")
 tmp.write_text(json.dumps(trace))
 tmp.rename(directory / (attempt + ".json"))
+if os.getenv("HANDOFF_TEST_EXIT_ZERO") and trace["herdrPane"] and not trace["tmuxPane"]:
+    sys.exit(0)
 deadline = time.monotonic() + 45
 while not (directory / (attempt + ".quit")).exists() and time.monotonic() < deadline:
     time.sleep(.025)
@@ -145,6 +147,8 @@ while not (directory / (attempt + ".quit")).exists() and time.monotonic() < dead
             env['HANDOFF_TEST_HOLD'] = '1'
         if detached:
             env['HANDOFF_TEST_DETACHED'] = '1'
+        if exit_zero:
+            env['HANDOFF_TEST_EXIT_ZERO'] = '1'
         self.config.write_text(json.dumps({'hosts': {
             'codex': {'command': [sys.executable, '-u', str(self.worker)], 'env': env},
         }}))
@@ -300,6 +304,79 @@ while not (directory / (attempt + ".quit")).exists() and time.monotonic() < dead
             print(json.dumps({'lostLayoutReply':True, 'audit':result['audit'],
                               'attempt':result['attempt'], 'effects':effects,
                               'changedEndpointStillPending':True}))
+
+    def test_tmux_to_herdr_handoff_reports_unconfirmed_zero_exit_once(self):
+        source, old = self.tmux_handoff_fixture(exit_zero=True)
+        archive, stopped = self.handoff_source_evidence(source)
+        assignment = self.handoff_record(source)
+        effects = []
+        observed = {}
+
+        def hold_layout(request, response):
+            method = request['method']
+            if method in ('workspace.create', 'workspace.report_metadata', 'layout.apply'):
+                self.assertTrue(archive.is_file() and stopped.is_file())
+                self.assertFalse(self.handoff_worker_alive(old))
+                effects.append(method)
+            if method == 'layout.apply':
+                row = json.loads(assignment.read_bytes())
+                self.assertEqual(row['audit'][-1]['phase'], 'starting')
+                self.assertNotEqual(row['attempt'], source['attempt'])
+                observed['receipt'] = receipt = Path(row['create']['receipt'])
+
+                def exited():
+                    raw = json.loads(receipt.read_bytes())
+                    return raw if raw['category'] == 'process_exited' else None
+
+                observed['terminal'] = live.wait_for(exited, seconds=4)
+            return response
+
+        with self.service.fault_proxy(hold_layout) as proxy:
+            args = self.target_handoff(proxy)
+            first = self.cli(*args)
+            self.assertEqual((first['result'], first['fromAttempt'], first['round']),
+                             ('uncertain', source['attempt'], source['round']))
+            view = self.status()
+            self.assertEqual((view['attempt'], view['status']), (first['attempt'], 'unknown'))
+            self.assertEqual(view['create']['receipt'], str(observed['receipt']))
+            self.assertEqual(view['launch']['exitCode'], 0)
+            event, = view['audit']
+            self.assertEqual((event['id'], event['phase'], event['result']),
+                             (first['audit'], 'starting', 'uncertain'))
+            self.assertEqual(event['close']['closeOperationId'], f'close:{source["attempt"]}')
+            zero = observed['terminal']['startupZero']
+            message, = self.cli('wait', '--dispatch', self.dispatch_id, '--scope', view['scope'],
+                                '--timeout', '4')['messages']
+            self.assertEqual((message['attempt'], message['round'], message['kind'], message['type']),
+                             (first['attempt'], first['round'], 'startup_failure', 'exited'))
+            self.assertEqual(message['fault']['launchId'], observed['receipt'].stem)
+            self.assertEqual((message['fault']['exitCode'], message['fault']['pid'],
+                              message['fault']['processStart']),
+                             (0, zero['pid'], zero['processStart']))
+            ack = self.cli('ack', message['messageId'])
+            self.assertEqual((ack['message'], ack['messageId'], ack['state']),
+                             (message['id'], message['messageId'], 'processed'))
+            self.assertTrue(self.cli('ack', message['id'])['duplicate'])
+            original_evidence = (archive.read_bytes(), stopped.read_bytes())
+            replay = self.cli(*args)
+            for key in ('result', 'audit', 'attempt', 'fromAttempt', 'endpoint'):
+                self.assertEqual(replay[key], first[key])
+            self.assertEqual((archive.read_bytes(), stopped.read_bytes()), original_evidence)
+            kept, = self.status()['messages']
+            self.assertEqual((kept['id'], kept['messageId'], kept['state']),
+                             (message['id'], message['messageId'], 'processed'))
+            self.assertEqual(effects, ['workspace.create', 'workspace.report_metadata', 'layout.apply'])
+            target = self.handoff_trace(first['attempt'])
+            self.assertEqual(target['pid'], zero['pid'])
+            target_stop = observed['receipt'].with_suffix('.stopped')
+            live.wait_for(target_stop.is_file)
+            tree = json.loads(target_stop.read_bytes())
+            self.assertEqual((tree['launchId'], tree['attempt'], tree['writerTreeStopped']),
+                             (observed['receipt'].stem, first['attempt'], True))
+            self.assertEqual(len(list(self.handoff_traces.glob('*.json'))), 2)
+            print(json.dumps({'audit':first['audit'], 'attempt':first['attempt'],
+                              'close':event['close']['closeOperationId'],
+                              'notice':message['messageId'], 'effects':effects}))
 
     def test_tmux_to_herdr_handoff_waits_for_source_writer(self):
         source, old = self.tmux_handoff_fixture(hold=True)

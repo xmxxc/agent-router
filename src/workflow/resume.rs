@@ -68,9 +68,11 @@ impl<'a> Resume<'a> {
         );
         let claude = row["host"] == "claude";
         let opencode = row["host"] == "opencode";
+        let herdr = row["backend"] == "herdr";
         ensure!(
-            row["backend"] == "tmux" && (row["host"] == "codex" || claude || opencode),
-            "resume requires a Linux Codex, Claude or OpenCode dispatch using the tmux backend"
+            (row["backend"] == "tmux" && (row["host"] == "codex" || claude || opencode))
+                || (herdr && row["host"] == "codex" && row["round"] == 1),
+            "resume requires a Linux Codex, Claude or OpenCode dispatch using the tmux backend, or an original Codex task using Herdr"
         );
         ensure!(
             assignment::identified(&row) && row["controllerOwner"].is_null(),
@@ -92,8 +94,32 @@ impl<'a> Resume<'a> {
                 "original creation is unresolved",
             ));
         }
-        let _execution = assignment::close_lock(&state, &row)?;
-        let (worker, inspection) = match backend::observe_for_resume(&state, &row) {
+        if herdr {
+            ensure!(
+                self.next.is_none() && generation.is_null(),
+                "Herdr resume requires the original task and report in an unowned scope"
+            );
+            ensure!(
+                assignment::resume_audit(&row).is_none(),
+                "Herdr resume already recorded for this task"
+            );
+            if !row["codexHome"].is_string() {
+                return Ok(reconcile(&row, Value::Null, "missing original Codex home"));
+            }
+        }
+        let _execution = (!herdr)
+            .then(|| assignment::close_lock(&state, &row))
+            .transpose()?;
+        let mut herdr_resume = None;
+        let observation = if herdr {
+            super::herdr::OfflineResume::verify(&state, &row).map(|(unit, worker, inspected)| {
+                herdr_resume = Some(unit);
+                (worker, inspected)
+            })
+        } else {
+            backend::observe_for_resume(&state, &row)
+        };
+        let (worker, inspection) = match observation {
             Ok(observation) => observation,
             Err(e) => {
                 return Ok(reconcile(
@@ -177,7 +203,13 @@ impl<'a> Resume<'a> {
         let attempt = format!("a-{}", Uuid::new_v4().simple());
         next["attempt"] = json!(attempt);
         next["executionId"] = json!(attempt);
-        next["tmuxLaunchProtocol"] = json!(backend::LAUNCH_PROTOCOL);
+        if herdr {
+            for field in ["backendHandle", "pendingReplyMessageId"] {
+                next.as_object_mut().unwrap().remove(field);
+            }
+        } else {
+            next["tmuxLaunchProtocol"] = json!(backend::LAUNCH_PROTOCOL);
+        }
         for field in [
             "create",
             controller::CALLBACK_REF_HASH,
@@ -190,7 +222,7 @@ impl<'a> Resume<'a> {
         }
         let options = host::Options {
             name: row["host"].as_str().context("missing host")?,
-            backend: "tmux",
+            backend: if herdr { "herdr" } else { "tmux" },
             config: row["launchConfig"].as_str(),
             model: row["model"].as_str(),
             effort: row["effort"].as_str(),
@@ -331,6 +363,9 @@ impl<'a> Resume<'a> {
                 "at":now.to_rfc3339(),"ownerGeneration":generation,"result":"pending",
                 "priorInspection":inspection,"priorWorker":worker,"priorCreate":row["create"]}),
             );
+            if herdr {
+                audit[event - 1]["priorBackendHandle"] = row["backendHandle"].clone();
+            }
             if let Some(proof) = claude_proof {
                 if let Err(error) = proof.publish(&ledger, &row, &mut next, &launch) {
                     let current = read()?;
@@ -366,9 +401,26 @@ impl<'a> Resume<'a> {
 
         // From here a lost response is indistinguishable from a running worker.
         // The scope lock still fences takeover, and callbacks can use the new assignment.
-        let mut answer = backend::resume(&state, &next, launch).unwrap_or_else(|e| {
-            json!({"result":"definitely-not-sent","diagnostic":format!("could not call tmux backend: {e}")})
-        });
+        let mut answer = if let Some(unit) = &mut herdr_resume {
+            match unit.launch(&mut next, launch) {
+                Ok(answer) => answer,
+                Err(e) => {
+                    return Ok(reconcile(
+                        &read()?,
+                        json!(event),
+                        &format!("cannot confirm Herdr restart: {e}"),
+                    ))
+                }
+            }
+        } else {
+            backend::resume(&state, &next, launch).unwrap_or_else(|e| {
+                json!({"result":"definitely-not-sent","diagnostic":format!("could not call tmux backend: {e}")})
+            })
+        };
+        if herdr && answer["result"] != "accepted" {
+            answer["result"] = json!("uncertain");
+            answer["error"] = json!("lifecycle_reconcile_required");
+        }
         let launch_result = match answer["result"].as_str() {
             _ if answer["launchResult"] == "accepted" || answer["category"] == "process_exited" => {
                 "accepted"
@@ -472,7 +524,11 @@ impl<'a> Resume<'a> {
         answer["operation"] = json!("resume");
         answer["audit"] = json!(event);
         answer["session"] = json!(session);
-        answer["tmux"] = next["tmux"].clone();
+        if herdr {
+            answer["backend"] = json!("herdr");
+        } else {
+            answer["tmux"] = next["tmux"].clone();
+        }
         if answer["result"] == "accepted" {
             answer["resumed"] = json!(self.dispatch);
         }
