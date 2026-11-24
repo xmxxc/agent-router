@@ -3808,6 +3808,22 @@ while time.monotonic() < deadline:
             "late": late.returncode, "wrong": wrong.returncode, "no_ref": no_ref.returncode,
             "ask": json.loads(question.stdout), "done": json.loads(complete.stdout),
         })
+    if assignment and Path("retry-callback").exists():
+        trigger = Path("retry-callback")
+        operation, mode = trigger.read_text().split()
+        trigger.unlink()
+        target, attempt, reference = assignment
+        # Match the compatibility request key, with optional identity/content variations.
+        if operation == "ask":
+            args = ("ask", "Different question?" if mode == "content" else "Pending task question?",
+                    "--message-id", "pending-question")
+        else:
+            args = ("done", "--report", report if mode == "content" else target)
+        if mode != "missing":
+            args += ("--callback-ref", "0" * 64 if mode == "wrong" else reference)
+        result = callback(*args, "--attempt", original if mode == "old" else attempt)
+        write_json("callback-replay", {"exit": result.returncode,
+                                      "receipt": json.loads(result.stdout) if result.returncode == 0 else None})
     if not select.select([0], [], [], .02)[0]:
         continue
     data = os.read(0, 4096)
@@ -4884,6 +4900,9 @@ int fsync(int fd) {
                 self.assertFalse(any(m["to"] == "worker" for m in row["messages"]))
                 before = (received.read_bytes(), formal.read_bytes())
                 self.assertIn("pending or uncertain", cli(*args, token=token, expected=1))
+                (self.work / "finish-first-externally").touch()
+                self.await_input_value((self.work / "first-done").exists)
+                self.assertIn("pending or uncertain", cli(*args, token=token, expected=1))
                 self.assertEqual((received.read_bytes(), formal.read_bytes()), before)
                 self.assertEqual(cli("status", "--dispatch", dispatch)["dispatches"][0]["audit"][-1], audit)
                 self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
@@ -4931,6 +4950,14 @@ int fsync(int fd) {
         self.await_input_value(callbacks_path.exists)
         callbacks = json.loads(callbacks_path.read_text())
         self.assertEqual([callbacks[key] for key in ("late", "wrong", "no_ref")], [1, 1, 1])
+        # Exercise the digest-only proof persisted by R24/R25.
+        ledger = self.state / "messages.json"
+        messages = json.loads(ledger.read_bytes())
+        for message in messages:
+            proof = message.get("continuedInputCallback")
+            if proof is not None:
+                message["continuedInputCallback"] = proof["referenceHash"]
+        ledger.write_text(json.dumps(messages))
         before_replay = cli("status", "--dispatch", dispatch)["dispatches"][0]
         self.assertEqual(before_replay["audit"][-1], audit)
         self.assertFalse(any(m["to"] == "worker" for m in before_replay["messages"]))
@@ -4954,6 +4981,119 @@ int fsync(int fd) {
             "round": final["round"], "enter_count": 1, "formal_count": 1,
             "prior_status": audit["result"], "evidence": final["audit"][-1]["inputEvidence"],
         }), flush=True)
+
+    def test_public_continue_reconciles_pending_after_same_key_authenticated_callback(self):
+        original = self.work
+        for operation in ("ask", "done"):
+            with self.subTest(operation=operation):
+                self.work = original / operation
+                self.work.mkdir()
+                cli, first, token, env = self.public_input_worker(scope=operation)
+                dispatch = first["dispatch"]
+                (self.work / "finish-first-externally").touch()
+                self.await_input_value((self.work / "first-done").exists)
+                args = ("continue", dispatch, "--task", "next-task", "--report", "report2")
+                gate = self.public_input_gate(env, "after-enter")
+                with subprocess.Popen([WFC, *args, "--owner-token", token], cwd=self.work,
+                                      env={**env, **gate}, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, text=True) as controller:
+                    try:
+                        self.await_input_value((self.work / "input-boundary").exists)
+                        self.assertIsNone(controller.poll())
+                    finally:
+                        controller.kill()
+                        (self.work / "release-input-boundary").touch()
+                        out, error = controller.communicate(timeout=15)
+                self.assertEqual((controller.returncode, out, error), (-signal.SIGKILL, "", ""))
+
+                received = self.work / "input-bytes"
+                formal = self.work / "formal-input"
+                sent = (received.read_bytes(), formal.read_bytes())
+                self.assertEqual(sent[0].count(b"\r"), 1)
+                self.assertEqual(len(sent[1].splitlines()), 1)
+                _, attempt, _ = json.loads((self.work / "accepted-round").read_text())
+                assignment = self.state / "dispatches" / f"{dispatch}.json"
+                pending = assignment.read_bytes()
+                row = json.loads(pending)
+                audit = row["audit"][-1]
+                self.assertEqual((row["round"], row["attempt"], row["executionId"], audit["result"]),
+                                 (2, attempt, first["executionId"], "pending"))
+                ledger = self.state / "messages.json"
+
+                def assert_waiting():
+                    before = ledger.read_bytes()
+                    self.assertIn("pending or uncertain", cli(*args, token=token, expected=1))
+                    self.assertEqual(assignment.read_bytes(), pending)
+                    self.assertEqual(ledger.read_bytes(), before)
+                    self.assertEqual((received.read_bytes(), formal.read_bytes()), sent)
+
+                assert_waiting()
+                if operation == "ask":
+                    compatibility = ("ask", "Pending task question?", "--message-id", "pending-question")
+                else:
+                    (self.work / "report2").write_text("second report")
+                    compatibility = ("done", "--report", "report2")
+                prior = cli(*compatibility, "--attempt", attempt, token=token, WFC_DISPATCH=dispatch)
+                prior.pop("next", None)
+                saved = json.loads(ledger.read_bytes())
+                old_message, = [message for message in saved if message["id"] == prior["message"]]
+                self.assertNotIn("continuedInputCallback", old_message)
+                assert_waiting()
+
+                def callback_replay(mode):
+                    result = self.work / "callback-replay"
+                    result.unlink(missing_ok=True)
+                    trigger = self.work / "new-callback-trigger"
+                    trigger.write_text(f"{operation} {mode}")
+                    trigger.replace(self.work / "retry-callback")
+                    self.await_input_value(result.exists)
+                    return json.loads(result.read_bytes())
+
+                for mode in ("old", "wrong", "missing", "content"):
+                    self.assertEqual(callback_replay(mode), {"exit": 1, "receipt": None})
+                self.assertEqual(json.loads(ledger.read_bytes()), saved)
+                assert_waiting()
+                exact = {"exit": 0, "receipt": {**prior, "duplicate": True}}
+                self.assertEqual(callback_replay("exact"), exact)
+                updated = ledger.read_bytes()
+                self.assertEqual(callback_replay("exact"), exact)
+                self.assertEqual(ledger.read_bytes(), updated)
+                proof = {
+                    "executionId": first["executionId"], "audit": audit["id"],
+                    "referenceHash": row["workerCallbackRefHash"],
+                }
+                self.assertEqual(json.loads(updated), [
+                    {**message, "continuedInputCallback": proof}
+                    if message["id"] == prior["message"] else message for message in saved
+                ])
+                for field in proof:
+                    corrupted = {**proof, field: "mismatch"}
+                    ledger.write_text(json.dumps([
+                        {**message, "continuedInputCallback": corrupted}
+                        if message["id"] == prior["message"] else message for message in saved
+                    ]))
+                    assert_waiting()
+                ledger.write_bytes(updated)
+
+                receipt = cli(*args, token=token)
+                self.assertEqual((receipt["round"], receipt["attempt"], receipt["audit"], receipt["duplicate"]),
+                                 (2, attempt, audit["id"], True))
+                # Simulate the durable Inbox write preceding an interrupted audit write.
+                assignment.write_bytes(pending)
+                published = ledger.read_bytes()
+                self.assertEqual(cli(*args, token=token), receipt)
+                self.assertEqual(ledger.read_bytes(), published)
+                state = cli("status", "--dispatch", dispatch)["dispatches"][0]
+                self.assertEqual(state["audit"][-1]["inputEvidence"], "authenticated-round-callback")
+                self.assertEqual([m["id"] for m in state["messages"] if m["to"] == "worker"],
+                                 [receipt["message"]])
+                self.assertEqual((received.read_bytes(), formal.read_bytes()), sent)
+                self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
+                print("R26 pending callback " + json.dumps({
+                    "operation": operation, "prior": "pending", "enter_count": 1, "formal_count": 1,
+                    "same_callback_receipt": True, "same_half_written_receipt": True,
+                }), flush=True)
+        self.work = original
 
     def test_public_nudge_reads_confirmed_key_while_other_input_is_unresolved(self):
         cli, first, token, _ = self.public_input_worker()

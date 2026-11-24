@@ -142,8 +142,8 @@ impl<'a> Request<'a> {
             let mut receipt = inbox.worker_input_receipt(&current, &event)?;
             if receipt.is_none()
                 && operation == "continue"
-                && event["result"] == "uncertain"
-                && inbox.verified_continued_input_callback(&current)?
+                && matches!(event["result"].as_str(), Some("pending" | "uncertain"))
+                && inbox.verified_continued_input_callback(&current, &event)?
             {
                 let evidence = json!(messages::CONTINUED_INPUT_CALLBACK);
                 event["inputEvidence"] = evidence.clone();

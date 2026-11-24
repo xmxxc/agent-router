@@ -524,11 +524,10 @@ impl Message {
         self.kind() == MessageKind::Done
     }
 
-    fn record_continued_input_callback(&mut self, reference: Option<&str>) {
-        // authorize_callback has verified both the worker secret and reference.
-        if let Some(reference) = reference {
+    fn record_continued_input_callback(&mut self, proof: Option<Value>) {
+        if let Some(proof) = proof {
             self.additional_fields
-                .insert("continuedInputCallback".into(), json!(body_hash(reference)));
+                .insert("continuedInputCallback".into(), proof);
         }
     }
 
@@ -933,6 +932,34 @@ fn check_snapshot_size(size: usize) -> Result<()> {
     Ok(())
 }
 
+fn continued_input_binding(row: &Value, event: &Value) -> Option<Value> {
+    (row["host"] == "codex"
+        && row["backend"] == "tmux"
+        && event["operation"] == "continue"
+        && event["round"] == row["round"]
+        && event["attempt"] == row["attempt"]
+        && matches!(
+            event["result"].as_str(),
+            Some("pending" | "uncertain" | "accepted")
+        ))
+    .then_some(())?;
+    Some(json!({
+        "executionId": row["executionId"].as_str()?,
+        "audit": event["id"].as_str()?,
+        "referenceHash": row[controller::CALLBACK_REF_HASH].as_str()?,
+    }))
+}
+
+fn authenticated_continued_input(row: &Value, reference: Option<&str>) -> Option<Value> {
+    // Called after authorize_callback has verified the worker secret and reference.
+    reference?;
+    row["audit"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find_map(|event| continued_input_binding(row, event))
+}
+
 impl Inbox {
     fn snapshot(dir: &Path) -> Result<Vec<Message>> {
         let path = dir.join("messages.json");
@@ -1233,6 +1260,45 @@ impl Inbox {
         Ok(receipt)
     }
 
+    fn attach_continued_input_callback(
+        &mut self,
+        receipt: &Value,
+        worker: &Identity,
+        proof: Option<Value>,
+    ) -> Result<()> {
+        let Some(proof) = proof else {
+            return Ok(());
+        };
+        let id = receipt["message"]
+            .as_u64()
+            .context("invalid callback receipt")?;
+        let message = self
+            .messages
+            .iter_mut()
+            .find(|message| message.id == id)
+            .context("missing callback receipt")?;
+        ensure!(
+            message.worker == *worker
+                && matches!(message.kind(), MessageKind::Done | MessageKind::Question)
+                && message
+                    .body_hash
+                    .as_deref()
+                    .is_none_or(|hash| message.matches_hash(hash)),
+            "continued callback receipt conflicts with the current assignment"
+        );
+        if let Some(saved) = message.additional_fields.get("continuedInputCallback") {
+            if saved == &proof {
+                return self.sync_directory();
+            }
+            ensure!(
+                saved == &proof["referenceHash"],
+                "continued callback evidence conflict"
+            );
+        }
+        message.record_continued_input_callback(Some(proof));
+        self.save()
+    }
+
     #[cfg(target_os = "linux")]
     pub(super) fn unresolved_reply(&self, row: &Value, except: Option<&str>) -> Result<bool> {
         if row["backend"] != "tmux" {
@@ -1277,8 +1343,12 @@ impl Inbox {
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) fn verified_continued_input_callback(&self, row: &Value) -> Result<bool> {
-        let Some(reference_hash) = row[controller::CALLBACK_REF_HASH].as_str() else {
+    pub(super) fn verified_continued_input_callback(
+        &self,
+        row: &Value,
+        event: &Value,
+    ) -> Result<bool> {
+        let Some(proof) = continued_input_binding(row, event) else {
             return Ok(false);
         };
         let worker = Identity::deserialize(row).context("read continued worker identity")?;
@@ -1286,10 +1356,17 @@ impl Inbox {
             message.worker == worker
                 && matches!(message.kind(), MessageKind::Done | MessageKind::Question)
                 && message
+                    .body_hash
+                    .as_deref()
+                    .is_none_or(|hash| message.matches_hash(hash))
+                && message
                     .additional_fields
                     .get("continuedInputCallback")
-                    .and_then(Value::as_str)
-                    == Some(reference_hash)
+                    .is_some_and(|saved| {
+                        saved == &proof
+                            // Earlier binaries stored only the reference digest.
+                            || (event["result"] == "uncertain" && saved == &proof["referenceHash"])
+                    })
         }))
     }
 
@@ -1342,8 +1419,9 @@ impl Inbox {
             (Some("pending"), Some(APPENDED_USER_ENTRY)) => {
                 Ok(Some((message.id, json!(APPENDED_USER_ENTRY))))
             }
-            (Some("uncertain"), Some(CONTINUED_INPUT_CALLBACK))
-                if matches!(input, WorkerInput::Continue { .. }) =>
+            (Some("pending" | "uncertain"), Some(CONTINUED_INPUT_CALLBACK))
+                if matches!(input, WorkerInput::Continue { .. })
+                    && self.verified_continued_input_callback(row, event)? =>
             {
                 Ok(Some((message.id, json!(CONTINUED_INPUT_CALLBACK))))
             }
@@ -1759,38 +1837,44 @@ impl<'a> Done<'a> {
             Ok::<_, anyhow::Error>((assignment, row, inbox, receipt, key))
         };
         let (initial, initial_row, inbox, duplicate, _) = check()?;
-        if let Some(receipt) = duplicate {
-            return Ok(receipt);
+        if let (Some(receipt), None) = (&duplicate, self.reference) {
+            return Ok(receipt.clone());
         }
         // Git can block. Let unrelated callbacks and waits proceed while sampling.
         drop(inbox);
-        let snapshot = Snapshot::read(&initial.cwd);
+        let snapshot = duplicate.is_none().then(|| Snapshot::read(&initial.cwd));
         // Publish after the same execution lock used for controller input.
         // The first check and Git probe hold neither lock while waiting.
         #[cfg(target_os = "linux")]
         let _execution = (initial_row["backend"] == "tmux" && initial_row["host"].is_string())
             .then(|| super::assignment::close_lock(&state, &initial_row))
             .transpose()?;
-        #[cfg(not(target_os = "linux"))]
-        let _ = initial_row;
-        let (current, _, mut inbox, duplicate, key) = check()?;
+        let (current, row, mut inbox, duplicate, key) = check()?;
         ensure!(
             initial.worker.round == current.worker.round
                 && initial.worker.attempt == current.worker.attempt
                 && initial.cwd == current.cwd
-                && initial.worker.scope() == current.worker.scope(),
+                && initial.worker.scope() == current.worker.scope()
+                && (self.reference.is_none()
+                    || ["host", "backend", "tmuxSocket", "executionId", "create"]
+                        .iter()
+                        .all(|key| initial_row[*key] == row[*key])),
             "assignment changed while sampling {dispatch}"
         );
+        let proof = authenticated_continued_input(&row, self.reference);
         if let Some(receipt) = duplicate {
+            inbox.attach_continued_input_callback(&receipt, &current.worker, proof)?;
             return Ok(receipt);
         }
+        let snapshot = snapshot
+            .context("callback receipt disappeared while waiting for its execution lock")?;
         let mut message = Message::new(inbox.messages.len() as u64 + 1, current.worker, key);
         message.report = Some(report);
         message.additional_fields = Map::from_iter([
             ("head".into(), json!(snapshot.head)),
             ("dirty".into(), json!(snapshot.dirty)),
         ]);
-        message.record_continued_input_callback(self.reference);
+        message.record_continued_input_callback(proof);
         inbox.publish(message).context("publish completion")
     }
 }
@@ -1898,19 +1982,20 @@ impl<'a> Ask<'a> {
             Ok((inbox, assignment, row, replay))
         };
         let (inbox, initial, row, replay) = check()?;
-        if let Some(replay) = replay {
-            return Ok(replay);
+        if let (Some(receipt), None) = (&replay, self.reference) {
+            return Ok(receipt.clone());
         }
-        // A new tmux or controlled-worker question holds the same attempt lock
-        // as close from observation through publication. Acquire it outside
-        // the inbox so a slow backend or close cannot block other scopes.
+        // New questions and authenticated receipt updates serialize with close.
+        // Wait for the execution lock outside Inbox.
         drop(inbox);
         let hosted = row["host"].is_string();
         let controlled = cfg!(target_os = "linux") && !hosted && row["worker"].is_object();
         let _close_lock = (row["backend"] == "tmux" || controlled)
             .then(|| super::assignment::close_lock(&state, &row))
             .transpose()?;
-        let blocked = if hosted {
+        let blocked = if replay.is_some() {
+            Ok(false)
+        } else if hosted {
             let mut inspected = row.clone();
             super::backend::observe(&state, &mut inspected).map(|(worker, _)| {
                 matches!(
@@ -1930,23 +2015,29 @@ impl<'a> Ask<'a> {
             blocked
         };
         let (mut inbox, assignment, current, replay) = check()?;
-        if let Some(replay) = replay {
-            return Ok(replay);
+        if let (Some(receipt), None) = (&replay, self.reference) {
+            return Ok(receipt.clone());
         }
         ensure!(
             initial.worker == assignment.worker
                 && ["host", "backend", "tmuxSocket", "endpoint", "executionId"]
                     .iter()
-                    .all(|key| row[*key] == current[*key]),
+                    .all(|key| row[*key] == current[*key])
+                && (self.reference.is_none() || row["create"] == current["create"]),
             "assignment changed while inspecting {dispatch}"
         );
+        let proof = authenticated_continued_input(&current, self.reference);
+        if let Some(receipt) = replay {
+            inbox.attach_continued_input_callback(&receipt, &assignment.worker, proof)?;
+            return Ok(receipt);
+        }
         ensure!(
             !blocked?,
             "attempt is no longer accepted for {dispatch}; its round is not running"
         );
         let mut message = Message::new(inbox.messages.len() as u64 + 1, assignment.worker, key);
         message.question_payload = Some(payload);
-        message.record_continued_input_callback(self.reference);
+        message.record_continued_input_callback(proof);
         let mut receipt = inbox.publish(message).context("publish question")?;
         receipt["next"] = json!("End your turn now; the answer arrives as your next message.");
         Ok(receipt)
