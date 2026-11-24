@@ -127,7 +127,29 @@ pub struct Screen {
     pub truncated: bool,
 }
 
+#[derive(Clone, Copy)]
+pub enum CodexInput {
+    Continue,
+    Nudge,
+}
+
+#[derive(PartialEq, Eq)]
+pub enum InputBoundary {
+    Prepare,
+    Send,
+}
+
 const INVALID: Failure = Failure::unknown("incomplete Herdr observation");
+const RECENT_LINES: u32 = 200;
+const NUDGE_HISTORY_LINES: u32 = 1000;
+
+fn after_input_check<T>(
+    check: impl FnOnce() -> std::io::Result<()>,
+    next: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    check().map_err(|_| Failure::unsent("Herdr input precondition changed"))?;
+    next()
+}
 
 fn field<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value[key].as_str().filter(|s| !s.is_empty()).ok_or(INVALID)
@@ -304,11 +326,43 @@ impl Handle {
         Ok(())
     }
 
-    fn observe_writers(&self, rpc: &Session) -> Result<process::Writers> {
-        self.guarded(rpc, false)?;
+    fn process_info(&self, rpc: &Session, require_writable: bool) -> Result<Value> {
+        self.guarded(rpc, require_writable)?;
         let pane = self.pane.as_deref().ok_or(INVALID)?;
-        let data = rpc.call("pane.process_info", json!({"pane_id":pane}))?;
-        process::writers(&data["process_info"], pane)
+        Ok(rpc.call("pane.process_info", json!({"pane_id":pane}))?["process_info"].take())
+    }
+
+    fn observe_writers(&self, rpc: &Session) -> Result<process::Writers> {
+        process::writers(
+            &self.process_info(rpc, false)?,
+            self.pane.as_deref().ok_or(INVALID)?,
+        )
+    }
+
+    fn require_foreground_writer(
+        &mut self,
+        rpc: &Session,
+        expected: &Process,
+        save: &mut impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<()> {
+        let info = self.process_info(rpc, true)?;
+        let writers = process::writers(&info, self.pane.as_deref().ok_or(INVALID)?)?;
+        self.remember_writers(&writers.known, save)?;
+        writers.completeness?;
+        if !writers.known.contains(expected)
+            || !info["foreground_processes"]
+                .as_array()
+                .is_some_and(|processes| {
+                    processes
+                        .iter()
+                        .any(|process| process["pid"] == expected.pid)
+                })
+        {
+            return Err(Failure::unsent(
+                "original Herdr worker is not in the pane foreground",
+            ));
+        }
+        Ok(())
     }
 
     fn checkpoint_writers(
@@ -407,21 +461,29 @@ impl Handle {
     }
 
     pub fn read(&self) -> Result<Screen> {
-        self.read_screen("text")
+        self.read_screen("recent", "text", RECENT_LINES)
     }
 
     fn read_ansi(&self) -> Result<Screen> {
-        self.read_screen("ansi")
+        self.read_screen("recent", "ansi", RECENT_LINES)
     }
 
-    fn read_screen(&self, format: &str) -> Result<Screen> {
+    fn read_nudge_history(&self) -> Result<Screen> {
+        self.read_screen("recent", "text", NUDGE_HISTORY_LINES)
+    }
+
+    fn read_visible(&self) -> Result<Screen> {
+        self.read_screen("visible", "text", NUDGE_HISTORY_LINES)
+    }
+
+    fn read_screen(&self, source: &str, format: &str, lines: u32) -> Result<Screen> {
         let rpc = self.session()?;
         self.guarded(&rpc, false)?;
-        let data = rpc.call("pane.read",json!({"pane_id":self.pane,"source":"recent","format":format,"strip_ansi":format != "ansi","lines":200}))?;
+        let data = rpc.call("pane.read",json!({"pane_id":self.pane,"source":source,"format":format,"strip_ansi":format != "ansi","lines":lines}))?;
         if data["read"]["pane_id"].as_str() != self.pane.as_deref()
             || data["read"]["workspace_id"].as_str() != self.workspace.as_deref()
-            || (format == "ansi"
-                && (data["read"]["format"] != "ansi" || data["read"]["source"] != "recent"))
+            || data["read"]["format"] != format
+            || data["read"]["source"] != source
         {
             return Err(INVALID);
         }
@@ -488,19 +550,75 @@ impl Handle {
         host: &str,
         mut save: impl FnMut(&Self) -> std::io::Result<()>,
     ) -> Result<()> {
-        let before = self.read().map_err(Failure::before_effect)?;
-        if screen::read_only(&before.text) {
-            return Err(Failure::refused("worker input is paused"));
-        }
-        screen::require_empty_reply_box(self, &before, host).map_err(Failure::before_effect)?;
-        // Preparation performs only observation and local checkpoints. An
-        // incomplete response to the subsequent input call may be post-effect.
-        let rpc = self
-            .prepare_send(true, &mut save)
-            .map_err(Failure::before_effect)?;
-        let params = json!({"pane_id":self.pane,"text":text,"keys":["Enter"]});
-        rpc.send_reply(params)?;
+        let (before, _) = self.send_to_empty_box(text, host, None, &mut save, |_| Ok(()))?;
         screen::confirm_reply(self, text, &before, host, &mut save).map_err(Failure::after_effect)
+    }
+
+    /// Submit one text/Enter request to a confirmed empty composer. After
+    /// submission, observe only, even if the entire draft is visible.
+    pub fn submit_codex_input(
+        &mut self,
+        text: &str,
+        writer: &Process,
+        action: CodexInput,
+        mut save: impl FnMut(&Self) -> std::io::Result<()>,
+        check: impl FnMut(InputBoundary) -> std::io::Result<()>,
+    ) -> Result<()> {
+        let (before, visible_copies) =
+            self.send_to_empty_box(text, "codex", Some((writer, action)), &mut save, check)?;
+        screen::confirm_codex_input(self, action, text, &before, visible_copies)
+            .map_err(Failure::after_effect)
+    }
+
+    fn send_to_empty_box(
+        &mut self,
+        text: &str,
+        host: &str,
+        worker_input: Option<(&Process, CodexInput)>,
+        save: &mut impl FnMut(&Self) -> std::io::Result<()>,
+        mut check: impl FnMut(InputBoundary) -> std::io::Result<()>,
+    ) -> Result<(Screen, Option<usize>)> {
+        // The caller may wait for the ledger. Observe the pane only after that
+        // check, with the original scope and execution locks still held.
+        let nudge = matches!(worker_input, Some((_, CodexInput::Nudge)));
+        let (before, visible_copies, rpc) = after_input_check(
+            || check(InputBoundary::Prepare),
+            || {
+                let before = self.read()?;
+                if screen::read_only(&before.text) {
+                    return Err(Failure::refused("worker input is paused"));
+                }
+                let visible_copies = if nudge {
+                    screen::nudge_visible_copies(
+                        text,
+                        &before,
+                        &self.read_nudge_history()?,
+                        &self.read_visible()?,
+                    )
+                } else {
+                    None
+                };
+                screen::require_empty_reply_box(self, &before, host)?;
+                let rpc = if let Some((writer, action)) = worker_input {
+                    screen::check_codex_input(action, &before, text)?;
+                    let rpc = self.session()?;
+                    self.require_foreground_writer(&rpc, writer, save)?;
+                    rpc
+                } else {
+                    self.prepare_send(true, save)?
+                };
+                Ok((before, visible_copies, rpc))
+            },
+        )
+        .map_err(Failure::before_effect)?;
+        // An incomplete response to the input call may be post-effect.
+        let params = json!({"pane_id":self.pane,"text":text,"keys":["Enter"]});
+        if worker_input.is_some() {
+            rpc.send_worker_input(params, || check(InputBoundary::Send))?;
+        } else {
+            rpc.send_reply(params)?;
+        }
+        Ok((before, visible_copies))
     }
 
     /// Close only the bound pane. Persist all observed writers before closing,
@@ -659,6 +777,58 @@ impl Handle {
             handle: next,
             audit,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    #[test]
+    fn input_authorization_precedes_final_observation() {
+        let order = RefCell::new(Vec::new());
+        let observed = super::after_input_check(
+            || {
+                order.borrow_mut().push("ledger and owner");
+                Ok(())
+            },
+            || {
+                order.borrow_mut().push("pane and foreground");
+                Ok("fresh observation")
+            },
+        )
+        .unwrap();
+        assert_eq!(observed, "fresh observation");
+        super::after_input_check(
+            || {
+                order.borrow_mut().push("owner at send");
+                Ok(())
+            },
+            || {
+                order.borrow_mut().push("first write");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *order.borrow(),
+            [
+                "ledger and owner",
+                "pane and foreground",
+                "owner at send",
+                "first write"
+            ]
+        );
+    }
+
+    #[test]
+    fn input_write_is_skipped_when_final_authorization_rejects() {
+        let denied = super::after_input_check::<()>(
+            || Err(std::io::Error::other("owner authorization declined")),
+            || panic!("a rejected authorization must not reach the write"),
+        )
+        .unwrap_err();
+        assert_eq!(denied.kind, super::FailureKind::DefinitelyNotSent);
     }
 }
 

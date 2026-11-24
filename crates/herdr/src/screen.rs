@@ -1,4 +1,4 @@
-use super::{Failure, Handle, Result, Screen};
+use super::{CodexInput, Failure, Handle, Result, Screen};
 use serde_json::json;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -471,6 +471,204 @@ pub(super) fn confirm_reply(
     unreachable!()
 }
 
+fn codex_history(screen: &Screen) -> Vec<&str> {
+    let mut lines = screen_lines(&screen.text);
+    lines.truncate(prompt_row(&lines).unwrap_or(0));
+    lines
+}
+
+fn matching_user_entries(history: &[&str], text: &str) -> usize {
+    (0..history.len())
+        .filter(|&index| matches_user_entry(&history[index..], text))
+        .count()
+}
+
+fn matches_user_entry(rows: &[&str], text: &str) -> bool {
+    let [first, tail @ ..] = rows else {
+        return false;
+    };
+    let Some(body) = first
+        .strip_prefix("› ")
+        .filter(|body| body.starts_with("[router] "))
+    else {
+        return false;
+    };
+    let Some(mut rest) = text.strip_prefix(body) else {
+        return false;
+    };
+    for row in tail {
+        if row.is_empty() {
+            return rest.is_empty();
+        }
+        if rest.is_empty() {
+            return false;
+        }
+        // A screen wrap may indent the continuation or omit its ending space.
+        let next = row.strip_prefix("  ").unwrap_or(row);
+        let Some(remaining) = rest
+            .strip_prefix(next)
+            .or_else(|| rest.strip_prefix(' ')?.strip_prefix(next))
+        else {
+            return false;
+        };
+        rest = remaining;
+    }
+    false
+}
+
+pub(super) fn check_codex_input(action: CodexInput, before: &Screen, text: &str) -> Result<()> {
+    match action {
+        CodexInput::Continue if matching_user_entries(&codex_history(before), text) != 0 => {
+            Err(Failure::unsent("new task already appeared before input"))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn appended_history<'a, 'row>(
+    base: &[&str],
+    history: &'a [&'row str],
+    truncated: bool,
+    text: &str,
+) -> Option<&'a [&'row str]> {
+    if base.is_empty() && truncated {
+        return None;
+    }
+    if history.starts_with(base) {
+        return Some(&history[base.len()..]);
+    }
+    if !truncated {
+        return None;
+    }
+    let old_copies = matching_user_entries(base, text);
+    let mut overlaps = (2..base.len()).filter(|&length| {
+        let retained = &base[base.len() - length..];
+        history.starts_with(retained)
+            && retained.windows(2).any(|pair| pair[0] != pair[1])
+            && matching_user_entries(retained, text) == old_copies
+            && base
+                .windows(length)
+                .filter(|part| *part == retained)
+                .count()
+                == 1
+            && history
+                .windows(length)
+                .filter(|part| *part == retained)
+                .count()
+                == 1
+    });
+    let overlap = overlaps.next()?;
+    overlaps.next().is_none().then_some(&history[overlap..])
+}
+
+fn visible_history_start(recent: &Screen, visible: &Screen) -> Option<usize> {
+    if visible.truncated {
+        return None;
+    }
+    let recent = screen_lines(&recent.text);
+    let viewport = screen_lines(&visible.text);
+    let first = viewport.iter().position(|line| !line.is_empty())?;
+    let viewport = &viewport[first..];
+    if !recent.ends_with(viewport) {
+        return None;
+    }
+    let start = recent.len() - viewport.len();
+    (prompt_row(&recent)? >= start).then_some(start)
+}
+
+pub(super) fn nudge_visible_copies(
+    text: &str,
+    before: &Screen,
+    archive: &Screen,
+    before_visible: &Screen,
+) -> Option<usize> {
+    // An unseen part of history might contain the same reminder. Account for
+    // prior copies with the wider read and locate the append with the recent read.
+    if archive.truncated {
+        return None;
+    }
+    let start = visible_history_start(archive, before_visible)?;
+    visible_history_start(before, before_visible)?;
+    let history = codex_history(archive);
+    let copies = matching_user_entries(&history[start..], text);
+    (history.ends_with(&codex_history(before)) && matching_user_entries(&history, text) == copies)
+        .then_some(copies)
+}
+
+fn confirms_nudge(
+    text: &str,
+    before: &Screen,
+    after: &Screen,
+    after_visible: &Screen,
+    visible_copies: Option<usize>,
+) -> bool {
+    let Some(copies) = visible_copies else {
+        return false;
+    };
+    if before.truncated && !after.truncated {
+        return false;
+    }
+    let Some(after_start) = visible_history_start(after, after_visible) else {
+        return false;
+    };
+    let base = codex_history(before);
+    let history = codex_history(after);
+    let Some(added) = appended_history(&base, &history, after.truncated, text) else {
+        return false;
+    };
+    let Some(first) = added.iter().position(|row| !row.is_empty()) else {
+        return false;
+    };
+    let entry_start = history.len() - added.len() + first;
+    entry_start >= after_start
+        && matching_user_entries(&history[after_start..entry_start], text) == copies
+        && matches_user_entry(&added[first..], text)
+        && matching_user_entries(added, text) == 1
+}
+
+pub(super) fn confirm_codex_input(
+    handle: &Handle,
+    action: CodexInput,
+    text: &str,
+    before: &Screen,
+    visible_copies: Option<usize>,
+) -> Result<()> {
+    for _ in 0..2 {
+        sleep(Duration::from_millis(300));
+        let screen = handle.read()?;
+        let entry = match action {
+            // The full brief contains a fresh callback reference.
+            CodexInput::Continue => matching_user_entries(&codex_history(&screen), text) == 1,
+            CodexInput::Nudge => confirms_nudge(
+                text,
+                before,
+                &screen,
+                &handle.read_visible()?,
+                visible_copies,
+            ),
+        };
+        if read_only(&screen.text)
+            || refusals(&screen.text) > refusals(&before.text)
+            || !matches!(
+                observe_herdr_reply_box(handle, &screen, "codex")?,
+                ReplyBox::Empty
+            )
+            || !entry
+        {
+            let diagnostic = match action {
+                CodexInput::Continue => {
+                    "Herdr did not show a new task entry in the Codex transcript"
+                }
+                CodexInput::Nudge => {
+                    "Herdr did not show a new reminder entry in the Codex transcript"
+                }
+            };
+            return Err(Failure::unknown(diagnostic));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn confirm_codex(
     handle: &mut Handle,
     text: &str,
@@ -601,6 +799,78 @@ mod tests {
             revision: 0,
             truncated: false,
         }
+    }
+
+    #[test]
+    fn codex_nudge_confirmation_distinguishes_visible_input_from_an_archived_copy() {
+        let text = "[router] Message from the controller: check the report";
+        let composer = "› Ask Codex to do anything\n\n  model · dir";
+        let before_view = view(&format!("› {text}\n\n{composer}"));
+        let after_view = view(&format!("› {text}\n\n› {text}\n\n{composer}"));
+        let before = view(&format!("Earlier output\n{}", before_view.text));
+        let after = view(&format!("Earlier output\n{}", after_view.text));
+        let copies = nudge_visible_copies(text, &before, &before, &before_view);
+        assert_eq!(copies, Some(1));
+        assert!(confirms_nudge(text, &before, &after, &after_view, copies));
+        let archived = nudge_visible_copies(text, &before, &before, &view(composer));
+        assert_eq!(archived, None);
+        assert!(!confirms_nudge(
+            text,
+            &before,
+            &after,
+            &after_view,
+            archived
+        ));
+        assert!(!confirms_nudge(
+            text,
+            &before,
+            &after,
+            &view("different snapshot"),
+            copies,
+        ));
+        let incomplete = Screen {
+            truncated: true,
+            ..view(&before.text)
+        };
+        assert_eq!(
+            nudge_visible_copies(text, &before, &incomplete, &before_view),
+            None
+        );
+
+        let recent = Screen {
+            truncated: true,
+            ..view(&format!(
+                "Dropped row\nStable row A\nStable row B\n{composer}"
+            ))
+        };
+        let current_view = view(&format!("› {text}\n\n{composer}"));
+        let current = Screen {
+            truncated: true,
+            ..view(&format!(
+                "Stable row A\nStable row B\n\n{}",
+                current_view.text
+            ))
+        };
+        let archive = view(&format!("Earlier output\n{}", recent.text));
+        let copies = nudge_visible_copies(text, &recent, &archive, &view(composer));
+        assert_eq!(copies, Some(0));
+        assert!(confirms_nudge(
+            text,
+            &recent,
+            &current,
+            &current_view,
+            copies
+        ));
+        let old_copy = view(&format!("› {text}\n\n{}", archive.text));
+        let archived = nudge_visible_copies(text, &recent, &old_copy, &view(composer));
+        assert_eq!(archived, None);
+        assert!(!confirms_nudge(
+            text,
+            &recent,
+            &current,
+            &current_view,
+            archived
+        ));
     }
 
     #[test]

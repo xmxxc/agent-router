@@ -977,8 +977,14 @@ fn check_snapshot_size(size: usize) -> Result<()> {
 }
 
 fn continued_input_binding(row: &Value, event: &Value) -> Option<Value> {
+    let supported = match row["backend"].as_str() {
+        Some("tmux") => true,
+        #[cfg(target_os = "linux")]
+        Some("herdr") => super::herdr::bound_record(row).is_ok(),
+        _ => false,
+    };
     (row["host"] == "codex"
-        && row["backend"] == "tmux"
+        && supported
         && super::assignment::unresolved_handoff(row).is_none()
         && event["operation"] == "continue"
         && event["round"] == row["round"]
@@ -1419,8 +1425,9 @@ impl Inbox {
                     .get("continuedInputCallback")
                     .is_some_and(|saved| {
                         saved == &proof
-                            // Earlier binaries stored only the reference digest.
-                            || (event["result"] == "uncertain" && saved == &proof["referenceHash"])
+                            // Older continuations stored only the authenticated reference digest.
+                            || (event["result"] == "uncertain"
+                                && saved == &proof["referenceHash"])
                     })
         }))
     }
@@ -1469,6 +1476,16 @@ impl Inbox {
             .additional_fields
             .get("inputEvidence")
             .and_then(Value::as_str);
+        let herdr_proof = super::herdr::APPENDED_USER_ENTRY;
+        if proof == Some(herdr_proof) {
+            let valid = row["backend"] == "herdr"
+                && super::herdr::bound_record(row).is_ok()
+                && (event["result"] == "pending"
+                    || (event["result"] == "accepted"
+                        && event["message"] == message.id
+                        && event["inputEvidence"] == herdr_proof));
+            return Ok(valid.then(|| (message.id, json!(herdr_proof))));
+        }
         use crate::tmux::APPENDED_USER_ENTRY;
         match (event["result"].as_str(), proof) {
             (Some("pending"), Some(APPENDED_USER_ENTRY)) => {
@@ -1506,7 +1523,10 @@ impl Inbox {
         ensure!(
             event["inputEvidence"] == crate::tmux::APPENDED_USER_ENTRY
                 || (event["operation"] == "continue"
-                    && event["inputEvidence"] == CONTINUED_INPUT_CALLBACK),
+                    && event["inputEvidence"] == CONTINUED_INPUT_CALLBACK)
+                || (event["inputEvidence"] == super::herdr::APPENDED_USER_ENTRY
+                    && row["backend"] == "herdr"
+                    && super::herdr::bound_record(row).is_ok()),
             "missing worker input evidence"
         );
         let worker = Identity::deserialize(row).context("read worker input identity")?;
@@ -1905,12 +1925,13 @@ impl<'a> Done<'a> {
         // Git can block. Let unrelated callbacks and waits proceed while sampling.
         drop(inbox);
         let snapshot = duplicate.is_none().then(|| Snapshot::read(&initial.cwd));
-        // Publish after the same execution lock used for controller input.
+        // Share the attempt lock with tmux input and Herdr reminders.
         // The first check and Git probe hold neither lock while waiting.
         #[cfg(target_os = "linux")]
-        let _execution = (initial_row["backend"] == "tmux" && initial_row["host"].is_string())
-            .then(|| super::assignment::close_lock(&state, &initial_row))
-            .transpose()?;
+        let _execution = (matches!(initial_row["backend"].as_str(), Some("tmux" | "herdr"))
+            && initial_row["host"].is_string())
+        .then(|| super::assignment::close_lock(&state, &initial_row))
+        .transpose()?;
         let (current, row, mut inbox, duplicate, key) = check()?;
         ensure!(
             initial.worker.round == current.worker.round

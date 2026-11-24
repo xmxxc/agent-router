@@ -221,6 +221,16 @@ impl Owners {
         Ok(false)
     }
 
+    pub(super) fn authorized_generation(
+        &self,
+        scope: &str,
+        token: Option<&str>,
+        operation: &str,
+    ) -> Result<Option<u64>> {
+        self.require(scope, token, operation)?;
+        Ok(self.0.get(scope).map(|lease| lease.generation))
+    }
+
     pub fn preflight(
         &self,
         scope: Option<&str>,
