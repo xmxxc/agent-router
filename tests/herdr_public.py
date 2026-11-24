@@ -249,6 +249,454 @@ for line in sys.stdin:
         self.assertFalse(self.status()['pendingInput'])
         self.assert_reply_worker_finished(question, 'accepted')
 
+    def launch_project_worker(self, proxy, *worker_args):
+        project = self.root/'ordinary project'
+        project.mkdir()
+        subprocess.run(['git', 'init', '-q', project], env=self.env, check=True)
+        (project/'README.md').write_text('isolated Herdr project\n')
+        self.root = project
+        worker = Path(__file__).resolve().parents[1]/'crates/herdr/tests/continue_worker.py'
+        self.dispatch(endpoint=proxy, command=[sys.executable, '-u', str(worker), *worker_args])
+        live.wait_for(lambda: '› Ask Codex to do anything' in self.reply_screen())
+
+    def setup_continue_project(self, proxy):
+        self.launch_project_worker(proxy)
+        project = self.root
+        (project/'finish-first').touch()
+        first_receipt = project/'report.receipt'
+        first = json.loads(live.wait_for(lambda: first_receipt.exists() and first_receipt.read_bytes()))
+        self.assertEqual(self.status()['state'], 'done')
+        task, report = project/'second task.md', project/'second report.md'
+        task.write_text('second ordinary project task\n')
+        options = ('continue', self.dispatch_id, '--task', task, '--report', report)
+        return first, report, options
+
+    def test_nudge_on_live_herdr_worker_replays_only_the_original_key(self):
+        sends = []
+
+        def observe(request, response):
+            if request['method'] in ('pane.send_input', 'pane.send_keys'):
+                sends.append((request['method'], request['params']['pane_id']))
+            return response
+
+        with self.service.fault_proxy(observe) as proxy:
+            self.launch_project_worker(proxy)
+            before = self.status()
+            scope = self.row['scope']
+            former = self.cli('owner', 'acquire', '--scope', scope, '--owner', 'A')
+            current = self.cli('owner', 'takeover', '--scope', scope, '--owner', 'B')
+            self.env['WFC_CONTROLLER_TOKEN'] = former['token']
+            args = ('nudge', self.dispatch_id, '--text', 'ordinary reminder', '--message-id')
+            self.cli(*args, 'original-key', error='stale_controller_owner')
+            self.assertEqual(sends, [])
+            self.env['WFC_CONTROLLER_TOKEN'] = current['token']
+            state = Path(self.env['WFC_STATE'])
+            record = state/'dispatches'/f'{self.dispatch_id}.json'
+            before_write = record.read_bytes()
+            sidecar = state/'router.db-journal'
+            recovery_marker = b'synthetic legacy recovery sidecar'
+            sidecar.write_bytes(recovery_marker)
+            try:
+                self.cli(*args, 'original-key', error='legacy state write blocked')
+                self.assertEqual(record.read_bytes(), before_write)
+                self.assertEqual(sidecar.read_bytes(), recovery_marker)
+                self.assertEqual(sends, [])
+                self.assertFalse((self.root/'inputs').exists())
+            finally:
+                sidecar.unlink()
+            first = self.cli(*args, 'original-key')
+            self.assertEqual((first['round'], first['attempt']), (before['round'], before['attempt']))
+            self.assertEqual(self.cli(*args, 'original-key'), {**first, 'duplicate': True})
+            self.assertEqual(sends, [('pane.send_input', self.h['pane'])])
+            self.cli('nudge', self.dispatch_id, '--text', 'changed reminder', '--message-id',
+                     'original-key', error='conflicts')
+            state = self.status()
+            for key in ('round', 'attempt', 'task', 'report', 'executionId'):
+                self.assertEqual(state.get(key), before.get(key))
+            for key in ('service', 'workspace', 'pane', 'terminal', 'nonce', 'receipt'):
+                self.assertEqual(state['backendHandle'][key], before['backendHandle'][key])
+            # A distinct user request can intentionally repeat the same text.
+            second = self.cli(*args, 'new-key')
+            self.assertNotEqual((second['audit'], second['message']), (first['audit'], first['message']))
+            self.assertEqual(sends, [('pane.send_input', self.h['pane'])] * 2)
+            self.assertEqual((self.root/'inputs').read_text().splitlines(),
+                             ['[router] Message from the controller: ordinary reminder'] * 2)
+            self.assertEqual(len((self.root/'launches').read_text().splitlines()), 1)
+            (self.root/'finish-first').touch()
+            live.wait_for((self.root/'report.receipt').exists)
+            self.assertEqual(self.status()['state'], 'done')
+            self.cli(*args, 'after-done', error='already finished')
+            self.assertEqual(self.cli(*args, 'original-key'), {**first, 'duplicate': True})
+            self.assertEqual(sends, [('pane.send_input', self.h['pane'])] * 2)
+            reminders = [m for m in self.status()['messages'] if m['type'] == 'nudge']
+            self.assertEqual([(m['id'], m['inputEvidence']) for m in reminders],
+                             [(result['message'], 'herdr-appended-user-entry') for result in (first, second)])
+            self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+
+    def test_uncertain_herdr_nudge_is_not_replayed_even_after_continued_worker_done(self):
+        writes = []
+
+        def lose(request, response):
+            method = request['method']
+            if method in ('pane.send_input', 'pane.send_keys'):
+                writes.append(method)
+            if method == 'pane.send_input' and 'lost reminder' in request['params']['text']:
+                return None
+            return response
+
+        with self.service.fault_proxy(lose) as proxy:
+            _, report, advance = self.setup_continue_project(proxy)
+            continued = self.cli(*advance)
+            reminder = ('nudge', self.dispatch_id, '--text', 'lost reminder', '--message-id', 'lost')
+            self.cli(*reminder, error='nudge uncertain')
+            unsettled = self.status()['audit'][-1]
+            self.assertEqual((unsettled['operation'], unsettled['result'], unsettled['attempt']),
+                             ('nudge', 'uncertain', continued['attempt']))
+            for key in ('lost', 'other-key'):
+                self.cli(*reminder[:-1], key, error='pending or uncertain')
+            self.assertEqual(self.cli(*advance), {**continued, 'duplicate': True})
+            (self.root/'finish-next').touch()
+            live.wait_for(report.with_suffix('.receipt').exists)
+            self.assertEqual(self.status()['state'], 'done')
+            self.cli(*reminder, error='pending or uncertain')
+            view = self.status()
+            self.assertEqual(view['audit'][-1], unsettled)
+            self.assertFalse(any(m['type'] == 'nudge' for m in view['messages']))
+            entries = (self.root/'inputs').read_text().splitlines()
+            self.assertEqual(entries[1:], ['[router] Message from the controller: lost reminder'])
+            self.assertEqual(writes, ['pane.send_input', 'pane.send_input'])
+            self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+
+    def test_nudge_after_herdr_history_scrolls_past_the_recent_window(self):
+        writes = []
+
+        def count(request, response):
+            if request['method'] in ('pane.send_input', 'pane.send_keys'):
+                writes.append(request['method'])
+            return response
+
+        with self.service.fault_proxy(count) as proxy:
+            self.launch_project_worker(proxy, '--long-history')
+            before = self.service.api('pane.read', pane_id=self.h['pane'], source='recent',
+                                      format='text', strip_ansi=True, lines=200)['read']
+            self.assertTrue(before['truncated'])
+            args = ('nudge', self.dispatch_id, '--text', 'reminder after scroll', '--message-id', 'long')
+            result = self.cli(*args)
+            self.assertEqual(self.cli(*args), {**result, 'duplicate': True})
+            self.assertEqual(result['attempt'], self.row['attempt'])
+            self.assertEqual((self.root/'inputs').read_text().splitlines(),
+                             ['[router] Message from the controller: reminder after scroll'])
+            self.assertEqual(writes, ['pane.send_input'])
+            self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+
+    def test_nudge_with_archived_match_or_misaligned_view_is_not_sent(self):
+        writes = []
+        reminder = 'verify the ordinary project'
+        case = None
+
+        def substitute_snapshot(request, response):
+            method = request['method']
+            if method in ('pane.send_input', 'pane.send_keys'):
+                writes.append(request['params']['pane_id'])
+            if method == 'pane.read' and case is not None and 'result' in response:
+                params = request['params']
+                read = response['result']['read']
+                if case == 'archived' and params['source'] == 'recent' and params['lines'] == 1000:
+                    read['text'] = f'› [router] Message from the controller: {reminder}\n\n' + read['text']
+                if case == 'misaligned' and params['source'] == 'visible':
+                    read['text'] = 'A separate view snapshot\n' + read['text']
+            return response
+
+        with self.service.fault_proxy(substitute_snapshot) as proxy:
+            self.launch_project_worker(proxy)
+            args = ('nudge', self.dispatch_id, '--text', reminder, '--message-id', 'snapshot')
+            original = self.status()
+            for case, diagnostic in (('archived', 'archived transcript entry'),
+                                     ('misaligned', 'viewport does not match recent history')):
+                with self.subTest(case=case):
+                    error = self.cli(*args, error='nudge definitely-not-sent')
+                    self.assertIn(diagnostic, error)
+                    current = self.status()
+                    self.assertEqual(current['audit'][-1]['result'], 'definitely-not-sent')
+                    for key in ('round', 'attempt', 'state', 'messages'):
+                        self.assertEqual(current[key], original[key])
+                    self.assertEqual(writes, [])
+                    self.assertFalse((self.root/'inputs').exists())
+            case = None
+            sent = self.cli(*args)
+            self.assertEqual(self.cli(*args), {**sent, 'duplicate': True})
+            self.assertEqual(writes, [self.h['pane']])
+            self.assertEqual((self.root/'inputs').read_text().splitlines(),
+                             [f'[router] Message from the controller: {reminder}'])
+            self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+
+    def test_nudge_over_herdr_observation_limit_is_not_sent(self):
+        writes = []
+
+        def count(request, response):
+            if request['method'] in ('pane.send_input', 'pane.send_keys'):
+                writes.append(request['params']['pane_id'])
+            return response
+
+        with self.service.fault_proxy(count) as proxy:
+            self.launch_project_worker(proxy, '--over-limit-history')
+            original = self.status()
+            snapshot = self.service.api('pane.read', pane_id=self.h['pane'], source='recent',
+                                        format='text', strip_ansi=True, lines=1000)['read']
+            self.assertTrue(snapshot['truncated'])
+            args = ('nudge', self.dispatch_id, '--text', 'review after scroll', '--message-id', 'over-limit')
+            error = self.cli(*args, error='nudge definitely-not-sent')
+            self.assertIn('history exceeds the observation window', error)
+            current = self.status()
+            self.assertEqual(current['audit'][-1]['result'], 'definitely-not-sent')
+            for key in ('round', 'attempt', 'state', 'messages'):
+                self.assertEqual(current[key], original[key])
+            self.assertEqual(writes, [])
+            self.assertFalse((self.root/'inputs').exists())
+
+            (self.root/'finish-first').touch()
+            live.wait_for((self.root/'report.receipt').exists)
+            task, report = self.root/'second task.md', self.root/'second report.md'
+            task.write_text('new task after the history limit\n')
+            sent = self.cli('continue', self.dispatch_id, '--task', task, '--report', report)
+            self.assertEqual((sent['round'], sent['result']), (2, 'accepted'))
+            self.assertEqual(writes, [self.h['pane']])
+            brief, = (self.root/'inputs').read_text().splitlines()
+            self.assertIn(sent['attempt'], brief)
+            self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+
+    def test_continue_completes_a_new_task_in_the_original_herdr_pane(self):
+        writes = []
+
+        def count(req, reply):
+            if req['method'] in ('pane.send_input', 'pane.send_keys'):
+                writes.append((req['method'], req['params']['pane_id']))
+            return reply
+
+        with self.service.fault_proxy(count) as proxy:
+            first, report, options = self.setup_continue_project(proxy)
+            old = self.cli('owner', 'acquire', '--scope', self.row['scope'], '--owner', 'A')
+            current = self.cli('owner', 'takeover', '--scope', self.row['scope'], '--owner', 'B')
+            self.env['WFC_CONTROLLER_TOKEN'] = old['token']
+            self.cli(*options, error='stale_controller_owner')
+            self.assertEqual(writes, [])
+            self.env['WFC_CONTROLLER_TOKEN'] = current['token']
+            before = self.status()['backendHandle']
+            original_report = (self.root/'report.md').read_bytes()
+            continued = self.cli(*options)
+            self.assertEqual((continued['round'], continued['result']), (2, 'accepted'))
+            self.assertNotEqual(continued['attempt'], self.row['attempt'])
+            repeated = self.cli(*options)
+            self.assertEqual(repeated, {**continued, 'duplicate': True})
+            (self.root/'check-old-callback').touch()
+            old_result = self.root/'old-callback.result'
+            self.assertNotEqual(live.wait_for(lambda: old_result.exists() and old_result.read_text()), '0')
+            (self.root/'finish-next').touch()
+            second_receipt = report.with_suffix('.receipt')
+            second = json.loads(live.wait_for(lambda: second_receipt.exists() and second_receipt.read_bytes()))
+            self.assertNotEqual(report.read_bytes(), original_report)
+            view = self.status()
+            self.assertTrue(view['backendAlive'])
+            self.assertEqual(view['state'], 'done')
+            for key in ('endpoint', 'service', 'workspace', 'pane', 'terminal', 'nonce', 'receipt'):
+                self.assertEqual(view['backendHandle'][key], before[key])
+            self.assertEqual(view['backendHandle']['writerProcesses'][0], before['writerProcesses'][0])
+            pid, = (self.root/'launches').read_text().splitlines()
+            self.assertEqual(report.read_text(), f'{report.name} from worker {pid}\n')
+            self.assertEqual(original_report.decode(), f'report.md from worker {pid}\n')
+            self.assertEqual((self.root/'report.md').read_bytes(), original_report)
+            self.assertEqual([(r['round'], r['result']['messageId']) for r in view['rounds']],
+                             [(1, first['messageId']), (2, second['messageId'])])
+            outgoing, = [m for m in view['messages'] if m['type'] == 'continue']
+            self.assertEqual((outgoing['id'], outgoing['inputEvidence']),
+                             (continued['message'], 'herdr-appended-user-entry'))
+            brief, = (self.root/'inputs').read_text().splitlines()
+            self.assertIn('second task.md', brief)
+            self.assertIn(continued['attempt'], brief)
+            self.assertEqual(writes, [('pane.send_input', before['pane'])])
+            self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+            closed = self.status()
+            self.assertFalse(closed['backendAlive'])
+            self.assertEqual(closed['rounds'], view['rounds'])
+
+    def test_continue_restores_old_herdr_round_after_proven_zero_write(self):
+        writes = []
+
+        def count(req, reply):
+            if req['method'] in ('pane.send_input', 'pane.send_keys'):
+                writes.append(req['method'])
+            return reply
+
+        with self.service.fault_proxy(count) as proxy:
+            first, report, options = self.setup_continue_project(proxy)
+            (self.root/'show-draft').touch()
+            live.wait_for(lambda: 'local user draft' in self.reply_screen())
+            self.cli(*options, error='draft')
+            view = self.status()
+            self.assertEqual((view['round'], view['attempt'], view['state']), (1, self.row['attempt'], 'done'))
+            self.assertEqual(view['rounds'][0]['result']['messageId'], first['messageId'])
+            self.assertEqual(view['audit'][-1]['result'], 'definitely-not-sent')
+            self.assertIn('local user draft', self.reply_screen())
+            self.assertFalse(report.exists())
+            self.assertFalse((self.root/'inputs').exists())
+            self.assertEqual(writes, [])
+            (self.root/'clear-draft').touch()
+            live.wait_for(lambda: '› Ask Codex to do anything' in self.reply_screen())
+            self.assertEqual(self.cli(*options)['round'], 2)
+            self.assertEqual(writes, ['pane.send_input'])
+            self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+
+    def test_continue_retries_after_herdr_rejects_input_without_enqueueing(self):
+        rejected, forwarded = [], []
+
+        def refuse_first(request):
+            if request['method'] == 'pane.send_input' and not rejected:
+                rejected.append(request['id'])
+                return {'id': request['id'], 'error': {
+                    'code': 'pane_send_failed', 'message': 'test queue did not accept input',
+                }}
+
+        def count(request, response):
+            if request['method'] in ('pane.send_input', 'pane.send_keys'):
+                forwarded.append((request['method'], request['id'], request['params']['pane_id']))
+            return response
+
+        with self.service.fault_proxy(count, respond_before_forward=refuse_first) as proxy:
+            first, report, options = self.setup_continue_project(proxy)
+            original_report = (self.root/'report.md').read_bytes()
+            self.cli(*options, error='Herdr did not enqueue worker input')
+            view = self.status()
+            self.assertEqual((view['round'], view['attempt'], view['state']), (1, self.row['attempt'], 'done'))
+            self.assertEqual(view['rounds'][0]['result']['messageId'], first['messageId'])
+            self.assertEqual(view['audit'][-1]['result'], 'definitely-not-sent')
+            self.assertEqual((self.root/'report.md').read_bytes(), original_report)
+            self.assertFalse((self.root/'inputs').exists())
+            self.assertFalse(report.exists())
+            self.assertEqual(forwarded, [])
+
+            retried = self.cli(*options)
+            self.assertEqual((retried['round'], retried['result']), (2, 'accepted'))
+            self.assertEqual(self.cli(*options), {**retried, 'duplicate': True})
+            method, request_id, pane = forwarded[0]
+            self.assertEqual((len(forwarded), method, pane), (1, 'pane.send_input', self.h['pane']))
+            self.assertEqual(len(rejected), 1)
+            self.assertNotEqual(request_id, rejected[0])
+            brief, = (self.root/'inputs').read_text().splitlines()
+            self.assertIn(retried['attempt'], brief)
+            self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+
+    def test_continue_does_not_resend_after_lost_herdr_input_receipt(self):
+        writes = []
+
+        def lose(req, reply):
+            if req['method'] in ('pane.send_input', 'pane.send_keys'):
+                writes.append(req['method'])
+                return None
+            return reply
+
+        with self.service.fault_proxy(lose) as proxy:
+            first, report, options = self.setup_continue_project(proxy)
+            self.cli(*options, error='uncertain')
+            view = self.status()
+            event, = view['audit']
+            self.assertEqual((view['round'], event['attempt'], event['result']), (2, view['attempt'], 'uncertain'))
+            self.assertEqual(view['rounds'][0]['result']['messageId'], first['messageId'])
+            self.cli(*options, error='pending or uncertain')
+            self.cli('--herdr-backend', payload=dict(op='submit', dispatch=self.dispatch_id,
+                     round=2, attempt=view['attempt'], text='must stay blocked'), error='pending or uncertain')
+            self.assertEqual(self.status()['audit'], [event])
+            received = self.root/'inputs'
+            brief, = live.wait_for(lambda: received.exists() and received.read_text().splitlines())
+            self.assertIn('second task.md', brief)
+            self.assertFalse(report.exists())
+            self.assertEqual(writes, ['pane.send_input'])
+            (self.root/'finish-next').touch()
+            second_receipt = report.with_suffix('.receipt')
+            second = json.loads(live.wait_for(lambda: second_receipt.exists() and second_receipt.read_bytes()))
+            state = Path(self.env['WFC_STATE'])
+            assignment = state/'dispatches'/f'{self.dispatch_id}.json'
+            ledger = state/'messages.json'
+            uncertain = assignment.read_bytes()
+            history = json.loads(ledger.read_bytes())
+            callback, = [m for m in history if m['messageId'] == second['messageId']]
+            proof = callback['continuedInputCallback']
+            self.assertEqual((proof['audit'], proof['executionId']), (event['id'], self.row['attempt']))
+            settled = self.cli(*options)
+            self.assertEqual((settled['audit'], settled['attempt'], settled['duplicate']),
+                             (event['id'], event['attempt'], True))
+
+            # Restore the uncertain assignment and the digest-only receipt emitted by R16.
+            callback['continuedInputCallback'] = proof['referenceHash']
+            ledger.write_text(json.dumps(history))
+            pending = json.loads(uncertain)
+            pending['audit'][-1]['result'] = 'pending'
+            assignment.write_text(json.dumps(pending))
+            self.cli(*options, error='pending or uncertain')
+            self.assertEqual(json.loads(assignment.read_bytes()), pending)
+            self.assertEqual(json.loads(ledger.read_bytes()), history)
+            assignment.write_bytes(uncertain)
+            self.assertEqual(self.cli(*options), settled)
+            self.assertEqual(writes, ['pane.send_input'])
+            self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+
+    def test_continue_keeps_herdr_ack_with_only_an_empty_redraw_uncertain(self):
+        writes = []
+
+        def count(req, reply):
+            if req['method'] in ('pane.send_input', 'pane.send_keys'):
+                writes.append(req['method'])
+            return reply
+
+        with self.service.fault_proxy(count) as proxy:
+            first, report, options = self.setup_continue_project(proxy)
+            (self.root/'discard-next-input').touch()
+            self.cli(*options, error='did not show a new task entry')
+            self.assertIn('› Ask Codex to do anything', self.reply_screen())
+            view = self.status()
+            event, = view['audit']
+            self.assertEqual((view['round'], event['result']), (2, 'uncertain'))
+            self.assertEqual(view['rounds'][0]['result']['messageId'], first['messageId'])
+            self.cli(*options, error='pending or uncertain')
+            self.assertEqual(self.status()['audit'], [event])
+            self.assertFalse(report.exists())
+            brief, = (self.root/'inputs').read_text().splitlines()
+            self.assertIn('second task.md', brief)
+            self.assertEqual(writes, ['pane.send_input'])
+            self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+
+    def test_continue_refuses_when_the_herdr_worker_loses_foreground(self):
+        writes = []
+
+        def count(req, reply):
+            if req['method'] in ('pane.send_input', 'pane.send_keys'):
+                writes.append(req['method'])
+            return reply
+
+        with self.service.fault_proxy(count) as proxy:
+            first, report, options = self.setup_continue_project(proxy)
+            worker_pid = int((self.root/'launches').read_text())
+
+            def foreground():
+                info = self.service.api('pane.process_info', pane_id=self.h['pane'])['process_info']
+                return {p['pid'] for p in info.get('foreground_processes', [])}
+
+            (self.root/'yield-foreground').touch()
+            pid_file = self.root/'foreground-pid'
+            other = int(live.wait_for(lambda: pid_file.exists() and pid_file.read_text()))
+            live.wait_for(lambda: other in foreground())
+            self.assertNotIn(worker_pid, foreground())
+            self.assertIn('› Ask Codex to do anything', self.reply_screen())
+            self.cli(*options, error='not in the pane foreground')
+            view = self.status()
+            self.assertEqual((view['round'], view['state'], view['audit'][-1]['result']),
+                             (1, 'done', 'definitely-not-sent'))
+            self.assertEqual(view['rounds'][0]['result']['messageId'], first['messageId'])
+            self.assertFalse(report.exists())
+            self.assertEqual(writes, [])
+            (self.root/'restore-foreground').touch()
+            live.wait_for(lambda: worker_pid in foreground())
+            self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+
     def test_public_reply_retains_claim_after_herdr_delivers_without_receipt(self):
         sends = []
 
@@ -1487,8 +1935,8 @@ while not Path('release').exists():
         import sqlite3
         with sqlite3.connect(state/'router.db') as db:
             db.execute('create table marker(x)')
-        self.reconcile(error='legacy router database')
-        self.cli('close', self.dispatch_id, error='legacy router database')
+        self.reconcile(error='legacy state write blocked')
+        self.cli('close', self.dispatch_id, error='legacy state write blocked')
         self.assertIsNone(self.status()['backendAlive'])
         (state/'router.db').unlink()
         path = state/'dispatches'/(self.dispatch_id+'.json')
