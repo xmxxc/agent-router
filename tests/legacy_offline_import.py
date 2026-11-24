@@ -167,6 +167,64 @@ def concurrent_import(binary, root, source, proof, target):
     return next(receipt for receipt in receipts if not receipt["duplicate"])
 
 
+def verify_legacy_token_bytes(binary, root, source):
+    fixture = root / "legacy-token-source"
+    fixture.mkdir()
+    database = Path(shutil.copyfile(source / "router.db", fixture / "router.db"))
+    target = root / "legacy-token-native"
+    legacy_token = " \t\u2003"
+    legacy_digest = digest(legacy_token.encode())
+    private_values = (legacy_token, json.dumps(legacy_token, ensure_ascii=False), legacy_digest)
+
+    def set_owner(owner, token):
+        with closing(sqlite3.connect(database)) as db, db:
+            db.execute("UPDATE controller_owner SET owner=?, token=? WHERE scope=?", (owner, token, SCOPE))
+
+    def reject(proof, diagnostic):
+        before = snapshot(fixture)
+        scratch = set(root.glob(".wfc-legacy-import-*"))
+        result = run(binary, root, target, *import_args(fixture, proof))
+        denied(result, diagnostic)
+        assert all(value not in result.stderr for value in private_values)
+        assert snapshot(fixture) == before and not target.exists()
+        assert set(root.glob(".wfc-legacy-import-*")) == scratch
+
+    for case, owner, token, diagnostic in (
+        ("empty", "fixture controller", "", "missing or invalid legacy token"),
+        ("blob", "fixture controller", b"fixture-blob", "unexpected blob in ledger column token"),
+        ("blank-owner", " \t", legacy_token, "missing or invalid legacy owner"),
+    ):
+        set_owner(owner, token)
+        proof = proof_for(root / f"legacy-token-{case}.json", database, target)
+        reject(proof, diagnostic)
+
+    set_owner("fixture controller", legacy_token)
+    before = snapshot(fixture)
+    recycled = proof_for(root / "legacy-token-recycled.json", database, target)
+    details = json.loads(recycled.read_text())
+    details["ownerReplacements"][SCOPE]["tokenSha256"] = legacy_digest
+    recycled.write_text(json.dumps(details))
+    reject(recycled, "invalid or reused replacement fingerprint")
+
+    proof = proof_for(root / "legacy-token-proof.json", database, target)
+    migrated = output(run(binary, root, target, *import_args(fixture, proof)))
+    assert digest(Path(migrated["backup"]).read_bytes()) == before["router.db"][1]
+    owner = json.loads((target / "controller-owners.json").read_bytes())[SCOPE]
+    assert owner["generation"] == 8 and legacy_digest in owner["retired"]
+    assert owner["fingerprint"] == digest(NEW.encode())
+    stale = run(binary, root, target, "ack", "41", token=legacy_token)
+    denied(stale, "stale_controller_owner")
+    assert all(value not in stale.stderr for value in private_values)
+    ack = output(run(binary, root, target, "ack", "41", token=NEW))
+    assert (ack["message"], ack["messageId"], ack["state"]) == (41, identifier(41), "processed")
+    status = output(run(binary, root, target, "status", "--dispatch", DISPATCH))
+    assert status["dispatches"][0]["controllerOwner"]["generation"] == 8
+    public = json.dumps([migrated, ack, status], ensure_ascii=False)
+    assert all(field not in public for field in (
+        *private_values, "ownerTokenRecorded", "ownerTokenMatchesCurrent", "\"fingerprint\"", "\"retired\""))
+    assert snapshot(fixture) == before
+
+
 def read_and_ack(binary, root, target, work, bodies):
     initial = output(run(binary, root, target, "status", "--dispatch", DISPATCH))["dispatches"][0]
     assert (initial["legacyArchived"], initial["backendAlive"], initial["attempt"]) == (True, False, CURRENT)
@@ -315,12 +373,14 @@ def fixture(binary, schema, root, version, backend):
     assert output(run(binary, root, target, *import_args(source, proof)))["duplicate"] is True
     assert snapshot(target) == after_writes
     evidence = interruption(binary, root, source)
+    verify_legacy_token_bytes(binary, root, source)
     assert snapshot(source) == original
     print(json.dumps({"syntheticPythonSchema": version, "legacyBackend": backend,
                       "sourceBeforeAfter": original["router.db"][1], "backup": digest(backup.read_bytes()),
                       "nativeLedgerBefore": old_bytes["messages.json"][1],
                       "nativeLedgerAfter": after_writes["messages.json"][1],
-                      "ackedOriginal": ack["messageId"], "newNumericId": done["message"], **evidence}), flush=True)
+                      "ackedOriginal": ack["messageId"], "newNumericId": done["message"],
+                      "whitespaceLegacyRotation": True, **evidence}), flush=True)
 
 
 if __name__ == "__main__":

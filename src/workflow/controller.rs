@@ -156,7 +156,14 @@ pub(super) fn stage_legacy_owners(
 
     let old_fingerprints: BTreeSet<_> = rows
         .iter()
-        .map(|row| text(row, "token").map(messages::body_hash))
+        .map(|row| {
+            // Frozen Python accepted any nonempty credential and compared it verbatim.
+            row["token"]
+                .as_str()
+                .filter(|token| !token.is_empty())
+                .context("missing or invalid legacy token")
+                .map(messages::body_hash)
+        })
         .collect::<Result<_>>()?;
     let mut new_fingerprints = BTreeSet::new();
     let mut owners = Owners::default();
