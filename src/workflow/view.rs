@@ -180,7 +180,9 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
             let unconfirmed_resume = super::assignment::resume_audit(row)
                 .is_some_and(|event| event["result"] != "accepted");
             let state = match row["worker"]["state"].as_str() {
-                _ if unconfirmed_resume => "unknown",
+                _ if unconfirmed_resume || super::assignment::unresolved_handoff(row).is_some() => {
+                    "unknown"
+                }
                 Some("exited" | "not_started") if startup_failure.is_some() => "failed",
                 _ if unresolved_worker => "unknown",
                 _ if unconfirmed_create && row["worker"]["state"] != "cancelled" => {

@@ -107,6 +107,21 @@ pub fn create(state: &Path, row: &Value, launch: Launch) -> Result<Value> {
 }
 
 #[cfg(target_os = "linux")]
+pub(super) fn create_for_handoff(
+    state: &Path,
+    row: &Value,
+    audit: usize,
+    launch: Launch,
+) -> Result<Value> {
+    call(
+        state,
+        row,
+        json!({"op":"create","executionId":row["executionId"],"handoffAudit":audit,
+            "cwd":row["cwd"],"label":row["label"],"argv":launch.argv,"env":launch.env}),
+    )
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn resume(state: &Path, row: &Value, launch: Launch) -> Result<Value> {
     // The OpenCode TUI owns submission after it proves adoption and claims
     // the brief. Use tmux for launch only on this public path.
@@ -235,7 +250,7 @@ fn existing_request(state: &Path, row: &Value, mut request: Value) -> Result<Val
     call(state, row, request)
 }
 
-fn receipt_id(row: &Value) -> Result<Option<&str>> {
+pub(super) fn receipt_id(row: &Value) -> Result<Option<&str>> {
     let create = &row["create"];
     if !create.is_null() {
         // R2 only created first-round assignments and stored the reply inline.
@@ -428,6 +443,50 @@ fn script_preflight_close(row: &Value) -> Option<Value> {
     })
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn handoff_writer(state: &Path, row: &Value) -> Result<Option<wfc_herdr::Process>> {
+    let launch = receipt_id(row)?.context("missing original launch receipt")?;
+    let known = state
+        .canonicalize()?
+        .join("launches")
+        .join(format!("{launch}.json"));
+    ensure!(
+        row["create"]["receipt"].as_str().map(Path::new) == Some(known.as_path()),
+        "unexpected original launch receipt path"
+    );
+    let receipt = private_receipt(state, Some(launch))?;
+    ensure!(
+        receipt["launchId"] == launch && receipt["treeTracked"] == true,
+        "unverified original worker tree; handoff requires a tracked native launch"
+    );
+    if exited(&receipt).is_some() {
+        return Ok(None);
+    }
+    let pid = receipt["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0 && receipt["category"] == "started")
+        .context("missing original writer process")?;
+    Ok(wfc_herdr::Process::observe(pid)?)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn handoff_tree_stopped(state: &Path, row: &Value) -> Result<Option<Value>> {
+    let launch = receipt_id(row)?.context("missing original launch receipt")?;
+    let path = state.join("launches").join(format!("{launch}.stopped"));
+    let Some(evidence) = super::handoff::read_order(&path)? else {
+        return Ok(None);
+    };
+    Ok((evidence["writerTreeStopped"] == true
+        && evidence["launchId"] == launch
+        && evidence["dispatch"] == row["dispatch"]
+        && evidence["attempt"] == row["attempt"]
+        && row["round"]
+            .as_u64()
+            .is_some_and(|round| evidence["round"] == round.to_string()))
+    .then_some(evidence))
+}
+
 fn closed_path(state: &Path, row: &Value) -> Result<PathBuf> {
     let attempt = row["attempt"]
         .as_str()
@@ -544,6 +603,62 @@ fn confirmed(row: &Value, saved: &Value) -> bool {
         Some("session_closed") => archived_exit(saved) || saved["worker"]["state"] == "cancelled",
         _ => false,
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn registered_tmux_round(
+    state: &Path,
+    dispatch: &str,
+    attempt: &str,
+    launch: &str,
+) -> Option<u64> {
+    let row = super::assignment::public_record(&state.join("dispatches"), dispatch).ok()??;
+    let expected = state.join("launches").join(format!("{launch}.json"));
+    if row["backend"] != "tmux"
+        || row["dispatch"] != dispatch
+        || row["attempt"] != attempt
+        || row["executionId"] != attempt
+        || receipt_id(&row).ok()? != Some(launch)
+        || row["create"]["receipt"].as_str().map(Path::new) != Some(expected.as_path())
+    {
+        return None;
+    }
+    row["round"].as_u64().filter(|round| *round > 0)
+}
+
+fn require_archived_worker_tree(
+    state: &Path,
+    row: &Value,
+    saved: &Value,
+    remember: bool,
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if saved_revocation(row, saved).is_none() {
+        let launch = receipt_id(row)?.or_else(|| {
+            (row["executionId"] == row["attempt"]
+                && saved["executionId"] == row["attempt"]
+                && close_operation(row).is_ok_and(|op| saved["closeOperationId"] == op))
+            .then(|| saved["launchId"].as_str().filter(|id| valid_launch(id)))
+            .flatten()
+        });
+        if let Some(launch) = launch {
+            let dispatch = row["dispatch"].as_str().context("missing dispatch")?;
+            if remember {
+                crate::tmux::launch::remember_unknown_close_identity(state, launch, dispatch)?;
+            }
+            ensure!(
+                crate::tmux::launch::close_worker_tree_ready(state, launch, dispatch, || Some((
+                    row["attempt"].as_str()?.to_owned(),
+                    row["round"].as_u64()?
+                )),),
+                "close uncertain: {}",
+                crate::tmux::launch::UNKNOWN_CLOSE_IDENTITY
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (state, row, saved, remember);
+    Ok(())
 }
 
 fn exited(evidence: &Value) -> Option<Value> {
@@ -745,7 +860,10 @@ pub(super) fn observe_with_mode(
         return super::herdr::observe(state, row, read_only);
     }
     let saved = archive(state, row)?.unwrap_or(Value::Null);
-    if confirmed(row, &saved) {
+    let archived = confirmed(row, &saved);
+    let archive_blocked =
+        archived && require_archived_worker_tree(state, row, &saved, false).is_err();
+    if archived && !archive_blocked {
         let mut observation = json!({"result":"completed","alive":false});
         copy_close_fields(&saved, &mut observation);
         let worker = closed_worker(state, row, &saved, true, read_only)?
@@ -758,7 +876,8 @@ pub(super) fn observe_with_mode(
     // A legacy release can replay an old absence from the backend's history,
     // even if the public archive never made it to disk.
     let legacy_absence = !supports_session_confirmation(row) && inspection["alive"] == false;
-    if revoked.is_some()
+    if archive_blocked
+        || revoked.is_some()
         || unverified_absence(&saved)
         || legacy_absence
         || saved["resourceCleanup"] == "uncertain"
@@ -853,6 +972,7 @@ pub(super) fn read_only_close(state: &Path, row: &Value) -> Result<Option<Value>
     }
     if row["backend"] == "tmux" {
         if let Some(saved) = archive(state, row)?.filter(|saved| confirmed(row, saved)) {
+            require_archived_worker_tree(state, row, &saved, false)?;
             return replay(state, row, &saved, false);
         }
     }
@@ -879,6 +999,7 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
         archive(state, row)?.unwrap_or(Value::Null)
     };
     if confirmed(row, &saved) {
+        require_archived_worker_tree(state, row, &saved, true)?;
         return replay(state, row, &saved, true)?.context("missing archived close receipt");
     }
 

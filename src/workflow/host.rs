@@ -227,6 +227,14 @@ pub(super) fn worker_brief(record: &Value, opening: &str) -> Result<String> {
     ))
 }
 
+#[derive(Clone, Copy)]
+enum WorkerStart<'a> {
+    Initial,
+    Resume(&'a str),
+    #[cfg(target_os = "linux")]
+    Handoff,
+}
+
 impl Options<'_> {
     pub fn prepare(&self, state: &Path, record: &mut Value) -> Result<Launch> {
         self.prepare_worker(state, record, None)
@@ -238,7 +246,14 @@ impl Options<'_> {
         record: &mut Value,
         resume: Option<&str>,
     ) -> Result<Launch> {
-        self.prepare_launch(state, record, resume, None)
+        let start = resume.map_or(WorkerStart::Initial, WorkerStart::Resume);
+        self.prepare_launch(state, record, start, None)
+            .map(|(launch, _)| launch)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn prepare_handoff(&self, state: &Path, record: &mut Value) -> Result<Launch> {
+        self.prepare_launch(state, record, WorkerStart::Handoff, None)
             .map(|(launch, _)| launch)
     }
     // The resume transaction owns publication and the subsequent terminal input.
@@ -275,7 +290,7 @@ impl Options<'_> {
             git: original["git"] == true,
             ..Options::default()
         }
-        .prepare_launch(state, next, Some(opening), Some(original))?;
+        .prepare_launch(state, next, WorkerStart::Resume(opening), Some(original))?;
         Ok((launch, input.context("missing OpenCode resume input")?))
     }
 
@@ -347,12 +362,19 @@ impl Options<'_> {
         &self,
         state: &Path,
         record: &mut Value,
-        resume: Option<&str>,
+        start: WorkerStart<'_>,
         original: Option<&Value>,
     ) -> Result<(Launch, Option<String>)> {
         let cwd = PathBuf::from(record["cwd"].as_str().context("missing cwd")?);
         let mut writable = writable_paths(state, record)?;
-        let mut brief = worker_brief(record, resume.unwrap_or(FIRST_BRIEF))?;
+        let opening = match start {
+            WorkerStart::Initial => FIRST_BRIEF,
+            WorkerStart::Resume(opening) => opening,
+            #[cfg(target_os = "linux")]
+            WorkerStart::Handoff => "[router] This task has been handed off to a new host",
+        };
+        let resume = matches!(start, WorkerStart::Resume(_));
+        let mut brief = worker_brief(record, opening)?;
         if self.name == "opencode" {
             brief.push_str(&format!(
                 " Current attempt {}.",
@@ -360,7 +382,7 @@ impl Options<'_> {
             ));
         }
         let (mut launch, selected_config, default_command) =
-            self.launch_prefix(&cwd, resume.is_none())?;
+            self.launch_prefix(&cwd, matches!(start, WorkerStart::Initial))?;
         #[cfg(not(target_os = "linux"))]
         let _ = default_command;
         if let Some(original) = original {
@@ -374,7 +396,7 @@ impl Options<'_> {
         let mut resume_input = None;
         match self.name {
             "codex" => {
-                if resume.is_some() {
+                if resume {
                     a.push("resume".into());
                 }
                 a.extend(
@@ -408,6 +430,13 @@ impl Options<'_> {
                 a.push(brief);
             }
             "opencode" => {
+                #[cfg(target_os = "linux")]
+                ensure!(
+                    !matches!(start, WorkerStart::Handoff)
+                        || !opencode::effective_setting(&launch.env, "WFC_OPENCODE_ISOLATED_STORE")
+                            .is_some_and(|value| value == Path::new("1")),
+                    "handoff does not support a private OpenCode opening"
+                );
                 #[cfg(target_os = "linux")]
                 let session = opencode::prepare(state, &mut launch.env, record, original, &brief)?;
                 #[cfg(not(target_os = "linux"))]
@@ -496,14 +525,14 @@ impl Options<'_> {
             match codex_home(&cwd, &launch.env) {
                 Ok(home) => {
                     record["codexHome"] = json!(home);
-                    if resume.is_some() {
+                    if resume {
                         launch.env.insert("CODEX_HOME".into(), json!(home));
                     }
                 }
-                Err(error) if resume.is_some() => return Err(error),
+                Err(error) if resume => return Err(error),
                 Err(_) => {}
             }
-            if resume.is_none() {
+            if !resume {
                 record["codexBriefHash"] = json!(super::messages::body_hash(
                     launch.argv.last().context("missing Codex brief")?
                 ));

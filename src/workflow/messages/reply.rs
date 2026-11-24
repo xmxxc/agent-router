@@ -250,7 +250,8 @@ fn validate(state: &Path, inbox: &Inbox, question: &Message, token: Option<&str>
     );
     inbox.require_question_round(&assignment, &row, Some(&worker.attempt))?;
     ensure!(
-        row["createPending"] != true
+        super::super::assignment::unresolved_handoff(&row).is_none()
+            && row["createPending"] != true
             && (!row["host"].is_string() || row["create"]["result"] == "accepted"),
         "question {} belongs to an unconfirmed execution",
         question.id

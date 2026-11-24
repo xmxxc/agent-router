@@ -21,6 +21,8 @@ pub struct Request {
     execution_id: Option<String>,
     #[serde(rename = "closeOperationId")]
     close_operation_id: Option<String>,
+    #[serde(rename = "handoffAudit")]
+    handoff_audit: Option<usize>,
     #[serde(rename = "legacyExecutionId")]
     legacy_execution_id: Option<String>,
     #[serde(rename = "legacyWorkerPane")]
@@ -79,6 +81,7 @@ struct Tmux<'a> {
     input_request: bool,
     new_execution_id: Option<&'a str>,
     close_operation_id: Option<&'a str>,
+    handoff_audit: Option<usize>,
     close_execution: Option<&'a str>,
     state: &'a Path,
     dispatch: &'a str,
@@ -770,6 +773,7 @@ impl Tmux<'_> {
             } else {
                 worker.check_before_kill()?;
                 t.worker_pane()?;
+                let hangup_target = self.close_hangup_target(&t, &worker)?;
                 // Leave a retained dead pane intact for reconciliation.
                 let action = format!(
                     "if-shell -F -t {} '#{{pane_dead}}' {{ display-message -p dead }} {{ {kill} }}",
@@ -792,6 +796,18 @@ impl Tmux<'_> {
                         "uncertain",
                         "session closed but worker exit order is unconfirmed",
                     ));
+                }
+                // The pane's supervisor survives hangup to write exit and tree-stop
+                // evidence. Deliver the confirmed close's hangup to its verified child.
+                if let Some(target) = hangup_target {
+                    if let Err(error) = binding::signal_worker(&target, libc::SIGHUP) {
+                        if error.raw_os_error() != Some(libc::ESRCH) {
+                            return Err(failure(
+                                "uncertain",
+                                "session closed but original worker hangup is unconfirmed",
+                            ));
+                        }
+                    }
                 }
                 CloseEffect::SessionClosed
             }
@@ -863,6 +879,7 @@ pub(crate) fn attach(state: &Path, dispatch: &str, socket: &Path, token: &str) -
         input_request: false,
         new_execution_id: None,
         close_operation_id: None,
+        handoff_audit: None,
         close_execution: None,
         session: format!("wfc-{dispatch}"),
         socket: Some(socket.to_owned()),
@@ -989,6 +1006,7 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
         legacy_recovery: request.legacy_recovery.as_ref(),
         new_execution_id: request.execution_id.as_deref().filter(|_| launching),
         close_operation_id: request.close_operation_id.as_deref(),
+        handoff_audit: request.handoff_audit,
         close_execution: request
             .execution_id
             .as_deref()
@@ -1003,6 +1021,21 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
         Ok(lock) => lock,
         Err(result) => return Ok(result),
     };
+    if let Some(audit) = request.handoff_audit {
+        ensure!(
+            matches!(&request.op, Operation::Create(_)) && !request.fresh_dispatch,
+            "handoff audit requires a replacement create"
+        );
+        let attempt = request
+            .execution_id
+            .as_deref()
+            .context("missing handoff execution")?;
+        if let Err(error) =
+            crate::workflow::handoff::require_launch(&state, &request.dispatch, attempt, audit)
+        {
+            return Ok(failure("definitely-not-sent", &format!("{error:#}")));
+        }
+    }
     let inspect = matches!(request.op, Operation::Inspect);
     if let Some(execution) = request.execution_id.as_deref().filter(|_| !launching) {
         native_id = match backend.registered_launch(execution) {
@@ -1010,6 +1043,11 @@ pub fn execute(state: &Path, request: Request) -> Result<Value> {
             Err(e) => return Ok(e),
         };
         backend.legacy_execution_id = Some(&native_id);
+    }
+    if matches!(&request.op, Operation::Close) {
+        if let Err(error) = backend.require_close_worker_tree(request.execution_id.as_deref()) {
+            return Ok(error);
+        }
     }
     let mut result = backend
         .operate(request.op, request.fresh_dispatch)

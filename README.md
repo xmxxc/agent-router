@@ -156,6 +156,8 @@ wfc wait --scope team-a --timeout 30
 
 状态目录一旦有租约记录，`wait` 和 `relay` 都需要指定 `--scope`。尚未认领的组仍可用原命令。普通总控可用 `status --dispatch ID` 查看组的 owner、代数和租约状态。
 
+Linux 的 `wfc handoff DISPATCH --host HOST [--task PATH --report PATH] [--model MODEL]` 支持同一仍在运行的原生 tmux 服务内切换宿主。未完成的任务在同一轮换 attempt，已完成的任务需要一对新路径才开启下一轮。新报告须留在原报告目录且此前未用过。交接记录保留旧宿主、旧模型和旧回执，替换 worker 使用自己的回调凭据。旧会话关停和原监督进程的全树退出回执都获证后，才提交一次新启动。缺少这份退出回执的旧启动需要先对账。若关停或启动结果失联，同一交接保持待核对，重试返回原审计，现有回收和接管入口保留围栏。
+
 外部投递结果为 `unknown` 时，先核实对方确已收到，再用下面的命令记录证据。
 
 ```sh

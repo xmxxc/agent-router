@@ -69,6 +69,68 @@ pub(crate) fn read_receipt(path: &Path) -> Option<Value> {
     Some(record)
 }
 
+pub(crate) const UNKNOWN_CLOSE_IDENTITY: &str =
+    "original worker identity is unknown and its stop is unconfirmed";
+
+pub(crate) fn remember_unknown_close_identity(
+    state: &Path,
+    launch: &str,
+    dispatch: &str,
+) -> Result<()> {
+    let path = state.join("launches").join(launch);
+    let marker = path.with_extension("identity-unknown");
+    if missing(&marker)
+        && read_receipt(&path.with_extension("json"))
+            .is_some_and(|receipt| receipt.get("processStart") == Some(&Value::Null))
+    {
+        // An older live supervisor can replace its started receipt with an
+        // exit receipt that omits the field while descendants are still alive.
+        super::binding::save(&marker, &json!({"launchId":launch,"dispatch":dispatch}))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn close_worker_tree_ready(
+    state: &Path,
+    launch: &str,
+    dispatch: &str,
+    identity: impl FnOnce() -> Option<(String, u64)>,
+) -> bool {
+    let path = state.join("launches").join(launch);
+    let Some(receipt) = read_receipt(&path.with_extension("json")) else {
+        return false;
+    };
+    let marker = path.with_extension("identity-unknown");
+    let previously_unknown = !missing(&marker);
+    if !receipt.is_object()
+        || (previously_unknown
+            && read_receipt(&marker) != Some(json!({"launchId":launch,"dispatch":dispatch})))
+    {
+        return false;
+    }
+    let process_start = receipt.get("processStart");
+    let explicitly_unknown = process_start == Some(&Value::Null);
+    if !explicitly_unknown && !previously_unknown {
+        return process_start.is_none_or(Value::is_string);
+    }
+    let Some((attempt, round)) = identity() else {
+        return false;
+    };
+    let round = round.to_string();
+    receipt["category"] == "process_exited"
+        && receipt["treeTracked"] == true
+        && receipt["launchId"] == launch
+        && receipt["exitCode"].as_u64().is_some_and(|code| code <= 255)
+        && (!explicitly_unknown || (receipt["attempt"] == attempt && receipt["round"] == round))
+        && read_receipt(&path.with_extension("stopped")).is_some_and(|stop| {
+            stop["writerTreeStopped"] == true
+                && stop["dispatch"] == dispatch
+                && stop["launchId"] == launch
+                && stop["attempt"] == attempt
+                && stop["round"] == round
+        })
+}
+
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq)]
 pub(super) enum SubmissionPhase {
     Prepared,
@@ -83,6 +145,8 @@ pub(super) struct Submission {
     pub(super) launch_id: String,
     dispatch: String,
     execution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    round: Option<u64>,
     pub(super) socket: Option<PathBuf>,
     pub(super) origin: Option<super::binding::ServerSession>,
     pub(super) phase: SubmissionPhase,
@@ -288,6 +352,51 @@ impl Tmux<'_> {
             .with_extension(extension)
     }
 
+    pub(super) fn require_close_worker_tree(&self, execution: Option<&str>) -> Reply<()> {
+        use super::binding::{valid_launch_id, Claim};
+        let selected = match (execution, self.legacy_execution_id) {
+            (Some(execution), Some(launch)) => {
+                Some((launch.to_owned(), Some(execution.to_owned())))
+            }
+            (_, Some(selector)) => self
+                .observed_launch(selector, false)?
+                .or_else(|| valid_launch_id(selector).then(|| selector.to_owned()))
+                .map(|id| (id, None)),
+            _ => match self.claim()? {
+                Some(Claim::Registered { id, execution }) if valid_launch_id(&id) => {
+                    Some((id, Some(execution)))
+                }
+                Some(
+                    Claim::Launch(id)
+                    | Claim::Released(Some(id))
+                    | Claim::Observed {
+                        receipt: Some(id), ..
+                    },
+                ) if valid_launch_id(&id) => Some((id, None)),
+                _ => None,
+            },
+        };
+        if let Some((id, execution)) = selected {
+            remember_unknown_close_identity(self.state, &id, self.dispatch)
+                .map_err(|_| failure("uncertain", UNKNOWN_CLOSE_IDENTITY))?;
+            let ready = close_worker_tree_ready(self.state, &id, self.dispatch, || {
+                let attempt = execution.as_deref()?;
+                let submission = self.submission(&id, Some(attempt)).ok()?;
+                let round = submission.round.or_else(|| {
+                    crate::workflow::registered_tmux_round(self.state, self.dispatch, attempt, &id)
+                })?;
+                Some((attempt.to_owned(), round))
+            });
+            if !ready
+                && !self.legacy_worker_cancelled(&id)
+                && self.cancellation(&id, execution.as_deref())?.is_none()
+            {
+                return Err(failure("uncertain", UNKNOWN_CLOSE_IDENTITY));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn submission(&self, id: &str, execution: Option<&str>) -> Reply<Submission> {
         let unknown = super::binding::unknown;
         let value = read_receipt(&self.launch_path(id, "submission")).ok_or_else(unknown)?;
@@ -348,6 +457,7 @@ impl Tmux<'_> {
             launch_id: id.to_owned(),
             dispatch: self.dispatch.to_owned(),
             execution_id: execution.map(str::to_owned),
+            round: None,
             socket: self.socket.clone(),
             origin: None,
             phase: SubmissionPhase::LegacyAbsent,
@@ -667,6 +777,11 @@ impl Tmux<'_> {
                 launch_id: id.clone(),
                 dispatch: self.dispatch.to_owned(),
                 execution_id: self.new_execution_id.map(str::to_owned),
+                round: spec
+                    .env
+                    .get("WFC_ROUND")
+                    .and_then(|round| round.parse::<u64>().ok())
+                    .filter(|round| *round > 0),
                 socket: self.socket.clone(),
                 origin: self.launch_server(),
                 phase: SubmissionPhase::Prepared,
@@ -691,6 +806,17 @@ impl Tmux<'_> {
                 .as_ref()
                 .map(|origin| self.pin_submission(origin))
                 .transpose()?;
+            if let Some(audit) = self.handoff_audit {
+                let execution = self.new_execution_id.ok_or_else(bad)?;
+                let previous = crate::workflow::handoff::require_launch(
+                    self.state,
+                    self.dispatch,
+                    execution,
+                    audit,
+                )
+                .map_err(|error| failure("definitely-not-sent", &format!("{error:#}")))?;
+                self.require_handoff_server(&previous, submission.origin.as_ref())?;
+            }
             submission.phase = SubmissionPhase::InFlight;
             super::binding::save(&path, &submission).map_err(|_| io_error())?;
             let out = if let Some(socket) = &pinned_socket {
@@ -843,10 +969,17 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
     fs::remove_file(spec_path)?;
     super::binding::record_server(&dir, id)?;
     let mut cmd = Command::new(spec.argv.first().context("empty launch argv")?);
+    // Track orphans before starting the worker. A direct child's exit alone
+    // cannot authorize a cross-host replacement.
+    ensure!(
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == 0
+            && unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) } != libc::SIG_ERR,
+        "cannot supervise the tmux worker process tree"
+    );
     cmd.args(&spec.argv[1..])
         .current_dir(spec.cwd)
         .env_clear()
-        .envs(spec.env);
+        .envs(&spec.env);
     for key in ["TMUX", "TMUX_PANE", "TERM"] {
         if let Some(value) = env::var_os(key) {
             cmd.env(key, value);
@@ -871,24 +1004,60 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
             return Ok(ExitCode::FAILURE);
         }
     };
+    let process_start = wfc_herdr::Process::observe_unreaped_child(&child)
+        .ok()
+        .flatten()
+        .map(|process| process.creation);
+    let identity_unknown = process_start.is_none();
     let watching = startup.as_ref().map(|startup| startup.watch(&child));
     // Ctrl-C addresses the terminal foreground group. Let the worker handle it
     // and keep its receipt writer alive to record the actual exit.
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
+        // Keep observing descendants when tmux closes the old terminal.
+        // Set this after spawn so the worker retains its own HUP behavior.
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
     }
-    let started_receipt = json!({"category":"started","pid":child.id(),"launchId":id});
+    let started_receipt = json!({"category":"started","pid":child.id(),"processStart":process_start,
+        "launchId":id,"treeTracked":true});
     let (status, _, started) = crate::workflow::startup::wait_host(&mut child, || {
         super::binding::save(&receipt, &started_receipt)
     })?;
     let code = status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
-    let mut terminal = json!({"category":"process_exited","exitCode":code,"launchId":id});
+    let mut terminal =
+        json!({"category":"process_exited","exitCode":code,"launchId":id,"treeTracked":true});
+    if identity_unknown {
+        // Direct exit can be published before adopted descendants have stopped.
+        terminal["processStart"] = Value::Null;
+        terminal["attempt"] = json!(spec.env.get("WFC_ATTEMPT"));
+        terminal["round"] = json!(spec.env.get("WFC_ROUND"));
+    }
     if let Some(watching) = watching {
         terminal["startupExit"] = watching.tmux_exit_evidence(status);
     }
     super::binding::save(&receipt, &terminal)?;
     started?;
+    wait_for_worker_tree()?;
+    super::binding::save(
+        &dir.join(format!("{id}.stopped")),
+        &json!({"launchId":id,"dispatch":dispatch,"attempt":spec.env.get("WFC_ATTEMPT"),
+            "round":spec.env.get("WFC_ROUND"),"writerTreeStopped":true}),
+    )?;
     Ok(ExitCode::from(code as u8))
+}
+
+fn wait_for_worker_tree() -> Result<()> {
+    loop {
+        if unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::__WALL) } > 0 {
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ECHILD) => return Ok(()),
+            Some(libc::EINTR) => (),
+            _ => return Err(error).context("wait for tmux worker descendants"),
+        }
+    }
 }
