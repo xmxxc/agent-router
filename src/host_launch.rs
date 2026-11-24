@@ -11,6 +11,7 @@ use std::os::unix::{
 };
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, env, fs};
 use uuid::Uuid;
 #[derive(Serialize, Deserialize)]
@@ -115,17 +116,63 @@ pub(crate) fn spec_path(state: &Path, id: &Path) -> Result<PathBuf> {
     Ok(state.join("launches").join(format!("{name}.spec")))
 }
 
+pub(crate) fn track_worker_tree() -> Result<()> {
+    // An orphan stays with this supervisor even when it leaves the terminal session.
+    anyhow::ensure!(
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == 0
+            && unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) } != libc::SIG_ERR,
+        "cannot supervise the worker process tree"
+    );
+    Ok(())
+}
+
+pub(crate) fn wait_for_worker_tree(grace: Option<Duration>) -> Result<bool> {
+    let deadline = grace.map(|grace| Instant::now() + grace);
+    loop {
+        let flags = libc::__WALL | if deadline.is_some() { libc::WNOHANG } else { 0 };
+        let child = unsafe { libc::waitpid(-1, std::ptr::null_mut(), flags) };
+        if child > 0 {
+            continue;
+        }
+        if child == 0 {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ECHILD) => return Ok(true),
+            Some(libc::EINTR) => (),
+            _ => return Err(error).context("wait for worker descendants"),
+        }
+    }
+}
+
+extern "C" fn finish_watching(_: libc::c_int) {}
+
 pub(crate) fn supervise(spec_path: &Path) -> Result<ExitCode> {
     let receipt = spec_path.with_extension("json");
     let spec: Spec = serde_json::from_reader(File::open(spec_path)?)?;
-    let startup = crate::workflow::startup::Startup::hosted(
-        &spec.env,
-        spec_path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .context("invalid launch ID")?,
-    );
+    let id = spec_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .context("invalid launch ID")?;
+    let startup = crate::workflow::startup::Startup::hosted(&spec.env, id);
+    let binding = json!({"backend":"herdr", "launchId":id,
+        "dispatch":spec.env.get("WFC_DISPATCH"), "attempt":spec.env.get("WFC_ATTEMPT"),
+        "round":spec.env.get("WFC_ROUND"), "treeTracked":true});
     fs::remove_file(spec_path)?;
+    track_worker_tree()?;
+    // Herdr signals the terminal session on close. Keep the receipt writer
+    // alive to reap the tree. Exec resets these caught signals in the worker.
+    let handler = finish_watching as *const () as libc::sighandler_t;
+    anyhow::ensure!(
+        unsafe { libc::signal(libc::SIGHUP, handler) } != libc::SIG_ERR
+            && unsafe { libc::signal(libc::SIGTERM, handler) } != libc::SIG_ERR,
+        "cannot preserve Herdr stop receipt writer"
+    );
     let mut cmd = Command::new(spec.argv.first().context("empty launch argv")?);
     cmd.args(&spec.argv[1..])
         .current_dir(spec.cwd)
@@ -168,7 +215,9 @@ pub(crate) fn supervise(spec_path: &Path) -> Result<ExitCode> {
     }
     // The child can leave the terminal foreground before the backend's first
     // process snapshot. Its unreaped PID still belongs to this launch.
-    let mut started_receipt = json!({"category":"started","pid":child.id()});
+    let mut started_receipt = binding.clone();
+    started_receipt["category"] = json!("started");
+    started_receipt["pid"] = json!(child.id());
     if let Ok(Some(writer)) = wfc_herdr::Process::observe(child.id()) {
         started_receipt["writerProcess"] = json!(writer);
     }
@@ -178,11 +227,20 @@ pub(crate) fn supervise(spec_path: &Path) -> Result<ExitCode> {
     let code = status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
-    let mut terminal = json!({"category":"process_exited","exitCode":code});
+    let mut terminal = binding;
+    terminal["category"] = json!("process_exited");
+    terminal["exitCode"] = json!(code);
     if let Some(zero) = watching.and_then(|watching| watching.host_exited(status, observed)) {
         terminal["startupZero"] = zero;
     }
     crate::workflow::write_json(&receipt, &terminal, None)?;
     started?;
+    // Keep ordinary pane exit bounded when a detached descendant survives.
+    // Only ECHILD permits a receipt. Herdr can also kill this supervisor
+    // during escalation, which likewise leaves the stop unconfirmed.
+    if wait_for_worker_tree(Some(Duration::from_millis(150)))? {
+        terminal["writerTreeStopped"] = json!(true);
+        crate::workflow::write_json(&spec_path.with_extension("stopped"), &terminal, None)?;
+    }
     Ok(ExitCode::from(code as u8))
 }

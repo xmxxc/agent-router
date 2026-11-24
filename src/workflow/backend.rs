@@ -122,6 +122,17 @@ pub(super) fn create_for_handoff(
 }
 
 #[cfg(target_os = "linux")]
+pub(super) fn handoff_target(state: &Path, row: &Value) -> Result<Value> {
+    let reply = call(state, row, json!({"op":"handofftarget"}))?;
+    ensure!(
+        reply["result"] == "accepted" && reply["service"].is_object(),
+        "cannot verify the target tmux service: {}",
+        reply["diagnostic"]
+    );
+    Ok(reply["service"].clone())
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn resume(state: &Path, row: &Value, launch: Launch) -> Result<Value> {
     // The OpenCode TUI owns submission after it proves adoption and claims
     // the brief. Use tmux for launch only on this public path.
@@ -740,7 +751,10 @@ pub(super) fn herdr_receipt(state: &Path, create: &Value) -> Result<Value> {
             && path.extension() == Some("json".as_ref()),
         "invalid launch receipt"
     );
-    private_receipt(state, Some(stem))
+    Ok(
+        super::handoff::read_order(&state.join("launches").join(format!("{stem}.json")))?
+            .unwrap_or(Value::Null),
+    )
 }
 
 pub(super) fn herdr_closes(row: &Value) -> impl DoubleEndedIterator<Item = &Value> {

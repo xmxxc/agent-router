@@ -85,7 +85,8 @@ for line in sys.stdin:
         pid = self.service.api('pane.process_info', pane_id=other)['process_info']['shell_pid']
         return other, pid
 
-    def tmux_handoff_fixture(self, *, hold=False, scope=None):
+    def tmux_handoff_fixture(self, *, hold=False, scope=None, backend='tmux',
+                             endpoint=None, detached=False):
         socket = self.root / 'handoff-tmux.sock'
         self.env['WFC_TMUX_SOCKET'] = str(socket)
         tmux = ['tmux', '-f', '/dev/null', '-S', str(socket)]
@@ -95,7 +96,7 @@ for line in sys.stdin:
                         capture_output=True, timeout=5)
         traces = self.root / 'handoff-workers'
         traces.mkdir()
-        self.worker.write_text('''import json, os, signal, time
+        self.worker.write_text('''import json, os, signal, subprocess, sys, time
 from pathlib import Path
 if os.getenv("HANDOFF_TEST_HOLD"):
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
@@ -107,6 +108,31 @@ trace = {"callback": {key: os.environ[key] for key in keys},
          "pid": os.getpid(),
          "startTicks": int(Path("/proc/self/stat").read_bytes().rsplit(b")", 1)[1].split()[19])}
 directory = Path("handoff-workers")
+if os.getenv("HANDOFF_TEST_DETACHED") and trace["herdrPane"]:
+    script = """import time
+from pathlib import Path
+deadline = time.monotonic() + 20
+while not Path("handoff-workers/release").exists() and time.monotonic() < deadline:
+    time.sleep(.025)
+"""
+    descendant = subprocess.Popen([sys.executable, "-c", script],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True)
+    trace["detached"] = {"pid": descendant.pid, "startTicks": int(
+        Path(f"/proc/{descendant.pid}/stat").read_bytes().rsplit(b")", 1)[1].split()[19])}
+check = directory / "reverse-check"
+if trace["tmuxPane"] and check.exists():
+    source = json.loads(check.read_bytes())
+    record = json.loads(Path(source["record"]).read_bytes())
+    marker = json.loads(Path(source["stop"]).read_bytes())
+    close, = [event for event in record["audit"] if event["operation"] == "close"]
+    try:
+        fields = Path(f'/proc/{source["pid"]}/stat').read_bytes().rsplit(b")", 1)[1].split()
+        old_alive = fields[0] not in (b"Z", b"X", b"x") and int(fields[19]) == source["startTicks"]
+    except FileNotFoundError:
+        old_alive = False
+    trace["sourceStoppedBeforeTarget"] = (not old_alive and marker["writerTreeStopped"]
+        and close["result"] == "completed" and close["attempt"] == marker["attempt"])
 tmp = directory / (attempt + ".tmp")
 tmp.write_text(json.dumps(trace))
 tmp.rename(directory / (attempt + ".json"))
@@ -114,12 +140,18 @@ deadline = time.monotonic() + 45
 while not (directory / (attempt + ".quit")).exists() and time.monotonic() < deadline:
     time.sleep(.025)
 ''')
-        env = {'HANDOFF_TEST_HOLD': '1'} if hold else {}
+        env = {}
+        if hold:
+            env['HANDOFF_TEST_HOLD'] = '1'
+        if detached:
+            env['HANDOFF_TEST_DETACHED'] = '1'
         self.config.write_text(json.dumps({'hosts': {
             'codex': {'command': [sys.executable, '-u', str(self.worker)], 'env': env},
         }}))
         flags = ('--scope', scope) if scope is not None else ()
-        row = self.cli('dispatch', '--host', 'codex', '--backend', 'tmux', '--task', self.task,
+        if endpoint is not None:
+            flags += ('--herdr-endpoint', endpoint)
+        row = self.cli('dispatch', '--host', 'codex', '--backend', backend, '--task', self.task,
                        '--cwd', self.root, '--report', self.root/'report.md',
                        '--launch-config', self.config, *flags)
         self.dispatch_id = row['dispatch']
@@ -127,10 +159,12 @@ while not (directory / (attempt + ".quit")).exists() and time.monotonic() < dead
         original = self.handoff_trace(row['attempt'])
 
         def stop_workers():
+            (traces / 'release').touch()
             for trace in traces.glob('*.json'):
                 (traces / (trace.stem + '.quit')).touch()
-            live.wait_for(lambda: all(not self.handoff_worker_alive(json.loads(trace.read_bytes()))
-                                      for trace in traces.glob('*.json')))
+            workers = [json.loads(trace.read_bytes()) for trace in traces.glob('*.json')]
+            workers += [worker['detached'] for worker in workers if 'detached' in worker]
+            live.wait_for(lambda: all(not self.handoff_worker_alive(worker) for worker in workers))
 
         self.addCleanup(stop_workers)
         return row, original
@@ -231,14 +265,12 @@ while not (directory / (attempt + ".quit")).exists() and time.monotonic() < dead
                              (source['attempt'], question['messageId'], question['message']))
             self.assertEqual(self.cli(*args), {**result, 'duplicate':True})
             self.cli(*self.target_handoff(self.service.endpoint), error='Herdr source handoff')
-            self.cli('handoff', self.dispatch_id, '--host', 'codex', '--backend', 'tmux',
-                     error='Herdr source handoff')
             self.assertTrue(self.handoff_worker_alive(new))
             self.assertEqual(archive.read_bytes(), original_close)
             self.assertEqual(effects, ['workspace.create', 'layout.apply'])
             print(json.dumps({'target':event['target'], 'oldClose':event['close']['closeOperationId'],
                               'oldMessageId':message['messageId'], 'createCalls':effects,
-                              'reverseRefused':True, 'duplicate':True}))
+                              'differentHerdrTargetRefused':True, 'duplicate':True}))
 
     def test_tmux_to_herdr_handoff_does_not_retry_after_layout_reply_loss(self):
         source, _ = self.tmux_handoff_fixture()
@@ -337,9 +369,182 @@ while not (directory / (attempt + ".quit")).exists() and time.monotonic() < dead
             print(json.dumps({'replacedTargetPeer':True, 'originalStopped':True,
                               'targetWorkspaceUnchanged':True, 'audit':result['audit']}))
 
+    def reverse_handoff(self, dispatch):
+        return ('handoff', dispatch, '--host', 'codex', '--backend', 'tmux')
+
+    def handoff_record(self, source):
+        state = Path(self.env['WFC_STATE'])
+        return state / 'dispatches' / f'{source["dispatch"]}.json'
+
+    def assert_no_tmux_handoff(self):
+        socket = self.env['WFC_TMUX_SOCKET']
+        sessions = subprocess.check_output(['tmux', '-S', socket, 'list-sessions', '-F', '#{session_name}'],
+                                          env=self.env, text=True, timeout=5)
+        self.assertEqual(sessions.splitlines(), ['sibling'])
+        self.assertEqual(len(list(self.handoff_traces.glob('*.json'))), 1)
+        self.assertFalse(list((Path(self.env['WFC_STATE'])/'launches').glob('*.submission')))
+
+    def assert_reverse_pending(self, args, first, source):
+        self.assertEqual(first['result'], 'uncertain', first)
+        replay = self.cli(*args)
+        for key in ('audit', 'attempt', 'fromAttempt', 'endpoint', 'result'):
+            self.assertEqual(replay[key], first[key], key)
+        row = self.status()
+        self.assertEqual(row['attempt'], source['attempt'])
+        self.assertEqual(sum(event['operation'] == 'handoff' for event in row['audit']), 1)
+        self.assert_no_tmux_handoff()
+        return row
+
+    def test_herdr_to_tmux_handoff_waits_for_confirmed_original_stop(self):
+        source, old = self.tmux_handoff_fixture(backend='herdr')
+        args = self.reverse_handoff(source['dispatch'])
+        path = self.handoff_record(source)
+        receipt = Path(source['create']['receipt'])
+        stopped = receipt.with_suffix('.stopped')
+        old_row = path.read_bytes()
+        socket = self.env['WFC_TMUX_SOCKET']
+        self.env['WFC_TMUX_SOCKET'] = str(self.root/'offline-tmux.sock')
+        self.cli(*args, error='target tmux service')
+        self.env['WFC_TMUX_SOCKET'] = socket
+        self.assertEqual(path.read_bytes(), old_row)
+        self.assertTrue(self.handoff_worker_alive(old))
+        self.assert_no_tmux_handoff()
+        (self.handoff_traces/'reverse-check').write_text(json.dumps(dict(old, record=str(path), stop=str(stopped))))
+        worker_env = {k:v for k,v in self.env.items() if k != 'WFC_CONTROLLER_TOKEN'} | old['callback']
+        question = json.loads(subprocess.check_output(
+            [live.DRIVER, 'ask', 'original Herdr question', '--attempt', source['attempt']],
+            env=worker_env, text=True, timeout=6))
+        report = Path(source['report'])
+        report.write_text('original contents')
+        result = self.cli(*args)
+        self.assertEqual((result['result'], result['backend'], result['endpoint'],
+                          result['fromAttempt'], result['round']),
+                         ('accepted', 'tmux', socket, source['attempt'], source['round']))
+        self.assertNotEqual(result['attempt'], source['attempt'])
+        trace = self.handoff_trace(result['attempt'])
+        self.assertTrue(trace['sourceStoppedBeforeTarget'])
+        self.assertIsNotNone(trace['tmuxPane'])
+        self.assertIsNone(trace['herdrPane'])
+        self.assertEqual(report.read_text(), 'original contents')
+        self.assertEqual(trace['callback']['WFC_REPORT'], str(report))
+        row = self.status()
+        event, closed = row['audit']
+        self.assertEqual((event['id'], event['phase'], event['fromBackend']),
+                         (result['audit'], 'complete', 'herdr'))
+        self.assertEqual(event['close']['id'], closed['id'])
+        self.assertEqual(closed['closeOperationId'], f'close:{source["attempt"]}')
+        self.assertEqual(closed['executionId'], source['attempt'])
+        self.assertEqual(event['writerStopEvidence'], json.loads(stopped.read_bytes()))
+        self.assertEqual((row['rounds'][0]['attempt'], row['rounds'][1]['attempt']),
+                         (source['attempt'], result['attempt']))
+        message, = row['messages']
+        self.assertEqual((message['attempt'], message['id'], message['messageId']),
+                         (source['attempt'], question['message'], question['messageId']))
+        closed_bytes = stopped.read_bytes()
+        self.assertEqual(self.cli(*args), {**result, 'duplicate':True})
+        self.assertEqual(stopped.read_bytes(), closed_bytes)
+        self.assertEqual(len(list(self.handoff_traces.glob('*.json'))), 2)
+        self.assertEqual(len(list((stopped.parent).glob('*.submission'))), 1)
+        print(json.dumps({'audit':result['audit'], 'sourceStoppedBeforeTarget':True,
+                          'close':closed['closeOperationId'], 'oldMessageId':message['messageId'],
+                          'tmuxSubmissions':1, 'duplicate':True}))
+
+    def test_herdr_to_tmux_handoff_legacy_receipt_stays_pending(self):
+        source, old = self.tmux_handoff_fixture(backend='herdr')
+        args = self.reverse_handoff(source['dispatch'])
+        path = self.handoff_record(source)
+        row = json.loads(path.read_bytes())
+        row.pop('executionId')
+        for key in ('herdrBinding', 'dispatch', 'attempt', 'round'):
+            row['create'].pop(key)
+        path.write_text(json.dumps(row))
+        first = self.cli(*args)
+        self.assertIn('supervision', first['diagnostic'])
+        view = self.assert_reverse_pending(args, first, source)
+        self.assertEqual([event['operation'] for event in view['audit']], ['handoff'])
+        self.assertTrue(self.handoff_worker_alive(old))
+        print(json.dumps({'legacyReceipt':True, 'audit':first['audit'], 'tmuxSubmissions':0}))
+
+    def test_tmux_herdr_tmux_handoff_restores_public_session(self):
+        original, _ = self.tmux_handoff_fixture()
+        _, old_stop = self.handoff_source_evidence(original)
+        first = self.cli(*self.target_handoff(self.service.endpoint))
+        self.assertEqual(first['result'], 'accepted', first)
+        herdr = self.status()
+        self.handoff_trace(first['attempt'])
+        args = self.reverse_handoff(original['dispatch'])
+        final = self.cli(*args)
+        self.assertEqual(final['result'], 'accepted', final)
+        self.assertEqual(final['fromAttempt'], herdr['attempt'])
+        trace = self.handoff_trace(final['attempt'])
+        view = self.status()
+        self.assertEqual(view['tmux'], 'wfc-' + original['dispatch'])
+        self.assertIsNotNone(trace['tmuxPane'])
+        self.assertEqual(self.cli(*args), {**final, 'duplicate':True})
+        self.assertTrue(old_stop.is_file())
+        self.assertEqual(len(list(self.handoff_traces.glob('*.json'))), 3)
+        self.assertEqual([event['id'] for event in view['audit']
+                          if event['operation'] == 'handoff'], [first['audit'], final['audit']])
+        print(json.dumps({'roundTrip':True, 'session':view['tmux'],
+                          'audits':[first['audit'], final['audit']]}))
+
+    def test_herdr_to_tmux_handoff_surviving_descendant_stays_pending(self):
+        source, old = self.tmux_handoff_fixture(backend='herdr', detached=True)
+        stopped = Path(source['create']['receipt']).with_suffix('.stopped')
+        args = self.reverse_handoff(source['dispatch'])
+        first = self.cli(*args)
+        self.assert_reverse_pending(args, first, source)
+        self.assertFalse(self.handoff_worker_alive(old))
+        self.assertTrue(self.handoff_worker_alive(old['detached']))
+        self.assertFalse(stopped.exists())
+        print(json.dumps({'survivingDetachedDescendant':True, 'audit':first['audit'],
+                          'tmuxSubmissions':0}))
+
+    def test_herdr_to_tmux_handoff_lost_close_keeps_original_audit(self):
+        effects = []
+        def lose(request, response):
+            if request['method'] == 'pane.close':
+                effects.append(request['params']['pane_id'])
+                return None
+            return response
+        with self.service.fault_proxy(lose) as proxy:
+            source, _ = self.tmux_handoff_fixture(backend='herdr', endpoint=proxy)
+            args = self.reverse_handoff(source['dispatch'])
+            first = self.cli(*args)
+            view = self.assert_reverse_pending(args, first, source)
+            event, close = view['audit']
+            self.assertEqual((event['id'], event['phase'], close['result']),
+                             (first['audit'], 'closing', 'uncertain'))
+            self.assertEqual(effects, [source['backendHandle']['pane']])
+            print(json.dumps({'lostCloseReply':True, 'audit':first['audit'],
+                              'closeCalls':len(effects), 'tmuxSubmissions':0}))
+
+    def test_herdr_to_tmux_handoff_mismatched_stop_stays_pending(self):
+        stopped = None
+        def change(request, response):
+            if request['method'] == 'pane.close':
+                live.wait_for(stopped.is_file)
+                marker = json.loads(stopped.read_bytes())
+                marker['attempt'] = 'a-' + '0'*32
+                substitute = stopped.with_suffix('.fixture')
+                substitute.write_text(json.dumps(marker))
+                substitute.replace(stopped)
+            return response
+        with self.service.fault_proxy(change) as proxy:
+            source, old = self.tmux_handoff_fixture(backend='herdr', endpoint=proxy)
+            stopped = Path(source['create']['receipt']).with_suffix('.stopped')
+            args = self.reverse_handoff(source['dispatch'])
+            first = self.cli(*args)
+            view = self.assert_reverse_pending(args, first, source)
+            event, close = view['audit']
+            self.assertEqual((event['id'], close['result']), (first['audit'], 'completed'))
+            self.assertFalse(self.handoff_worker_alive(old))
+            print(json.dumps({'mismatchedStop':True, 'closeCompleted':True,
+                              'audit':first['audit'], 'tmuxSubmissions':0}))
+
     def test_dispatch_current_execution_done_and_close(self):
         self.dispatch()
-        self.env['WFC_HERDR_ENDPOINT'] = '/missing/different.sock'
+        self.env['WFC_HERDR_ENDPOINT'] = str(self.root/'different.sock')
         view = self.status()
         self.assertTrue(view['backendAlive'])
         self.assertNotIn('workerCallbackHash', self.row)

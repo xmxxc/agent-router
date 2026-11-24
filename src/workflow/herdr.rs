@@ -36,6 +36,83 @@ fn launch_receipt(state: &Path, create: &Value) -> Result<Value> {
     Ok(launch)
 }
 
+fn launch_binding(handle: &Value) -> Value {
+    json!({"endpoint":handle["endpoint"],"service":handle["service"],
+        "workspace":handle["workspace"],"pane":handle["pane"],"terminal":handle["terminal"],
+        "nonce":handle["nonce"],"receipt":handle["receipt"]})
+}
+
+pub(super) fn verify_handoff_source(state: &Path, row: &Value) -> Result<()> {
+    let launch = backend::receipt_id(row)?.context("missing original Herdr launch")?;
+    let binding = &row["create"]["herdrBinding"];
+    let receipt = launch_receipt(state, &row["create"])?;
+    ensure!(
+        row["executionId"] == row["attempt"]
+            && row["create"]["receipt"]
+                == json!(state.join("launches").join(format!("{launch}.json")))
+            && binding == &launch_binding(&row["backendHandle"])
+            && [
+                "endpoint",
+                "workspace",
+                "pane",
+                "terminal",
+                "nonce",
+                "receipt"
+            ]
+            .iter()
+            .all(|&key| binding[key].as_str().is_some_and(|value| !value.is_empty()))
+            && binding["service"].is_object()
+            && receipt["backend"] == "herdr"
+            && matches!(
+                receipt["category"].as_str(),
+                Some("started" | "process_exited")
+            )
+            && receipt["treeTracked"] == true
+            && receipt["launchId"] == launch
+            && receipt["dispatch"] == row["dispatch"]
+            && receipt["attempt"] == row["attempt"]
+            && row["round"]
+                .as_u64()
+                .is_some_and(|round| receipt["round"] == round.to_string()),
+        "original Herdr launch has no matching worker tree supervision"
+    );
+    Ok(())
+}
+
+pub(super) fn handoff_close(row: &Value, source: &Value) -> Result<Value> {
+    let attempt = source["attempt"]
+        .as_str()
+        .context("missing Herdr attempt")?;
+    let closed = backend::herdr_closes(row)
+        .rfind(|event| event["attempt"] == attempt)
+        .context("missing original Herdr close audit")?;
+    ensure!(
+        closed["result"] == "completed"
+            && closed["closeOperationId"] == format!("close:{attempt}")
+            && closed["executionId"] == source["executionId"]
+            && closed["dispatch"] == source["dispatch"]
+            && closed["round"] == source["round"]
+            && launch_binding(&closed["target"]) == source["create"]["herdrBinding"],
+        "Herdr close does not confirm this original execution"
+    );
+    if row["attempt"] == attempt {
+        backend::verify_herdr_close_target(row, closed)?;
+    }
+    let mut evidence = closed.clone();
+    evidence["resourceCleanup"] = json!("confirmed");
+    Ok(evidence)
+}
+
+pub(super) fn handoff_tree_stopped(state: &Path, source: &Value) -> Result<Option<Value>> {
+    Ok(
+        backend::handoff_tree_stopped(state, source)?.filter(|evidence| {
+            evidence["backend"] == "herdr"
+                && evidence["treeTracked"] == true
+                && evidence["category"] == "process_exited"
+        }),
+    )
+}
+
 const INVALID_CLOSE_WORKER: &str = "invalid closed worker outcome";
 
 fn valid_close_worker(worker: &Value) -> bool {
@@ -410,7 +487,11 @@ fn launch_assignment<'a>(
         ],
     };
     let mut prepared = unit.row.clone();
+    prepared["executionId"] = json!(attempt);
     prepared["create"] = json!({"result":"uncertain","receipt":files.receipt});
+    for key in ["dispatch", "round", "attempt"] {
+        prepared["create"][key] = prepared[key].clone();
+    }
     prepared["pendingInput"] = json!(false);
     if unit.published {
         unit.save(prepared)?;
@@ -447,6 +528,12 @@ fn launch_assignment<'a>(
         Err(e) => json!(e),
     };
     answer["receipt"] = json!(files.receipt);
+    for key in ["dispatch", "round", "attempt"] {
+        answer[key] = unit.row[key].clone();
+    }
+    if answer["result"] == "accepted" {
+        answer["herdrBinding"] = launch_binding(&unit.row["backendHandle"]);
+    }
     if !unit.row["backendHandle"].is_null() {
         let mut next = unit.row.clone();
         next["create"] = answer.clone();
@@ -565,6 +652,12 @@ impl Assignment<'_> {
             receipt[key] = self.row[key].clone();
         }
         receipt["operation"] = json!("close");
+        if self.row["create"]["herdrBinding"].is_object() {
+            receipt["executionId"] = self.row["executionId"].clone();
+            if let Some(attempt) = self.row["attempt"].as_str() {
+                receipt["closeOperationId"] = json!(format!("close:{attempt}"));
+            }
+        }
         receipt
     }
 
@@ -610,6 +703,15 @@ fn lock_close<'a>(state: &'a Path, row: &Value) -> Result<Assignment<'a>> {
         "Herdr attempt or scope changed"
     );
     Ok(unit)
+}
+
+pub(super) fn lock_handoff_source(state: &Path, row: &Value) -> Result<File> {
+    let unit = lock_close(state, row)?;
+    ensure!(
+        unit.row == *row,
+        "Herdr assignment changed while preparing handoff"
+    );
+    Ok(unit._lock)
 }
 
 pub(super) fn read_only_close(state: &Path, row: &Value) -> Result<Option<Value>> {
