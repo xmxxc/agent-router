@@ -471,6 +471,67 @@ pub(super) fn confirm_reply(
     unreachable!()
 }
 
+pub(super) fn matching_user_entries(screen: &Screen, text: &str) -> usize {
+    let lines = screen_lines(&screen.text);
+    let Some(composer) = prompt_row(&lines) else {
+        return 0;
+    };
+    let history = &lines[..composer];
+    (0..history.len())
+        .filter(|&index| {
+            let Some(body) = history[index]
+                .strip_prefix("› ")
+                .filter(|body| body.starts_with("[router] "))
+            else {
+                return false;
+            };
+            let Some(mut rest) = text.strip_prefix(body) else {
+                return false;
+            };
+            for row in &history[index + 1..] {
+                if row.is_empty() {
+                    return rest.is_empty();
+                }
+                if rest.is_empty() {
+                    return false;
+                }
+                // A screen wrap may indent the continuation or omit its ending space.
+                let next = row.strip_prefix("  ").unwrap_or(row);
+                let Some(remaining) = rest
+                    .strip_prefix(next)
+                    .or_else(|| rest.strip_prefix(' ')?.strip_prefix(next))
+                else {
+                    return false;
+                };
+                rest = remaining;
+            }
+            false
+        })
+        .count()
+}
+
+pub(super) fn confirm_continue(handle: &Handle, text: &str, before: &Screen) -> Result<()> {
+    // The exact brief contains a fresh callback reference. A draft or a
+    // redraw of the empty box cannot establish this entry.
+    for _ in 0..2 {
+        sleep(Duration::from_millis(300));
+        let screen = handle.read()?;
+        if read_only(&screen.text)
+            || refusals(&screen.text) > refusals(&before.text)
+            || !matches!(
+                observe_herdr_reply_box(handle, &screen, "codex")?,
+                ReplyBox::Empty
+            )
+            || matching_user_entries(&screen, text) != 1
+        {
+            return Err(Failure::unknown(
+                "Herdr did not show a new task entry in the Codex transcript",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn confirm_codex(
     handle: &mut Handle,
     text: &str,
