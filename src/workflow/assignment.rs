@@ -70,10 +70,20 @@ pub(super) fn unresolved_resume(row: &Value) -> Option<&Value> {
         .filter(|event| matches!(event["result"].as_str(), Some("pending" | "uncertain")))
 }
 
+fn handoff_preflight(event: &Value) -> bool {
+    // A diagnostic from the read-only probe precedes the durable handoff intent.
+    event["operation"] == "handoff"
+        && event["phase"] == "preflight"
+        && event["toAttempt"].is_null()
+        && event["close"].is_null()
+        && event["launch"].is_null()
+}
+
 pub(super) fn unresolved_handoff(row: &Value) -> Option<&Value> {
     row["audit"].as_array()?.iter().rev().find(|event| {
         event["operation"] == "handoff"
             && event["dispatch"] == row["dispatch"]
+            && !handoff_preflight(event)
             && (event["fromAttempt"] == row["attempt"] || event["toAttempt"] == row["attempt"])
             && matches!(event["result"].as_str(), Some("pending" | "uncertain"))
     })
@@ -85,11 +95,10 @@ pub(super) fn handoff_blocks_old_writer(row: &Value) -> bool {
 
 #[cfg(target_os = "linux")]
 pub(super) fn unresolved_lifecycle(row: &Value) -> Option<&Value> {
-    row["audit"]
-        .as_array()?
-        .iter()
-        .rev()
-        .find(|event| matches!(event["result"].as_str(), Some("pending" | "uncertain")))
+    row["audit"].as_array()?.iter().rev().find(|event| {
+        matches!(event["result"].as_str(), Some("pending" | "uncertain"))
+            && !handoff_preflight(event)
+    })
 }
 
 pub(super) fn public_record(dir: &Path, id: &str) -> Result<Option<Value>> {

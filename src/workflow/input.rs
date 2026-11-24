@@ -93,10 +93,15 @@ impl<'a> Request<'a> {
         let path = dir.join(format!("{}.json", self.dispatch));
         let original = assignment::public_record(&dir, self.dispatch)?
             .with_context(|| format!("unknown dispatch {}", self.dispatch))?;
-        ensure!(
-            original["backend"] == "tmux" && original["host"] == "codex",
-            "{operation} requires a supported live Codex/tmux assignment"
-        );
+        let require_host = |row: &Value, replay: Option<usize>| -> Result<()> {
+            ensure!(
+                row["backend"] == "tmux"
+                    && (row["host"] == "codex"
+                        || replay.is_some_and(|index| row["audit"][index]["result"] == "accepted")),
+                "{operation} requires a supported live Codex/tmux assignment"
+            );
+            Ok(())
+        };
         let scope = record_scope(&original).context("invalid dispatch scope")?;
         let token = controller::token(self.token);
         controller::Owners::read(&state)?.require(scope, token.as_deref(), operation)?;
@@ -106,6 +111,7 @@ impl<'a> Request<'a> {
         };
         let original_unresolved = assignment::input_unresolved(&original);
         let initial_replay = replay_index(&original, &self.action, nudge.as_deref(), self.key)?;
+        require_host(&original, initial_replay)?;
         ensure!(
             !original_unresolved || initial_replay.is_some(),
             "input is pending or uncertain; verify the prior input before retrying"
@@ -135,6 +141,7 @@ impl<'a> Request<'a> {
                         && event["fromRound"] == original["round"]
                         && event["fromAttempt"] == original["attempt"])
             });
+        require_host(&current, replay)?;
         ensure!(
             assignment::unresolved_handoff(&current).is_none()
                 || replay.is_some_and(|index| current["audit"][index]["result"] == "accepted"),
@@ -458,7 +465,6 @@ fn replay_index(
     let Some(audit) = row["audit"].as_array() else {
         return Ok(None);
     };
-    let unresolved = assignment::input_unresolved(row);
     if matches!(action, Action::Nudge(_)) {
         let Some(key) = key else {
             return Ok(None);
@@ -481,8 +487,10 @@ fn replay_index(
     }
     Ok(audit.iter().rposition(|event| {
         event["operation"] == action.name()
-            && (matches!(event["result"].as_str(), Some("pending" | "uncertain"))
-                || (!unresolved && event["result"] == "accepted"))
+            && matches!(
+                event["result"].as_str(),
+                Some("pending" | "uncertain" | "accepted")
+            )
             && event["round"] == row["round"]
             && event["attempt"] == row["attempt"]
             && match action {

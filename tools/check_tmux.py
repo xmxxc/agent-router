@@ -4277,7 +4277,7 @@ os.execv({TMUX!r}, [{TMUX!r}, *sys.argv[1:]])
         print(json.dumps({"failedIntentWrite": True, "sameAssignment": True, "takeoverBlocked": True}),
               flush=True)
 
-    def public_input_worker(self, scope="rounds", legacy=False, codex_home=None):
+    def public_input_worker(self, scope="rounds", legacy=False, codex_home=None, handoff=False):
         worker = self.work / "round-worker.py"
         worker.write_text(r"""import json, os, select, shlex, subprocess, sys, time, tty
 from pathlib import Path
@@ -4501,6 +4501,8 @@ while time.monotonic() < deadline:
         if legacy:
             (self.work / "legacy-worker").touch()
         settings = {"hosts": {"codex": {"command": [sys.executable, str(worker)]}}}
+        if handoff:
+            settings["hosts"]["opencode"] = settings["hosts"]["codex"]
         if codex_home is not None:
             settings["env"] = {"CODEX_HOME": str(codex_home)}
         config.write_text(json.dumps(settings))
@@ -4611,6 +4613,135 @@ os.execv(real, [real, *args])
             self.assertLess(time.monotonic(), deadline, "timed out waiting for the input fixture")
             time.sleep(.02)
         return value
+
+    def test_public_input_survives_read_only_handoff_preflight_failure(self):
+        cli, original, token, env = self.public_input_worker(handoff=True)
+        dispatch = original["dispatch"]
+        args = ("handoff", dispatch, "--host", "opencode")
+        pane = self.active_pane(dispatch)
+        submissions = set((self.state / "launches").glob("*.submission"))
+        self.assertEqual(len(submissions), 1)
+        shim = self.work / "tmux"
+        shim.write_text(f"""#!{sys.executable}
+import json, sys
+from pathlib import Path
+with Path({str(self.work / 'preflight-commands')!r}).open("a") as log:
+    print(json.dumps(sys.argv[1:]), file=log)
+sys.exit(75)
+""")
+        shim.chmod(0o700)
+        failed = cli(*args, token=token, PATH=f"{self.work}:{env['PATH']}")
+        self.assertEqual((failed["result"], failed["attempt"]), ("uncertain", original["attempt"]))
+        calls = [json.loads(line) for line in (self.work / "preflight-commands").read_text().splitlines()]
+        self.assertTrue(calls and all(call[0] == "-N" for call in calls))
+        recovered = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        preflight, = recovered["audit"]
+        self.assertEqual((preflight["id"], preflight["phase"], preflight["result"], recovered["state"]),
+                         (failed["audit"], "preflight", "uncertain", "working"))
+        self.assertIn("unverified", preflight["diagnostic"])
+        self.assertFalse(any(field in preflight for field in ("toAttempt", "close", "launch")))
+        self.assertEqual(self.active_pane(dispatch), pane)
+        self.assertEqual(set((self.state / "launches").glob("*.submission")), submissions)
+        self.assertFalse(list((self.state / "dispatches").glob("*.closed")))
+        self.assertFalse(list(self.state.glob("handoff-order-*.json")))
+        self.assertFalse((self.work / "input-bytes").exists())
+
+        receipt = cli("nudge", dispatch, "--text", "preflight recovered", token=token)
+        self.assertEqual((receipt["round"], receipt["attempt"]), (1, original["attempt"]))
+        payload = "[router] Message from the controller: preflight recovered"
+        self.assertEqual((self.work / "input-bytes").read_bytes(), payload.encode() + b"\r")
+        self.assertEqual((self.work / "formal-input").read_text().splitlines(), [json.dumps(payload)])
+        handoff = cli(*args, token=token)
+        self.assertEqual((handoff["result"], handoff["fromAttempt"]), ("accepted", original["attempt"]))
+        self.assertNotEqual(handoff["audit"], preflight["id"])
+        self.assertEqual(cli(*args, token=token), {**handoff, "duplicate": True})
+        status = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual(status["audit"][0], preflight)
+        self.assertEqual([m["id"] for m in status["messages"] if m["type"] == "nudge"], [receipt["message"]])
+        self.assertEqual(len(list((self.state / "launches").glob("*.submission"))), 2)
+        self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
+        print("R28 preflight diagnostic kept; one original input and one replacement", flush=True)
+
+    def test_public_nudge_replays_confirmed_receipt_after_handoff(self):
+        cli, original, token, _ = self.public_input_worker(handoff=True)
+        dispatch = original["dispatch"]
+        reminder = ("nudge", dispatch, "--text", "original reminder", "--message-id", "before-handoff")
+        receipt = cli(*reminder, token=token)
+        pid_path = self.work / "worker-pid"
+        old_pid = pid_path.read_text()
+        handoff = cli("handoff", dispatch, "--host", "opencode", token=token)
+        self.assertEqual((handoff["result"], handoff["round"], handoff["fromAttempt"]),
+                         ("accepted", 1, original["attempt"]))
+        self.assertNotEqual(handoff["attempt"], original["attempt"])
+        self.await_input_value(lambda: pid_path.read_text() not in ("", old_pid))
+        owner = cli("takeover", "--scope", "rounds", "--owner", "B")["token"]
+        observed = (self.state / "messages.json", self.state / "dispatches" / f"{dispatch}.json",
+                    self.work / "input-bytes", self.work / "formal-input")
+        before = tuple(path.read_bytes() for path in observed)
+        self.assertIn("stale_controller_owner", cli(*reminder, token=token, expected=1))
+        self.assertEqual(cli(*reminder, token=owner), {**receipt, "duplicate": True})
+        self.assertIn("conflicts", cli("nudge", dispatch, "--text", "different reminder",
+                                       "--message-id", "before-handoff", token=owner, expected=1))
+        self.assertIn("requires a supported live Codex/tmux assignment",
+                      cli("nudge", dispatch, "--text", "new reminder", token=owner, expected=1))
+        self.assertEqual(tuple(path.read_bytes() for path in observed), before)
+        # The old receipt must still belong to this assignment's round history.
+        assignment = json.loads(before[1])
+        assignment["rounds"] = [r for r in assignment["rounds"] if r["attempt"] != original["attempt"]]
+        observed[1].write_text(json.dumps(assignment))
+        try:
+            self.assertIn("worker input history conflict", cli(*reminder, token=owner, expected=1))
+            self.assertEqual(tuple(observed[i].read_bytes() for i in (0, 2, 3)),
+                             (before[0], before[2], before[3]))
+        finally:
+            observed[1].write_bytes(before[1])
+        self.assertEqual(before[2], b"[router] Message from the controller: original reminder\r")
+        self.assertEqual(len(before[3].splitlines()), 1)
+        history = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((history["host"], history["attempt"]), ("opencode", handoff["attempt"]))
+        self.assertEqual([(m["id"], m["attempt"]) for m in history["messages"] if m["type"] == "nudge"],
+                         [(receipt["message"], original["attempt"])])
+        self.assertEqual(len(list((self.state / "launches").glob("*.submission"))), 2)
+        self.assertEqual(cli("close", dispatch, token=owner)["resourceCleanup"], "confirmed")
+        print("R28 handoff replay returned the historical reminder without new input", flush=True)
+
+    def test_public_continue_replays_confirmed_receipt_while_nudge_is_unresolved(self):
+        cli, original, token, _ = self.public_input_worker()
+        dispatch = original["dispatch"]
+        (self.work / "finish-first-externally").touch()
+        self.await_input_value((self.work / "first-done").exists)
+        args = ("continue", dispatch, "--task", "next-task", "--report", "report2")
+        omit = self.work / "omit-transcript"
+        omit.touch()
+        self.assertIn("continue uncertain", cli(*args, token=token, expected=1))
+        self.await_input_value((self.work / "accepted-round").exists)
+        omit.unlink()
+        (self.work / "ask-current-round").touch()
+        self.await_input_value((self.work / "current-question").exists)
+        receipt = cli(*args, token=token)
+        status = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((status["state"], status["round"], status["attempt"]),
+                         ("asking", 2, receipt["attempt"]))
+        self.assertEqual(status["audit"][-1]["inputEvidence"], "authenticated-round-callback")
+
+        (self.work / "change-draft").touch()
+        nudge = ("nudge", dispatch, "--text", "make this uncertain", "--message-id", "pending")
+        self.assertIn("nudge uncertain", cli(*nudge, token=token, expected=1))
+        status = cli("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((status["audit"][-1]["operation"], status["audit"][-1]["result"]),
+                         ("nudge", "uncertain"))
+        observed = (self.state / "messages.json", self.state / "dispatches" / f"{dispatch}.json",
+                    self.work / "input-bytes", self.work / "formal-input")
+        before = tuple(path.read_bytes() for path in observed)
+        self.assertEqual(cli(*args, token=token), receipt)
+        self.assertIn("pending or uncertain", cli(*args[:-1], "other-report", token=token, expected=1))
+        self.assertIn("pending or uncertain", cli(*nudge, token=token, expected=1))
+        self.assertEqual(tuple(path.read_bytes() for path in observed), before)
+        self.assertEqual(before[2].count(b"\r"), 1)
+        self.assertEqual(len(before[3].splitlines()), 1)
+        self.assertEqual([m["id"] for m in status["messages"] if m["to"] == "worker"], [receipt["message"]])
+        self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
+        print("R28 continue replay preserved the unresolved reminder and original receipt", flush=True)
 
     def test_public_continue_and_nudge_share_live_worker(self):
         cli, first, token, env = self.public_input_worker()
