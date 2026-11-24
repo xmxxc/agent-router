@@ -51,6 +51,24 @@ pub fn stopped_ledger(database: &Path) -> Result<StoppedLedger> {
         )?,
         "offline snapshot has an unresolved lifecycle event"
     );
+    // Current-generation credentials are checked against the source owner per audit row.
+    ensure!(
+        !db.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM lifecycle_event e
+                JOIN dispatch d ON d.id=e.dispatch
+                JOIN controller_owner o ON o.scope=d.scope
+                WHERE e.operation='backend_reconcile' AND e.owner_generation < o.generation
+                GROUP BY d.scope,e.owner_generation
+                HAVING count(*) <> count(CASE WHEN typeof(e.owner_token)='text'
+                                           AND e.owner_token COLLATE BINARY <> '' THEN 1 END)
+                    OR count(DISTINCT e.owner_token COLLATE BINARY) <> 1
+            )",
+            [],
+            |row| row.get::<_, bool>(0)
+        )?,
+        "legacy Herdr binding credentials are empty or inconsistent in an earlier owner generation"
+    );
     let high_water = db.query_row(
         "SELECT max(coalesce((SELECT max(seq) FROM sqlite_sequence WHERE name='message'),0),
                     coalesce((SELECT max(id) FROM message),0))",

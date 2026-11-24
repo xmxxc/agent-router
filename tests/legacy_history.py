@@ -370,7 +370,8 @@ def verify_herdr_scope_order(binary, root, later_owner_source, work):
                        SELECT ?,?,operation,round,?,result,diagnostic,?,?,resolver_actor,resolution_evidence,?,?
                        FROM lifecycle_event WHERE id=12""", (
             (13, second, attempt, 2, "fixture-earlier-generation", 13.125, 13.25),
-            (14, HERDR_BOUND, HERDR_ATTEMPT, 3, "another-old-fixture", 15.125, 15.25),
+            (14, HERDR_BOUND, HERDR_ATTEMPT, 2, "fixture-earlier-generation", 14.125, 14.25),
+            (15, HERDR_BOUND, HERDR_ATTEMPT, 3, "another-old-fixture", 15.125, 15.25),
         ))
     before = snapshot(source)
     target = root / "herdr-scope-order-native"
@@ -381,7 +382,7 @@ def verify_herdr_scope_order(binary, root, later_owner_source, work):
     second_view, _ = lookup(binary, root, target, second)
     assert first_view["controllerOwner"]["generation"] == second_view["controllerOwner"]["generation"] == 4
     assert [(event["id"], event["ownerGeneration"], event["attempt"]) for event in first_view["legacyAudit"]] == [
-        (12, None, HERDR_ATTEMPT), (14, 3, HERDR_ATTEMPT)]
+        (12, None, HERDR_ATTEMPT), (14, 2, HERDR_ATTEMPT), (15, 3, HERDR_ATTEMPT)]
     audit, = second_view["legacyAudit"]
     assert (audit["id"], audit["ownerGeneration"], audit["attempt"]) == (13, 2, attempt)
     for event in [*first_view["legacyAudit"], audit]:
@@ -389,19 +390,24 @@ def verify_herdr_scope_order(binary, root, later_owner_source, work):
         assert {"owner_token", "ownerTokenRecorded", "ownerTokenMatchesCurrent"}.isdisjoint(event)
         assert "fixture-earlier-generation" not in json.dumps(event) and "another-old-fixture" not in json.dumps(event)
     assert snapshot(source) == before
-    print(json.dumps({"herdrScopeAuditOrder": [12, 13, 14], "historyGenerations": [None, 2, 3],
+    print(json.dumps({"herdrScopeAuditOrder": [12, 13, 14, 15], "historyGenerations": [None, 2, 2, 3],
                       "sourceAndBackup": before["router.db"][1]}), flush=True)
 
+    prior_diagnostic = "legacy Herdr binding credentials are empty or inconsistent in an earlier owner generation"
     for case, mutation, operands, diagnostic in (
-        ("lost-owner", "UPDATE lifecycle_event SET owner_generation=NULL, owner_token=NULL WHERE id=14", (),
+        ("lost-owner", "UPDATE lifecycle_event SET owner_generation=NULL, owner_token=NULL WHERE id=15", (),
          "became unmanaged after a managed binding"),
-        ("regressed", "UPDATE lifecycle_event SET owner_generation=1 WHERE id=14", (),
+        ("regressed", "UPDATE lifecycle_event SET owner_generation=1 WHERE id=15", (),
          "owner generation 1 precedes earlier binding generation 2"),
-        ("wrong-credential", "UPDATE lifecycle_event SET owner_token=? WHERE id=14", ("fixture-wrong-owner",),
+        ("wrong-credential", "UPDATE lifecycle_event SET owner_token=? WHERE id=15", ("fixture-wrong-owner",),
          "credential conflicts with the source owner at the same generation"),
-        ("empty-credential", "UPDATE lifecycle_event SET owner_token='' WHERE id=14", (),
+        ("empty-credential", "UPDATE lifecycle_event SET owner_token='' WHERE id=15", (),
          "credential conflicts with the source owner at the same generation"),
-        ("consumed", "UPDATE lifecycle_event SET consumed_at=16 WHERE id=14", (), "has a consumption timestamp"),
+        ("consumed", "UPDATE lifecycle_event SET consumed_at=16 WHERE id=15", (), "has a consumption timestamp"),
+        ("prior-missing-credential", "UPDATE lifecycle_event SET owner_token=NULL WHERE id=14", (), prior_diagnostic),
+        ("prior-empty-credential", "UPDATE lifecycle_event SET owner_token='' WHERE id=14", (), prior_diagnostic),
+        ("prior-wrong-credential", "UPDATE lifecycle_event SET owner_token=? WHERE id=14",
+         ("fixture-conflicting-prior-owner",), prior_diagnostic),
     ):
         rejects_incomplete_confirmation(binary, root, source, f"herdr-scope-{case}", mutation, operands, diagnostic)
 
