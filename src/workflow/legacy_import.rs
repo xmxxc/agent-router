@@ -324,10 +324,13 @@ fn check_audit_generations(record: &Value, event: &Value, current: Option<&Value
     };
     let operation = generation("ownerGeneration")?;
     let resolution = generation("resolutionOwnerGeneration")?;
-    ensure!(
-        event["ownerTokenRecorded"] != 1 || operation.is_some(),
-        "managed legacy lifecycle operation lacks owner generation"
-    );
+    let backend_reconcile = event["operation"] == "backend_reconcile";
+    if event["ownerTokenRecorded"] == 1 || (backend_reconcile && resolution.is_some()) {
+        ensure!(
+            operation.is_some(),
+            "managed legacy lifecycle operation lacks owner generation"
+        );
+    }
     if let Some(latest) = operation.max(resolution) {
         let current = current
             .and_then(Value::as_u64)
@@ -338,18 +341,22 @@ fn check_audit_generations(record: &Value, event: &Value, current: Option<&Value
         );
     }
     if let Some(operation) = operation {
-        if event["operation"] == "backend_reconcile" && resolution.is_none() {
-            check_settled_herdr_binding(record, event)?;
-        } else if !event["resolver_actor"].is_null() {
-            ensure!(
-                resolution.is_some(),
-                "managed legacy lifecycle resolution lacks owner generation"
-            );
-        }
         if let Some(resolution) = resolution {
             ensure!(
                 resolution >= operation,
                 "legacy resolution owner generation precedes the operation"
+            );
+        }
+        if backend_reconcile {
+            check_settled_herdr_binding(record, event)?;
+            ensure!(
+                resolution.is_none(),
+                "settled legacy Herdr backend_reconcile has an unexpected resolution owner generation"
+            );
+        } else if !event["resolver_actor"].is_null() {
+            ensure!(
+                resolution.is_some(),
+                "managed legacy lifecycle resolution lacks owner generation"
             );
         }
     }
