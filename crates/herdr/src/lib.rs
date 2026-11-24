@@ -127,6 +127,12 @@ pub struct Screen {
     pub truncated: bool,
 }
 
+#[derive(Clone, Copy)]
+pub enum CodexInput {
+    Continue,
+    Nudge,
+}
+
 const INVALID: Failure = Failure::unknown("incomplete Herdr observation");
 
 fn observe_after_input_check<T>(
@@ -534,23 +540,29 @@ impl Handle {
 
     /// Submit one text/Enter request to a confirmed empty composer. After
     /// submission, observe only, even if the entire draft is visible.
-    pub fn continue_codex(
+    pub fn submit_codex_input(
         &mut self,
         text: &str,
         writer: &Process,
+        action: CodexInput,
         mut save: impl FnMut(&Self) -> std::io::Result<()>,
         before_write: impl FnOnce() -> std::io::Result<()>,
     ) -> Result<()> {
-        let before =
-            self.send_to_empty_box(text, "codex", Some(writer), &mut save, before_write)?;
-        screen::confirm_continue(self, text, &before).map_err(Failure::after_effect)
+        let before = self.send_to_empty_box(
+            text,
+            "codex",
+            Some((writer, action)),
+            &mut save,
+            before_write,
+        )?;
+        screen::confirm_codex_input(self, action, text, &before).map_err(Failure::after_effect)
     }
 
     fn send_to_empty_box(
         &mut self,
         text: &str,
         host: &str,
-        writer: Option<&Process>,
+        worker_input: Option<(&Process, CodexInput)>,
         save: &mut impl FnMut(&Self) -> std::io::Result<()>,
         before_write: impl FnOnce() -> std::io::Result<()>,
     ) -> Result<Screen> {
@@ -562,10 +574,8 @@ impl Handle {
                 return Err(Failure::refused("worker input is paused"));
             }
             screen::require_empty_reply_box(self, &before, host)?;
-            if writer.is_some() && screen::matching_user_entries(&before, text) != 0 {
-                return Err(Failure::unsent("new task already appeared before input"));
-            }
-            let rpc = if let Some(writer) = writer {
+            let rpc = if let Some((writer, action)) = worker_input {
+                screen::check_codex_input(action, &before, text)?;
                 let rpc = self.session()?;
                 self.require_foreground_writer(&rpc, writer, save)?;
                 rpc

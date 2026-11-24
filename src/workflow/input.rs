@@ -95,12 +95,12 @@ impl<'a> Request<'a> {
         let path = dir.join(format!("{}.json", self.dispatch));
         let original = assignment::public_record(&dir, self.dispatch)?
             .with_context(|| format!("unknown dispatch {}", self.dispatch))?;
-        let herdr_continue = operation == "continue" && original["backend"] == "herdr";
+        let herdr_input = original["backend"] == "herdr";
         let require_host = |row: &Value, replay: Option<usize>| -> Result<()> {
             if row["backend"] == "herdr" {
                 ensure!(
-                    operation == "continue" && row["host"] == "codex",
-                    "Herdr input requires a Codex continuation"
+                    row["host"] == "codex",
+                    "Herdr input requires a Codex assignment"
                 );
                 return Ok(());
             }
@@ -138,7 +138,7 @@ impl<'a> Request<'a> {
             ["host", "backend", "create"]
                 .iter()
                 .all(|key| current[*key] == original[*key])
-                && if herdr_continue {
+                && if herdr_input {
                     herdr::same_binding(&original, &current)
                 } else {
                     current["executionId"] == original["executionId"]
@@ -200,6 +200,11 @@ impl<'a> Request<'a> {
             }
             return Ok(input_response(self.dispatch, &event, true));
         }
+        // Herdr's pane lock serializes transports. The attempt lock also
+        // serializes a fresh reminder with `done`, which can publish during status.
+        let _completion = (herdr_input && operation == "nudge")
+            .then(|| assignment::close_lock(&state, &current))
+            .transpose()?;
         ensure!(
             !original_unresolved && !assignment::input_unresolved(&current),
             "input is pending or uncertain; verify the prior input before retrying"
@@ -212,7 +217,7 @@ impl<'a> Request<'a> {
         ensure!(
             current["controllerOwner"].is_null()
                 && assignment::identified(&current)
-                && (herdr_continue
+                && (herdr_input
                     || (current["executionId"].is_string()
                         && current["tmuxSocket"]
                             .as_str()
@@ -225,11 +230,11 @@ impl<'a> Request<'a> {
             backend::archive(&state, &current)?.is_none(),
             "execution resources are closing or closed; use resume for an exited worker"
         );
-        let mut herdr_target = herdr_continue
-            .then(|| herdr::ContinueTarget::verify(&state, &current))
+        let mut herdr_target = herdr_input
+            .then(|| herdr::InputTarget::verify(&state, &current))
             .transpose()?;
         let legacy_callback = operation == "continue"
-            && !herdr_continue
+            && !herdr_input
             && current[controller::CALLBACK_HASH].is_null()
             && current[controller::CALLBACK_REF_HASH].is_null();
         let worker = if herdr_target.is_some() {
@@ -266,7 +271,7 @@ impl<'a> Request<'a> {
                 view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
             ensure!(
                 !inbox.unresolved_reply(&current, None)?
-                    && (!herdr_continue || !herdr::unsettled_continue_reply(&current, &history)),
+                    && (!herdr_input || !herdr::unsettled_reply(&current, &history)),
                 "reply is pending or uncertain on this execution; verify it before input"
             );
             let mut projected = current.clone();
@@ -274,7 +279,7 @@ impl<'a> Request<'a> {
             view::project(&mut projected, &history, Some(true), false)?;
             let mut next = current.clone();
             if let Some(target) = &herdr_target {
-                target.stage(&mut next);
+                target.save_writer_evidence(&mut next);
             }
             let mut event = json!({"id":format!("i-{}", Uuid::new_v4().simple()),
                 "operation":operation, "result":"pending", "ownerGeneration":generation,
@@ -311,6 +316,9 @@ impl<'a> Request<'a> {
                     next["attempt"] = json!(attempt);
                     next["task"] = json!(task);
                     next["report"] = json!(report);
+                    if let Some(target) = &herdr_target {
+                        target.bind_continued_execution(&mut next);
+                    }
                     if let Some(reference) = &reference {
                         next[controller::CALLBACK_REF_HASH] = json!(messages::body_hash(reference));
                     } else {
@@ -371,8 +379,7 @@ impl<'a> Request<'a> {
                         view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
                     ensure!(
                         !inbox.unresolved_reply(&current, None)?
-                            && (!herdr_continue
-                                || !herdr::unsettled_continue_reply(&current, &history)),
+                            && (!herdr_input || !herdr::unsettled_reply(&current, &history)),
                         "reply is pending or uncertain on this execution; verify it before input"
                     );
                     let mut projected = current.clone();
@@ -411,7 +418,12 @@ impl<'a> Request<'a> {
             })
         };
         let answer = if let Some(target) = &mut herdr_target {
-            target.submit(&text, || {
+            let action = if operation == "continue" {
+                wfc_herdr::CodexInput::Continue
+            } else {
+                wfc_herdr::CodexInput::Nudge
+            };
+            target.submit(action, &text, || {
                 check_boundary(PrepareText)
                     .and_then(|()| check_boundary(Text))
                     .map_err(|error| std::io::Error::other(error.to_string()))
@@ -610,7 +622,7 @@ fn lock_input(
         if let Some(scope_lock) = controller::try_scope_lock(state, scope)? {
             controller::Owners::read(state)?.require(scope, token, operation)?;
             let execution = if row["backend"] == "herdr" {
-                herdr::try_continue_lock(state, row)?
+                herdr::try_input_lock(state, row)?
             } else {
                 assignment::try_reply_lock(state, row)?
             };

@@ -1,4 +1,4 @@
-use super::{Failure, Handle, Result, Screen};
+use super::{CodexInput, Failure, Handle, Result, Screen};
 use serde_json::json;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -471,62 +471,142 @@ pub(super) fn confirm_reply(
     unreachable!()
 }
 
-pub(super) fn matching_user_entries(screen: &Screen, text: &str) -> usize {
-    let lines = screen_lines(&screen.text);
-    let Some(composer) = prompt_row(&lines) else {
-        return 0;
-    };
-    let history = &lines[..composer];
+fn codex_history(screen: &Screen) -> Vec<&str> {
+    let mut lines = screen_lines(&screen.text);
+    lines.truncate(prompt_row(&lines).unwrap_or(0));
+    lines
+}
+
+fn matching_user_entries(history: &[&str], text: &str) -> usize {
     (0..history.len())
-        .filter(|&index| {
-            let Some(body) = history[index]
-                .strip_prefix("› ")
-                .filter(|body| body.starts_with("[router] "))
-            else {
-                return false;
-            };
-            let Some(mut rest) = text.strip_prefix(body) else {
-                return false;
-            };
-            for row in &history[index + 1..] {
-                if row.is_empty() {
-                    return rest.is_empty();
-                }
-                if rest.is_empty() {
-                    return false;
-                }
-                // A screen wrap may indent the continuation or omit its ending space.
-                let next = row.strip_prefix("  ").unwrap_or(row);
-                let Some(remaining) = rest
-                    .strip_prefix(next)
-                    .or_else(|| rest.strip_prefix(' ')?.strip_prefix(next))
-                else {
-                    return false;
-                };
-                rest = remaining;
-            }
-            false
-        })
+        .filter(|&index| matches_user_entry(&history[index..], text))
         .count()
 }
 
-pub(super) fn confirm_continue(handle: &Handle, text: &str, before: &Screen) -> Result<()> {
-    // The exact brief contains a fresh callback reference. A draft or a
-    // redraw of the empty box cannot establish this entry.
+fn matches_user_entry(rows: &[&str], text: &str) -> bool {
+    let [first, tail @ ..] = rows else {
+        return false;
+    };
+    let Some(body) = first
+        .strip_prefix("› ")
+        .filter(|body| body.starts_with("[router] "))
+    else {
+        return false;
+    };
+    let Some(mut rest) = text.strip_prefix(body) else {
+        return false;
+    };
+    for row in tail {
+        if row.is_empty() {
+            return rest.is_empty();
+        }
+        if rest.is_empty() {
+            return false;
+        }
+        // A screen wrap may indent the continuation or omit its ending space.
+        let next = row.strip_prefix("  ").unwrap_or(row);
+        let Some(remaining) = rest
+            .strip_prefix(next)
+            .or_else(|| rest.strip_prefix(' ')?.strip_prefix(next))
+        else {
+            return false;
+        };
+        rest = remaining;
+    }
+    false
+}
+
+pub(super) fn check_codex_input(action: CodexInput, before: &Screen, text: &str) -> Result<()> {
+    match action {
+        CodexInput::Continue if matching_user_entries(&codex_history(before), text) != 0 => {
+            Err(Failure::unsent("new task already appeared before input"))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn appended_history<'a, 'row>(
+    base: &[&str],
+    history: &'a [&'row str],
+    truncated: bool,
+    text: &str,
+) -> Option<&'a [&'row str]> {
+    if base.is_empty() && truncated {
+        return None;
+    }
+    if let Some(added) = history.strip_prefix(base) {
+        return Some(added);
+    }
+    if !truncated {
+        return None;
+    }
+    let old_copies = matching_user_entries(base, text);
+    let mut overlaps = (2..base.len()).filter(|&length| {
+        let retained = &base[base.len() - length..];
+        history.starts_with(retained)
+            && retained.windows(2).any(|pair| pair[0] != pair[1])
+            && matching_user_entries(retained, text) == old_copies
+            && base
+                .windows(length)
+                .filter(|part| *part == retained)
+                .count()
+                == 1
+            && history
+                .windows(length)
+                .filter(|part| *part == retained)
+                .count()
+                == 1
+    });
+    let overlap = overlaps.next()?;
+    overlaps.next().is_none().then_some(&history[overlap..])
+}
+
+pub(super) fn confirm_codex_input(
+    handle: &Handle,
+    action: CodexInput,
+    text: &str,
+    before: &Screen,
+) -> Result<()> {
+    let base = codex_history(before);
     for _ in 0..2 {
         sleep(Duration::from_millis(300));
         let screen = handle.read()?;
+        let history = codex_history(&screen);
+        let entry = match action {
+            // The full brief contains a fresh callback reference.
+            CodexInput::Continue => matching_user_entries(&history, text) == 1,
+            // A reminder may repeat previous text. Retain the transcript prefix,
+            // or its unique suffix if the recent window has scrolled.
+            CodexInput::Nudge => {
+                (!before.truncated || screen.truncated)
+                    && appended_history(&base, &history, screen.truncated, text).is_some_and(
+                        |added| {
+                            added
+                                .iter()
+                                .position(|row| !row.is_empty())
+                                .is_some_and(|first| matches_user_entry(&added[first..], text))
+                                && matching_user_entries(added, text) == 1
+                        },
+                    )
+            }
+        };
         if read_only(&screen.text)
             || refusals(&screen.text) > refusals(&before.text)
             || !matches!(
                 observe_herdr_reply_box(handle, &screen, "codex")?,
                 ReplyBox::Empty
             )
-            || matching_user_entries(&screen, text) != 1
+            || !entry
         {
-            return Err(Failure::unknown(
-                "Herdr did not show a new task entry in the Codex transcript",
-            ));
+            let diagnostic = match action {
+                CodexInput::Continue => {
+                    "Herdr did not show a new task entry in the Codex transcript"
+                }
+                CodexInput::Nudge => {
+                    "Herdr did not show a new reminder entry in the Codex transcript"
+                }
+            };
+            return Err(Failure::unknown(diagnostic));
         }
     }
     Ok(())

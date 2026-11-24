@@ -15,10 +15,10 @@ use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use wfc_herdr::{FailureKind, Handle, Launch, Mapping, Process};
+use wfc_herdr::{CodexInput, FailureKind, Handle, Launch, Mapping, Process};
 
 pub const USAGE: &str = "wfc herdr-reconcile DISPATCH --pane P --terminal T --actor NAME --evidence TEXT [--workspace W] [--old-writer-evidence TEXT] [--owner-token TOKEN]";
-pub(super) const CONTINUE_INPUT_EVIDENCE: &str = "herdr-appended-user-entry";
+pub(super) const APPENDED_USER_ENTRY: &str = "herdr-appended-user-entry";
 
 pub(super) fn native_state(state: &Path) -> Result<()> {
     ensure!(
@@ -107,7 +107,7 @@ pub(super) fn same_binding(before: &Value, after: &Value) -> bool {
         && before["writerProcesses"].get(0) == after["writerProcesses"].get(0)
 }
 
-pub(super) fn unsettled_continue_reply(row: &Value, history: &[Value]) -> bool {
+pub(super) fn unsettled_reply(row: &Value, history: &[Value]) -> bool {
     history.iter().any(|message| {
         message["type"] == "reply"
             && message["round"] == row["round"]
@@ -123,7 +123,7 @@ fn open_assignment_lock(path: &Path) -> Result<File> {
     File::open(path.with_extension("herdr-lock")).context("missing native Herdr assignment lock")
 }
 
-pub(super) fn try_continue_lock(state: &Path, row: &Value) -> Result<Option<File>> {
+pub(super) fn try_input_lock(state: &Path, row: &Value) -> Result<Option<File>> {
     native_state(state)?;
     let id = row["dispatch"]
         .as_str()
@@ -755,12 +755,12 @@ fn writable_input(unit: &Assignment<'_>, round: u64, attempt: &str) -> Result<()
     Ok(())
 }
 
-pub(super) struct ContinueTarget {
+pub(super) struct InputTarget {
     handle: Handle,
     writer: Process,
 }
 
-impl ContinueTarget {
+impl InputTarget {
     // The caller holds the scope and the stable physical assignment lock.
     pub(super) fn verify(state: &Path, row: &Value) -> Result<Self> {
         ensure!(
@@ -786,21 +786,26 @@ impl ContinueTarget {
         Ok(Self { handle, writer })
     }
 
-    pub(super) fn stage(&self, next: &mut Value) {
+    pub(super) fn bind_continued_execution(&self, next: &mut Value) {
         next["executionId"] = json!(self.handle.attempt);
-        self.save_writer_evidence(next);
     }
 
     pub(super) fn save_writer_evidence(&self, next: &mut Value) {
         next["backendHandle"]["writerProcesses"] = json!(self.handle.writers);
     }
 
-    pub(super) fn submit(&mut self, text: &str, check: impl FnOnce() -> io::Result<()>) -> Value {
+    pub(super) fn submit(
+        &mut self,
+        action: CodexInput,
+        text: &str,
+        check: impl FnOnce() -> io::Result<()>,
+    ) -> Value {
         let writer = &self.writer;
         let mut late_writers = None;
-        let result = self.handle.continue_codex(
+        let result = self.handle.submit_codex_input(
             text,
             writer,
+            action,
             // Writers observed before staging were persisted with the audit.
             // A new writer during preparation needs a fresh preflight.
             |observed| {
@@ -818,7 +823,7 @@ impl ContinueTarget {
             self.handle.writers = writers;
         }
         match result {
-            Ok(()) => json!({"result":"accepted", "inputEvidence":CONTINUE_INPUT_EVIDENCE}),
+            Ok(()) => json!({"result":"accepted", "inputEvidence":APPENDED_USER_ENTRY}),
             Err(error) => json!(error),
         }
     }
