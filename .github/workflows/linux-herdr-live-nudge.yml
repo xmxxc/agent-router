@@ -1,0 +1,201 @@
+name: Jammy Herdr live nudge and input ordering
+
+on:
+  push:
+    branches: [rust-router/32-herdr-reminder-build-r20-jammy-ci]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  public-herdr-live-nudge:
+    name: '#32 Herdr nudge, continue and shared tmux replay'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    env:
+      WFC_BUILD_ID: d2b3178016294d1db074412159f797b1213a262a
+      WFC_PRODUCT_TREE: 79ced0d6c083ee9be0cc0544c906b126b6ca77f1
+      WFC_PRODUCT_PARENTS: ddab29bb137fc9b99d1fd3cec8dc45ec096d8ca7
+      WFC_INPUTS_SHA256: c2f24062a0c7c5165f40f7ae567ce19ee54d4e09fe851f7c5106f4f118ee77aa
+      NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+      HERDR_RELEASE_URL: https://github.com/herdrdev/herdr/releases/download/v0.9.5/herdr-linux-x86_64
+      HERDR_RELEASE_SHA: 14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TERM_COLOR: never
+      PYTHONUTF8: '1'
+      EVIDENCE: ${{ github.workspace }}/linux-herdr-live-nudge-evidence
+    steps:
+      - name: Record run identity
+        run: |
+          mkdir -p "$EVIDENCE"
+          printf 'Workflow %s\nRun %s attempt %s\nProduct %s\nTree %s\n' \
+            "$GITHUB_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            "$WFC_BUILD_ID" "$WFC_PRODUCT_TREE" | tee "$EVIDENCE/run.log"
+          { cat /etc/os-release; getconf GNU_LIBC_VERSION; uname -a; id -u; } | tee -a "$EVIDENCE/run.log"
+          test "$(id -u)" -ne 0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.WFC_BUILD_ID }}
+          path: product
+          persist-credentials: false
+      - name: Check out the CI-only runner helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: ci
+          persist-credentials: false
+      - name: Check out the verified native CI zlib archive
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.NATIVE_INPUT_SHA }}
+          sparse-checkout: vendor/zlib-1.3.1.tar.gz
+          sparse-checkout-cone-mode: false
+          path: native-input
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        with:
+          version: '0.16.0'
+      - name: Verify sources and prepare the native build
+        working-directory: product
+        run: |
+          git show -s --format='Product %H tree %T' | tee "$EVIDENCE/sources.log"
+          git -C ../ci show -s --format='CI %H tree %T' | tee -a "$EVIDENCE/sources.log"
+          test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
+          test "$(git rev-parse HEAD)" = "$WFC_BUILD_ID"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$WFC_PRODUCT_TREE"
+          parents=$(git cat-file -p HEAD | sed -n '/^$/q; s/^parent //p' | paste -sd' ' -)
+          printf 'Product parents %s\n' "$parents" | tee -a "$EVIDENCE/sources.log"
+          test "$parents" = "$WFC_PRODUCT_PARENTS"
+          test "$(git -C ../ci rev-parse HEAD)" = "$GITHUB_WORKFLOW_SHA"
+          test "$(git -C ../ci cat-file -p HEAD | sed -n '/^$/q; s/^parent //p')" = "$WFC_BUILD_ID"
+          test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
+          printf '%s  %s\n' 17e88863f3600672ab49182f217281b6fc4d3c762bde361935e436a95214d05c \
+            ../native-input/vendor/zlib-1.3.1.tar.gz | sha256sum --check --strict | tee "$EVIDENCE/inputs.log"
+          printf '%s  %s\n' "$WFC_INPUTS_SHA256" vendor/INPUTS.sha256 | sha256sum --check --strict | tee -a "$EVIDENCE/inputs.log"
+          sha256sum --check --strict vendor/INPUTS.sha256 | tee -a "$EVIDENCE/inputs.log"
+          sha256sum tests/herdr_public.py crates/herdr/tests/{continue_worker,live}.py tools/check_tmux.py \
+            crates/herdr/src/{lib,screen}.rs src/workflow/{input,herdr,messages}.rs \
+            ../ci/.github/workflows/linux-herdr-live-nudge.yml ../ci/tools/ci/herdr-next-task/*.py | tee -a "$EVIDENCE/inputs.log"
+          rustup toolchain install 1.96.1 --profile minimal 2>&1 | tee "$EVIDENCE/toolchain.log"
+          { rustc +1.96.1 -vV; cargo +1.96.1 --version; zig version; python --version; } | tee -a "$EVIDENCE/toolchain.log"
+          test "$(zig version)" = 0.16.0
+          python tools/prepare.py --zlib-archive ../native-input/vendor/zlib-1.3.1.tar.gz 2>&1 | tee -a "$EVIDENCE/inputs.log"
+      - name: Prime the pinned Wuffs package with bounded download retries
+        working-directory: product/vendor/libghostty-vt
+        run: |
+          url=https://deps.files.ghostty.org/wuffs-7411f488fe2e2c205c3d3b3d28638b7356522930.tar.gz
+          archive="$RUNNER_TEMP/wuffs.tar.gz"
+          {
+            printf 'Wuffs source %s\n' "$url"
+            curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+              --retry-max-time 120 --connect-timeout 15 --max-time 60 "$url" -o "$archive"
+            printf '%s  %s\n' 17877d346f7988651d6c62e45b2e3b05c86809a6442c5e34612374b2a9719a1c "$archive" | sha256sum --check --strict
+            package=$(zig fetch "$archive")
+            printf 'Wuffs Zig package %s\n' "$package"
+            test "$package" = 'N-V-__8AAP5JWgCGP_AD0teWpa4krRvE9VPZzvviGdbmN4jI'
+          } 2>&1 | tee "$EVIDENCE/wuffs.log"
+      - name: Build the fixed release CLI
+        id: build
+        working-directory: product
+        run: |
+          cargo +1.96.1 build --release --locked --bin wfc 2>&1 | tee "$EVIDENCE/build.log"
+          sha256sum target/release/wfc | tee "$EVIDENCE/release-elf.sha256"
+          readelf -hW -- target/release/wfc | tee "$EVIDENCE/binary.log"
+          version=$(target/release/wfc --version)
+          printf '%s\n' "$version" | tee -a "$EVIDENCE/binary.log"
+          [[ "$version" == *"(Rust, x86_64-unknown-linux-gnu, release, build $WFC_BUILD_ID)" ]]
+      - name: Verify authorization precedes the final Herdr observation
+        working-directory: product
+        run: |
+          cargo +1.96.1 test --release --locked -p wfc-herdr --lib \
+            tests::input_authorization_precedes_final_observation -- --exact \
+            2>&1 | tee "$EVIDENCE/herdr-input-order.log"
+          grep -Fx 'test tests::input_authorization_precedes_final_observation ... ok' "$EVIDENCE/herdr-input-order.log"
+          grep -F 'test result: ok. 1 passed; 0 failed;' "$EVIDENCE/herdr-input-order.log"
+      - name: Download and verify pinned Herdr
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        id: herdr
+        run: |
+          asset="$RUNNER_TEMP/herdr-v0.9.5"
+          {
+            printf 'Herdr source %s\n' "$HERDR_RELEASE_URL"
+            curl --fail --silent --show-error --location --retry 2 --retry-max-time 150 \
+              --connect-timeout 15 --max-time 100 --output "$asset" "$HERDR_RELEASE_URL"
+            printf '%s  %s\n' "$HERDR_RELEASE_SHA" "$asset" | sha256sum --check --strict
+            chmod 700 "$asset"
+            readelf -hW "$asset"
+            version=$("$asset" --version)
+            printf '%s\n' "$version"
+            test "$version" = 'herdr 0.9.5'
+            printf 'HERDR_BIN=%s\n' "$asset" >> "$GITHUB_ENV"
+          } 2>&1 | tee "$EVIDENCE/herdr.log"
+      - name: Verify Herdr live nudge and the original-pane continue regressions
+        if: ${{ !cancelled() && steps.herdr.outcome == 'success' }}
+        working-directory: product
+        run: |
+          sha256sum --check --strict "$EVIDENCE/release-elf.sha256" | tee "$EVIDENCE/test-binary.log"
+          selectors=(
+            PublicLifecycle.test_continue_completes_a_new_task_in_the_original_herdr_pane
+            PublicLifecycle.test_continue_restores_old_herdr_round_after_proven_zero_write
+            PublicLifecycle.test_continue_does_not_resend_after_lost_herdr_input_receipt
+            PublicLifecycle.test_continue_keeps_herdr_ack_with_only_an_empty_redraw_uncertain
+            PublicLifecycle.test_continue_refuses_when_the_herdr_worker_loses_foreground
+            PublicLifecycle.test_legacy_authority_or_later_round_is_left_pending
+            PublicLifecycle.test_nudge_on_live_herdr_worker_replays_only_the_original_key
+            PublicLifecycle.test_uncertain_herdr_nudge_is_not_replayed_even_after_continued_worker_done
+            PublicLifecycle.test_nudge_after_herdr_history_scrolls_past_the_recent_window
+            PublicLifecycle.test_named_status_during_done_then_exit
+          )
+          printf '%s\n' "${selectors[@]}" | tee "$EVIDENCE/selectors.log"
+          python -Bu ../ci/tools/ci/herdr-next-task/reap.py python -Bu tests/herdr_public.py \
+            "$HERDR_BIN" target/release/wfc -v "${selectors[@]}" 2>&1 | tee "$EVIDENCE/public-herdr.log"
+          for selector in "${selectors[@]}"; do
+            grep -E "^${selector#*.} .+ \.\.\. ok$" "$EVIDENCE/public-herdr.log"
+          done
+          grep -F 'Ran 10 tests' "$EVIDENCE/public-herdr.log"
+          grep -Fx 'OK' "$EVIDENCE/public-herdr.log"
+          grep -Fx 'Own descendants reaped: ECHILD, extra cleanup signals: 0' "$EVIDENCE/public-herdr.log"
+      - name: Verify shared tmux nudge and read-only receipt replay
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: |
+          tmux -V | tee "$EVIDENCE/tmux-version.log"
+          sha256sum --check --strict "$EVIDENCE/release-elf.sha256" | tee "$EVIDENCE/tmux-test-binary.log"
+          selectors=(
+            Backend.test_public_nudge_distinguishes_new_intent_and_keyed_replay
+            Backend.test_public_continue_replays_confirmed_receipt_while_nudge_is_unresolved
+          )
+          printf '%s\n' "${selectors[@]}" | tee "$EVIDENCE/tmux-selectors.log"
+          result=0
+          python -Bu ../ci/tools/ci/herdr-next-task/reap.py python -Bu tools/check_tmux.py \
+            target/release/wfc -v "${selectors[@]}" \
+            > "$EVIDENCE/tmux-stdout.log" 2> "$EVIDENCE/public-tmux.log" || result=$?
+          cat "$EVIDENCE/tmux-stdout.log" "$EVIDENCE/public-tmux.log"
+          test "$result" -eq 0
+          for selector in "${selectors[@]}"; do
+            grep -E "^${selector#*.} .+ \.\.\. ok$" "$EVIDENCE/public-tmux.log"
+          done
+          grep -F 'Ran 2 tests' "$EVIDENCE/public-tmux.log"
+          grep -Fx 'OK' "$EVIDENCE/public-tmux.log"
+          grep -Fx 'Own descendants reaped: ECHILD, extra cleanup signals: 0' "$EVIDENCE/tmux-stdout.log"
+      - name: Checksum the evidence logs
+        if: ${{ always() }}
+        run: |
+          cd "$EVIDENCE"
+          shopt -s nullglob
+          sha256sum -- *.log *.sha256 > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() }}
+        with:
+          name: linux-herdr-live-nudge-${{ env.WFC_BUILD_ID }}-attempt-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 14
