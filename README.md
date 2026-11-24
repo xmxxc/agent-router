@@ -154,6 +154,8 @@ Herdr 0.9.5 在发送提醒前用最多 1000 行历史核对同文来源。历�
 
 旧同文或旧拒收从滚动历史重现时，画面可能和一次实际新输入相同。若在提交后才无法确认送达，`wfc status --dispatch ID` 的 `audit` 会保留原审计号、轮次及诊断，重复请求不会再发键。若续派的 worker 已用本轮 `--callback-ref` 成功发问或回报，可以用原 `continue` 参数取回同一输入回执。即使后续任务已发问或回报，待核提醒仍保留原审计号。
 
+Herdr 的账本预检或首写检查明确拒绝输入，且结算无法重新打开账本或保存派发记录时，命令错误会附带 `noSendProof`。例如旧库写保护同时挡住首写和结算。保护解除后，现任 owner 可用原 `nudge` 或 `continue` 参数加上 `--no-send-proof PROOF` 结算同一个审计。此调用只恢复记录，返回 `definitely-not-sent`。之后可把原命令作为正常请求重新提交。证明缺失、暂存记录变更或已有输入证据冲突时，原审计仍待核。
+
 在已认领的组中，worker 可用启动时分配的独立回调凭据发问或回报。总控兼容入口使用当前租约的凭据。`ask` 与 `done` 均接受显式的 `--owner-token`。
 
 `wait` 默认等待 3600 秒，`--timeout` 接受小数秒，设为 0 可立即查询。它按提交顺序返回 `messages`，包含派发、轮次、attempt、角色、scope、数字编号 `id` 和 `messageId`。报告消息包含路径和 Git 快照，问题消息包含 `question` 和 `options`。可按 `--scope NAME`、`--dispatch ID` 或两者共同筛选。首次提交为 `unsent`（版本 1），领取为 `received`（版本 2）。消息在输出前标记为已收取，其他等待者可领取剩余消息。超时返回 `{"messages":[],"timedOut":true}`，退出码为 3。

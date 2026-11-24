@@ -1,5 +1,6 @@
 """Linux integration: python3 tests/herdr_public.py HERDR WFC [-v]."""
 import fcntl
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -585,6 +586,125 @@ for line in sys.stdin:
             self.assertIn(retried['attempt'], brief)
             self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
 
+    def test_herdr_zero_send_proof_settles_the_original_nudge_and_continue(self):
+        writes = []
+
+        def count(request, response):
+            if request['method'] in ('pane.send_input', 'pane.send_keys'):
+                writes.append((request['method'], request['params']['pane_id']))
+            return response
+
+        def structured(data):
+            return json.dumps(data, separators=(',', ':'), sort_keys=True, ensure_ascii=False).encode()
+
+        def synthetic_record(data):
+            # Whole-second values keep the synthetic record's JSON encoding stable.
+            return json.loads(data, parse_float=lambda number: int(float(number)))
+
+        def seal(pending, audit, previous, proof):
+            claims = dict(audit=audit['id'], assignmentHash=sha256(structured(pending)).hexdigest(),
+                          previous=previous)
+            pending['herdrNoSendRecovery'] = dict(
+                commitment=sha256(structured([proof, claims])).hexdigest(), claims=claims)
+            record.write_bytes(structured(pending))
+
+        with self.service.fault_proxy(count) as proxy:
+            self.launch_project_worker(proxy)
+            state = Path(self.env['WFC_STATE'])
+            record = state/'dispatches'/f'{self.dispatch_id}.json'
+            ledger = state/'messages.json'
+            scope = self.row['scope']
+            former = self.cli('owner', 'acquire', '--scope', scope, '--owner', 'A')
+            active = self.cli('owner', 'takeover', '--scope', scope, '--owner', 'B')
+            self.env['WFC_CONTROLLER_TOKEN'] = active['token']
+            record_before = synthetic_record(record.read_bytes())
+            reminder = ('nudge', self.dispatch_id, '--text', 'review after blocked write', '--message-id', 'restore')
+            nudge_proof = 'a'*64
+            event = dict(id='i-'+'1'*32, operation='nudge', result='pending', ownerGeneration=former['generation'],
+                         fromRound=record_before['round'], fromAttempt=record_before['attempt'],
+                         round=record_before['round'], attempt=record_before['attempt'],
+                         text=reminder[3], requestKey=reminder[-1])
+            pending = {**record_before, 'audit': [event]}
+            record.write_bytes(structured(pending))
+            self.cli(*reminder, '--no-send-proof', nudge_proof, error='no pending zero-send proof')
+            seal(pending, event, None, nudge_proof)
+            saved = record.read_bytes()
+            before_messages = ledger.read_bytes() if ledger.exists() else None
+            recover = (*reminder,'--no-send-proof',nudge_proof)
+            sidecar = state/'router.db-journal'
+            sidecar.write_bytes(b'synthetic legacy recovery record')
+            try:
+                self.cli(*recover, error='legacy state write blocked')
+                self.assertEqual(record.read_bytes(), saved)
+                self.assertEqual(sidecar.read_bytes(), b'synthetic legacy recovery record')
+                self.assertNotIn('herdrNoSendRecovery', self.status())
+            finally:
+                sidecar.unlink()
+            self.cli(*recover, '--owner-token', former['token'], error='stale_controller_owner')
+            self.cli(*reminder, '--no-send-proof', 'f'*64, error='invalid zero-send proof')
+            self.cli(*reminder[:-1], 'wrong', '--no-send-proof', nudge_proof, error='original input request')
+            self.assertEqual(record.read_bytes(), saved)
+            settled = self.cli(*recover)
+            self.assertEqual((settled['round'], settled['attempt'], settled['audit'], settled['result']),
+                             (event['round'], event['attempt'], event['id'], 'definitely-not-sent'))
+            status = self.status()
+            self.assertNotIn('herdrNoSendRecovery', status)
+            self.assertEqual(status['audit'][-1]['inputEvidence'], 'herdr-first-write-blocked')
+            self.assertEqual(ledger.read_bytes() if ledger.exists() else None, before_messages)
+            self.assertEqual(writes, [])
+            self.assertFalse((self.root/'inputs').exists())
+            self.cli(*recover, error='no pending zero-send proof')
+            sent = self.cli(*reminder)
+            self.assertEqual(self.cli(*reminder), {**sent, 'duplicate': True})
+            self.assertEqual(writes, [('pane.send_input', self.h['pane'])])
+
+            (self.root/'finish-first').touch()
+            receipt = self.root/'report.receipt'
+            first = json.loads(live.wait_for(lambda: receipt.exists() and receipt.read_bytes()))
+            original_report = (self.root/'report.md').read_bytes()
+            completed = synthetic_record(json.dumps(self.status()))
+            record_before = synthetic_record(record.read_bytes())
+            task, report = self.root/'next task.md', self.root/'next report.md'
+            task.write_text('normal work after an unsent continuation\n')
+            advance = ('continue', self.dispatch_id, '--task', task, '--report', report)
+            event = dict(id='i-'+'2'*32, operation='continue', result='pending', ownerGeneration=active['generation'],
+                         fromRound=record_before['round'], fromAttempt=record_before['attempt'], round=2,
+                         attempt='a-'+'2'*32, task=str(task), report=str(report))
+            prior = {key: record_before[key] for key in
+                     ('round', 'attempt', 'task', 'report', 'rounds', 'executionId', 'workerCallbackRefHash')
+                     if key in record_before}
+            next_round = dict(round=event['round'], attempt=event['attempt'], task=event['task'], report=event['report'],
+                              created=completed['created'], completed=None, state='running', result=None)
+            pending = {**record_before, 'audit': [*record_before['audit'], event],
+                       'rounds': [*completed['rounds'], next_round], 'round': next_round['round'],
+                       'attempt': next_round['attempt'], 'task': str(task), 'report': str(report),
+                       'executionId': self.h['attempt'], 'workerCallbackRefHash': 'c'*64}
+            continue_proof = 'b'*64
+            seal(pending, event, prior, continue_proof)
+            before_messages = ledger.read_bytes()
+            settled = self.cli(*advance, '--no-send-proof', continue_proof)
+            self.assertEqual((settled['round'], settled['attempt'], settled['audit'], settled['result']),
+                             (event['fromRound'], event['fromAttempt'], event['id'], 'definitely-not-sent'))
+            restored = self.status()
+            self.assertEqual(restored['state'], 'done')
+            self.assertEqual(restored['report'], record_before['report'])
+            self.assertEqual(restored['rounds'][0]['result']['messageId'], first['messageId'])
+            self.assertEqual(restored['rounds'][0]['result']['id'], first['message'])
+            self.assertEqual((self.root/'report.md').read_bytes(), original_report)
+            self.assertEqual(ledger.read_bytes(), before_messages)
+            self.assertFalse(report.exists())
+            self.assertEqual(writes, [('pane.send_input', self.h['pane'])])
+
+            advanced = self.cli(*advance)
+            self.assertEqual((advanced['round'], advanced['result']), (2, 'accepted'))
+            self.assertNotEqual(advanced['attempt'], event['attempt'])
+            self.assertEqual(self.cli(*advance), {**advanced, 'duplicate': True})
+            self.assertEqual(writes, [('pane.send_input', self.h['pane'])] * 2)
+            reminder_line, continued_line = (self.root/'inputs').read_text().splitlines()
+            self.assertIn(reminder[3], reminder_line)
+            self.assertIn(advanced['attempt'], continued_line)
+            self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+
     def test_continue_does_not_resend_after_lost_herdr_input_receipt(self):
         writes = []
 
@@ -602,6 +722,7 @@ for line in sys.stdin:
             self.assertEqual((view['round'], event['attempt'], event['result']), (2, view['attempt'], 'uncertain'))
             self.assertEqual(view['rounds'][0]['result']['messageId'], first['messageId'])
             self.cli(*options, error='pending or uncertain')
+            self.cli(*options, '--no-send-proof', 'd'*64, error='no pending zero-send proof')
             self.cli('--herdr-backend', payload=dict(op='submit', dispatch=self.dispatch_id,
                      round=2, attempt=view['attempt'], text='must stay blocked'), error='pending or uncertain')
             self.assertEqual(self.status()['audit'], [event])

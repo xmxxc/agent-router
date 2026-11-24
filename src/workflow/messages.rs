@@ -1395,7 +1395,7 @@ impl Inbox {
     }
 
     #[cfg(target_os = "linux")]
-    fn worker_input_key(event: &Value) -> Result<String> {
+    pub(super) fn worker_input_key(event: &Value) -> Result<String> {
         let id = event["id"]
             .as_str()
             .and_then(|id| id.strip_prefix("i-"))

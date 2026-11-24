@@ -1,4 +1,6 @@
 //! Public input to the existing worker, with round changes committed before typing.
+mod recovery;
+
 use super::{
     assignment, backend, controller, ensure_state_writable, herdr, messages, record_scope, view,
     writable_state_dir, write_json,
@@ -16,9 +18,10 @@ use std::{
 use uuid::Uuid;
 
 pub const CONTINUE_USAGE: &str =
-    "wfc continue DISPATCH --task FILE --report FILE [--owner-token TOKEN]";
+    "wfc continue DISPATCH --task FILE --report FILE [--owner-token TOKEN] [--no-send-proof PROOF]";
 pub const NUDGE_USAGE: &str =
-    "wfc nudge DISPATCH --text TEXT [--message-id KEY] [--owner-token TOKEN]";
+    "wfc nudge DISPATCH --text TEXT [--message-id KEY] [--owner-token TOKEN] [--no-send-proof PROOF]";
+pub(super) const NO_SEND_RECOVERY: &str = "herdrNoSendRecovery";
 
 pub fn usage(name: &str) -> &'static str {
     if name == "continue" {
@@ -46,38 +49,51 @@ pub struct Request<'a> {
     dispatch: &'a str,
     token: Option<&'a str>,
     key: Option<&'a str>,
+    no_send_proof: Option<&'a str>,
     action: Action<'a>,
 }
 
 impl<'a> Request<'a> {
     pub fn parse(name: &str, args: &'a [OsString]) -> Result<Self> {
         let mut dispatch = None;
-        let (token, key, action) = if name == "continue" {
-            let [token, task, report] = messages::options(
+        let (token, key, no_send_proof, action) = if name == "continue" {
+            let [token, task, report, no_send_proof] = messages::options(
                 args,
-                ["--owner-token", "--task", "--report"],
+                ["--owner-token", "--task", "--report", "--no-send-proof"],
                 Some((&mut dispatch, "dispatch ID")),
             )?;
             (
                 token,
                 None,
+                no_send_proof,
                 Action::Continue {
                     task: Path::new(task.context("missing --task")?),
                     report: Path::new(report.context("missing --report")?),
                 },
             )
         } else {
-            let [token, text, key] = messages::options(
+            let [token, text, key, no_send_proof] = messages::options(
                 args,
-                ["--owner-token", "--text", "--message-id"],
+                ["--owner-token", "--text", "--message-id", "--no-send-proof"],
                 Some((&mut dispatch, "dispatch ID")),
             )?;
             ensure!(
                 key.is_none_or(|key| !key.trim().is_empty() && !key.chars().any(char::is_control)),
                 "invalid --message-id"
             );
-            (token, key, Action::Nudge(text.context("missing --text")?))
+            (
+                token,
+                key,
+                no_send_proof,
+                Action::Nudge(text.context("missing --text")?),
+            )
         };
+        ensure!(
+            no_send_proof.is_none_or(
+                |proof| proof.len() == 64 && proof.bytes().all(|byte| byte.is_ascii_hexdigit())
+            ),
+            "invalid --no-send-proof"
+        );
         let dispatch = dispatch
             .filter(|id| super::valid_id(id))
             .context("invalid or missing dispatch ID")?;
@@ -85,6 +101,7 @@ impl<'a> Request<'a> {
             dispatch,
             token,
             key,
+            no_send_proof,
             action,
         })
     }
@@ -128,7 +145,7 @@ impl<'a> Request<'a> {
         let initial_replay = replay_index(&original, &self.action, nudge.as_deref(), self.key)?;
         require_host(&original, initial_replay)?;
         ensure!(
-            !original_unresolved || initial_replay.is_some(),
+            !original_unresolved || initial_replay.is_some() || self.no_send_proof.is_some(),
             "input is pending or uncertain; verify the prior input before retrying"
         );
         let (_scope, _execution) =
@@ -168,6 +185,55 @@ impl<'a> Request<'a> {
                 || replay.is_some_and(|index| current["audit"][index]["result"] == "accepted"),
             "handoff is unresolved; reconcile the original execution before input"
         );
+        if let Some(proof) = self.no_send_proof {
+            ensure!(
+                herdr_input && same_round,
+                "zero-send recovery requires the original Herdr input"
+            );
+            let _inbox = messages::Inbox::open(&state)?;
+            authorized_generation(&state, scope, token.as_deref(), operation)?;
+            let (mut restored, mut event) = recovery::restore(current.clone(), proof)?;
+            ensure!(
+                event["operation"] == operation
+                    && match &self.action {
+                        Action::Nudge(_) =>
+                            event["requestKey"] == json!(self.key)
+                                && event["text"].as_str() == nudge.as_deref(),
+                        Action::Continue { task, report } =>
+                            same_continue_paths(&event, task, report),
+                    },
+                "zero-send proof requires the original input request"
+            );
+            ensure!(
+                herdr::same_binding(&current, &restored),
+                "zero-send proof does not match the original Herdr execution"
+            );
+            let message_key = messages::Inbox::worker_input_key(&event)?;
+            let history =
+                view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
+            ensure!(
+                !history.iter().any(|message| {
+                    message["messageId"] == message_key
+                        || (operation == "continue"
+                            && message["round"] == event["round"]
+                            && message["attempt"] == event["attempt"])
+                }),
+                "worker history conflicts with zero-send proof; keep the input pending"
+            );
+            event["result"] = json!("definitely-not-sent");
+            event["inputEvidence"] = json!("herdr-first-write-blocked");
+            event["diagnostic"] = json!("Herdr input was blocked before its first write");
+            *restored["audit"]
+                .as_array_mut()
+                .and_then(|events| events.last_mut())
+                .context("missing pending input audit")? = event.clone();
+            authorized_generation(&state, scope, token.as_deref(), operation)?;
+            save(&state, &path, &restored)?;
+            return Ok(
+                json!({"dispatch":self.dispatch,"operation":operation,"result":"definitely-not-sent",
+                "round":restored["round"],"attempt":restored["attempt"],"audit":event["id"]}),
+            );
+        }
         if let Some(index) = replay {
             let mut event = current["audit"][index].clone();
             let mut inbox = messages::Inbox::open(&state)?;
@@ -199,6 +265,10 @@ impl<'a> Request<'a> {
                     .context("invalid input audit")?
                     .remove("diagnostic");
                 current["audit"][index] = event.clone();
+                current
+                    .as_object_mut()
+                    .context("invalid input assignment")?
+                    .remove(NO_SEND_RECOVERY);
                 save(&state, &path, &current)?;
             } else {
                 messages::sync_directory(&dir).context("sync the settled worker input")?;
@@ -274,6 +344,9 @@ impl<'a> Request<'a> {
         let herdr_owners = herdr_input
             .then(|| controller::Owners::read(&state))
             .transpose()?;
+        // Only this process knows the random proof until it witnesses a refused first write.
+        let staged_proof =
+            herdr_input.then(|| format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()));
         let (mut next, index, text, generation) = {
             let inbox = messages::Inbox::open(&state)?;
             let generation = authorized_generation(&state, scope, token.as_deref(), operation)?;
@@ -371,6 +444,9 @@ impl<'a> Request<'a> {
                 .context("invalid input audit")?;
             let index = audit.len();
             audit.push(event);
+            if let Some(proof) = &staged_proof {
+                recovery::stage(&current, &mut next, proof, index)?;
+            }
             save(&state, &path, &next)?;
             (next, index, text, generation)
         };
@@ -465,7 +541,20 @@ impl<'a> Request<'a> {
             }
             _ => "uncertain",
         };
-        let mut inbox = messages::Inbox::open(&state)?;
+        // Only the local preparation and first-write callbacks set this error.
+        // An RPC response can report zero enqueue after request bytes were sent.
+        let rejected_before_write = first_write_error.is_some();
+        let audit_id = next["audit"][index]["id"].clone();
+        let settlement_error = |error, outcome| {
+            let proof = recovery::proof_after_refusal(
+                staged_proof.as_deref(),
+                rejected_before_write,
+                outcome,
+            );
+            recovery::settlement_error(error, proof, self.dispatch, &audit_id)
+        };
+        let mut inbox =
+            messages::Inbox::open(&state).map_err(|error| settlement_error(error, outcome))?;
         let saved = super::read_record(&path)?;
         ensure!(
             saved["attempt"] == next["attempt"]
@@ -512,7 +601,10 @@ impl<'a> Request<'a> {
         } else {
             audit[index] = event.clone();
         }
-        save(&state, &path, &next)?;
+        next.as_object_mut()
+            .context("invalid input assignment")?
+            .remove(NO_SEND_RECOVERY);
+        save(&state, &path, &next).map_err(|error| settlement_error(error, outcome))?;
         if let Some(error) = first_write_error {
             return Err(error);
         }
@@ -576,26 +668,28 @@ fn replay_index(
             && event["round"] == row["round"]
             && event["attempt"] == row["attempt"]
             && match action {
-                Action::Continue { task, report } => {
-                    let resolved = task.canonicalize().or_else(|error| {
-                        if error.kind() == ErrorKind::NotFound {
-                            canonical_parent_path(task)
-                        } else {
-                            Err(error)
-                        }
-                    });
-                    resolved
-                        .ok()
-                        .and_then(|path| path_text(path).ok())
-                        .is_some_and(|task| event["task"] == task)
-                        && canonical_parent_path(report)
-                            .ok()
-                            .and_then(|path| path_text(path).ok())
-                            .is_some_and(|report| event["report"] == report)
-                }
+                Action::Continue { task, report } => same_continue_paths(event, task, report),
                 Action::Nudge(_) => false,
             }
     }))
+}
+
+fn same_continue_paths(event: &Value, task: &Path, report: &Path) -> bool {
+    let resolved = task.canonicalize().or_else(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            canonical_parent_path(task)
+        } else {
+            Err(error)
+        }
+    });
+    resolved
+        .ok()
+        .and_then(|path| path_text(path).ok())
+        .is_some_and(|task| event["task"] == task)
+        && canonical_parent_path(report)
+            .ok()
+            .and_then(|path| path_text(path).ok())
+            .is_some_and(|report| event["report"] == report)
 }
 
 fn nudge_text(text: &str) -> Result<String> {
