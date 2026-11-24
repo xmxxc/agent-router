@@ -1,0 +1,228 @@
+name: Jammy cross handoff on the current Linux base
+on:
+  push:
+    branches: [rust-router/35-cross-handoff-current-r30-jammy-ci]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  linux-handoff:
+    name: '#35 native cross handoff and #34 shared input'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      PRODUCT_SHA: 2cb07a8f151b28f08db4de4d095a08f4ff8566ff
+      PRODUCT_TREE: 8d24e9a7d0f53b175a1af3ffcd5eb5072655a92b
+      PRODUCT_PARENTS: 021c29aa0961a60fc96f6db04c5cdc40f7656b32 98cedd46925928c397ffee9d6511428441b2f70e
+      NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+      NATIVE_INPUT_TREE: 7480986f4468ffafc76b95012562945ee586b52a
+      HERDR_SHA256: 14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d
+      TARGET: x86_64-unknown-linux-gnu
+      CARGO_BUILD_JOBS: '2'
+      EVIDENCE: ${{ github.workspace }}/linux-cross-handoff-current-r30-evidence
+    steps:
+      - name: Record workflow and run identity
+        run: |
+          mkdir -p "$EVIDENCE"
+          printf '%s\n' "workflow=$GITHUB_WORKFLOW_SHA" "head=$GITHUB_SHA" \
+            "ref=$GITHUB_REF" "run=$GITHUB_RUN_ID" "attempt=$GITHUB_RUN_ATTEMPT" \
+            "expectedProduct=$PRODUCT_SHA" "expectedTree=$PRODUCT_TREE" \
+            "expectedParents=$PRODUCT_PARENTS" | tee "$EVIDENCE/run.log"
+      - name: Check out the fixed workflow and test runner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: ci
+          persist-credentials: false
+      - name: Check out the fixed PR product
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          persist-credentials: false
+      - name: Check out the approved zlib archive
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.NATIVE_INPUT_SHA }}
+          path: native-input
+          sparse-checkout: vendor/zlib-1.3.1.tar.gz
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Check the approved sources and both input manifests
+        working-directory: product
+        run: |
+          {
+            test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
+            test "$GITHUB_REF" = refs/heads/rust-router/35-cross-handoff-current-r30-jammy-ci
+            test "$(git -C ../ci rev-parse HEAD)" = "$GITHUB_WORKFLOW_SHA"
+            ci_parents=$(git -C ../ci cat-file -p HEAD | sed -n '/^$/q; s/^parent //p' | paste -sd' ' -)
+            test "$ci_parents" = "$PRODUCT_SHA"
+            git -C ../ci show -s --format='ci=%H tree=%T parents=%P'
+            test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+            test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+            parents=$(git cat-file -p HEAD | sed -n '/^$/q; s/^parent //p' | paste -sd' ' -)
+            test "$parents" = "$PRODUCT_PARENTS"
+            git show -s --format='product=%H tree=%T parents=%P'
+            test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
+            test "$(git -C ../native-input rev-parse 'HEAD^{tree}')" = "$NATIVE_INPUT_TREE"
+            git -C ../native-input show -s --format='nativeInput=%H tree=%T'
+            for checkout in . ../ci ../native-input; do
+              test -z "$(git -C "$checkout" status --porcelain)"
+            done
+            approved=../ci/tools/ci/resume/APPROVED.sha256
+            sha256sum "$approved" vendor/INPUTS.sha256 ../ci/tools/ci/resume/{verify.sh,run.py,reap.py} \
+              ../ci/.github/workflows/linux-handoff.yml
+            sha256sum --check --strict "$approved"
+            sha256sum --check --strict vendor/INPUTS.sha256
+            wc -l "$approved" vendor/INPUTS.sha256
+          } 2>&1 | tee "$EVIDENCE/sources.log"
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - name: Install the approved Zig archive
+        run: |
+          {
+            package=zig-x86_64-linux-0.16.0
+            archive="$RUNNER_TEMP/$package.tar.xz"
+            digest=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+            verified=0
+            for base in https://ziglang.org/download/0.16.0 https://zig.bcr.ist; do
+              url="$base/$package.tar.xz"
+              printf 'Downloading %s\n' "$url"
+              if curl --fail --silent --show-error --location --retry 2 --retry-max-time 180 \
+                --connect-timeout 15 --max-time 120 --output "$archive" "$url" &&
+                printf '%s  %s\n' "$digest" "$archive" | sha256sum --check --strict; then
+                verified=1
+                break
+              fi
+            done
+            test "$verified" = 1
+            tar -xJf "$archive" -C "$RUNNER_TEMP"
+            zig_dir="$RUNNER_TEMP/$package"
+            version=$("$zig_dir/zig" version)
+            printf 'Zig %s\n' "$version"
+            test "$version" = 0.16.0
+            printf '%s\n' "$zig_dir" >> "$GITHUB_PATH"
+          } 2>&1 | tee "$EVIDENCE/zig-install.log"
+      - name: Prepare native tmux and the fixed build toolchain
+        run: |
+          {
+            rustup toolchain install 1.96.1 --profile minimal
+            command -v tmux
+            test "$(id -u)" -ne 0
+            grep -Fx 'VERSION_ID="22.04"' /etc/os-release
+            getconf GNU_LIBC_VERSION
+            test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.35"
+            id -u
+            uname -srm
+            rustc +1.96.1 -vV
+            cargo +1.96.1 --version
+            zig version
+            python3 --version
+            tmux -V
+            cc --version
+          } 2>&1 | tee "$EVIDENCE/toolchain.log"
+      - name: Materialize verified Ghostty and zlib sources
+        working-directory: product
+        run: |
+          python3 tools/prepare.py --zlib-archive ../native-input/vendor/zlib-1.3.1.tar.gz \
+            2>&1 | tee "$EVIDENCE/native-prepare.log"
+      - name: Prime the pinned Wuffs package
+        working-directory: product/vendor/libghostty-vt
+        run: |
+          {
+            url=https://deps.files.ghostty.org/wuffs-7411f488fe2e2c205c3d3b3d28638b7356522930.tar.gz
+            archive="$RUNNER_TEMP/wuffs.tar.gz"
+            printf 'Wuffs source %s\n' "$url"
+            curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+              --retry-max-time 120 --connect-timeout 15 --max-time 60 "$url" -o "$archive"
+            printf '%s  %s\n' 17877d346f7988651d6c62e45b2e3b05c86809a6442c5e34612374b2a9719a1c "$archive" |
+              sha256sum --check --strict
+            package=$(zig fetch "$archive")
+            printf 'Wuffs Zig package %s\n' "$package"
+            test "$package" = 'N-V-__8AAP5JWgCGP_AD0teWpa4krRvE9VPZzvviGdbmN4jI'
+          } 2>&1 | tee "$EVIDENCE/wuffs.log"
+      - name: Build and identify the fixed release ELF
+        id: build
+        working-directory: product
+        env:
+          WFC_BUILD_ID: ${{ env.PRODUCT_SHA }}
+        run: |
+          {
+            cargo +1.96.1 build --release --locked --target "$TARGET" --bin wfc
+            binary="target/$TARGET/release/wfc"
+            version=$("$binary" --version)
+            printf '%s\n' "$version"
+            [[ "$version" == *"(Rust, $TARGET, release, build $PRODUCT_SHA)" ]]
+            sha256sum "$binary" | tee "$EVIDENCE/elf.sha256"
+            readelf -hW "$binary"
+          } 2>&1 | tee "$EVIDENCE/build.log"
+      - name: Verify the fixed Herdr 0.9.5 release ELF
+        id: herdr
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          {
+            herdr="$RUNNER_TEMP/herdr-linux-x86_64"
+            url=https://github.com/herdrdev/herdr/releases/download/v0.9.5/herdr-linux-x86_64
+            printf '%s\n' "$url"
+            curl --fail --silent --show-error --location --retry 3 --retry-connrefused \
+              --retry-max-time 120 --connect-timeout 15 --max-time 60 "$url" -o "$herdr"
+            printf '%s  %s\n' "$HERDR_SHA256" "$herdr" | sha256sum --check --strict
+            chmod 700 "$herdr"
+            test "$("$herdr" --version)" = 'herdr 0.9.5'
+            "$herdr" --version
+            sha256sum "$herdr" | tee "$EVIDENCE/herdr-elf.sha256"
+          } 2>&1 | tee "$EVIDENCE/herdr-release.log"
+      - name: Recheck both Herdr close status regressions
+        if: ${{ !cancelled() && steps.herdr.outcome == 'success' }}
+        working-directory: product
+        run: |
+          export HERDR_BINARY="$RUNNER_TEMP/herdr-linux-x86_64"
+          bash ../ci/tools/ci/resume/verify.sh herdr-close-status 2>&1 | tee "$EVIDENCE/herdr-close-status.log"
+      - name: Verify existing same-service tmux handoff
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: bash ../ci/tools/ci/resume/verify.sh tmux-handoff 2>&1 | tee "$EVIDENCE/tmux-handoff.log"
+      - name: Verify tmux to Herdr handoff with a private service
+        if: ${{ !cancelled() && steps.herdr.outcome == 'success' }}
+        working-directory: product
+        run: |
+          export HERDR_BINARY="$RUNNER_TEMP/herdr-linux-x86_64"
+          bash ../ci/tools/ci/resume/verify.sh cross-handoff 2>&1 | tee "$EVIDENCE/cross-handoff.log"
+      - name: Verify Herdr to tmux handoff with private native services
+        if: ${{ !cancelled() && steps.herdr.outcome == 'success' }}
+        working-directory: product
+        run: |
+          export HERDR_BINARY="$RUNNER_TEMP/herdr-linux-x86_64"
+          bash ../ci/tools/ci/resume/verify.sh reverse-handoff 2>&1 | tee "$EVIDENCE/reverse-handoff.log"
+      - name: Verify standalone Herdr create and close
+        if: ${{ !cancelled() && steps.herdr.outcome == 'success' }}
+        working-directory: product
+        run: |
+          export HERDR_BINARY="$RUNNER_TEMP/herdr-linux-x86_64"
+          bash ../ci/tools/ci/resume/verify.sh herdr-close 2>&1 | tee "$EVIDENCE/herdr-close.log"
+      - name: Verify the shared tmux input preflight and original receipts
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: bash ../ci/tools/ci/resume/verify.sh input-compat 2>&1 | tee "$EVIDENCE/input-compat.log"
+      - name: Checksum the available evidence
+        if: ${{ always() }}
+        run: |
+          cd "$EVIDENCE"
+          shopt -s nullglob
+          files=( *.log *.sha256 )
+          sha256sum -- "${files[@]}" > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+      - name: Upload Jammy handoff and process evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-cross-handoff-current-r30-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 14
