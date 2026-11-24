@@ -657,6 +657,103 @@ while not (directory / (attempt + ".quit")).exists() and time.monotonic() < dead
                           'close':closed['closeOperationId'], 'oldMessageId':message['messageId'],
                           'tmuxSubmissions':1, 'duplicate':True}))
 
+    def test_completed_herdr_to_tmux_handoff_starts_next_round_once(self):
+        source, old = self.tmux_handoff_fixture(backend='herdr')
+        task = Path(source['task'])
+        report = Path(source['report'])
+        task_bytes = task.read_bytes()
+        report_bytes = b'Completed on the original Herdr worker.\n'
+        report.write_bytes(report_bytes)
+        worker_env = {k:v for k,v in self.env.items() if k != 'WFC_CONTROLLER_TOKEN'} | old['callback']
+        done = json.loads(subprocess.check_output(
+            [live.DRIVER, 'done', '--report', report, '--attempt', source['attempt']],
+            env=worker_env, text=True, timeout=6))
+        claimed, = self.cli('wait', '--dispatch', source['dispatch'], '--scope', source['scope'],
+                            '--timeout', '4')['messages']
+        self.assertEqual((claimed['type'], claimed['round'], claimed['attempt'],
+                          claimed['id'], claimed['messageId']),
+                         ('done', 1, source['attempt'], done['message'], done['messageId']))
+        ack = self.cli('ack', done['messageId'])
+        self.assertEqual(ack['state'], 'processed')
+        completed = self.status()
+        self.assertEqual((completed['status'], completed['round']), ('completed', 1))
+
+        args = self.reverse_handoff(source['dispatch'])
+        self.cli(*args, error='give the next --task and --report')
+        self.assert_no_tmux_handoff()
+        self.assertTrue(self.handoff_worker_alive(old))
+        self.assertEqual(self.status().get('audit'), completed.get('audit'))
+
+        next_task = self.root / 'round-two-task.md'
+        next_task.write_text('Work on the second task.\n')
+        next_report = report.with_name('round-two-report.md')
+        receipt = Path(source['create']['receipt'])
+        stopped = receipt.with_suffix('.stopped')
+        record = self.handoff_record(source)
+        (self.handoff_traces / 'reverse-check').write_text(json.dumps(
+            {'pid':old['pid'], 'startTicks':old['startTicks'], 'record':str(record), 'stop':str(stopped)}))
+        args += ('--task', next_task, '--report', next_report)
+        result = self.cli(*args)
+        self.assertEqual((result['result'], result['round'], result['dispatch'], result['backend'],
+                          result['fromAttempt'], result['endpoint']),
+                         ('accepted', 2, source['dispatch'], 'tmux', source['attempt'],
+                          self.env['WFC_TMUX_SOCKET']))
+        self.assertNotEqual(result['attempt'], source['attempt'])
+        new = self.handoff_trace(result['attempt'])
+        self.assertTrue(new['sourceStoppedBeforeTarget'])
+        self.assertIsNotNone(new['tmuxPane'])
+        self.assertIsNone(new['herdrPane'])
+        self.assertTrue(self.handoff_worker_alive(new))
+        self.assertFalse(self.handoff_worker_alive(old))
+        self.assertEqual([new['callback'][name] for name in
+                          ('WFC_ROUND', 'WFC_ATTEMPT', 'WFC_SCOPE', 'WFC_TASK', 'WFC_REPORT')],
+                         ['2', result['attempt'], source['scope'], str(next_task), str(next_report)])
+
+        current = self.status()
+        self.assertEqual((current['round'], current['attempt'], current['scope']),
+                         (2, result['attempt'], source['scope']))
+        first, second = current['rounds']
+        self.assertEqual(first, completed['rounds'][0])
+        self.assertEqual((second['round'], second['attempt'], second['task'], second['report'], second['state']),
+                         (2, result['attempt'], str(next_task), str(next_report), 'running'))
+        event, closed = current['audit']
+        self.assertEqual((event['id'], event['fromRound'], event['fromAttempt'], event['round'],
+                          event['toAttempt'], event['phase'], event['result']),
+                         (result['audit'], 1, source['attempt'], 2, result['attempt'], 'complete', 'accepted'))
+        self.assertEqual((event['fromTask'], event['fromReport'], event['toTask'], event['toReport']),
+                         (str(task), str(report), str(next_task), str(next_report)))
+        self.assertEqual(event['close'], {**closed, 'resourceCleanup':'confirmed'})
+        self.assertEqual((closed['round'], closed['attempt'], closed['executionId'],
+                          closed['closeOperationId'], closed['result']),
+                         (1, source['attempt'], source['attempt'], f'close:{source["attempt"]}', 'completed'))
+        stop_bytes = stopped.read_bytes()
+        stop = json.loads(stop_bytes)
+        self.assertEqual(event['writerStopEvidence'], stop)
+        self.assertEqual((stop['launchId'], stop['round'], stop['attempt'], stop['writerTreeStopped']),
+                         (receipt.stem, '1', source['attempt'], True))
+        kept, = current['messages']
+        self.assertEqual((kept['round'], kept['attempt'], kept['id'], kept['messageId'], kept['state']),
+                         (1, source['attempt'], done['message'], done['messageId'], 'processed'))
+
+        self.assertEqual(self.cli(*args), {**result, 'duplicate':True})
+        self.assertEqual(self.cli('ack', done['message']), {**ack, 'duplicate':True})
+        after = self.status()
+        self.assertEqual((after['audit'], after['rounds'], after['messages']),
+                         (current['audit'], current['rounds'], current['messages']))
+        self.assertEqual(stopped.read_bytes(), stop_bytes)
+        self.assertEqual(task.read_bytes(), task_bytes)
+        self.assertEqual(report.read_bytes(), report_bytes)
+        self.assertFalse(next_report.exists())
+        self.assertEqual({path.stem for path in self.handoff_traces.glob('*.json')},
+                         {source['attempt'], result['attempt']})
+        submission, = stopped.parent.glob('*.submission')
+        self.assertEqual(submission.stem, Path(current['create']['receipt']).stem)
+        print(json.dumps({'completedHerdrNextRound':True, 'audit':result['audit'],
+                          'oldRound':1, 'newRound':2, 'oldAttempt':source['attempt'],
+                          'newAttempt':result['attempt'], 'oldMessage':done['message'],
+                          'oldMessageId':done['messageId'], 'close':closed['closeOperationId'],
+                          'sourceStoppedBeforeTarget':True, 'tmuxSubmissions':1, 'duplicate':True}), flush=True)
+
     def test_herdr_to_tmux_handoff_legacy_receipt_stays_pending(self):
         source, old = self.tmux_handoff_fixture(backend='herdr')
         args = self.reverse_handoff(source['dispatch'])
@@ -697,9 +794,20 @@ while not (directory / (attempt + ".quit")).exists() and time.monotonic() < dead
         self.assertEqual([message['messageId'] for message in view['messages']],
                          [question['messageId'], done['messageId']])
         self.assertEqual(view['audit'], [preflight])
-        self.cli(*args, '--task', self.task, '--report', self.root/'next-report.md',
-                 error='first-round target')
-        self.assertEqual(self.status()['audit'], [preflight])
+        next_task = self.root / 'legacy-next-task.md'
+        next_task.write_text('Next task for the original assignment.\n')
+        next_report = self.root / 'legacy-next-report.md'
+        next_args = args + ('--task', next_task, '--report', next_report)
+        next_pending = self.cli(*next_args)
+        self.assertEqual(next_pending['result'], 'uncertain')
+        self.assertEqual(next_pending['diagnostic'], first['diagnostic'])
+        self.assertNotEqual(next_pending['audit'], first['audit'])
+        self.assertEqual(self.cli(*next_args), next_pending)
+        self.assertEqual(self.cli(*args), first)
+        original, next_intent = self.status()['audit']
+        self.assertEqual(original, preflight)
+        self.assertEqual((next_intent['id'], next_intent['phase'], next_intent['toTask'], next_intent['toReport']),
+                         (next_pending['audit'], 'preflight', str(next_task), str(next_report)))
         self.assert_no_tmux_handoff()
         print(json.dumps({'legacyReceipt':True, 'audit':first['audit'], 'tmuxSubmissions':0}))
 

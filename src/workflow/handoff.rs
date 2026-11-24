@@ -123,8 +123,8 @@ impl<'a> Handoff<'a> {
             "Herdr source handoff requires a tmux target"
         );
         ensure!(
-            !herdr_source || (generation.is_null() && row["round"] == 1 && self.next.is_none()),
-            "Herdr source handoff requires an unowned scope and a first-round target"
+            !herdr_source || (generation.is_null() && row["round"] == 1),
+            "Herdr source handoff requires an unowned first-round assignment"
         );
         ensure!(
             row["host"].is_string()
@@ -178,6 +178,13 @@ impl<'a> Handoff<'a> {
                 event["fromBackend"] = json!("herdr");
                 event["toModel"] = json!(self.model);
                 event["target"] = json!({"backend":"tmux","endpoint":socket});
+                if let Some((task, report)) = self.next {
+                    let task = task.canonicalize().context("resolve next task file")?;
+                    let report = super::resolve_report_path(report)?;
+                    event["toTask"] = json!(task.to_str().context("task path must be UTF-8")?);
+                    event["toReport"] =
+                        json!(report.to_str().context("report path must be UTF-8")?);
+                }
                 // A repeated Herdr diagnostic keeps its number. A later
                 // successful probe can still reach the durable close intent.
                 if let Some(previous) = audit.iter().rfind(|previous| {
@@ -192,6 +199,8 @@ impl<'a> Handoff<'a> {
                             "fromHost",
                             "toHost",
                             "toModel",
+                            "toTask",
+                            "toReport",
                             "ownerGeneration",
                             "result",
                             "diagnostic",
@@ -287,10 +296,6 @@ impl<'a> Handoff<'a> {
             Ok(old)
         };
         let completed = completion(&history()?)?["state"] == "done";
-        ensure!(
-            !herdr_source || !completed,
-            "Herdr source handoff requires an unfinished first-round assignment"
-        );
         ensure!(
             completed == self.next.is_some(),
             "{}",
