@@ -1,6 +1,7 @@
 use super::{
-    assignment, controller, legacy_view_state, messages, observe_dispatch, project_dispatch,
-    record_scope, state_dir, valid_id, view, worker_owner, StateView,
+    assignment, controller, legacy_view_state, messages, native_ledger_exists, observe_dispatch,
+    project_dispatch, record_scope, state_dir, valid_id, view, worker_owner, writable_state_dir,
+    StateView,
 };
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
@@ -55,21 +56,19 @@ impl<'a> Reclaim<'a> {
     }
 
     pub fn run(self) -> Result<ExitCode> {
-        let state_view = if self.yes {
-            StateView::ReclaimConfirm
+        let state = if self.yes {
+            let state = writable_state_dir()?;
+            native_ledger_exists(&state.join("messages.json"), StateView::ReclaimConfirm, true)?;
+            state
         } else {
-            StateView::ReclaimPreview
-        };
-        if let Some(state) = legacy_view_state(self.dispatches.first().map(OsStr::new), state_view)?
-        {
-            if self.yes {
-                eprintln!("wfc: reclaim supports only read-only preview of Python history");
-                return Ok(ExitCode::from(2));
+            if let Some(state) = legacy_view_state(
+                self.dispatches.first().map(OsStr::new),
+                StateView::ReclaimPreview,
+            )? {
+                return self.legacy_preview(&state);
             }
-            return self.legacy_preview(&state);
-        }
-
-        let state = state_dir()?;
+            state_dir()?
+        };
         let dir = state.join("dispatches");
         let named = !self.dispatches.is_empty();
         let mut targets = Vec::new();
@@ -311,6 +310,11 @@ fn confirm(
     token: Option<&str>,
     named: bool,
 ) -> Result<Value> {
+    if selected["legacyArchived"] == true {
+        let mut item = session(selected);
+        gone(&mut item);
+        return Ok(item);
+    }
     let _lock = controller::lock_scope(state, scope)?;
     authorize(state, scope, token)?;
     let id = selected["dispatch"].as_str().context("missing dispatch")?;

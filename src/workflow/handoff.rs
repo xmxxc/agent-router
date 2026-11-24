@@ -53,7 +53,7 @@ impl<'a> Handoff<'a> {
 
     pub fn run(self) -> Result<Value> {
         controller::require_controller("handoff")?;
-        let state = super::state_dir()?;
+        let state = super::writable_state_dir()?;
         let dir = state.join("dispatches");
         let path = dir.join(format!("{}.json", self.dispatch));
         let read = || {

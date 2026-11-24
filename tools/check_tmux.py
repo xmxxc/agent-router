@@ -103,8 +103,16 @@ def composer(mode, logfile, reply_worker=False):
                     report = Path(os.environ["WFC_REPORT"])
                     Path("finish").unlink()
                     report.write_text("original worker received the answer\n")
-                    subprocess.run([wfc, "done", "--report", report, "--attempt", attempt,
-                                    "--message-id", "reply-done"], check=True, stdout=subprocess.DEVNULL)
+                    command = [wfc, "done", "--report", report, "--attempt", attempt, "--message-id", "reply-done"]
+                    if mode == "empty-with-done-receipt":
+                        done = subprocess.run(command, capture_output=True, text=True, timeout=15)
+                        evidence = Path("done-result.tmp")
+                        evidence.write_text(json.dumps({"exit": done.returncode, "stdout": done.stdout,
+                                                        "stderr": done.stderr}))
+                        evidence.rename("done-result.json")
+                        done.check_returncode()
+                    else:
+                        subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
                 if not select.select([0], [], [], .025)[0]:
                     continue
             b = os.read(0, 1)
@@ -4742,6 +4750,94 @@ sys.exit(75)
         self.assertEqual([m["id"] for m in status["messages"] if m["to"] == "worker"], [receipt["message"]])
         self.assertEqual(cli("close", dispatch, token=token)["resourceCleanup"], "confirmed")
         print("R28 continue replay preserved the unresolved reminder and original receipt", flush=True)
+
+    def test_public_worker_input_uses_imported_inbox_high_water(self):
+        repo = Path(__file__).resolve().parents[1]
+        sys.path.insert(0, str(repo / "tests"))
+        try:
+            from legacy_offline_import import DISPATCH, build_source, import_args, proof_for
+        finally:
+            sys.path.pop(0)
+        fixture = self.root / "stopped-fixture"
+        fixture.mkdir()
+        source, _, _ = build_source(fixture, repo / "crates/legacy-state/src/schema.sql", "tmux")
+        database = source / "router.db"
+        original_bytes = database.read_bytes()
+        proof = proof_for(fixture / "proof.json", database, self.state)
+        imported = self.resume_cli(*import_args(source, proof))
+        self.assertEqual(imported["messageHighWater"], 90)
+        ledger = self.state / "messages.json"
+        self.assertEqual([row["id"] for row in json.loads(ledger.read_bytes())], [41, 49, 60, 61])
+
+        cli, original, owner, _ = self.public_input_worker()
+        dispatch = original["dispatch"]
+        archived = cli("status", "--dispatch", DISPATCH)
+        self.assertIn("offline legacy assignment has no input target",
+                      cli("nudge", DISPATCH, "--text", "archived reminder", token=owner, expected=1))
+        remind = ("nudge", dispatch, "--text", "first reminder", "--message-id", "imported-nudge")
+        nudge = cli(*remind, token=owner)
+        self.assertEqual(nudge["message"], 91)
+        record = self.state / "dispatches" / f"{dispatch}.json"
+        bytestream = self.work / "input-bytes"
+        transcript = self.work / "formal-input"
+        observed = (ledger, record, bytestream, transcript)
+
+        def content():
+            return tuple(path.read_bytes() for path in observed)
+
+        def blocked_by_legacy(args):
+            # The literal native path and Python's expanded path are distinct.
+            literal = self.work / "~"
+            literal.mkdir(exist_ok=True)
+            (literal / "mixed").symlink_to(self.state, target_is_directory=True)
+            expanded = self.root / "mixed"
+            expanded.mkdir(exist_ok=True)
+            mixed = expanded / "router.db"
+            mixed.write_bytes(original_bytes)
+            before = content()
+            try:
+                self.assertIn("legacy state write blocked", cli(*args, token=owner, expected=1, WFC_STATE="~/mixed"))
+                self.assertEqual(content(), before)
+                self.assertEqual(mixed.read_bytes(), original_bytes)
+            finally:
+                mixed.unlink()
+                (literal / "mixed").unlink()
+
+        before = content()
+        self.assertEqual(cli(*remind, token=owner), {**nudge, "duplicate": True})
+        self.assertEqual(content(), before)
+        blocked_by_legacy(("nudge", dispatch, "--text", "blocked new reminder", "--message-id", "blocked"))
+
+        (self.work / "finish-first-externally").touch()
+        done_path = self.work / "first-done"
+        self.await_input_value(done_path.exists)
+        done = json.loads(done_path.read_bytes())
+        self.assertEqual(done["message"], 92)
+        continue_args = ("continue", dispatch, "--task", "next-task", "--report", "report2")
+        omit = self.work / "omit-transcript"
+        omit.touch()
+        self.assertIn("continue uncertain", cli(*continue_args, token=owner, expected=1))
+        self.await_input_value((self.work / "accepted-round").exists)
+        omit.unlink()
+        (self.work / "ask-current-round").touch()
+        self.await_input_value((self.work / "current-question").exists)
+        self.assertEqual(json.loads((self.work / "current-question").read_bytes())["message"], 93)
+        blocked_by_legacy(continue_args)
+        continued = cli(*continue_args, token=owner)
+        self.assertEqual((continued["round"], continued["message"]), (2, 94))
+
+        before = content()
+        self.assertEqual(cli(*continue_args, token=owner), continued)
+        self.assertEqual(cli(*remind, token=owner), {**nudge, "duplicate": True})
+        self.assertEqual(content(), before)
+        self.assertEqual(before[2].count(b"\r"), 2)
+        self.assertEqual(len(before[3].splitlines()), 2)
+        self.assertEqual([row["id"] for row in json.loads(before[0])], [41, 49, 60, 61, 91, 92, 93, 94])
+        self.assertEqual(cli("status", "--dispatch", DISPATCH), archived)
+        self.assertEqual(database.read_bytes(), original_bytes)
+        self.assertEqual(Path(imported["backup"]).read_bytes(), original_bytes)
+        self.assertEqual(cli("close", dispatch, token=owner)["resourceCleanup"], "confirmed")
+        print("Imported high-water 90; original input numbers 91 and 94 replayed without new input", flush=True)
 
     def test_public_continue_and_nudge_share_live_worker(self):
         cli, first, token, env = self.public_input_worker()

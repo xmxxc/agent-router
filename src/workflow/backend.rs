@@ -75,7 +75,9 @@ fn call(state: &Path, row: &Value, mut request: Value) -> Result<Value> {
     request["dispatch"] = row["dispatch"].clone();
     let mut command = Command::new(env::current_exe()?);
     super::controller::strip_credentials(&mut command);
-    command.arg("--tmux-backend").env("WFC_STATE", state);
+    // Pass the native path separately. The child must inherit the original
+    // WFC_STATE selection to recheck the Python path after its backend lock.
+    command.arg("--tmux-backend").arg(state);
     if let Some(socket) = row["tmuxSocket"].as_str() {
         command.env("WFC_TMUX_SOCKET", socket);
     }

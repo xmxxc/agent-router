@@ -12,7 +12,10 @@ use receipt::{Delivery, Resolution, State};
 #[cfg(target_os = "linux")]
 pub use reply::{Reply, REPLY_USAGE};
 
-use super::{controller, git_snapshot::Snapshot, resolve_report_path, state_dir, valid_id};
+use super::{
+    controller, ensure_state_writable, git_snapshot::Snapshot, resolve_report_path, valid_id,
+    writable_state_dir,
+};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -207,6 +210,7 @@ impl Assignment {
             row["createPending"] = json!(true);
         }
         let assignment = Self::deserialize(&row).context("read worker assignment identity")?;
+        ensure!(row["legacyArchived"] != true, "offline legacy assignment has no writable worker");
         ensure!(
             assignment.controller_owner.is_none(),
             "controller owner authorization required for {dispatch}"
@@ -318,6 +322,8 @@ struct Message {
     request_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     body_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_body: Option<String>,
     #[serde(flatten)]
     delivery: Delivery,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -489,6 +495,7 @@ impl Message {
             worker_input: None,
             request_key,
             body_hash: None,
+            legacy_body: None,
             delivery: Delivery::unsent(),
             resolution: None,
             created_at: Some(receipt::timestamp()),
@@ -539,6 +546,11 @@ impl Message {
     }
 
     fn valid_payload(&self) -> bool {
+        if let Some(raw) = &self.legacy_body {
+            if self.body_hash.as_deref() != Some(body_hash(raw).as_str()) {
+                return false;
+            }
+        }
         if self.worker_input.is_some() {
             return matches!(self.kind(), MessageKind::Continue | MessageKind::Nudge)
                 && self.report.is_none()
@@ -646,7 +658,14 @@ impl Message {
     }
 
     fn computed_hash(&self) -> String {
+        if let Some(raw) = &self.legacy_body {
+            return body_hash(raw);
+        }
         body_hash(&canonical_body(self.body()))
+    }
+
+    fn claimable(&self) -> bool {
+        self.is_controller_message() && self.delivery.state == State::Unsent && self.legacy_body.is_none()
     }
 
     fn matches_hash(&self, hash: &str) -> bool {
@@ -724,6 +743,19 @@ impl Message {
                 view.insert("tmux".into(), tmux.clone());
             }
         }
+        if let Some(raw) = &self.legacy_body {
+            view.insert("body".into(), json!(raw));
+            view.insert("bodyHash".into(), json!(self.body_hash));
+            view.insert("at".into(), json!(self.created_at));
+            view.insert("to".into(), json!("controller"));
+            view.insert("delivered".into(), json!(self.delivery.delivered()));
+            if let Some(resolution) = &self.resolution {
+                view.insert("resolution".into(), json!(resolution));
+            }
+            if self.delivery.state == State::Unsent {
+                view.insert("legacyDeliveryHeld".into(), json!(true));
+            }
+        }
         Value::Object(view)
     }
 
@@ -751,7 +783,16 @@ pub(super) struct Inbox {
     lock: PublishLock,
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn stage_legacy_messages(state: &Path, rows: &[Value]) -> Result<()> {
+    let messages = rows.iter().cloned().map(serde_json::from_value::<Message>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    ensure!(messages.iter().all(Message::valid_payload), "invalid staged legacy receipt");
+    super::write_json(&state.join("messages.json"), &serde_json::to_value(messages)?, None)
+}
+
 fn lock_file(dir: &Path) -> Result<File> {
+    ensure_state_writable(dir)?;
     fs::create_dir_all(dir).context("create message directory")?;
     let path = dir.join("messages.lock");
     let mut options = private_file();
@@ -809,6 +850,7 @@ impl PublishLock {
 pub(super) fn lock_for_publish(dir: &Path) -> Result<PublishLock> {
     let lock = lock_file(dir)?;
     lock.lock().context("lock controller messages")?;
+    ensure_state_writable(dir)?;
     Ok(PublishLock::held(dir, lock))
 }
 
@@ -816,6 +858,7 @@ pub(super) fn lock_for_publish(dir: &Path) -> Result<PublishLock> {
 pub(super) fn lock_for_private_publish(dir: &Path) -> Result<PublishLock> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
+    ensure_state_writable(dir)?;
     let lock = private_file()
         .create(true)
         .truncate(false)
@@ -831,6 +874,7 @@ pub(super) fn lock_for_private_publish(dir: &Path) -> Result<PublishLock> {
         "unsafe private Inbox lock"
     );
     lock.lock().context("lock controller messages")?;
+    ensure_state_writable(dir)?;
     Ok(PublishLock::held(dir, lock))
 }
 
@@ -962,6 +1006,15 @@ fn authenticated_continued_input(row: &Value, reference: Option<&str>) -> Option
 }
 
 impl Inbox {
+    fn next_id(&self) -> Result<u64> {
+        #[cfg(target_os = "linux")]
+        let high_water = super::legacy_import::high_water(&self.dir)?;
+        #[cfg(not(target_os = "linux"))]
+        let high_water = 0;
+        self.messages.iter().map(|message| message.id).max().unwrap_or(0)
+            .max(high_water).checked_add(1).context("message ID exhausted")
+    }
+
     fn snapshot(dir: &Path) -> Result<Vec<Message>> {
         let path = dir.join("messages.json");
         match File::open(&path) {
@@ -1011,6 +1064,7 @@ impl Inbox {
             Err(TryLockError::WouldBlock) => return Ok(None),
             Err(TryLockError::Error(e)) => return Err(e).context("lock controller messages"),
         }
+        ensure_state_writable(state)?;
         Ok(Some(Self::read_locked(
             state,
             PublishLock::held(state, lock),
@@ -1027,8 +1081,7 @@ impl Inbox {
             .messages
             .iter_mut()
             .filter(|m| {
-                m.is_controller_message()
-                    && m.delivery.state == State::Unsent
+                m.claimable()
                     && dispatch.is_none_or(|id| id == m.worker.dispatch)
                     && scope.is_none_or(|scope| scope == m.worker.scope())
             })
@@ -1049,7 +1102,7 @@ impl Inbox {
         assignment: Assignment,
         host: &Value,
         failure: &super::startup::Failure<'_>,
-    ) -> bool {
+    ) -> Result<bool> {
         let worker = &assignment.worker;
         if self.messages.iter().any(|m| {
             m.is_controller_message()
@@ -1057,10 +1110,10 @@ impl Inbox {
                 && m.worker.attempt == worker.attempt
                 && m.worker.round == worker.round
         }) {
-            return false;
+            return Ok(false);
         }
-        self.push_startup_failure(assignment, host, failure);
-        true
+        self.push_startup_failure(assignment, host, failure)?;
+        Ok(true)
     }
 
     #[cfg(target_os = "linux")]
@@ -1069,13 +1122,13 @@ impl Inbox {
         assignment: Assignment,
         host: &Value,
         failure: &super::startup::Failure<'_>,
-    ) {
+    ) -> Result<()> {
         let worker = assignment.worker;
         let key = format!(
             "startup:{}:{}:{}",
             worker.dispatch, worker.round, worker.attempt
         );
-        let mut message = Message::new(self.messages.len() as u64 + 1, worker, Some(key));
+        let mut message = Message::new(self.next_id()?, worker, Some(key));
         message.report = assignment.report;
         message.additional_fields = Map::from_iter([
             ("type".into(), json!(failure.message_type())),
@@ -1086,6 +1139,7 @@ impl Inbox {
         ]);
         message.body_hash = Some(message.computed_hash());
         self.messages.push(message);
+        Ok(())
     }
 
     fn validate_done(
@@ -1456,7 +1510,7 @@ impl Inbox {
             "missing worker input evidence"
         );
         let worker = Identity::deserialize(row).context("read worker input identity")?;
-        let mut message = Message::new(self.messages.len() as u64 + 1, worker, None);
+        let mut message = Message::new(self.next_id()?, worker, None);
         message.message_id = Self::worker_input_key(event)?;
         ensure!(
             !self
@@ -1497,6 +1551,7 @@ impl Inbox {
         &self,
         write_contents: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
     ) -> Result<()> {
+        ensure_state_writable(&self.dir)?;
         let tmp = self.dir.join("messages.pending");
         let file = Self::open_pending(&tmp)?;
         let mut writer = BufWriter::new(file);
@@ -1626,12 +1681,13 @@ pub(super) fn publish_startup_failure_locked(
     let row = super::decode_record(file, &path)?;
     let assignment = Assignment::deserialize(&row)?;
     ensure!(
-        assignment.worker.attempt == attempt
+        row["legacyArchived"] != true
+            && assignment.worker.attempt == attempt
             && assignment.worker.round > 0
             && assignment.controller_owner.is_none(),
         "startup failure does not match the current assignment"
     );
-    if inbox.append_startup_failure(assignment, &row["host"], failure) {
+    if inbox.append_startup_failure(assignment, &row["host"], failure)? {
         inbox.save().context("publish startup failure")?;
     }
     Ok(())
@@ -1691,7 +1747,7 @@ impl Reclaimed {
         // The lock is released before the caller enters the backend.
         let mut inbox = Inbox::open(state)?;
         check_ledger_replacement(state)?;
-        self.append(&mut inbox);
+        self.append(&mut inbox)?;
         let bytes = serde_json::to_vec(&inbox.messages)?;
         check_snapshot_size(bytes.len())?;
         let pending = inbox.dir.join("messages.pending");
@@ -1711,7 +1767,7 @@ impl Reclaimed {
 
     pub(super) fn publish(self, state: &Path) -> Result<u64> {
         let mut inbox = Inbox::open(state)?;
-        let id = self.append(&mut inbox);
+        let id = self.append(&mut inbox)?;
         let bytes = serde_json::to_vec(&inbox.messages)?;
         check_snapshot_size(bytes.len())?;
         inbox
@@ -1720,8 +1776,8 @@ impl Reclaimed {
         Ok(id)
     }
 
-    fn append(&self, inbox: &mut Inbox) -> u64 {
-        let id = inbox.messages.len() as u64 + 1;
+    fn append(&self, inbox: &mut Inbox) -> Result<u64> {
+        let id = inbox.next_id()?;
         inbox.messages.push(Message {
             id,
             message_id: self.message_id.clone(),
@@ -1732,6 +1788,7 @@ impl Reclaimed {
             worker_input: None,
             request_key: None,
             body_hash: None,
+            legacy_body: None,
             delivery: Delivery::unsent(),
             resolution: None,
             created_at: Some(receipt::timestamp()),
@@ -1740,7 +1797,7 @@ impl Reclaimed {
                 ("tmux".into(), self.tmux.clone()),
             ]),
         });
-        id
+        Ok(id)
     }
 }
 
@@ -1797,7 +1854,7 @@ impl<'a> Done<'a> {
             .with_context(|| format!("report not found: {}", self.report.display()))?;
         ensure!(report.is_file(), "report not found: {}", report.display());
         ensure!(report.to_str().is_some(), "report path must be UTF-8");
-        let state = state_dir()?;
+        let state = writable_state_dir()?;
         let dispatch = env::var("WFC_DISPATCH")
             .context("run done inside a dispatched worker (WFC_DISPATCH)")?;
         ensure!(valid_id(&dispatch), "invalid dispatch ID");
@@ -1873,7 +1930,7 @@ impl<'a> Done<'a> {
         }
         let snapshot = snapshot
             .context("callback receipt disappeared while waiting for its execution lock")?;
-        let mut message = Message::new(inbox.messages.len() as u64 + 1, current.worker, key);
+        let mut message = Message::new(inbox.next_id()?, current.worker, key);
         message.report = Some(report);
         message.additional_fields = Map::from_iter([
             ("head".into(), json!(snapshot.head)),
@@ -1921,7 +1978,7 @@ impl<'a> Ask<'a> {
     }
 
     pub fn run(self) -> Result<Value> {
-        let state = state_dir()?;
+        let state = writable_state_dir()?;
         let dispatch = env::var("WFC_DISPATCH")
             .context("run ask inside a dispatched worker (WFC_DISPATCH)")?;
         ensure!(valid_id(&dispatch), "invalid dispatch ID");
@@ -2044,7 +2101,7 @@ impl<'a> Ask<'a> {
             !blocked?,
             "attempt is no longer accepted for {dispatch}; its round is not running"
         );
-        let mut message = Message::new(inbox.messages.len() as u64 + 1, assignment.worker, key);
+        let mut message = Message::new(inbox.next_id()?, assignment.worker, key);
         message.question_payload = Some(payload);
         message.record_continued_input_callback(proof);
         let mut receipt = inbox.publish(message).context("publish question")?;
@@ -2083,7 +2140,7 @@ impl<'a> Wait<'a> {
     }
 
     pub fn run(self) -> Result<Vec<Value>> {
-        let state = state_dir()?;
+        let state = writable_state_dir()?;
         let token = controller::token(self.owner_token);
         let start = Instant::now();
         #[cfg(target_os = "linux")]

@@ -1,5 +1,8 @@
 //! Public input to the existing worker, with round changes committed before typing.
-use super::{assignment, backend, controller, messages, record_scope, state_dir, view, write_json};
+use super::{
+    assignment, backend, controller, ensure_state_writable, messages, record_scope, view,
+    writable_state_dir, write_json,
+};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
@@ -88,11 +91,15 @@ impl<'a> Request<'a> {
 
     pub fn run(self) -> Result<Value> {
         let operation = self.action.name();
-        let state = state_dir()?;
+        let state = writable_state_dir()?;
         let dir = state.join("dispatches");
         let path = dir.join(format!("{}.json", self.dispatch));
         let original = assignment::public_record(&dir, self.dispatch)?
             .with_context(|| format!("unknown dispatch {}", self.dispatch))?;
+        ensure!(
+            original["legacyArchived"] != true,
+            "offline legacy assignment has no input target"
+        );
         let require_host = |row: &Value, replay: Option<usize>| -> Result<()> {
             ensure!(
                 row["backend"] == "tmux"
@@ -178,7 +185,7 @@ impl<'a> Request<'a> {
                     .context("invalid input audit")?
                     .remove("diagnostic");
                 current["audit"][index] = event.clone();
-                save(&path, &dir, &current)?;
+                save(&state, &path, &current)?;
             } else {
                 messages::sync_directory(&dir).context("sync the settled worker input")?;
             }
@@ -319,7 +326,7 @@ impl<'a> Request<'a> {
                 .context("invalid input audit")?;
             let index = audit.len();
             audit.push(event);
-            save(&path, &dir, &next)?;
+            save(&state, &path, &next)?;
             (next, index, text, generation)
         };
 
@@ -354,6 +361,7 @@ impl<'a> Request<'a> {
                         );
                     }
                 } else {
+                    ensure_state_writable(&state)?;
                     ensure!(
                         authorized_generation(&state, scope, token.as_deref(), operation)?
                             == generation,
@@ -430,7 +438,7 @@ impl<'a> Request<'a> {
         } else {
             audit[index] = event.clone();
         }
-        save(&path, &dir, &next)?;
+        save(&state, &path, &next)?;
         if let Some(error) = first_write_error {
             return Err(error);
         }
@@ -569,9 +577,10 @@ fn lock_input(
     }
 }
 
-fn save(path: &Path, dir: &Path, row: &Value) -> Result<()> {
+fn save(state: &Path, path: &Path, row: &Value) -> Result<()> {
+    ensure_state_writable(state)?;
     write_json(path, row, None)?;
-    messages::sync_directory(dir)
+    messages::sync_directory(&state.join("dispatches"))
 }
 
 fn next_paths(

@@ -1,9 +1,11 @@
 //! A durable question claim fences duplicate input, including after a lost reply.
 use super::{
-    literal_question_argument, state_dir, valid_id, Assignment, Inbox, InputResult, Message,
-    ReplyRecord, State,
+    literal_question_argument, valid_id, Assignment, Inbox, InputResult, Message, ReplyRecord,
+    State,
 };
-use crate::workflow::{assignment, backend, controller, herdr, legacy_view_state, StateView};
+use crate::workflow::{
+    assignment, backend, controller, herdr, legacy_view_state, writable_state_dir, StateView,
+};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
@@ -64,7 +66,7 @@ impl<'a> Reply<'a> {
             legacy_view_state(None, StateView::Status)?.is_none(),
             "reply requires the native Rust question ledger"
         );
-        let state = state_dir()?;
+        let state = writable_state_dir()?;
         let token = controller::token(self.owner_token);
         let answer = self
             .answer
@@ -97,11 +99,7 @@ impl<'a> Reply<'a> {
                 !inbox.unresolved_reply(&row, None)?,
                 "another reply is pending or uncertain on this execution; verify it before input"
             );
-            let mut claim = Message::new(
-                inbox.messages.len() as u64 + 1,
-                original.worker.clone(),
-                None,
-            );
+            let mut claim = Message::new(inbox.next_id()?, original.worker.clone(), None);
             claim.reply_payload = Some(ReplyRecord {
                 to: question,
                 question_message_id: original.message_id.clone(),
@@ -307,7 +305,8 @@ fn submit(
                                 let check = match boundary {
                                     PrepareText => begin(true),
                                     PrepareEnter => begin(false),
-                                    Text | Enter => controller::Owners::read(state)
+                                    Text | Enter => crate::workflow::ensure_state_writable(state)
+                                        .and_then(|()| controller::Owners::read(state))
                                         .and_then(|owners| owners.require(scope, token, "reply"))
                                         .map(|_| ()),
                                 };

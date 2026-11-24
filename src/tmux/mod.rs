@@ -946,6 +946,15 @@ pub(crate) fn attach(state: &Path, dispatch: &str, socket: &Path, token: &str) -
     Ok(())
 }
 
+fn write_refusal(state: &Path, read_only: bool) -> Option<Value> {
+    if read_only {
+        return None;
+    }
+    crate::workflow::ensure_state_writable(state).err().map(|error| {
+        json!({"result":"refused","category":"legacy_state_write_blocked","diagnostic":format!("{error:#}")})
+    })
+}
+
 pub fn execute(state: &Path, request: Request) -> Result<Value> {
     execute_checked(state, request, None, &mut |_| Ok(()))
 }
@@ -992,6 +1001,16 @@ pub(crate) fn execute_checked(
             .is_none_or(|id| request.legacy_execution_id.is_some() && binding::valid_launch_id(id)),
         "invalid legacy launch ID"
     );
+    ensure!(
+        !request.read_only
+            || (matches!(request.op, Operation::Inspect)
+                && !request.fresh_dispatch
+                && request.legacy_recovery.is_none()),
+        "readOnly requires ordinary inspect without legacy recovery"
+    );
+    if let Some(refusal) = write_refusal(state, request.read_only) {
+        return Ok(refusal);
+    }
     if matches!(request.op, Operation::Create(_) | Operation::Resume { .. }) {
         fs::create_dir_all(state).context("create tmux state directory")?;
     }
@@ -1020,13 +1039,6 @@ pub(crate) fn execute_checked(
         request.legacy_recovery.is_none()
             || (matches!(request.op, Operation::Inspect) && !request.fresh_dispatch),
         "legacyRecovery requires ordinary inspect"
-    );
-    ensure!(
-        !request.read_only
-            || (matches!(request.op, Operation::Inspect)
-                && !request.fresh_dispatch
-                && request.legacy_recovery.is_none()),
-        "readOnly requires ordinary inspect without legacy recovery"
     );
     let native_id;
     let mut backend = Tmux {
@@ -1057,6 +1069,9 @@ pub(crate) fn execute_checked(
         Ok(lock) => lock,
         Err(result) => return Ok(result),
     };
+    if let Some(refusal) = write_refusal(&state, request.read_only) {
+        return Ok(refusal);
+    }
     if let Some(audit) = request.handoff_audit {
         ensure!(
             matches!(&request.op, Operation::Create(_)) && !request.fresh_dispatch,

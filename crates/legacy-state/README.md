@@ -81,3 +81,33 @@ python3 -B crates/legacy-state/tests/python_equivalent.py /path/to/pr39 /path/to
 已收未 ack 与 unknown 回执、各表逐条数据，以及迁移后原 Python 对 owner 的校验和 ack。
 
 共享根命令接入后，需用最终 Linux 下载件复验状态目录发现、历史回执公开字段、owner/worker 鉴权、实际后端身份、回收与回退。
+
+## 在 Linux 的公共 `wfc` 中导入已停副本
+
+`wfc migrate-legacy --offline-copy SOURCE --stop-proof FILE` 用于已停止写入的独立
+#39/#40 SQLite 副本。将 `WFC_STATE` 显式设为一个尚不存在的绝对目录，目录的父级必须已存在，
+并且源和目标的目录树须分开。旧 writer、worker、waiter、relay 和重启入口须先停止。提交无
+WAL 或 journal 的一致快照。命令会拒绝还记录有 waiter、非终态轮次或未决生命周期事件的副本。
+
+`FILE` 是 JSON。`sourceSha256` 为 `SOURCE/router.db` 的 SHA-256，`target` 为规范化的绝对目标，`writersStopped` 必须为
+`true`，`stoppedBy` 与 `evidence` 记录经办人和停写依据。每个原受管 scope 都需要一条
+`ownerReplacements` 项，键为原 scope，值含 `tokenSha256`（新高熵凭据的 SHA-256）和
+`leaseUntil`（未来的 Unix 秒时间）。原 owner 身份保留，代数增加一。新凭据本身应由操作者
+独立交给授权方。日志和回执只展示 owner 元数据。未受管 scope 不填替换项。
+
+导入会原子发布完整目标，原 SQLite 字节留在目标的私有 `legacy-source/router.db` 备份。
+同一来源和同一停写凭证可重复请求，已发布目标中的后续写入会保留。有完整身份和摘要的
+controller `done`、`question` 回执进入原生确认账本。冻结版的 worker 回执和 watchdog
+故障消息保留为只读历史，`reply` 用原问题编号核实轮次和 attempt。原消息未记录的执行身份
+按旧事件定义保留为空。无法确认关联或无法安全表示的数据会使整个导入拒绝。
+源消息的数字 ID 必须全局唯一。同一轮次和 attempt 的最终有效 `done` 必须和存储结果相容，
+两边都记录的字段需一致，合规的早期重复回执照常保留。
+受管审计要求同 scope 的旧所有者行覆盖操作和处置的代次。所有旧 Herdr 已结算绑定都须核对
+原轮次和 attempt、原证据及空迁移字段。发生时受管的绑定同时记录操作代和所有者凭据。发生时未受管的绑定
+保留空操作代和空凭据，即使 scope 后来取得所有者。同一 scope 按审计编号核对绑定顺序。成为受管后，后续绑定
+须继续受管，操作代维持或递增。等于源现任代的旧凭据在私有 SQLite 中比对，校验结果留在导入过程。
+两种绑定的处置代与消费时间均为空。投递裁决要求主回执与独立记录一对一匹配，包括原始 SQLite 时间、正文摘要、
+处置证据及状态变更。
+原 `received` 可用原数字 ID 或 `messageId` 确认，`unknown` 留待明确对账，旧 `unsent`
+留待审查。旧派工可查询历史，旧会话和回调仍不属于 Rust 管理范围。启用后已经产生写入的
+回退需保全新回执并对账外部效果。

@@ -44,13 +44,14 @@ impl<'a> Resume<'a> {
 
     pub fn run(self) -> Result<Value> {
         controller::require_controller("resume")?;
-        let state = super::state_dir()?;
+        let state = super::writable_state_dir()?;
         let dir = state.join("dispatches");
         let read = || {
             assignment::public_record(&dir, self.dispatch)?
                 .with_context(|| format!("unknown native dispatch {}", self.dispatch))
         };
         let initial = read()?;
+        ensure!(initial["legacyArchived"] != true, "offline legacy assignment has no resumable worker");
         let scope = super::record_scope(&initial).context("invalid dispatch scope")?;
         let token = controller::token(self.owner_token);
         let authorize = || -> Result<Value> {

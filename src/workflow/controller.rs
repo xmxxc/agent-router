@@ -3,7 +3,7 @@
 //! Serialize lease changes and ledger claims under messages.lock. A scoped
 //! relay holds its scope lock from claim through external I/O and settlement,
 //! releasing messages.lock while delivery is in flight.
-use super::{host, messages, state_dir, write_json};
+use super::{ensure_state_writable, host, messages, writable_state_dir, write_json};
 use anyhow::{ensure, Context, Result};
 use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
@@ -138,6 +138,58 @@ fn stale(
 #[serde(transparent)]
 pub(super) struct Owners(BTreeMap<String, Lease>);
 
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct LegacyOwnerReplacement {
+    token_sha256: String,
+    lease_until: f64,
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn stage_legacy_owners(
+    state: &Path,
+    rows: Vec<Value>,
+    mut replacements: BTreeMap<String, LegacyOwnerReplacement>,
+) -> Result<Vec<Value>> {
+    use super::legacy_import::{sha256_text, text};
+
+    let old_fingerprints: BTreeSet<_> = rows
+        .iter()
+        .map(|row| text(row, "token").map(messages::body_hash))
+        .collect::<Result<_>>()?;
+    let mut new_fingerprints = BTreeSet::new();
+    let mut owners = Owners::default();
+    let mut issued = Vec::new();
+    for row in rows {
+        let scope = text(&row, "scope")?;
+        let owner = text(&row, "owner")?;
+        ensure!(host::clean(scope) == scope, "unsupported legacy owner scope {scope}");
+        let prior = row["generation"].as_u64().filter(|n| *n > 0).context("invalid legacy owner generation")?;
+        let generation = prior.checked_add(1).context("legacy owner generation exhausted")?;
+        let old_until = row["lease_until"].as_f64().context("invalid legacy owner lease")?;
+        lease_time(old_until)?;
+        let replacement = replacements.remove(scope).with_context(|| format!("missing owner replacement for {scope}"))?;
+        let fingerprint = replacement.token_sha256;
+        ensure!(
+            sha256_text(&fingerprint) && !old_fingerprints.contains(&fingerprint)
+                && new_fingerprints.insert(fingerprint.clone()),
+            "invalid or reused replacement fingerprint for scope {scope}"
+        );
+        let until = replacement.lease_until;
+        ensure!(until.is_finite() && until > now(), "replacement lease must still be active for scope {scope}");
+        lease_time(until)?;
+        owners.0.insert(scope.to_owned(), Lease {
+            owner: owner.to_owned(), generation, until, fingerprint, retired: old_fingerprints.clone(),
+        });
+        issued.push(json!({"scope":scope,"owner":owner,"previousGeneration":prior,
+            "previousLeaseUntil":old_until,"generation":generation,"leaseUntil":until}));
+    }
+    ensure!(replacements.is_empty(), "owner replacement names a scope absent from the offline snapshot");
+    write_json(&state.join("controller-owners.json"), &json!(owners), None)?;
+    Ok(issued)
+}
+
 impl Owners {
     // Mutations publish one complete snapshot by rename. Read-only callers
     // can preflight or display a lease without creating state or taking a lock.
@@ -203,8 +255,13 @@ fn scope_lock_file(state: &Path, scope: &str) -> Result<File> {
 
 #[cfg(target_os = "linux")]
 pub(super) fn try_scope_lock(state: &Path, scope: &str) -> Result<Option<File>> {
+    ensure_state_writable(state)?;
     let lock = scope_lock_file(state, scope)?;
-    try_lock(&lock).map(|locked| locked.then_some(lock))
+    if !try_lock(&lock)? {
+        return Ok(None);
+    }
+    ensure_state_writable(state)?;
+    Ok(Some(lock))
 }
 
 fn try_lock(file: &File) -> Result<bool> {
@@ -216,6 +273,7 @@ fn try_lock(file: &File) -> Result<bool> {
 }
 
 pub(super) fn lock_scope(state: &Path, scope: &str) -> Result<File> {
+    ensure_state_writable(state)?;
     fs::create_dir_all(state)?;
     let lock = scope_lock_file(state, scope)?;
     let start = Instant::now();
@@ -229,6 +287,7 @@ pub(super) fn lock_scope(state: &Path, scope: &str) -> Result<File> {
         }
         std::thread::sleep(remaining.min(Duration::from_millis(50)));
     }
+    ensure_state_writable(state)?;
     Ok(lock)
 }
 
@@ -268,7 +327,7 @@ impl<'a> Owner<'a> {
     }
 
     pub fn run(self) -> Result<Value> {
-        let state = state_dir()?;
+        let state = writable_state_dir()?;
         let _scope_lock = lock_scope(&state, &self.scope)?;
         let _ledger_lock = messages::lock_for_publish(&state)?;
         let mut owners = Owners::read(&state)?;
