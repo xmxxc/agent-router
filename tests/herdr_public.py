@@ -678,8 +678,8 @@ while not (directory / (attempt + ".quit")).exists() and time.monotonic() < dead
         completed = self.status()
         self.assertEqual((completed['status'], completed['round']), ('completed', 1))
 
-        args = self.reverse_handoff(source['dispatch'])
-        self.cli(*args, error='give the next --task and --report')
+        same_round = self.reverse_handoff(source['dispatch'])
+        self.cli(*same_round, error='give the next --task and --report')
         self.assert_no_tmux_handoff()
         self.assertTrue(self.handoff_worker_alive(old))
         self.assertEqual(self.status().get('audit'), completed.get('audit'))
@@ -692,7 +692,7 @@ while not (directory / (attempt + ".quit")).exists() and time.monotonic() < dead
         record = self.handoff_record(source)
         (self.handoff_traces / 'reverse-check').write_text(json.dumps(
             {'pid':old['pid'], 'startTicks':old['startTicks'], 'record':str(record), 'stop':str(stopped)}))
-        args += ('--task', next_task, '--report', next_report)
+        args = same_round + ('--task', next_task, '--report', next_report)
         result = self.cli(*args)
         self.assertEqual((result['result'], result['round'], result['dispatch'], result['backend'],
                           result['fromAttempt'], result['endpoint']),
@@ -735,15 +735,31 @@ while not (directory / (attempt + ".quit")).exists() and time.monotonic() < dead
         self.assertEqual((kept['round'], kept['attempt'], kept['id'], kept['messageId'], kept['state']),
                          (1, source['attempt'], done['message'], done['messageId'], 'processed'))
 
+        self.assertFalse(next_report.exists())
+        next_report_bytes = b'Completed on the replacement tmux worker.\n'
+        next_report.write_bytes(next_report_bytes)
+        replacement_env = {k:v for k,v in self.env.items() if k != 'WFC_CONTROLLER_TOKEN'} | new['callback']
+        next_done = json.loads(subprocess.check_output(
+            [live.DRIVER, 'done', '--report', next_report, '--attempt', result['attempt']],
+            env=replacement_env, text=True, timeout=6))
+        finished = self.status()
+        self.assertEqual((finished['status'], finished['round'], finished['attempt']),
+                         ('completed', 2, result['attempt']))
+        self.assertEqual(finished['rounds'][0], first)
+        self.assertEqual(finished['rounds'][1]['result']['messageId'], next_done['messageId'])
+        self.assertEqual(finished['audit'], current['audit'])
+        self.assertEqual(len(finished['messages']), 2)
+
+        self.cli(*same_round, error='handoff requires a different host or backend')
         self.assertEqual(self.cli(*args), {**result, 'duplicate':True})
         self.assertEqual(self.cli('ack', done['message']), {**ack, 'duplicate':True})
         after = self.status()
         self.assertEqual((after['audit'], after['rounds'], after['messages']),
-                         (current['audit'], current['rounds'], current['messages']))
+                         (finished['audit'], finished['rounds'], finished['messages']))
         self.assertEqual(stopped.read_bytes(), stop_bytes)
         self.assertEqual(task.read_bytes(), task_bytes)
         self.assertEqual(report.read_bytes(), report_bytes)
-        self.assertFalse(next_report.exists())
+        self.assertEqual(next_report.read_bytes(), next_report_bytes)
         self.assertEqual({path.stem for path in self.handoff_traces.glob('*.json')},
                          {source['attempt'], result['attempt']})
         submission, = stopped.parent.glob('*.submission')
@@ -752,7 +768,8 @@ while not (directory / (attempt + ".quit")).exists() and time.monotonic() < dead
                           'oldRound':1, 'newRound':2, 'oldAttempt':source['attempt'],
                           'newAttempt':result['attempt'], 'oldMessage':done['message'],
                           'oldMessageId':done['messageId'], 'close':closed['closeOperationId'],
-                          'sourceStoppedBeforeTarget':True, 'tmuxSubmissions':1, 'duplicate':True}), flush=True)
+                          'sourceStoppedBeforeTarget':True, 'tmuxSubmissions':1, 'duplicate':True,
+                          'replayRequiresNextPaths':True}), flush=True)
 
     def test_herdr_to_tmux_handoff_legacy_receipt_stays_pending(self):
         source, old = self.tmux_handoff_fixture(backend='herdr')

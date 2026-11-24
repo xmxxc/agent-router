@@ -4,9 +4,9 @@ use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
     ffi::OsString,
-    fs::OpenOptions,
+    fs::{self, Metadata, OpenOptions},
     io::ErrorKind,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -363,13 +363,12 @@ impl<'a> Handoff<'a> {
                 .cloned()
                 .context("missing round history")?;
             if completed {
-                ensure!(
-                    !rounds
-                        .iter()
-                        .chain(&history)
-                        .any(|old| old["report"] == next["report"]),
-                    "the next report was already used by this dispatch"
-                );
+                let report = Path::new(next["report"].as_str().context("missing next report")?);
+                let previous = rounds
+                    .iter()
+                    .chain(&history)
+                    .filter_map(|old| old["report"].as_str().map(Path::new));
+                require_unused_report(report, previous)?;
             } else if let Some(last) = rounds
                 .iter_mut()
                 .rev()
@@ -561,15 +560,6 @@ impl<'a> Handoff<'a> {
         {
             return Ok(None);
         }
-        if let Some((task, report)) = self.next {
-            let task = task.canonicalize()?;
-            let report = super::resolve_report_path(report)?;
-            if row["task"].as_str().map(Path::new) != Some(task.as_path())
-                || row["report"].as_str().map(Path::new) != Some(report.as_path())
-            {
-                return Ok(None);
-            }
-        }
         let event = row["audit"]
             .as_array()
             .into_iter()
@@ -585,6 +575,26 @@ impl<'a> Handoff<'a> {
                     && event["launch"]["receipt"] == row["create"]["receipt"]
             });
         let Some(event) = event else { return Ok(None) };
+        let Some(from_round) = event["fromRound"].as_u64().filter(|&round| round > 0) else {
+            return Ok(None);
+        };
+        let Some(to_round) = from_round.checked_add(u64::from(self.next.is_some())) else {
+            return Ok(None);
+        };
+        if event["round"].as_u64() != Some(to_round) || row["round"].as_u64() != Some(to_round) {
+            return Ok(None);
+        }
+        if let Some((task, report)) = self.next {
+            let task = task.canonicalize()?;
+            let report = super::resolve_report_path(report)?;
+            if row["task"].as_str().map(Path::new) != Some(task.as_path())
+                || event["toTask"].as_str().map(Path::new) != Some(task.as_path())
+                || row["report"].as_str().map(Path::new) != Some(report.as_path())
+                || event["toReport"].as_str().map(Path::new) != Some(report.as_path())
+            {
+                return Ok(None);
+            }
+        }
         let matches_target = match self.endpoint {
             Some(endpoint) => {
                 event["target"]["backend"] == "herdr" && event["target"]["endpoint"] == endpoint
@@ -672,6 +682,43 @@ impl<'a> Handoff<'a> {
         }
         Ok(next)
     }
+}
+
+fn require_unused_report<'a>(
+    report: &Path,
+    previous: impl Iterator<Item = &'a Path> + Clone,
+) -> Result<()> {
+    ensure!(
+        super::resolve_report_path(report)? == report,
+        "the next report destination changed"
+    );
+    ensure!(
+        !previous.clone().any(|old| old == report),
+        "the next report was already used by this dispatch"
+    );
+    match fs::symlink_metadata(report) {
+        Ok(metadata) => require_distinct_report_identity(
+            &metadata,
+            previous.filter_map(|old| fs::metadata(old).ok()),
+        ),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("inspect the next report"),
+    }
+}
+
+fn require_distinct_report_identity(
+    report: &Metadata,
+    previous: impl Iterator<Item = Metadata>,
+) -> Result<()> {
+    ensure!(report.is_file(), "--report must name a file");
+    let identity = |file: &Metadata| (file.dev(), file.ino());
+    ensure!(
+        !previous
+            .filter(Metadata::is_file)
+            .any(|old| identity(&old) == identity(report)),
+        "the next report was already used by this dispatch"
+    );
+    Ok(())
 }
 
 pub(super) fn settle_launch(row: &mut Value, index: usize, mut reply: Value) {
@@ -980,4 +1027,41 @@ pub(super) fn require_scope_settled(state: &Path, scope: &str) -> Result<()> {
         event["id"]
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handoff_next_report_checks_file_identity() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("wfc-handoff-report-{}", Uuid::new_v4()));
+        fs::create_dir(&root)?;
+        let result = (|| -> Result<()> {
+            let dir = root.canonicalize()?;
+            let original = dir.join("original.md");
+            let prepared = dir.join("prepared.md");
+            let missing = dir.join("new.md");
+            fs::write(&original, b"original report")?;
+            fs::write(&prepared, b"prepared report")?;
+            let metadata = fs::metadata(&original)?;
+            let same = require_distinct_report_identity(
+                &metadata,
+                std::iter::once(fs::metadata(&original)?),
+            )
+            .unwrap_err();
+            assert_eq!(
+                same.to_string(),
+                "the next report was already used by this dispatch"
+            );
+            require_unused_report(&prepared, std::iter::once(original.as_path()))?;
+            require_unused_report(&missing, std::iter::once(original.as_path()))?;
+            assert_eq!(fs::read(original)?, b"original report");
+            assert_eq!(fs::read(prepared)?, b"prepared report");
+            assert!(!missing.try_exists()?);
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(root);
+        result
+    }
 }
