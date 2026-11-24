@@ -47,6 +47,7 @@ struct Assignment<'a> {
     _lock: File,
     path: PathBuf,
     row: Value,
+    published: bool,
 }
 
 impl<'a> Assignment<'a> {
@@ -97,6 +98,7 @@ impl<'a> Assignment<'a> {
         if !take_lock(&lock)? {
             return Ok(None);
         }
+        let published = new.is_none();
         let row = match new {
             Some(row) => {
                 ensure!(!path.try_exists()?, "dispatch already published");
@@ -121,6 +123,7 @@ impl<'a> Assignment<'a> {
             state,
             path,
             row,
+            published,
         }))
     }
 
@@ -151,7 +154,7 @@ impl<'a> Assignment<'a> {
     }
 
     fn save(&mut self, next: Value) -> Result<()> {
-        if self.row["backendHandle"].is_null() {
+        if !self.published {
             ensure!(
                 !self.path.try_exists()?,
                 "Herdr assignment already published"
@@ -162,6 +165,7 @@ impl<'a> Assignment<'a> {
         write_json(&self.path, &next, None)?;
         File::open(self.path.parent().unwrap())?.sync_all()?;
         self.row = next;
+        self.published = true;
         Ok(())
     }
 
@@ -316,12 +320,30 @@ impl Assignment<'_> {
 
 pub(super) fn create(state: &Path, row: &Value, launch: host::Launch) -> Result<Value> {
     let id = row["dispatch"].as_str().context("missing dispatch")?;
+    let mut unit = Assignment::lock(state, id, Some(row.clone()))?;
+    let answer = launch_into(&mut unit, launch, None)?;
+    ensure!(
+        answer["result"] == "accepted",
+        "backend create {} for {id}: {}",
+        answer["result"],
+        answer["diagnostic"]
+    );
+    Ok(unit.row)
+}
+
+fn launch_into(
+    unit: &mut Assignment<'_>,
+    launch: host::Launch,
+    expected_service: Option<&Process>,
+) -> Result<Value> {
+    let row = unit.row.clone();
+    let state = unit.state;
+    let id = row["dispatch"].as_str().context("missing dispatch")?;
     let cwd = Path::new(row["cwd"].as_str().context("missing cwd")?);
     let prefill = match launch.argv.as_slice() {
         [.., flag, brief] if row["host"] == "opencode" && flag == "--prompt" => Some(brief.clone()),
         _ => None,
     };
-    let mut unit = Assignment::lock(state, id, Some(row.clone()))?;
     let files = host_launch::prepare(
         state,
         id,
@@ -342,15 +364,28 @@ pub(super) fn create(state: &Path, row: &Value, launch: host::Launch) -> Result<
             files.id.clone(),
         ],
     };
-    unit.row["create"] = json!({"result":"uncertain","receipt":files.receipt});
-    unit.row["pendingInput"] = json!(false);
-    unit.row["audit"] = json!([]);
+    let mut pending = row.clone();
+    pending["create"] = json!({"result":"uncertain","receipt":files.receipt});
+    pending["pendingInput"] = json!(false);
+    if unit.published {
+        unit.save(pending)?;
+    } else {
+        pending["audit"] = json!([]);
+        unit.row = pending;
+    }
     // The provider checkpoints the nonce and service before its first external effect.
     let created = Handle::create(
         Path::new(row["endpoint"].as_str().context("missing endpoint")?),
         row["attempt"].as_str().context("missing attempt")?,
         &launch,
-        |h| unit.checkpoint(h),
+        |h| {
+            // The first checkpoint is before workspace.create. Later RPCs
+            // stay pinned to the verified peer within the provider session.
+            if expected_service.is_some_and(|service| h.service.as_ref() != Some(service)) {
+                return Err(io::Error::other("Herdr service identity changed"));
+            }
+            unit.checkpoint(h)
+        },
     );
     let mut answer = match created {
         Ok(_) => {
@@ -378,26 +413,73 @@ pub(super) fn create(state: &Path, row: &Value, launch: host::Launch) -> Result<
     };
     answer["receipt"] = json!(files.receipt);
     if !unit.row["backendHandle"].is_null() {
-        let mut next = unit.row.clone();
-        next["create"] = answer.clone();
-        unit.save(next)?;
+        if expected_service.is_none() {
+            let mut next = unit.row.clone();
+            next["create"] = answer.clone();
+            unit.save(next)?;
+        }
         if answer["result"] != "accepted" {
             if let Some(terminal) = host_launch::read_receipt(&files.receipt) {
                 super::startup::unconfirmed_zero(state, &unit.row, &files.id, &terminal);
             }
         }
-    } else if !unit.path.try_exists()? {
+    } else if expected_service.is_none() && !unit.path.try_exists()? {
         // No checkpoint means the provider never issued workspace.create.
         std::fs::remove_file(&files.receipt)?;
         std::fs::remove_file(unit.path.with_extension("herdr-lock"))?;
     }
-    ensure!(
-        answer["result"] == "accepted",
-        "backend create {} for {id}: {}",
-        answer["result"],
-        answer["diagnostic"]
-    );
-    Ok(unit.row)
+    Ok(answer)
+}
+
+pub(super) struct OfflineResume<'a> {
+    unit: Assignment<'a>,
+    service: Process,
+}
+
+impl<'a> OfflineResume<'a> {
+    pub(super) fn verify(state: &'a Path, row: &Value) -> Result<(Self, Value, Value)> {
+        let mut unit = lock_close(state, row)?;
+        ensure!(unit.row == *row, "Herdr assignment changed before resume");
+        ensure!(
+            row["create"]["result"] == "accepted" && row["pendingInput"] == false,
+            "original Herdr creation or input is unresolved"
+        );
+        let evidence = launch_receipt(state, &row["create"])?;
+        ensure!(
+            evidence["category"] == "process_exited"
+                && evidence["exitCode"]
+                    .as_u64()
+                    .is_some_and(|code| code <= 255),
+            "original Herdr worker has no confirmed exit receipt"
+        );
+        let mut handle = unit.handle()?;
+        unit.verified_archive(&handle)?;
+        ensure!(
+            handle.stopped_evidence.is_none(),
+            "expected the original Herdr binding"
+        );
+        let service = handle
+            .service
+            .clone()
+            .context("missing original Herdr service")?;
+        ensure!(
+            handle.confirm_closed(|h| unit.checkpoint(h))?,
+            "original Herdr pane or writers are still present"
+        );
+        let inspection = json!({"result":"accepted","alive":false,"owned":true});
+        let worker = backend::herdr_worker(&evidence, &inspection);
+        Ok((Self { unit, service }, worker, inspection))
+    }
+
+    pub(super) fn launch(&mut self, next: &mut Value, launch: host::Launch) -> Result<Value> {
+        // The caller wrote the new attempt under the Inbox lock. Keep the
+        // stable Herdr assignment lock through the replacement checkpoints.
+        self.unit.row = next.clone();
+        self.unit.current()?;
+        let answer = launch_into(&mut self.unit, launch, Some(&self.service))?;
+        *next = self.unit.row.clone();
+        Ok(answer)
+    }
 }
 
 pub(super) fn observe(state: &Path, row: &mut Value, read_only: bool) -> Result<(Value, Value)> {

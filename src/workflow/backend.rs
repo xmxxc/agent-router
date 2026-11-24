@@ -834,11 +834,20 @@ pub(super) fn herdr_receipt(state: &Path, create: &Value) -> Result<Value> {
 }
 
 pub(super) fn herdr_closes(row: &Value) -> impl DoubleEndedIterator<Item = &Value> {
+    let resumed_from = super::assignment::resume_audit(row).map(|event| &event["fromAttempt"]);
     row["audit"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|event| event["operation"] == "close")
+        .filter(move |event| {
+            event["operation"] == "close"
+                && !resumed_from.is_some_and(|old| {
+                    old.is_string()
+                        && event["attempt"] == *old
+                        && event["dispatch"] == row["dispatch"]
+                        && event["round"] == row["round"]
+                })
+        })
 }
 
 fn close_is_pending(event: &Value) -> bool {

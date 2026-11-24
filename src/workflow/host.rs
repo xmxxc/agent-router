@@ -521,11 +521,11 @@ impl Options<'_> {
             record["launchConfig"] = json!(path);
         }
         #[cfg(target_os = "linux")]
-        if self.name == "codex" && self.backend == "tmux" {
+        if self.name == "codex" && matches!(self.backend, "tmux" | "herdr") {
             match codex_home(&cwd, &launch.env) {
                 Ok(home) => {
                     record["codexHome"] = json!(home);
-                    if resume {
+                    if resume || self.backend == "herdr" {
                         launch.env.insert("CODEX_HOME".into(), json!(home));
                     }
                 }
