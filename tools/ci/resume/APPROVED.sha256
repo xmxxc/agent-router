@@ -1,0 +1,11 @@
+b27200ea481ca48ac36277391799ee7d822d691f26d04550f9867a369ed55dd0  vendor/INPUTS.sha256
+9faaefd15bfc7f7153dd3f8d20b2848eeb7ffd38c00f65e3e554b62cba922204  tools/check_tmux.py
+f415d6b767156943dd1b1dc9c4e27a12c51728a853ecc848da531a785d67d815  tests/herdr_public.py
+b4d226d78ea2c1b2494478c083b136caed6338d25ff6b24fe336522ad966817f  crates/herdr/tests/live.py
+0dd1312f73e13ef2b6343b1c7c307f743d824d1a90da430da24595e72e643eea  crates/herdr/tests/job_control.py
+17e88863f3600672ab49182f217281b6fc4d3c762bde361935e436a95214d05c  ../native-input/vendor/zlib-1.3.1.tar.gz
+45c22d87f622e73a6effafaf515c81cac9b83de6a803775b60c40f9ec8b6aa46  ../ci/tools/ci/resume/verify.sh
+770687361dac0693fce2dcb7c0738c648124ed0ba5ac6b602af3e4d3f46f2628  ../ci/tools/ci/resume/run.py
+46123b92ba3e7e2702fe0c279adb32a52b138a1c54523ab2a29a2dcde945e32f  ../ci/tools/ci/resume/reap.py
+77badfd6f385775348c0deac6917cae1037c314137e05cc8d5c33dbd7777f220  ../ci/tools/ci/resume/check_offline_resume.py
+22baf405a191bddd17532a7a0c60ea359884333cff1a2d33dec075e855abe14b  ../ci/tools/ci/resume/resume_worker.py
