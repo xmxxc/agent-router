@@ -93,8 +93,16 @@ def composer(mode, logfile, reply_worker=False):
                     report = Path(os.environ["WFC_REPORT"])
                     Path("finish").unlink()
                     report.write_text("original worker received the answer\n")
-                    subprocess.run([wfc, "done", "--report", report, "--attempt", attempt,
-                                    "--message-id", "reply-done"], check=True, stdout=subprocess.DEVNULL)
+                    command = [wfc, "done", "--report", report, "--attempt", attempt, "--message-id", "reply-done"]
+                    if mode == "empty-with-done-receipt":
+                        done = subprocess.run(command, capture_output=True, text=True, timeout=15)
+                        evidence = Path("done-result.tmp")
+                        evidence.write_text(json.dumps({"exit": done.returncode, "stdout": done.stdout,
+                                                        "stderr": done.stderr}))
+                        evidence.rename("done-result.json")
+                        done.check_returncode()
+                    else:
+                        subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
                 if not select.select([0], [], [], .025)[0]:
                     continue
             b = os.read(0, 1)

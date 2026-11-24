@@ -68,6 +68,8 @@ fn run() -> anyhow::Result<ExitCode> {
             #[cfg(target_os = "linux")]
             println!("{}", workflow::reclaim::USAGE);
             #[cfg(target_os = "linux")]
+            println!("{}", workflow::legacy_import::USAGE);
+            #[cfg(target_os = "linux")]
             println!("{}", workflow::worker_owner::CLOSE_USAGE);
             #[cfg(target_os = "linux")]
             println!("{}", workflow::herdr::USAGE);
@@ -136,9 +138,14 @@ fn run() -> anyhow::Result<ExitCode> {
             return host_launch::supervise(&spec);
         }
         #[cfg(target_os = "linux")]
-        Some("--tmux-backend") if args.is_empty() => {
+        Some("--tmux-backend") if args.len() <= 1 => {
             let request = serde_json::from_reader(std::io::stdin().lock())?;
-            println!("{}", tmux::execute(&workflow::state_dir()?, request)?);
+            let state = match args.first() {
+                Some(path) => Path::new(path).to_owned(),
+                None => workflow::state_dir()?,
+            };
+            anyhow::ensure!(state.is_absolute(), "tmux backend requires an absolute state path");
+            println!("{}", tmux::execute(&state, request)?);
         }
         #[cfg(target_os = "linux")]
         Some("--tmux-attach") if args.len() == 4 => {
@@ -311,6 +318,15 @@ fn run() -> anyhow::Result<ExitCode> {
             };
             controller::require_controller("status")?;
             println!("{}", workflow::status(id, active)?);
+        }
+        #[cfg(target_os = "linux")]
+        Some("migrate-legacy") => {
+            if args == ["--help"] || args == ["-h"] {
+                println!("{}", workflow::legacy_import::USAGE);
+            } else {
+                controller::require_controller("migrate-legacy")?;
+                println!("{}", workflow::legacy_import::run(&args)?);
+            }
         }
         #[cfg(target_os = "linux")]
         Some("reclaim") => {

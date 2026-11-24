@@ -8,9 +8,9 @@ pub use registration::waiters;
 
 use super::{
     recovery::{GenerationStamps, Generations, Scan, Stamp},
-    spaced_json, state_dir, Identity, Inbox, State,
+    spaced_json, Identity, Inbox, State,
 };
-use crate::workflow::{controller, worker_owner};
+use crate::workflow::{controller, ensure_state_writable, worker_owner, writable_state_dir};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
@@ -118,10 +118,12 @@ impl<'a> Relay<'a> {
     }
 
     pub fn run(self) -> Result<()> {
-        let state = state_dir()?;
+        let state = writable_state_dir()?;
         let token = controller::token(self.owner_token);
-        let preflight =
-            || controller::Owners::read(&state)?.preflight(self.scope, token.as_deref(), "relay");
+        let preflight = || {
+            ensure_state_writable(&state)?;
+            controller::Owners::read(&state)?.preflight(self.scope, token.as_deref(), "relay")
+        };
         preflight()?;
         let target = self.target.resolve()?;
         let timeout = seconds(&env::var("WFC_QUEUE_TIMEOUT").unwrap_or_else(|_| "60".into()))?;
@@ -129,6 +131,7 @@ impl<'a> Relay<'a> {
         // transport locks before starting the delivery window.
         let mut assignments = scope_assignments(&state, self.scope, None, || false)?
             .context("initial relay authorization did not finish")?;
+        ensure_state_writable(&state)?;
         if self.detach {
             fs::create_dir_all(&state)?;
             let log = state.join("relay.log");
@@ -238,6 +241,7 @@ impl<'a> Relay<'a> {
                 _ => None,
             };
             if let Some((batch, text)) = batch {
+                ensure_state_writable(&state)?;
                 let limit = remaining().min(timeout);
                 let outcome = match &target {
                     Target::Codex(thread) => {
@@ -366,8 +370,7 @@ fn claim_batch(
     let mut text = String::from(PREFIX);
     let dispatches = inbox.dir.join("dispatches");
     for m in &mut inbox.messages {
-        if !m.is_controller_message()
-            || m.delivery.state != State::Unsent
+        if !m.claimable()
             || scope.is_some_and(|s| s != m.worker.scope())
         {
             continue;

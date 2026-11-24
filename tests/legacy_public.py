@@ -110,7 +110,8 @@ def legacy_case(binary, label, setting):
         for command in ("status", "reclaim"):
             err = run(binary, cwd, home, setting, (command, "--dispatch", "d-000000ff"), code=1)
             assert "unknown dispatch d-000000ff" in err, err
-        run(binary, cwd, home, setting, ("reclaim", "--yes"), code=2)
+        error = run(binary, cwd, home, setting, ("reclaim", "--yes"), code=1)
+        assert "legacy state write blocked" in error, error
         run(binary, cwd, home, setting, ("reclaim", "--dispatch"), code=2)
         err = run(binary, cwd, home, setting, ("reply", "30", "native reply"), code=1)
         assert "reply requires the native Rust question ledger" in err, err
@@ -267,73 +268,46 @@ def native_ledger_directory(binary):
         assert "unknown dispatch d-000000ff" in unknown, unknown
         assert snapshot(root) == before
 
-        task = root / "private-task.md"
-        task.write_text("controlled worker for the reclaim refusal fixture")
-        worker = run(binary, root, root, str(root), (
-            "dispatch", "--role", "fixture", "--task", str(task), "--cwd", str(root),
-            "--", "/bin/sleep", "90",
-        ))
-        target = worker["dispatch"]
         database = root / "router.db"
         parked = root / "router.fixture"
 
         def reject_reclaim(path_fragment, diagnostic):
             before = snapshot(root)
-            for flags in ((), ("--dispatch", DISPATCH), ("--dispatch", target)):
+            for flags in ((), ("--dispatch", DISPATCH)):
                 error = run(binary, root, root, str(root), ("reclaim", "--yes", *flags), code=1)
                 assert path_fragment in error and diagnostic in error, error
                 assert snapshot(root) == before
 
-        try:
-            for legacy_present in (True, False):
-                if not legacy_present:
-                    database.rename(parked)
-                    before = snapshot(root)
-                    missing = run(binary, root, root, str(root),
-                                  ("reclaim", "--dispatch", DISPATCH), code=1)
-                    assert f"unknown dispatch {DISPATCH}" in missing, missing
-                    assert snapshot(root) == before
-                reject_reclaim("messages.json", "not a regular file")
-            native.rmdir()
-            native.symlink_to("missing-messages-target")
-            try:
-                reject_reclaim("messages.json", f"os error {errno.ENOENT}")
-            finally:
-                native.unlink()
+        reject_reclaim("router.db", "legacy state write blocked")
+        database.rename(parked)
+        before = snapshot(root)
+        missing = run(binary, root, root, str(root), ("reclaim", "--dispatch", DISPATCH), code=1)
+        assert f"unknown dispatch {DISPATCH}" in missing, missing
+        assert snapshot(root) == before
+        reject_reclaim("messages.json", "not a regular file")
+        native.rmdir()
+        native.symlink_to("missing-messages-target")
+        reject_reclaim("messages.json", f"os error {errno.ENOENT}")
+        native.unlink()
 
-            # A valid native ledger and live worker do not make an ambiguous
-            # old path safe to ignore for confirmation.
-            native.write_text("[]")
-            database.symlink_to(database.name)
-            try:
-                reject_reclaim("router.db", f"os error {errno.ELOOP}")
-            finally:
-                database.unlink()
-            database.mkdir()
-            try:
-                reject_reclaim("router.db", "not a regular file")
-            finally:
-                database.rmdir()
-            database.write_bytes(b"SQLite format 3\0")
-            try:
-                reject_reclaim("router.db", "verify")
-            finally:
-                database.unlink()
-            for statement in ("CREATE TABLE unrelated(id INTEGER PRIMARY KEY)",
-                              "CREATE TABLE message(body TEXT)"):
-                with closing(sqlite3.connect(database)) as db:
-                    db.execute(statement)
-                    db.commit()
-                try:
-                    reject_reclaim("router.db", "unrecognized router.db schema")
-                finally:
-                    database.unlink()
-            status = run(binary, root, root, str(root), ("status", "--dispatch", target))
-            assert status["dispatches"][0]["backendAlive"] is True, status
-        finally:
-            if parked.exists():
-                parked.rename(database)
-            run(binary, root, root, str(root), ("close", target))
+        native.write_text("[]")
+        database.symlink_to(database.name)
+        reject_reclaim("router.db", "legacy state write blocked")
+        database.unlink()
+        database.mkdir()
+        reject_reclaim("router.db", "legacy state write blocked")
+        database.rmdir()
+        database.write_bytes(b"SQLite format 3\0")
+        reject_reclaim("router.db", "legacy state write blocked")
+        database.unlink()
+        for statement in ("CREATE TABLE unrelated(id INTEGER PRIMARY KEY)",
+                          "CREATE TABLE message(body TEXT)"):
+            with closing(sqlite3.connect(database)) as db:
+                db.execute(statement)
+                db.commit()
+            reject_reclaim("router.db", "legacy state write blocked")
+            database.unlink()
+        parked.rename(database)
         print("a messages.json directory reports the path type error; the legacy ledger is unchanged")
 
 
@@ -362,10 +336,16 @@ def native_ledger_lookup_failure(binary):
                 assert "messages.json" in error and f"os error {expected}" in error, error
 
         confirms = tuple((*args, "--yes") for args in previews)
+
+        def fenced():
+            for args in confirms:
+                error = run(binary, root, root, setting, args, code=1)
+                assert "router.db" in error and "legacy state write blocked" in error, error
         native.symlink_to(native.name)
         before = snapshot(root)
         existing_preview()
-        refuses(COMMANDS[:3] + confirms, errno.ELOOP)
+        refuses(COMMANDS[:3], errno.ELOOP)
+        fenced()
         assert snapshot(root) == before
 
         database.rename(saved_database)
@@ -418,7 +398,7 @@ def native_ledger_lookup_failure(binary):
         native.chmod(0)
         try:
             existing_preview()
-            refuses(confirms, errno.EACCES)
+            fenced()
             assert stat.S_IMODE(native.stat().st_mode) == 0
         finally:
             native.chmod(mode)
