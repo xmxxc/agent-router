@@ -36,6 +36,39 @@ fn launch_receipt(state: &Path, create: &Value) -> Result<Value> {
     Ok(launch)
 }
 
+fn receipt_writer(evidence: &Value) -> Result<Process> {
+    let writer: Process = serde_json::from_value(evidence["writerProcess"].clone())
+        .context("unconfirmed launched worker identity")?;
+    ensure!(evidence["pid"] == writer.pid, "launch receipt PID mismatch");
+    Ok(writer)
+}
+
+enum LaunchConfirmation {
+    Pending,
+    Started(Process),
+    Terminal(Value),
+}
+
+fn confirm_launch(
+    first: Value,
+    recheck: impl FnOnce() -> Result<Value>,
+) -> Result<LaunchConfirmation> {
+    // The supervisor can replace the started receipt before we confirm it.
+    let evidence = if first["category"] == "started" {
+        recheck()?
+    } else {
+        first
+    };
+    Ok(match evidence["category"].as_str() {
+        Some("unknown") => LaunchConfirmation::Pending,
+        Some("started") => LaunchConfirmation::Started(receipt_writer(&evidence)?),
+        Some("process_exited" | "executable_missing" | "permission_denied" | "spawn_failed") => {
+            LaunchConfirmation::Terminal(evidence)
+        }
+        _ => anyhow::bail!("worker startup is unconfirmed"),
+    })
+}
+
 const INVALID_CLOSE_WORKER: &str = "invalid closed worker outcome";
 
 fn valid_close_worker(worker: &Value) -> bool {
@@ -198,12 +231,7 @@ impl<'a> Assignment<'a> {
         }
         let evidence = launch_receipt(self.state, &self.row["create"])?;
         match evidence["category"].as_str() {
-            Some("started") => {
-                let writer: Process = serde_json::from_value(evidence["writerProcess"].clone())
-                    .context("unconfirmed launched worker identity")?;
-                ensure!(evidence["pid"] == writer.pid, "launch receipt PID mismatch");
-                Ok(Some(writer))
-            }
+            Some("started") => receipt_writer(&evidence).map(Some),
             Some(
                 "process_exited" | "executable_missing" | "permission_denied" | "spawn_failed",
             ) => Ok(None),
@@ -211,15 +239,25 @@ impl<'a> Assignment<'a> {
         }
     }
 
+    fn remember_launched_writer(
+        &mut self,
+        h: &mut Handle,
+        writer: Process,
+        read_only: bool,
+    ) -> Result<()> {
+        if !h.writers.is_empty() && !h.writers.contains(&writer) {
+            h.writers.push(writer);
+            if !read_only {
+                self.checkpoint(h)?;
+            }
+        }
+        Ok(())
+    }
+
     fn tracked_handle(&mut self, read_only: bool) -> Result<Handle> {
         let mut h = self.handle()?;
         if let Some(writer) = self.launched_writer()? {
-            if !h.writers.is_empty() && !h.writers.contains(&writer) {
-                h.writers.push(writer);
-                if !read_only {
-                    self.checkpoint(&h)?;
-                }
-            }
+            self.remember_launched_writer(&mut h, writer, read_only)?;
         }
         Ok(h)
     }
@@ -387,29 +425,52 @@ fn launch_into(
             unit.checkpoint(h)
         },
     );
-    let mut answer = match created {
+    let (mut answer, terminal) = match created {
         Ok(_) => {
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
-                let evidence = host_launch::read_receipt(&files.receipt).unwrap_or(Value::Null);
-                if evidence["category"] == "started" {
-                    break match unit.tracked_handle(false) {
-                        Ok(_) => match &prefill {
-                            Some(text) => {
-                                unit.input(InputAction::ActivatePrefill(text), || Ok(()))?
+                let first = host_launch::read_receipt(&files.receipt).unwrap_or(Value::Null);
+                match confirm_launch(first, || launch_receipt(state, &unit.row["create"])) {
+                    Ok(LaunchConfirmation::Started(writer)) => {
+                        let recorded = unit
+                            .handle()
+                            .and_then(|mut h| unit.remember_launched_writer(&mut h, writer, false));
+                        let answer = match recorded {
+                            Ok(()) => match &prefill {
+                                Some(text) => {
+                                    unit.input(InputAction::ActivatePrefill(text), || Ok(()))?
+                                }
+                                None => json!({"result":"accepted"}),
+                            },
+                            Err(e) => {
+                                json!({"result":"uncertain","diagnostic":e.to_string()})
                             }
-                            None => json!({"result":"accepted"}),
-                        },
-                        Err(e) => json!({"result":"uncertain","diagnostic":e.to_string()}),
-                    };
+                        };
+                        break (answer, None);
+                    }
+                    Ok(LaunchConfirmation::Terminal(evidence)) => {
+                        let answer = json!({"result":"uncertain","category":evidence["category"],"diagnostic":"worker start not confirmed"});
+                        break (answer, Some(evidence));
+                    }
+                    Ok(LaunchConfirmation::Pending) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Ok(LaunchConfirmation::Pending) => {
+                        break (
+                            json!({"result":"uncertain","category":"unknown","diagnostic":"worker start not confirmed"}),
+                            None,
+                        );
+                    }
+                    Err(e) => {
+                        break (
+                            json!({"result":"uncertain","diagnostic":e.to_string()}),
+                            None,
+                        );
+                    }
                 }
-                if evidence["category"] != "unknown" || Instant::now() >= deadline {
-                    break json!({"result":"uncertain","category":evidence["category"],"diagnostic":"worker start not confirmed"});
-                }
-                std::thread::sleep(Duration::from_millis(20));
             }
         }
-        Err(e) => json!(e),
+        Err(e) => (json!(e), None),
     };
     answer["receipt"] = json!(files.receipt);
     if !unit.row["backendHandle"].is_null() {
@@ -419,7 +480,7 @@ fn launch_into(
             unit.save(next)?;
         }
         if answer["result"] != "accepted" {
-            if let Some(terminal) = host_launch::read_receipt(&files.receipt) {
+            if let Some(terminal) = terminal.or_else(|| host_launch::read_receipt(&files.receipt)) {
                 super::startup::unconfirmed_zero(state, &unit.row, &files.id, &terminal);
             }
         }
@@ -910,5 +971,82 @@ impl Reconcile {
         Ok(
             json!({"dispatch":self.dispatch,"round":round,"attempt":attempt,"result":"accepted","audit":event,"inputReplayed":false}),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn started_receipt() -> Value {
+        json!({"category":"started","pid":42,
+            "writerProcess":{"pid":42,"creation":"linux:fixture:125"}})
+    }
+
+    #[test]
+    fn herdr_confirmation_keeps_terminal_receipt_and_one_notice() -> Result<()> {
+        let state =
+            std::env::temp_dir().join(format!("wfc-herdr-confirm-{}", uuid::Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let dispatch = "d-aabbccdd";
+            let attempt = "a-123456789abc";
+            let launch = "11111111111111111111111111111111";
+            let receipt = state.join("launches").join(format!("{launch}.json"));
+            let assignment = state.join("dispatches").join(format!("{dispatch}.json"));
+            std::fs::create_dir_all(receipt.parent().unwrap())?;
+            std::fs::create_dir_all(assignment.parent().unwrap())?;
+            let row = json!({"dispatch":dispatch,"attempt":attempt,"round":1,"role":"worker",
+                "scope":"fixture-scope","cwd":state,"report":state.join("report"),"host":"codex",
+                "create":{"result":"uncertain","receipt":receipt}});
+            write_json(&assignment, &row, None)?;
+            write_json(&receipt, &started_receipt(), None)?;
+            let first = host_launch::read_receipt(&receipt).context("missing fixture receipt")?;
+            let terminal = json!({"category":"process_exited","exitCode":0,
+                "startupZero":{"pid":42,"processStart":"linux:fixture:125"}});
+            let confirmation = confirm_launch(first, || {
+                write_json(&receipt, &terminal, None)?;
+                launch_receipt(&state, &row["create"])
+            })?;
+            let LaunchConfirmation::Terminal(observed) = confirmation else {
+                anyhow::bail!("a terminal receipt must not confirm startup");
+            };
+            assert_eq!(observed, terminal);
+            super::super::startup::unconfirmed_zero(&state, &row, launch, &observed);
+            let notices = super::super::messages::history(&state, dispatch)?;
+            let [notice] = notices.as_slice() else {
+                anyhow::bail!("expected a single notice for the current attempt");
+            };
+            assert_eq!(notice["attempt"], attempt);
+            assert_eq!(notice["type"], "exited");
+            assert_eq!(notice["state"], "unsent");
+            assert_eq!(notice["fault"]["launchId"], launch);
+            assert_eq!(notice["fault"]["exitCode"], 0);
+            assert_eq!(notice["fault"]["processStart"], "linux:fixture:125");
+            super::super::startup::unconfirmed_zero(&state, &row, launch, &observed);
+            assert_eq!(super::super::messages::history(&state, dispatch)?, notices);
+            assert_eq!(read_record(&assignment)?, row);
+            assert_eq!(host_launch::read_receipt(&receipt), Some(terminal));
+            Ok(())
+        })();
+        let _ = std::fs::remove_dir_all(state);
+        result
+    }
+
+    #[test]
+    fn herdr_confirmation_requires_the_verified_started_writer() -> Result<()> {
+        let reading = confirm_launch(started_receipt(), || Ok(started_receipt()))?;
+        let LaunchConfirmation::Started(writer) = reading else {
+            anyhow::bail!("expected a verified started writer");
+        };
+        assert_eq!(writer.pid, 42);
+        assert_eq!(writer.creation, "linux:fixture:125");
+        let mut wrong = started_receipt();
+        wrong["pid"] = json!(17);
+        assert!(confirm_launch(started_receipt(), || Ok(wrong)).is_err());
+        assert!(matches!(
+            confirm_launch(started_receipt(), || Ok(json!({"category":"unknown"})))?,
+            LaunchConfirmation::Pending
+        ));
+        Ok(())
     }
 }
