@@ -114,7 +114,7 @@ impl Session {
             service,
             deadline,
         };
-        let pong = rpc.exchange(socket, "ping", json!({}), None, || {})?;
+        let pong = rpc.exchange(socket, "ping", json!({}), None, None, || {})?;
         if pong["version"] != "0.9.5" || pong["protocol"] != 22 {
             return Err(Failure::refused(
                 "Herdr requires version 0.9.5 / protocol 22",
@@ -133,11 +133,11 @@ impl Session {
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
         let unsent = (method == "pane.close").then_some("Herdr close was not sent");
-        self.call_with_write_boundary(method, params, unsent, || {})
+        self.call_with_write_boundary(method, params, unsent, None, || {})
     }
 
     pub(super) fn apply_layout(&self, params: Value, on_write: impl FnOnce()) -> Result<Value> {
-        self.call_with_write_boundary("layout.apply", params, None, on_write)
+        self.call_with_write_boundary("layout.apply", params, None, None, on_write)
     }
 
     pub(super) fn send_reply(&self, params: Value) -> Result<Value> {
@@ -145,6 +145,21 @@ impl Session {
             "pane.send_input",
             params,
             Some("Herdr reply input was not sent"),
+            None,
+            || {},
+        )
+    }
+
+    pub(super) fn send_worker_input(
+        &self,
+        params: Value,
+        mut authorize: impl FnMut() -> std::io::Result<()>,
+    ) -> Result<Value> {
+        self.call_with_write_boundary(
+            "pane.send_input",
+            params,
+            Some("Herdr worker input was not sent"),
+            Some(&mut authorize),
             || {},
         )
     }
@@ -154,6 +169,7 @@ impl Session {
         method: &str,
         params: Value,
         unsent: Option<&'static str>,
+        authorize: Option<&mut dyn FnMut() -> std::io::Result<()>>,
         on_write: impl FnOnce(),
     ) -> Result<Value> {
         let before_send = |e: Failure| {
@@ -169,7 +185,7 @@ impl Session {
                 "Herdr service identity changed",
             )));
         }
-        self.exchange(socket, method, params, unsent, on_write)
+        self.exchange(socket, method, params, unsent, authorize, on_write)
     }
 
     fn exchange(
@@ -178,8 +194,11 @@ impl Session {
         method: &str,
         params: Value,
         unsent: Option<&'static str>,
+        mut authorize: Option<&mut dyn FnMut() -> std::io::Result<()>>,
         on_write: impl FnOnce(),
     ) -> Result<Value> {
+        // Only the bound public worker input call opts into this protocol rule.
+        let worker_input = method == "pane.send_input" && authorize.is_some();
         let id = Uuid::new_v4().simple().to_string();
         let mut frame =
             serde_json::to_vec(&json!({"id":id, "method":method, "params":params})).unwrap();
@@ -205,13 +224,26 @@ impl Session {
             socket
                 .set_write_timeout(Some(remaining().map_err(|_| write_failure)?))
                 .map_err(|_| write_failure)?;
-            let n = socket.write(bytes).map_err(|_| write_failure)?;
+            let nonblocking = authorize.is_some();
+            let n = match authorize.take() {
+                Some(check) => {
+                    socket.set_nonblocking(true).map_err(|_| write_failure)?;
+                    super::after_input_check(check, || {
+                        socket.write(bytes).map_err(|_| write_failure)
+                    })?
+                }
+                None => socket.write(bytes).map_err(|_| write_failure)?,
+            };
             if n == 0 {
                 return Err(write_failure);
             }
             // Any written bytes can leave delivery uncertain.
             if let Some(on_write) = on_write.take() {
                 on_write();
+            }
+            if nonblocking {
+                // Only the first write is an authorization boundary.
+                socket.set_nonblocking(false).map_err(|_| unknown)?;
             }
             bytes = &bytes[n..];
         }
@@ -239,6 +271,12 @@ impl Session {
                 return Err(unknown);
             }
             return Err(match error["code"].as_str() {
+                // Protocol 22 enqueues all of pane.send_input as one item.
+                Some("pane_send_failed")
+                    if worker_input && error["message"].as_str().is_some_and(|s| !s.is_empty()) =>
+                {
+                    Failure::unsent("Herdr did not enqueue worker input")
+                }
                 Some(
                     "invalid_request"
                     | "invalid_target"

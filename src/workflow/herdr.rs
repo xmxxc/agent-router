@@ -1,4 +1,4 @@
-//! R1 Herdr assignments. A stable lock covers inspection, input claims, close
+//! Herdr assignments. A stable lock covers inspection, input claims, close
 //! and reconciliation while atomic replacements publish complete record generations.
 use super::{
     backend, controller, ensure_no_legacy_db, ensure_state_writable, host, read_record,
@@ -15,9 +15,10 @@ use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use wfc_herdr::{FailureKind, Handle, Launch, Mapping, Process};
+use wfc_herdr::{CodexInput, FailureKind, Handle, InputBoundary, Launch, Mapping, Process};
 
 pub const USAGE: &str = "wfc herdr-reconcile DISPATCH --pane P --terminal T --actor NAME --evidence TEXT [--workspace W] [--old-writer-evidence TEXT] [--owner-token TOKEN]";
+pub(super) const APPENDED_USER_ENTRY: &str = "herdr-appended-user-entry";
 
 fn launch_receipt(state: &Path, create: &Value) -> Result<Value> {
     let launch = backend::herdr_receipt(state, create)?;
@@ -163,6 +164,91 @@ fn valid_close_worker(worker: &Value) -> bool {
     worker["state"] == "cancelled" || (worker["state"] == "exited" && worker["exit_code"].is_i64())
 }
 
+// Herdr's ownership tokens are attached to the original physical launch.
+// Later logical attempts keep this binding and the same receipt intact.
+pub(super) fn bound_record(row: &Value) -> Result<&Value> {
+    let h = &row["backendHandle"];
+    let original = row["round"] == 1 && h["attempt"] == row["attempt"];
+    let continued = row["round"].as_u64().is_some_and(|round| round > 1)
+        && h["attempt"]
+            .as_str()
+            .is_some_and(|id| valid_identity(id, "a-"))
+        && h["attempt"] == row["executionId"]
+        && h["receipt"].is_string()
+        && row["create"]["result"] == "accepted"
+        && row["rounds"].as_array().into_iter().flatten().any(|round| {
+            round["round"] == 1 && round["attempt"] == h["attempt"] && round["state"] == "completed"
+        })
+        && row["audit"].as_array().into_iter().flatten().any(|event| {
+            event["operation"] == "continue"
+                && event["round"] == row["round"]
+                && event["attempt"] == row["attempt"]
+                && matches!(
+                    event["result"].as_str(),
+                    Some("pending" | "accepted" | "uncertain")
+                )
+        });
+    ensure!(
+        (original || continued)
+            && h["round"] == 1
+            && h["dispatch"] == row["dispatch"]
+            && h["endpoint"] == row["endpoint"]
+            && h["receipt"] == row["create"]["receipt"],
+        "Herdr execution identity mismatch"
+    );
+    Ok(h)
+}
+
+pub(super) fn same_binding(before: &Value, after: &Value) -> bool {
+    let (Ok(before), Ok(after)) = (bound_record(before), bound_record(after)) else {
+        return false;
+    };
+    [
+        "attempt",
+        "endpoint",
+        "receipt",
+        "service",
+        "workspace",
+        "pane",
+        "terminal",
+        "nonce",
+    ]
+    .iter()
+    .all(|&key| before[key] == after[key])
+        && before["writerProcesses"].get(0) == after["writerProcesses"].get(0)
+}
+
+pub(super) fn unsettled_reply(row: &Value, history: &[Value]) -> bool {
+    history.iter().any(|message| {
+        message["type"] == "reply"
+            && message["round"] == row["round"]
+            && message["attempt"] == row["attempt"]
+            && matches!(
+                message["inputResult"].as_str(),
+                Some("pending" | "uncertain")
+            )
+    })
+}
+
+fn open_assignment_lock(path: &Path) -> Result<File> {
+    File::open(path.with_extension("herdr-lock")).context("missing native Herdr assignment lock")
+}
+
+pub(super) fn try_input_lock(state: &Path, row: &Value) -> Result<Option<File>> {
+    ensure_state_writable(state)?;
+    let id = row["dispatch"]
+        .as_str()
+        .filter(|id| valid_id(id))
+        .context("invalid dispatch ID")?;
+    let path = state.join("dispatches").join(format!("{id}.json"));
+    let lock = open_assignment_lock(&path)?;
+    if !super::assignment::try_input_lock(&lock)? {
+        return Ok(None);
+    }
+    ensure_state_writable(state)?;
+    Ok(Some(lock))
+}
+
 struct Assignment<'a> {
     state: &'a Path,
     _lock: File,
@@ -221,7 +307,7 @@ impl<'a> Assignment<'a> {
                 .mode(0o600)
                 .open(lock_path)?
         } else {
-            File::open(lock_path).context("missing native Herdr assignment lock")?
+            open_assignment_lock(&path)?
         };
         if !take_lock(&lock)? {
             return Ok(None);
@@ -239,11 +325,11 @@ impl<'a> Assignment<'a> {
         };
         ensure!(
             row["backend"] == "herdr"
-                && row["round"] == 1
+                && (row["round"] == 1 || bound_record(&row).is_ok())
                 && row["attempt"]
                     .as_str()
                     .is_some_and(|a| valid_identity(a, "a-")),
-            "current Herdr R1 assignment required"
+            "current Herdr R1 or verified continued assignment required"
         );
         ensure!(
             row["controllerOwner"].is_null(),
@@ -259,16 +345,7 @@ impl<'a> Assignment<'a> {
     }
 
     fn bound_record(&self) -> Result<&Value> {
-        let h = &self.row["backendHandle"];
-        ensure!(
-            h["dispatch"] == self.row["dispatch"]
-                && h["round"] == self.row["round"]
-                && h["attempt"] == self.row["attempt"]
-                && h["endpoint"] == self.row["endpoint"]
-                && h["receipt"] == self.row["create"]["receipt"],
-            "Herdr execution identity mismatch"
-        );
-        Ok(h)
+        bound_record(&self.row)
     }
 
     fn handle(&self) -> Result<Handle> {
@@ -303,7 +380,7 @@ impl<'a> Assignment<'a> {
     fn binding(&self, handle: &Handle) -> Value {
         let mut h = json!(handle);
         h["dispatch"] = self.row["dispatch"].clone();
-        h["round"] = self.row["round"].clone();
+        h["round"] = json!(1);
         h["state"] = json!(if handle.stopped_evidence.is_some() {
             "not-started"
         } else if !handle.writers.is_empty() {
@@ -1007,7 +1084,93 @@ fn writable_input(unit: &Assignment<'_>, round: u64, attempt: &str) -> Result<()
         unit.row["create"]["result"] == "accepted",
         "Herdr launch is not active"
     );
+    ensure!(
+        !super::assignment::input_unresolved(&unit.row),
+        "Herdr input is pending or uncertain"
+    );
     Ok(())
+}
+
+pub(super) struct InputTarget {
+    handle: Handle,
+    writer: Process,
+}
+
+impl InputTarget {
+    // The caller holds the scope and the stable physical assignment lock.
+    pub(super) fn verify(state: &Path, row: &Value) -> Result<Self> {
+        ensure!(
+            backend::herdr_closes(row)
+                .next_back()
+                .is_none_or(|event| !matches!(
+                    event["result"].as_str(),
+                    Some("pending" | "uncertain" | "completed")
+                )),
+            "Herdr execution resources are closing or closed"
+        );
+        ensure!(row["pendingInput"] == false, "Herdr input is still pending");
+        let receipt = launch_receipt(state, &row["create"])?;
+        ensure!(
+            receipt["category"] == "started",
+            "Herdr launch is not running"
+        );
+        let writer = receipt_writer(&receipt)?;
+        let mut handle = Handle::deserialize(bound_record(row)?)?;
+        ensure!(
+            handle.inspect(|_| Ok(()))? && writer.alive()?,
+            "Herdr worker is not running"
+        );
+        if !handle.writers.contains(&writer) {
+            handle.writers.push(writer.clone());
+        }
+        Ok(Self { handle, writer })
+    }
+}
+
+impl super::input::HerdrInputTarget for InputTarget {
+    fn bind_continued_execution(&self, next: &mut Value) {
+        next["executionId"] = json!(self.handle.attempt);
+    }
+
+    fn save_writer_evidence(&self, next: &mut Value) {
+        next["backendHandle"]["writerProcesses"] = json!(self.handle.writers);
+    }
+
+    fn submit(
+        &mut self,
+        action: CodexInput,
+        text: &str,
+        mut check: impl FnMut(InputBoundary) -> io::Result<()>,
+    ) -> Value {
+        let writer = &self.writer;
+        let mut late_writers = None;
+        let result = self.handle.submit_codex_input(
+            text,
+            writer,
+            action,
+            // Writers observed before staging were persisted with the audit.
+            // A new writer during preparation needs a fresh preflight.
+            |observed| {
+                late_writers = Some(observed.writers.clone());
+                Err(io::Error::other("Herdr pane writers changed before input"))
+            },
+            |boundary| {
+                if boundary == InputBoundary::Prepare
+                    && !writer.alive().map_err(io::Error::other)?
+                {
+                    return Err(io::Error::other("original Herdr worker stopped"));
+                }
+                check(boundary)
+            },
+        );
+        if let Some(writers) = late_writers {
+            self.handle.writers = writers;
+        }
+        match result {
+            Ok(()) => json!({"result":"accepted", "inputEvidence":APPENDED_USER_ENTRY}),
+            Err(error) => json!(error),
+        }
+    }
 }
 
 // The caller holds the scope lock and must release it when the assignment
@@ -1115,6 +1278,10 @@ impl Reconcile {
         ensure!(
             super::assignment::unresolved_handoff(&unit.row).is_none(),
             "Herdr handoff still pending"
+        );
+        ensure!(
+            unit.row["round"] == 1,
+            "Herdr pane reconciliation requires the original task round"
         );
         ensure!(
             unit.verified_archive(&unit.handle()?)?.is_none(),

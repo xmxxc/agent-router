@@ -41,7 +41,7 @@ pub(crate) fn strip_credentials(command: &mut std::process::Command) {
 }
 
 #[derive(Debug)]
-pub struct ControllerError(Value);
+pub struct ControllerError(pub(super) Value);
 
 impl fmt::Display for ControllerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -226,6 +226,16 @@ impl Owners {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    pub(super) fn authorized_generation(
+        &self,
+        scope: &str,
+        token: Option<&str>,
+        operation: &str,
+    ) -> Result<Option<u64>> {
+        self.require(scope, token, operation)?;
+        Ok(self.0.get(scope).map(|lease| lease.generation))
     }
 
     pub fn preflight(

@@ -146,9 +146,15 @@ wfc wait --scope team-a --timeout 30
 
 `ask` 把问题交给派发所属的总控组。`--options` 按逗号拆分并去掉空项，省略时为空列表。显式提供 `--attempt` 时，相同问题和选项重试会取回原编号。也可用 `--message-id` 自定键，同一派发内用同一键提交不同内容会报冲突。任务存活并等待答复时，状态显示 `asking` 和 `waiting-human`。
 
-在 Linux 可用 `wfc nudge DISPATCH --text TEXT [--message-id KEY]` 提醒当前仍在处理任务的 Codex/tmux worker。省略 `--message-id` 时，每次合法调用都是一条新提醒，可以主动再次发送同文。需要在返回丢失或结算报错后精确取回回执时，从首次发送起为该意图使用同一个键。同一派发内，同键同正文会取回原数字 `message`，同键不同正文会报冲突。发送结果仍待核对时，只有匹配且已证实送达的收据可以用于补结算。另一条输入待核对时，已有的确认键仍可只读取回原号，新输入会继续受阻。
+在 Linux 可用 `wfc nudge DISPATCH --text TEXT [--message-id KEY]` 提醒仍在处理任务的 Codex worker，支持 tmux 和 Herdr 的原活窗格。任务完成后，`wfc continue DISPATCH --task FILE --report FILE` 可在同一原活窗格开始新一轮。受管 scope 需要当前 owner 凭据。
 
-旧同文或旧拒收从滚动历史重现时，画面可能和一次实际新输入相同。此时命令会保留待核，`wfc status --dispatch ID` 的 `audit` 可以查看原轮次及诊断，重试不会再发键。若续派的 worker 已用该轮的 `--callback-ref` 成功发问或回报，可以用原 `continue` 参数重取同一输入的回执。
+省略提醒的 `--message-id` 时，每次合法调用都是一条新提醒，可以主动再次发送同文。从首次发送起使用同一个键，便可在回执输出丢失后精确重取。同一派发内，同键同正文会取回已确认的原数字 `message`，同键不同正文会报冲突。另一条输入待核时，已有的确认键仍可只读取回原号，新输入会继续受阻。
+
+Herdr 0.9.5 在发送提醒前用最多 1000 行历史核对同文来源。历史超出窗口、归档已有同文，或当前可见区与历史无法对齐时，命令会在发键前返回 `definitely-not-sent`。原轮保留，可以继续提交其他合法输入。
+
+旧同文或旧拒收从滚动历史重现时，画面可能和一次实际新输入相同。若在提交后才无法确认送达，`wfc status --dispatch ID` 的 `audit` 会保留原审计号、轮次及诊断，重复请求不会再发键。若续派的 worker 已用本轮 `--callback-ref` 成功发问或回报，可以用原 `continue` 参数取回同一输入回执。即使后续任务已发问或回报，待核提醒仍保留原审计号。
+
+Herdr 的账本预检或首写检查明确拒绝输入，且结算无法重新打开账本或保存派发记录时，命令错误会附带 `noSendProof`。例如旧库写保护同时挡住首写和结算。保护解除后，现任 owner 可用原 `nudge` 或 `continue` 参数加上 `--no-send-proof PROOF` 结算同一个审计。此调用只恢复记录，返回 `definitely-not-sent`。之后可把原命令作为正常请求重新提交。证明缺失、暂存记录变更或已有输入证据冲突时，原审计仍待核。
 
 在已认领的组中，worker 可用启动时分配的独立回调凭据发问或回报。总控兼容入口使用当前租约的凭据。`ask` 与 `done` 均接受显式的 `--owner-token`。
 
