@@ -411,6 +411,49 @@ def verify_herdr_scope_order(binary, root, later_owner_source, work):
     ):
         rejects_incomplete_confirmation(binary, root, source, f"herdr-scope-{case}", mutation, operands, diagnostic)
 
+    verify_herdr_credential_rotation(binary, root, source)
+
+
+def verify_herdr_credential_rotation(binary, root, ordered_source):
+    source = root / "herdr-rotation-source"
+    source.mkdir()
+    database = Path(shutil.copyfile(ordered_source / "router.db", source / "router.db"))
+    with closing(sqlite3.connect(database)) as db, db:
+        # Generation 5 can reuse 3's credential. Generation 6 has no Herdr audit.
+        db.execute("""INSERT INTO lifecycle_event
+                   (id,dispatch,operation,round,attempt,result,diagnostic,owner_generation,owner_token,
+                    resolver_actor,resolution_evidence,created,resolved_at)
+                   SELECT 16,dispatch,operation,round,attempt,result,diagnostic,5,owner_token,
+                          resolver_actor,resolution_evidence,16.125,16.25 FROM lifecycle_event WHERE id=15""")
+        db.execute("UPDATE controller_owner SET generation=6, token=?, updated=17 WHERE scope=?",
+                   ("fixture-generation-six", OTHER))
+
+    before = snapshot(source)
+    target = root / "herdr-rotation-native"
+    proof = proof_for(root / "herdr-rotation-proof.json", database, target)
+    imported = output(run(binary, root, target, *import_args(source, proof)))
+    assert digest(Path(imported["backup"]).read_bytes()) == before["router.db"][1]
+    first, _ = lookup(binary, root, target, HERDR_BOUND)
+    second, _ = lookup(binary, root, target, "d-00000034")
+    assert first["controllerOwner"]["generation"] == second["controllerOwner"]["generation"] == 7
+    events = sorted([*first["legacyAudit"], *second["legacyAudit"]], key=lambda event: event["id"])
+    assert [(event["id"], event["ownerGeneration"]) for event in events] == [
+        (12, None), (13, 2), (14, 2), (15, 3), (16, 5)]
+    public = json.dumps([first, second])
+    for private in ("owner_token", "ownerTokenRecorded", "ownerTokenMatchesCurrent", "fixture-earlier-generation",
+                    "another-old-fixture", "fixture-generation-six"):
+        assert private not in public
+    assert snapshot(source) == before
+    print(json.dumps({"herdrRotationGenerations": [None, 2, 2, 3, 5], "sourceOwnerGeneration": 6,
+                      "sourceAndBackup": before["router.db"][1]}), flush=True)
+
+    diagnostic = "legacy Herdr binding reuses a credential across adjacent owner generations"
+    for case, mutation, operands in (
+        ("adjacent-history", "UPDATE lifecycle_event SET owner_token=(SELECT owner_token FROM lifecycle_event WHERE id=13) WHERE id=15", ()),
+        ("adjacent-current", "UPDATE controller_owner SET token=(SELECT owner_token FROM lifecycle_event WHERE id=16) WHERE scope=?", (OTHER,)),
+    ):
+        rejects_incomplete_confirmation(binary, root, source, f"herdr-rotation-{case}", mutation, operands, diagnostic)
+
 
 def lookup(binary, root, target, dispatch):
     snapshot_now = snapshot(target)

@@ -51,23 +51,41 @@ pub fn stopped_ledger(database: &Path) -> Result<StoppedLedger> {
         )?,
         "offline snapshot has an unresolved lifecycle event"
     );
-    // Current-generation credentials are checked against the source owner per audit row.
+    // Each consistent prior group contributes one credential. The source owner
+    // supplies the current generation even when it has no Herdr audit row.
+    let (inconsistent, adjacent_reuse) = db.query_row(
+        "WITH prior_credentials AS (
+            SELECT d.scope, e.owner_generation AS generation,
+                   min(e.owner_token COLLATE BINARY) AS token,
+                   count(*) = count(CASE WHEN typeof(e.owner_token)='text'
+                                         AND e.owner_token COLLATE BINARY <> '' THEN 1 END)
+                       AND count(DISTINCT e.owner_token COLLATE BINARY) = 1 AS consistent
+            FROM lifecycle_event e
+            JOIN dispatch d ON d.id=e.dispatch
+            JOIN controller_owner o ON o.scope=d.scope
+            WHERE e.operation='backend_reconcile' AND e.owner_generation < o.generation
+            GROUP BY d.scope,e.owner_generation
+        ), credentials AS (
+            SELECT scope, generation, token FROM prior_credentials
+            WHERE consistent AND typeof(generation)='integer' AND generation > 0
+            UNION ALL
+            SELECT scope, generation, token FROM controller_owner
+            WHERE typeof(generation)='integer' AND generation > 0
+        )
+        SELECT EXISTS (SELECT 1 FROM prior_credentials WHERE NOT consistent),
+               EXISTS (SELECT 1 FROM credentials earlier JOIN credentials later
+                       ON earlier.scope=later.scope AND earlier.generation=later.generation-1
+                       WHERE earlier.token COLLATE BINARY = later.token)",
+        [],
+        |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+    )?;
     ensure!(
-        !db.query_row(
-            "SELECT EXISTS (
-                SELECT 1 FROM lifecycle_event e
-                JOIN dispatch d ON d.id=e.dispatch
-                JOIN controller_owner o ON o.scope=d.scope
-                WHERE e.operation='backend_reconcile' AND e.owner_generation < o.generation
-                GROUP BY d.scope,e.owner_generation
-                HAVING count(*) <> count(CASE WHEN typeof(e.owner_token)='text'
-                                           AND e.owner_token COLLATE BINARY <> '' THEN 1 END)
-                    OR count(DISTINCT e.owner_token COLLATE BINARY) <> 1
-            )",
-            [],
-            |row| row.get::<_, bool>(0)
-        )?,
+        !inconsistent,
         "legacy Herdr binding credentials are empty or inconsistent in an earlier owner generation"
+    );
+    ensure!(
+        !adjacent_reuse,
+        "legacy Herdr binding reuses a credential across adjacent owner generations"
     );
     let high_water = db.query_row(
         "SELECT max(coalesce((SELECT max(seq) FROM sqlite_sequence WHERE name='message'),0),
