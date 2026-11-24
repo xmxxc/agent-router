@@ -452,6 +452,7 @@ impl<'a> Handoff<'a> {
         for field in [
             "create",
             "worker",
+            controller::CALLBACK_REF_HASH,
             "hostSession",
             "opencodeOpening",
             "opencodeSession",

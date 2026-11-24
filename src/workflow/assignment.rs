@@ -173,6 +173,7 @@ pub(super) fn try_input_lock(file: &File) -> Result<bool> {
 }
 
 fn attempt_lock_file(state: &Path, row: &Value) -> Result<File> {
+    let row = super::backend::execution_row(row)?;
     let dir = state.join("close-locks");
     let id = row["dispatch"]
         .as_str()
@@ -188,4 +189,13 @@ fn attempt_lock_file(state: &Path, row: &Value) -> Result<File> {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     Ok(options.open(dir.join(format!("{id}.{attempt}")))?)
+}
+
+pub(super) fn input_unresolved(row: &Value) -> bool {
+    row["audit"].as_array().into_iter().flatten().any(|event| {
+        matches!(event["operation"].as_str(), Some("continue" | "nudge"))
+            && matches!(event["result"].as_str(), Some("pending" | "uncertain"))
+            && event["round"] == row["round"]
+            && event["attempt"] == row["attempt"]
+    })
 }

@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub const DONE_USAGE: &str =
-    "wfc done --report FILE [--attempt ID] [--message-id KEY] [--owner-token TOKEN]";
+    "wfc done --report FILE [--attempt ID] [--callback-ref REF] [--message-id KEY] [--owner-token TOKEN]";
 pub const ASK_USAGE: &str =
     "wfc ask QUESTION [--options CSV] [--attempt ID] [--callback-ref REF] [--message-id KEY] [--owner-token TOKEN]";
 pub const WAIT_USAGE: &str =
@@ -193,6 +193,8 @@ struct Assignment {
     controller_owner: Option<Value>,
     #[serde(rename = "workerCallbackHash")]
     callback_hash: Option<String>,
+    #[serde(rename = "workerCallbackRefHash")]
+    callback_ref_hash: Option<String>,
 }
 
 impl Assignment {
@@ -216,31 +218,81 @@ impl Assignment {
         state: &Path,
         dispatch: &str,
         expected_attempt: Option<&str>,
+        reference: Option<&str>,
     ) -> Result<(Self, Value)> {
         let (assignment, row) = Self::read(state, dispatch)?;
         let worker = &assignment.worker;
-        if let Some(round) = env::var_os("WFC_ROUND") {
+        // A continued task has the original host's environment. Selection
+        // by explicit attempt is provisional until the callback is verified.
+        // On a proven pre-credential launch, an explicit current attempt
+        // selects the new task; authorize_callback still requires its owner.
+        let legacy_continue = expected_attempt == Some(worker.attempt.as_str())
+            && assignment.callback_hash.is_none()
+            && assignment.callback_ref_hash.is_none()
+            && row["backend"] == "tmux"
+            && row["host"] == "codex"
+            && row["audit"].as_array().into_iter().flatten().any(|event| {
+                event["operation"] == "continue"
+                    && event["legacyOwnerCallback"] == true
+                    && matches!(
+                        event["result"].as_str(),
+                        Some("pending" | "accepted" | "uncertain")
+                    )
+                    && event["round"] == worker.round
+                    && event["attempt"] == worker.attempt
+            });
+        if legacy_continue {
             ensure!(
-                round.to_str().and_then(|s| s.parse::<u64>().ok()) == Some(worker.round),
-                "round mismatch for {dispatch}"
+                matches!(
+                    super::backend::execution_row(&row)?,
+                    std::borrow::Cow::Owned(_)
+                ),
+                "cannot verify the original execution for the legacy callback"
+            );
+        }
+        if reference.is_none() && !legacy_continue {
+            if let Some(round) = env::var_os("WFC_ROUND") {
+                ensure!(
+                    round.to_str().and_then(|s| s.parse::<u64>().ok()) == Some(worker.round),
+                    "round mismatch for {dispatch}"
+                );
+            }
+            ensure!(
+                env::var_os("WFC_ATTEMPT")
+                    .is_none_or(|v| v.to_str() == Some(worker.attempt.as_str())),
+                "attempt is no longer accepted for {dispatch}"
             );
         }
         ensure!(
-            env::var_os("WFC_ATTEMPT").is_none_or(|v| v.to_str() == Some(worker.attempt.as_str()))
-                && expected_attempt.is_none_or(|id| id == worker.attempt),
+            expected_attempt.is_none_or(|id| id == worker.attempt),
             "attempt is no longer accepted for {dispatch}"
         );
         Ok((assignment, row))
     }
 
     // Call with the ledger lock held while checking the current assignment.
-    fn authorize_callback(&self, state: &Path, token: Option<&str>, operation: &str) -> Result<()> {
+    fn authorize_callback(
+        &self,
+        state: &Path,
+        token: Option<&str>,
+        operation: &str,
+        attempt: Option<&str>,
+        reference: Option<&str>,
+    ) -> Result<()> {
+        if reference.is_some() && attempt.is_none() {
+            return Err(controller::invalid_worker_callback(operation).into());
+        }
         if let Some(secret) = controller::worker_callback() {
-            if secret.to_str().is_some_and(|secret| {
-                self.callback_hash.as_deref() == Some(body_hash(secret).as_str())
-            }) {
+            if self.callback_ref_hash == reference.map(body_hash)
+                && secret.to_str().is_some_and(|secret| {
+                    self.callback_hash.as_deref() == Some(body_hash(secret).as_str())
+                })
+            {
                 return Ok(());
             }
+            return Err(controller::invalid_worker_callback(operation).into());
+        }
+        if reference.is_some() {
             return Err(controller::invalid_worker_callback(operation).into());
         }
         controller::Owners::read(state)?.require(self.worker.scope(), token, operation)?;
@@ -261,6 +313,8 @@ struct Message {
     question_payload: Option<Question>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reply_payload: Option<ReplyRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_input: Option<WorkerInput>,
     request_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     body_hash: Option<String>,
@@ -283,6 +337,34 @@ enum MessageKind {
     Question,
     Reply,
     Reclaimed,
+    Continue,
+    Nudge,
+}
+
+#[cfg(target_os = "linux")]
+pub(super) const CONTINUED_INPUT_CALLBACK: &str = "authenticated-round-callback";
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum WorkerInput {
+    Continue { task: String, report: String },
+    Nudge { text: String },
+}
+
+impl WorkerInput {
+    #[cfg(target_os = "linux")]
+    fn from_audit(event: &Value) -> Result<Self> {
+        let mut payload = event.clone();
+        payload["type"] = event["operation"].clone();
+        Ok(Self::deserialize(payload)?)
+    }
+
+    fn kind(&self) -> MessageKind {
+        match self {
+            Self::Continue { .. } => MessageKind::Continue,
+            Self::Nudge { .. } => MessageKind::Nudge,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -404,6 +486,7 @@ impl Message {
             report: None,
             question_payload: None,
             reply_payload: None,
+            worker_input: None,
             request_key,
             body_hash: None,
             delivery: Delivery::unsent(),
@@ -426,6 +509,8 @@ impl Message {
             == Some("startup_failure")
         {
             MessageKind::StartupFailure
+        } else if let Some(input) = &self.worker_input {
+            input.kind()
         } else if self.reply_payload.is_some() {
             MessageKind::Reply
         } else if self.question_payload.is_some() {
@@ -439,6 +524,13 @@ impl Message {
         self.kind() == MessageKind::Done
     }
 
+    fn record_continued_input_callback(&mut self, proof: Option<Value>) {
+        if let Some(proof) = proof {
+            self.additional_fields
+                .insert("continuedInputCallback".into(), proof);
+        }
+    }
+
     fn is_controller_message(&self) -> bool {
         matches!(
             self.kind(),
@@ -447,6 +539,14 @@ impl Message {
     }
 
     fn valid_payload(&self) -> bool {
+        if self.worker_input.is_some() {
+            return matches!(self.kind(), MessageKind::Continue | MessageKind::Nudge)
+                && self.report.is_none()
+                && self.question_payload.is_none()
+                && self.reply_payload.is_none()
+                && self.request_key.is_none()
+                && self.delivery.state == State::Received;
+        }
         match self.kind() {
             MessageKind::StartupFailure => {
                 self.question_payload.is_none()
@@ -456,6 +556,7 @@ impl Message {
                         .get("fault")
                         .is_some_and(Value::is_object)
             }
+            MessageKind::Continue | MessageKind::Nudge => false,
             MessageKind::Done => self.report.is_some(),
             MessageKind::Question => self.report.is_none(),
             MessageKind::Reply => self.report.is_none() && self.question_payload.is_none(),
@@ -490,6 +591,8 @@ impl Message {
             MessageKind::Question => "question",
             MessageKind::Reply => "reply",
             MessageKind::Reclaimed => "reclaimed",
+            MessageKind::Continue => "continue",
+            MessageKind::Nudge => "nudge",
         }
     }
 
@@ -509,6 +612,22 @@ impl Message {
             for key in ["kind", "host", "message", "fault"] {
                 if let Some(value) = self.additional_fields.get(key) {
                     body.insert(key.into(), value.clone());
+                }
+            }
+            return body;
+        }
+        if let Some(input) = &self.worker_input {
+            body.insert("scope".into(), json!(self.worker.scope()));
+            if let Some(evidence) = self.additional_fields.get("inputEvidence") {
+                body.insert("inputEvidence".into(), evidence.clone());
+            }
+            match input {
+                WorkerInput::Continue { task, report } => {
+                    body.insert("task".into(), json!(task));
+                    body.insert("report".into(), json!(report));
+                }
+                WorkerInput::Nudge { text } => {
+                    body.insert("text".into(), json!(text));
                 }
             }
             return body;
@@ -625,7 +744,7 @@ pub(super) fn private_file() -> OpenOptions {
     options
 }
 
-struct Inbox {
+pub(super) struct Inbox {
     dir: PathBuf,
     messages: Vec<Message>,
     // The lock lives on a stable file because save replaces the data file.
@@ -813,6 +932,35 @@ fn check_snapshot_size(size: usize) -> Result<()> {
     Ok(())
 }
 
+fn continued_input_binding(row: &Value, event: &Value) -> Option<Value> {
+    (row["host"] == "codex"
+        && row["backend"] == "tmux"
+        && super::assignment::unresolved_handoff(row).is_none()
+        && event["operation"] == "continue"
+        && event["round"] == row["round"]
+        && event["attempt"] == row["attempt"]
+        && matches!(
+            event["result"].as_str(),
+            Some("pending" | "uncertain" | "accepted")
+        ))
+    .then_some(())?;
+    Some(json!({
+        "executionId": row["executionId"].as_str()?,
+        "audit": event["id"].as_str()?,
+        "referenceHash": row[controller::CALLBACK_REF_HASH].as_str()?,
+    }))
+}
+
+fn authenticated_continued_input(row: &Value, reference: Option<&str>) -> Option<Value> {
+    // Called after authorize_callback has verified the worker secret and reference.
+    reference?;
+    row["audit"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find_map(|event| continued_input_binding(row, event))
+}
+
 impl Inbox {
     fn snapshot(dir: &Path) -> Result<Vec<Message>> {
         let path = dir.join("messages.json");
@@ -843,7 +991,7 @@ impl Inbox {
         }
     }
 
-    fn open(dir: &Path) -> Result<Self> {
+    pub(super) fn open(dir: &Path) -> Result<Self> {
         Self::read_locked(dir, lock_for_publish(dir)?)
     }
 
@@ -1113,6 +1261,220 @@ impl Inbox {
         Ok(receipt)
     }
 
+    fn attach_continued_input_callback(
+        &mut self,
+        receipt: &Value,
+        worker: &Identity,
+        proof: Option<Value>,
+    ) -> Result<()> {
+        let Some(proof) = proof else {
+            return Ok(());
+        };
+        let id = receipt["message"]
+            .as_u64()
+            .context("invalid callback receipt")?;
+        let message = self
+            .messages
+            .iter_mut()
+            .find(|message| message.id == id)
+            .context("missing callback receipt")?;
+        ensure!(
+            message.worker == *worker
+                && matches!(message.kind(), MessageKind::Done | MessageKind::Question)
+                && message
+                    .body_hash
+                    .as_deref()
+                    .is_none_or(|hash| message.matches_hash(hash)),
+            "continued callback receipt conflicts with the current assignment"
+        );
+        if let Some(saved) = message.additional_fields.get("continuedInputCallback") {
+            if saved == &proof {
+                return self.sync_directory();
+            }
+            ensure!(
+                saved == &proof["referenceHash"],
+                "continued callback evidence conflict"
+            );
+        }
+        message.record_continued_input_callback(Some(proof));
+        self.save()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn unresolved_reply(&self, row: &Value, except: Option<&str>) -> Result<bool> {
+        if row["backend"] != "tmux" {
+            return Ok(false);
+        }
+        let physical = super::backend::execution_row(row)?;
+        let launch_round = physical["round"].as_u64();
+        Ok(self.messages.iter().any(|message| {
+            message.worker.dispatch == row["dispatch"]
+                && except != Some(message.message_id.as_str())
+                && message.reply_payload.as_ref().is_some_and(|reply| {
+                    matches!(
+                        reply.input_result,
+                        InputResult::Pending | InputResult::Uncertain
+                    )
+                })
+                && ((row["round"] == message.worker.round
+                    && row["attempt"] == message.worker.attempt)
+                    || (launch_round.is_some_and(|round| {
+                        // Resume can replace an attempt without advancing its
+                        // logical round. Only the chosen launch starts this chain.
+                        round < message.worker.round
+                            || (round == message.worker.round
+                                && physical["attempt"] == message.worker.attempt)
+                    }) && row["round"]
+                        .as_u64()
+                        .is_some_and(|round| message.worker.round < round)
+                        && row["rounds"].as_array().into_iter().flatten().any(|round| {
+                            round["round"] == message.worker.round
+                                && round["attempt"] == message.worker.attempt
+                        })))
+        }))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn worker_input_key(event: &Value) -> Result<String> {
+        let id = event["id"]
+            .as_str()
+            .and_then(|id| id.strip_prefix("i-"))
+            .context("invalid input audit ID")?;
+        Ok(format!("m-{id}"))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn verified_continued_input_callback(
+        &self,
+        row: &Value,
+        event: &Value,
+    ) -> Result<bool> {
+        let Some(proof) = continued_input_binding(row, event) else {
+            return Ok(false);
+        };
+        let worker = Identity::deserialize(row).context("read continued worker identity")?;
+        Ok(self.messages.iter().any(|message| {
+            message.worker == worker
+                && matches!(message.kind(), MessageKind::Done | MessageKind::Question)
+                && message
+                    .body_hash
+                    .as_deref()
+                    .is_none_or(|hash| message.matches_hash(hash))
+                && message
+                    .additional_fields
+                    .get("continuedInputCallback")
+                    .is_some_and(|saved| {
+                        saved == &proof
+                            // Earlier binaries stored only the reference digest.
+                            || (event["result"] == "uncertain" && saved == &proof["referenceHash"])
+                    })
+        }))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn worker_input_receipt(
+        &self,
+        row: &Value,
+        event: &Value,
+    ) -> Result<Option<(u64, Value)>> {
+        let key = Self::worker_input_key(event)?;
+        let Some(message) = self
+            .messages
+            .iter()
+            .find(|message| message.message_id == key)
+        else {
+            return Ok(None);
+        };
+        let mut worker = Identity::deserialize(row).context("read worker input identity")?;
+        if event["round"] != worker.round || event["attempt"] != worker.attempt {
+            ensure!(
+                event["result"] == "accepted"
+                    && row["rounds"].as_array().into_iter().flatten().any(|round| {
+                        round["round"] == event["round"] && round["attempt"] == event["attempt"]
+                    }),
+                "worker input history conflict"
+            );
+            worker.round = event["round"].as_u64().context("invalid input round")?;
+            worker.attempt = event["attempt"]
+                .as_str()
+                .context("invalid input attempt")?
+                .to_owned();
+        }
+        let input = WorkerInput::from_audit(event)?;
+        ensure!(
+            message.worker == worker
+                && message.worker_input.as_ref() == Some(&input)
+                && message.delivery.state == State::Received
+                && message
+                    .body_hash
+                    .as_ref()
+                    .is_some_and(|hash| message.matches_hash(hash)),
+            "worker input history conflict"
+        );
+        let proof = message
+            .additional_fields
+            .get("inputEvidence")
+            .and_then(Value::as_str);
+        use crate::tmux::APPENDED_USER_ENTRY;
+        match (event["result"].as_str(), proof) {
+            (Some("pending"), Some(APPENDED_USER_ENTRY)) => {
+                Ok(Some((message.id, json!(APPENDED_USER_ENTRY))))
+            }
+            (Some("pending" | "uncertain"), Some(CONTINUED_INPUT_CALLBACK))
+                if matches!(input, WorkerInput::Continue { .. })
+                    && self.verified_continued_input_callback(row, event)? =>
+            {
+                Ok(Some((message.id, json!(CONTINUED_INPUT_CALLBACK))))
+            }
+            (
+                Some("accepted"),
+                Some(evidence @ (APPENDED_USER_ENTRY | CONTINUED_INPUT_CALLBACK)),
+            ) if event["message"] == message.id
+                && event["inputEvidence"] == evidence
+                && (evidence != CONTINUED_INPUT_CALLBACK
+                    || matches!(input, WorkerInput::Continue { .. })) =>
+            {
+                Ok(Some((message.id, json!(evidence))))
+            }
+            // R15 kept the evidence on its settled audit only.
+            (Some("accepted"), None)
+                if event["message"] == message.id
+                    && event["inputEvidence"] == "new-transcript-entry" =>
+            {
+                Ok(Some((message.id, event["inputEvidence"].clone())))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn publish_worker_input(&mut self, row: &Value, event: &Value) -> Result<u64> {
+        ensure!(
+            event["inputEvidence"] == crate::tmux::APPENDED_USER_ENTRY
+                || (event["operation"] == "continue"
+                    && event["inputEvidence"] == CONTINUED_INPUT_CALLBACK),
+            "missing worker input evidence"
+        );
+        let worker = Identity::deserialize(row).context("read worker input identity")?;
+        let mut message = Message::new(self.messages.len() as u64 + 1, worker, None);
+        message.message_id = Self::worker_input_key(event)?;
+        ensure!(
+            !self
+                .messages
+                .iter()
+                .any(|prior| prior.message_id == message.message_id),
+            "worker input history conflict"
+        );
+        message.worker_input = Some(WorkerInput::from_audit(event)?);
+        message
+            .additional_fields
+            .insert("inputEvidence".into(), event["inputEvidence"].clone());
+        message.claim(State::Received)?;
+        let id = message.id;
+        self.publish(message)?;
+        Ok(id)
+    }
+
     fn open_pending(path: &Path) -> Result<File> {
         // A crash before rename can only leave a scratch file. The next writer
         // holds the same lock and rewrites it from the committed snapshot.
@@ -1146,7 +1508,7 @@ impl Inbox {
         self.sync_directory()
     }
 
-    fn sync_directory(&self) -> Result<()> {
+    pub(super) fn sync_directory(&self) -> Result<()> {
         sync_directory(&self.dir)
     }
 }
@@ -1288,7 +1650,7 @@ pub(super) fn history(state: &Path, dispatch: &str) -> Result<Vec<Value>> {
                     view["to"] = json!("controller");
                     view["delivered"] = json!(m.delivery.delivered());
                 }
-                MessageKind::Reclaimed => {
+                MessageKind::Reclaimed | MessageKind::Continue | MessageKind::Nudge => {
                     view["to"] = json!("worker");
                     view["delivered"] = json!(m.delivery.delivered());
                 }
@@ -1367,6 +1729,7 @@ impl Reclaimed {
             report: Some(self.report.clone()),
             question_payload: None,
             reply_payload: None,
+            worker_input: None,
             request_key: None,
             body_hash: None,
             delivery: Delivery::unsent(),
@@ -1401,20 +1764,28 @@ pub(super) fn reply_was_not_sent(state: &Path, row: &Value, message_id: &str) ->
 pub struct Done<'a> {
     report: &'a Path,
     attempt: Option<&'a str>,
+    reference: Option<&'a str>,
     key: Option<&'a str>,
     owner_token: Option<&'a str>,
 }
 
 impl<'a> Done<'a> {
     pub fn parse(args: &'a [OsString]) -> Result<Self> {
-        let [report, attempt, key, owner_token] = options(
+        let [report, attempt, reference, key, owner_token] = options(
             args,
-            ["--report", "--attempt", "--message-id", "--owner-token"],
+            [
+                "--report",
+                "--attempt",
+                "--callback-ref",
+                "--message-id",
+                "--owner-token",
+            ],
             None,
         )?;
         Ok(Self {
             report: Path::new(report.context("missing --report")?),
             attempt,
+            reference,
             key,
             owner_token,
         })
@@ -1433,8 +1804,15 @@ impl<'a> Done<'a> {
         let token = controller::token(self.owner_token);
         let check = || {
             let inbox = Inbox::open(&state)?;
-            let (assignment, row) = Assignment::current(&state, &dispatch, self.attempt)?;
-            assignment.authorize_callback(&state, token.as_deref(), "done")?;
+            let (assignment, row) =
+                Assignment::current(&state, &dispatch, self.attempt, self.reference)?;
+            assignment.authorize_callback(
+                &state,
+                token.as_deref(),
+                "done",
+                self.attempt,
+                self.reference,
+            )?;
             // R1 dispatches had neither field and derived the default key from
             // the worker's launch environment. Assignment::current checked it.
             let r1_worker = assignment.report.is_none()
@@ -1461,32 +1839,47 @@ impl<'a> Done<'a> {
                     assignment.worker.attempt
                 );
             }
-            Ok::<_, anyhow::Error>((assignment, inbox, receipt, key))
+            Ok::<_, anyhow::Error>((assignment, row, inbox, receipt, key))
         };
-        let (initial, inbox, duplicate, _) = check()?;
-        if let Some(receipt) = duplicate {
-            return Ok(receipt);
+        let (initial, initial_row, inbox, duplicate, _) = check()?;
+        if let (Some(receipt), None) = (&duplicate, self.reference) {
+            return Ok(receipt.clone());
         }
         // Git can block. Let unrelated callbacks and waits proceed while sampling.
         drop(inbox);
-        let snapshot = Snapshot::read(&initial.cwd);
-        let (current, mut inbox, duplicate, key) = check()?;
+        let snapshot = duplicate.is_none().then(|| Snapshot::read(&initial.cwd));
+        // Publish after the same execution lock used for controller input.
+        // The first check and Git probe hold neither lock while waiting.
+        #[cfg(target_os = "linux")]
+        let _execution = (initial_row["backend"] == "tmux" && initial_row["host"].is_string())
+            .then(|| super::assignment::close_lock(&state, &initial_row))
+            .transpose()?;
+        let (current, row, mut inbox, duplicate, key) = check()?;
         ensure!(
             initial.worker.round == current.worker.round
                 && initial.worker.attempt == current.worker.attempt
                 && initial.cwd == current.cwd
-                && initial.worker.scope() == current.worker.scope(),
+                && initial.worker.scope() == current.worker.scope()
+                && (self.reference.is_none()
+                    || ["host", "backend", "tmuxSocket", "executionId", "create"]
+                        .iter()
+                        .all(|key| initial_row[*key] == row[*key])),
             "assignment changed while sampling {dispatch}"
         );
+        let proof = authenticated_continued_input(&row, self.reference);
         if let Some(receipt) = duplicate {
+            inbox.attach_continued_input_callback(&receipt, &current.worker, proof)?;
             return Ok(receipt);
         }
+        let snapshot = snapshot
+            .context("callback receipt disappeared while waiting for its execution lock")?;
         let mut message = Message::new(inbox.messages.len() as u64 + 1, current.worker, key);
         message.report = Some(report);
         message.additional_fields = Map::from_iter([
             ("head".into(), json!(snapshot.head)),
             ("dirty".into(), json!(snapshot.dirty)),
         ]);
+        message.record_continued_input_callback(proof);
         inbox.publish(message).context("publish completion")
     }
 }
@@ -1550,14 +1943,18 @@ impl<'a> Ask<'a> {
         let token = controller::token(self.owner_token);
         let check = || -> Result<_> {
             let inbox = Inbox::open(&state)?;
-            let (assignment, row) = Assignment::current(&state, &dispatch, attempt)?;
-            // A reference is for a later assignment in the same live session.
-            if self.reference.is_some()
-                || (self.attempt == Some("") && controller::worker_callback().is_some())
-            {
+            let (assignment, row) =
+                Assignment::current(&state, &dispatch, attempt, self.reference)?;
+            if self.attempt == Some("") && controller::worker_callback().is_some() {
                 return Err(controller::invalid_worker_callback("ask").into());
             }
-            assignment.authorize_callback(&state, token.as_deref(), "ask")?;
+            assignment.authorize_callback(
+                &state,
+                token.as_deref(),
+                "ask",
+                attempt,
+                self.reference,
+            )?;
             ensure!(
                 env::var_os("WFC_SCOPE")
                     .is_none_or(|v| v.to_str() == Some(assignment.worker.scope())),
@@ -1594,19 +1991,20 @@ impl<'a> Ask<'a> {
             Ok((inbox, assignment, row, replay))
         };
         let (inbox, initial, row, replay) = check()?;
-        if let Some(replay) = replay {
-            return Ok(replay);
+        if let (Some(receipt), None) = (&replay, self.reference) {
+            return Ok(receipt.clone());
         }
-        // A new tmux or controlled-worker question holds the same attempt lock
-        // as close from observation through publication. Acquire it outside
-        // the inbox so a slow backend or close cannot block other scopes.
+        // New questions and authenticated receipt updates serialize with close.
+        // Wait for the execution lock outside Inbox.
         drop(inbox);
         let hosted = row["host"].is_string();
         let controlled = cfg!(target_os = "linux") && !hosted && row["worker"].is_object();
         let _close_lock = (row["backend"] == "tmux" || controlled)
             .then(|| super::assignment::close_lock(&state, &row))
             .transpose()?;
-        let blocked = if hosted {
+        let blocked = if replay.is_some() {
+            Ok(false)
+        } else if hosted {
             let mut inspected = row.clone();
             super::backend::observe(&state, &mut inspected).map(|(worker, _)| {
                 matches!(
@@ -1626,22 +2024,29 @@ impl<'a> Ask<'a> {
             blocked
         };
         let (mut inbox, assignment, current, replay) = check()?;
-        if let Some(replay) = replay {
-            return Ok(replay);
+        if let (Some(receipt), None) = (&replay, self.reference) {
+            return Ok(receipt.clone());
         }
         ensure!(
             initial.worker == assignment.worker
                 && ["host", "backend", "tmuxSocket", "endpoint", "executionId"]
                     .iter()
-                    .all(|key| row[*key] == current[*key]),
+                    .all(|key| row[*key] == current[*key])
+                && (self.reference.is_none() || row["create"] == current["create"]),
             "assignment changed while inspecting {dispatch}"
         );
+        let proof = authenticated_continued_input(&current, self.reference);
+        if let Some(receipt) = replay {
+            inbox.attach_continued_input_callback(&receipt, &assignment.worker, proof)?;
+            return Ok(receipt);
+        }
         ensure!(
             !blocked?,
             "attempt is no longer accepted for {dispatch}; its round is not running"
         );
         let mut message = Message::new(inbox.messages.len() as u64 + 1, assignment.worker, key);
         message.question_payload = Some(payload);
+        message.record_continued_input_callback(proof);
         let mut receipt = inbox.publish(message).context("publish question")?;
         receipt["next"] = json!("End your turn now; the answer arrives as your next message.");
         Ok(receipt)
