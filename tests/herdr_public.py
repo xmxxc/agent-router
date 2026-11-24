@@ -85,9 +85,516 @@ for line in sys.stdin:
         pid = self.service.api('pane.process_info', pane_id=other)['process_info']['shell_pid']
         return other, pid
 
+    def tmux_handoff_fixture(self, *, hold=False, scope=None, backend='tmux',
+                             endpoint=None, detached=False):
+        socket = self.root / 'handoff-tmux.sock'
+        self.env['WFC_TMUX_SOCKET'] = str(socket)
+        tmux = ['tmux', '-f', '/dev/null', '-S', str(socket)]
+        subprocess.run(tmux + ['new-session', '-d', '-s', 'sibling', '/bin/cat'],
+                       env=self.env, check=True, capture_output=True, timeout=5)
+        self.addCleanup(subprocess.run, tmux + ['kill-server'], env=self.env,
+                        capture_output=True, timeout=5)
+        traces = self.root / 'handoff-workers'
+        traces.mkdir()
+        self.worker.write_text('''import json, os, signal, subprocess, sys, time
+from pathlib import Path
+if os.getenv("HANDOFF_TEST_HOLD"):
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+attempt = os.environ["WFC_ATTEMPT"]
+keys = ("WFC_DISPATCH", "WFC_ROUND", "WFC_ATTEMPT", "WFC_SCOPE",
+        "WFC_REPORT", "WFC_TASK", "WFC_WORKER_CALLBACK")
+trace = {"callback": {key: os.environ[key] for key in keys},
+         "tmuxPane": os.getenv("TMUX_PANE"), "herdrPane": os.getenv("HERDR_PANE_ID"),
+         "pid": os.getpid(),
+         "startTicks": int(Path("/proc/self/stat").read_bytes().rsplit(b")", 1)[1].split()[19])}
+directory = Path("handoff-workers")
+if os.getenv("HANDOFF_TEST_DETACHED") and trace["herdrPane"]:
+    script = """import time
+from pathlib import Path
+deadline = time.monotonic() + 20
+while not Path("handoff-workers/release").exists() and time.monotonic() < deadline:
+    time.sleep(.025)
+"""
+    descendant = subprocess.Popen([sys.executable, "-c", script],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True)
+    trace["detached"] = {"pid": descendant.pid, "startTicks": int(
+        Path(f"/proc/{descendant.pid}/stat").read_bytes().rsplit(b")", 1)[1].split()[19])}
+check = directory / "reverse-check"
+if trace["tmuxPane"] and check.exists():
+    source = json.loads(check.read_bytes())
+    record = json.loads(Path(source["record"]).read_bytes())
+    marker = json.loads(Path(source["stop"]).read_bytes())
+    close, = [event for event in record["audit"] if event["operation"] == "close"]
+    try:
+        fields = Path(f'/proc/{source["pid"]}/stat').read_bytes().rsplit(b")", 1)[1].split()
+        old_alive = fields[0] not in (b"Z", b"X", b"x") and int(fields[19]) == source["startTicks"]
+    except FileNotFoundError:
+        old_alive = False
+    trace["sourceStoppedBeforeTarget"] = (not old_alive and marker["writerTreeStopped"]
+        and close["result"] == "completed" and close["attempt"] == marker["attempt"])
+tmp = directory / (attempt + ".tmp")
+tmp.write_text(json.dumps(trace))
+tmp.rename(directory / (attempt + ".json"))
+deadline = time.monotonic() + 45
+while not (directory / (attempt + ".quit")).exists() and time.monotonic() < deadline:
+    time.sleep(.025)
+''')
+        env = {}
+        if hold:
+            env['HANDOFF_TEST_HOLD'] = '1'
+        if detached:
+            env['HANDOFF_TEST_DETACHED'] = '1'
+        self.config.write_text(json.dumps({'hosts': {
+            'codex': {'command': [sys.executable, '-u', str(self.worker)], 'env': env},
+        }}))
+        flags = ('--scope', scope) if scope is not None else ()
+        if endpoint is not None:
+            flags += ('--herdr-endpoint', endpoint)
+        row = self.cli('dispatch', '--host', 'codex', '--backend', backend, '--task', self.task,
+                       '--cwd', self.root, '--report', self.root/'report.md',
+                       '--launch-config', self.config, *flags)
+        self.dispatch_id = row['dispatch']
+        self.handoff_traces = traces
+        original = self.handoff_trace(row['attempt'])
+
+        def stop_workers():
+            (traces / 'release').touch()
+            for trace in traces.glob('*.json'):
+                (traces / (trace.stem + '.quit')).touch()
+            workers = [json.loads(trace.read_bytes()) for trace in traces.glob('*.json')]
+            workers += [worker['detached'] for worker in workers if 'detached' in worker]
+            live.wait_for(lambda: all(not self.handoff_worker_alive(worker) for worker in workers))
+
+        self.addCleanup(stop_workers)
+        return row, original
+
+    def handoff_trace(self, attempt):
+        trace = self.handoff_traces / (attempt + '.json')
+        return live.wait_for(lambda: json.loads(trace.read_bytes()) if trace.is_file() else None)
+
+    def handoff_worker_alive(self, trace):
+        try:
+            stat = Path(f'/proc/{trace["pid"]}/stat').read_bytes()
+        except (FileNotFoundError, ProcessLookupError):
+            return False
+        fields = stat.rsplit(b')', 1)[1].split()
+        return fields[0] not in (b'Z', b'X', b'x') and int(fields[19]) == trace['startTicks']
+
+    def target_handoff(self, endpoint):
+        return ('handoff', self.dispatch_id, '--host', 'codex', '--backend', 'herdr',
+                '--herdr-endpoint', endpoint)
+
+    def handoff_source_evidence(self, source):
+        state = Path(self.env['WFC_STATE'])
+        archive = state / 'dispatches' / f'{source["dispatch"]}.{source["attempt"]}.closed'
+        stopped = Path(source['create']['receipt']).with_suffix('.stopped')
+        return archive, stopped
+
+    def test_tmux_to_herdr_handoff_preserves_original_receipts_and_launches_once(self):
+        source, old = self.tmux_handoff_fixture()
+        archive, stopped = self.handoff_source_evidence(source)
+        worker_env = {k:v for k,v in self.env.items() if k != 'WFC_CONTROLLER_TOKEN'} | old['callback']
+        question = subprocess.check_output([live.DRIVER, 'ask', 'original', '--attempt', source['attempt']],
+                                           env=worker_env, text=True, timeout=6)
+        question = json.loads(question)
+        assignment = Path(self.env['WFC_STATE']) / 'dispatches' / f'{self.dispatch_id}.json'
+        original = assignment.read_bytes()
+        for bad in (('handoff', self.dispatch_id, '--host', 'codex', '--backend', 'herdr'),
+                    self.target_handoff(self.root/'offline.sock')):
+            self.cli(*bad, error='Herdr')
+            self.assertEqual(assignment.read_bytes(), original)
+            self.assertFalse(archive.exists())
+            self.assertTrue(self.handoff_worker_alive(old))
+        lock = assignment.with_suffix('.herdr-lock')
+        lock.symlink_to(self.root/'missing-lock-target')
+        try:
+            self.cli(*self.target_handoff(self.service.endpoint), error='assignment lock')
+            self.assertEqual(assignment.read_bytes(), original)
+            self.assertFalse(archive.exists())
+            self.assertTrue(self.handoff_worker_alive(old))
+        finally:
+            lock.unlink()
+
+        effects = []
+        corrupt_snapshot = True
+
+        def snapshot(request, response):
+            if corrupt_snapshot and request['method'] == 'session.snapshot':
+                response['result']['snapshot'] = {}
+            return response
+
+        def verify_before_forwarding(stream):
+            frame = stream.readline()
+            request = json.loads(frame)
+            if request['method'] in ('workspace.create', 'layout.apply'):
+                close = json.loads(archive.read_bytes())
+                stop = json.loads(stopped.read_bytes())
+                self.assertEqual(close['closeOperationId'], f'close:{source["attempt"]}')
+                self.assertEqual((stop['launchId'], stop['attempt']),
+                                 (stopped.stem, source['attempt']))
+                self.assertFalse(self.handoff_worker_alive(old))
+                effects.append(request['method'])
+            return frame
+
+        with self.service.fault_proxy(snapshot, read_frame=verify_before_forwarding) as proxy:
+            args = self.target_handoff(proxy)
+            self.cli(*args, error='incomplete Herdr target snapshot')
+            self.assertEqual(assignment.read_bytes(), original)
+            self.assertFalse(archive.exists())
+            self.assertTrue(self.handoff_worker_alive(old))
+            self.assertEqual(effects, [])
+            corrupt_snapshot = False
+            result = self.cli(*args)
+            self.assertEqual((result['result'], result['backend'], result['endpoint'], result['round'],
+                              result['fromAttempt']), ('accepted', 'herdr', str(proxy), 1, source['attempt']))
+            self.assertNotEqual(result['attempt'], source['attempt'])
+            new = self.handoff_trace(result['attempt'])
+            self.assertEqual(new['callback']['WFC_TASK'], old['callback']['WFC_TASK'])
+            self.assertNotEqual(new['callback']['WFC_WORKER_CALLBACK'],
+                                old['callback']['WFC_WORKER_CALLBACK'])
+            self.assertIsNone(new['tmuxPane'])
+            row = self.status()
+            self.assertEqual(new['herdrPane'], row['backendHandle']['pane'])
+            original_close = archive.read_bytes()
+            event, = row['audit']
+            self.assertEqual(event['target']['service'], row['backendHandle']['service'])
+            self.assertEqual(event['close']['closeOperationId'], f'close:{source["attempt"]}')
+            message, = row['messages']
+            self.assertEqual((message['attempt'], message['messageId'], message['id']),
+                             (source['attempt'], question['messageId'], question['message']))
+            self.assertEqual(self.cli(*args), {**result, 'duplicate':True})
+            self.cli(*self.target_handoff(self.service.endpoint), error='Herdr source handoff')
+            self.assertTrue(self.handoff_worker_alive(new))
+            self.assertEqual(archive.read_bytes(), original_close)
+            self.assertEqual(effects, ['workspace.create', 'layout.apply'])
+            print(json.dumps({'target':event['target'], 'oldClose':event['close']['closeOperationId'],
+                              'oldMessageId':message['messageId'], 'createCalls':effects,
+                              'differentHerdrTargetRefused':True, 'duplicate':True}))
+
+    def test_tmux_to_herdr_handoff_does_not_retry_after_layout_reply_loss(self):
+        source, _ = self.tmux_handoff_fixture()
+        archive, stopped = self.handoff_source_evidence(source)
+        effects = []
+        def lose(request, response):
+            if request['method'] in ('workspace.create', 'layout.apply'):
+                self.assertTrue(archive.is_file() and stopped.is_file())
+                effects.append(request['method'])
+            return None if request['method'] == 'layout.apply' else response
+
+        with self.service.fault_proxy(lose) as proxy:
+            args = self.target_handoff(proxy)
+            result = self.cli(*args)
+            self.assertEqual(result['result'], 'uncertain', result)
+            new = self.handoff_trace(result['attempt'])
+            self.assertTrue(self.handoff_worker_alive(new))
+            for replay in (args, self.target_handoff(self.service.endpoint)):
+                pending = self.cli(*replay)
+                for key in ('attempt','audit','fromAttempt','result','endpoint'):
+                    self.assertEqual(pending[key], result[key])
+            row = self.status()
+            self.assertEqual(row['audit'][0]['result'], 'uncertain')
+            self.assertEqual(row['audit'][0]['phase'], 'starting')
+            self.assertEqual(effects, ['workspace.create', 'layout.apply'])
+            self.assertEqual(len(list(self.handoff_traces.glob('*.json'))), 2)
+            print(json.dumps({'lostLayoutReply':True, 'audit':result['audit'],
+                              'attempt':result['attempt'], 'effects':effects,
+                              'changedEndpointStillPending':True}))
+
+    def test_tmux_to_herdr_handoff_waits_for_source_writer(self):
+        source, old = self.tmux_handoff_fixture(hold=True)
+        archive, stopped = self.handoff_source_evidence(source)
+        effects = []
+        def observe(request, response):
+            if request['method'] in ('workspace.create', 'layout.apply'):
+                effects.append(request['method'])
+            return response
+        with self.service.fault_proxy(observe) as proxy:
+            args = self.target_handoff(proxy)
+            result = self.cli(*args)
+            self.assertEqual(result['result'], 'uncertain')
+            self.assertIn('original writer has not stopped', result['diagnostic'])
+            self.assertTrue(archive.is_file())
+            self.assertFalse(stopped.exists())
+            self.assertTrue(self.handoff_worker_alive(old))
+            replay = self.cli(*args)
+            self.assertEqual((replay['result'], replay['audit']), ('uncertain', result['audit']))
+            self.assertEqual(effects, [])
+            print(json.dumps({'closeRecorded':True, 'writerSurvived':True,
+                              'targetEffects':effects, 'audit':result['audit']}))
+
+    def test_tmux_to_herdr_handoff_refuses_a_replaced_service(self):
+        source, old = self.tmux_handoff_fixture(hold=True)
+        archive, stopped = self.handoff_source_evidence(source)
+        endpoint = self.service.endpoint
+        def workspace_ids():
+            return sorted(row['workspace_id']
+                          for row in self.service.api('session.snapshot')['snapshot']['workspaces'])
+
+        workspaces = workspace_ids()
+        quit_file = self.handoff_traces / (source['attempt'] + '.quit')
+        with self.service.fault_proxy(lambda req, reply: reply) as proxy:
+            args = self.target_handoff(proxy)
+            swapped = False
+            with subprocess.Popen([live.DRIVER, *map(str, args)], env=self.env, text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE) as handoff:
+                try:
+                    live.wait_for(archive.is_file)
+                    self.assertTrue(self.handoff_worker_alive(old))
+                    # The original proxy and the already-running Herdr service
+                    # have different peers. Swap only the private socket name.
+                    endpoint.replace(proxy)
+                    swapped = True
+                    quit_file.touch()
+                    out, err = handoff.communicate(timeout=15)
+                finally:
+                    quit_file.touch()
+                    try:
+                        if handoff.poll() is None:
+                            handoff.kill()
+                            handoff.communicate(timeout=5)
+                    finally:
+                        if swapped:
+                            proxy.replace(endpoint)
+            self.assertEqual(handoff.returncode, 0, err)
+            result = json.loads(out)
+            self.assertEqual(result['result'], 'uncertain')
+            self.assertIn('Herdr service identity changed', result['diagnostic'])
+            self.assertTrue(stopped.is_file())
+            self.assertEqual(workspace_ids(), workspaces)
+            self.assertEqual(len(list(self.handoff_traces.glob('*.json'))), 1)
+            replay = self.cli(*args)
+            self.assertEqual((replay['result'], replay['audit'], replay['attempt']),
+                             ('uncertain', result['audit'], result['attempt']))
+            print(json.dumps({'replacedTargetPeer':True, 'originalStopped':True,
+                              'targetWorkspaceUnchanged':True, 'audit':result['audit']}))
+
+    def reverse_handoff(self, dispatch):
+        return ('handoff', dispatch, '--host', 'codex', '--backend', 'tmux')
+
+    def handoff_record(self, source):
+        state = Path(self.env['WFC_STATE'])
+        return state / 'dispatches' / f'{source["dispatch"]}.json'
+
+    def assert_no_tmux_handoff(self):
+        socket = self.env['WFC_TMUX_SOCKET']
+        sessions = subprocess.check_output(['tmux', '-S', socket, 'list-sessions', '-F', '#{session_name}'],
+                                          env=self.env, text=True, timeout=5)
+        self.assertEqual(sessions.splitlines(), ['sibling'])
+        self.assertEqual(len(list(self.handoff_traces.glob('*.json'))), 1)
+        self.assertFalse(list((Path(self.env['WFC_STATE'])/'launches').glob('*.submission')))
+
+    def assert_reverse_pending(self, args, first, source):
+        self.assertEqual(first['result'], 'uncertain', first)
+        replay = self.cli(*args)
+        for key in ('audit', 'attempt', 'fromAttempt', 'endpoint', 'result'):
+            self.assertEqual(replay[key], first[key], key)
+        row = self.status()
+        self.assertEqual(row['attempt'], source['attempt'])
+        self.assertEqual(sum(event['operation'] == 'handoff' for event in row['audit']), 1)
+        self.assert_no_tmux_handoff()
+        return row
+
+    def test_herdr_to_tmux_handoff_waits_for_confirmed_original_stop(self):
+        source, old = self.tmux_handoff_fixture(backend='herdr')
+        args = self.reverse_handoff(source['dispatch'])
+        path = self.handoff_record(source)
+        receipt = Path(source['create']['receipt'])
+        stopped = receipt.with_suffix('.stopped')
+        old_row = path.read_bytes()
+        socket = self.env['WFC_TMUX_SOCKET']
+        self.env['WFC_TMUX_SOCKET'] = str(self.root/'offline-tmux.sock')
+        self.cli(*args, error='target tmux service')
+        self.env['WFC_TMUX_SOCKET'] = socket
+        self.assertEqual(path.read_bytes(), old_row)
+        self.assertTrue(self.handoff_worker_alive(old))
+        self.assert_no_tmux_handoff()
+        (self.handoff_traces/'reverse-check').write_text(json.dumps(dict(old, record=str(path), stop=str(stopped))))
+        worker_env = {k:v for k,v in self.env.items() if k != 'WFC_CONTROLLER_TOKEN'} | old['callback']
+        question = json.loads(subprocess.check_output(
+            [live.DRIVER, 'ask', 'original Herdr question', '--attempt', source['attempt']],
+            env=worker_env, text=True, timeout=6))
+        report = Path(source['report'])
+        report.write_text('original contents')
+        result = self.cli(*args)
+        self.assertEqual((result['result'], result['backend'], result['endpoint'],
+                          result['fromAttempt'], result['round']),
+                         ('accepted', 'tmux', socket, source['attempt'], source['round']))
+        self.assertNotEqual(result['attempt'], source['attempt'])
+        trace = self.handoff_trace(result['attempt'])
+        self.assertTrue(trace['sourceStoppedBeforeTarget'])
+        self.assertIsNotNone(trace['tmuxPane'])
+        self.assertIsNone(trace['herdrPane'])
+        self.assertEqual(report.read_text(), 'original contents')
+        self.assertEqual(trace['callback']['WFC_REPORT'], str(report))
+        row = self.status()
+        event, closed = row['audit']
+        self.assertEqual((event['id'], event['phase'], event['fromBackend']),
+                         (result['audit'], 'complete', 'herdr'))
+        self.assertEqual(event['close']['id'], closed['id'])
+        self.assertEqual(closed['closeOperationId'], f'close:{source["attempt"]}')
+        self.assertEqual(closed['executionId'], source['attempt'])
+        self.assertEqual(event['writerStopEvidence'], json.loads(stopped.read_bytes()))
+        self.assertEqual((row['rounds'][0]['attempt'], row['rounds'][1]['attempt']),
+                         (source['attempt'], result['attempt']))
+        message, = row['messages']
+        self.assertEqual((message['attempt'], message['id'], message['messageId']),
+                         (source['attempt'], question['message'], question['messageId']))
+        closed_bytes = stopped.read_bytes()
+        self.assertEqual(self.cli(*args), {**result, 'duplicate':True})
+        self.assertEqual(stopped.read_bytes(), closed_bytes)
+        self.assertEqual(len(list(self.handoff_traces.glob('*.json'))), 2)
+        self.assertEqual(len(list((stopped.parent).glob('*.submission'))), 1)
+        print(json.dumps({'audit':result['audit'], 'sourceStoppedBeforeTarget':True,
+                          'close':closed['closeOperationId'], 'oldMessageId':message['messageId'],
+                          'tmuxSubmissions':1, 'duplicate':True}))
+
+    def test_herdr_to_tmux_handoff_legacy_receipt_stays_pending(self):
+        source, old = self.tmux_handoff_fixture(backend='herdr')
+        args = self.reverse_handoff(source['dispatch'])
+        path = self.handoff_record(source)
+        row = json.loads(path.read_bytes())
+        row.pop('executionId')
+        for key in ('herdrBinding', 'dispatch', 'attempt', 'round'):
+            row['create'].pop(key)
+        path.write_text(json.dumps(row))
+        first = self.cli(*args)
+        self.assertIn('supervision', first['diagnostic'])
+        view = self.assert_reverse_pending(args, first, source)
+        self.assertEqual([event['operation'] for event in view['audit']], ['handoff'])
+        self.assertEqual(view['status'], 'online')
+        preflight, = view['audit']
+        self.assertEqual(preflight['phase'], 'preflight')
+        self.assertFalse(any(field in preflight for field in ('toAttempt', 'close', 'launch')))
+        self.assertFalse(list(Path(self.env['WFC_STATE']).glob('handoff-order-*.json')))
+        socket = Path(self.env['WFC_TMUX_SOCKET'])
+        hidden = socket.with_suffix('.hidden')
+        socket.rename(hidden)
+        try:
+            self.assertEqual(self.cli(*args), first)
+        finally:
+            hidden.rename(socket)
+        self.assertTrue(self.handoff_worker_alive(old))
+        worker_env = {k:v for k,v in self.env.items() if k != 'WFC_CONTROLLER_TOKEN'} | old['callback']
+        question = json.loads(subprocess.check_output(
+            [live.DRIVER, 'ask', 'still running', '--attempt', source['attempt']],
+            env=worker_env, text=True, timeout=6))
+        report = Path(source['report'])
+        report.write_text('completed by the original worker')
+        done = json.loads(subprocess.check_output(
+            [live.DRIVER, 'done', '--report', report, '--attempt', source['attempt']],
+            env=worker_env, text=True, timeout=6))
+        view = self.assert_reverse_pending(args, first, source)
+        self.assertEqual(view['status'], 'completed')
+        self.assertEqual([message['messageId'] for message in view['messages']],
+                         [question['messageId'], done['messageId']])
+        self.assertEqual(view['audit'], [preflight])
+        self.cli(*args, '--task', self.task, '--report', self.root/'next-report.md',
+                 error='first-round target')
+        self.assertEqual(self.status()['audit'], [preflight])
+        self.assert_no_tmux_handoff()
+        print(json.dumps({'legacyReceipt':True, 'audit':first['audit'], 'tmuxSubmissions':0}))
+
+    def test_tmux_herdr_tmux_handoff_restores_public_session(self):
+        original, _ = self.tmux_handoff_fixture()
+        _, old_stop = self.handoff_source_evidence(original)
+        first = self.cli(*self.target_handoff(self.service.endpoint))
+        self.assertEqual(first['result'], 'accepted', first)
+        herdr = self.status()
+        self.handoff_trace(first['attempt'])
+        args = self.reverse_handoff(original['dispatch'])
+        final = self.cli(*args)
+        self.assertEqual(final['result'], 'accepted', final)
+        self.assertEqual(final['fromAttempt'], herdr['attempt'])
+        trace = self.handoff_trace(final['attempt'])
+        view = self.status()
+        self.assertEqual(view['tmux'], 'wfc-' + original['dispatch'])
+        self.assertIsNotNone(trace['tmuxPane'])
+        self.assertEqual(self.cli(*args), {**final, 'duplicate':True})
+        self.assertTrue(old_stop.is_file())
+        self.assertEqual(len(list(self.handoff_traces.glob('*.json'))), 3)
+        self.assertEqual([event['id'] for event in view['audit']
+                          if event['operation'] == 'handoff'], [first['audit'], final['audit']])
+        print(json.dumps({'roundTrip':True, 'session':view['tmux'],
+                          'audits':[first['audit'], final['audit']]}))
+
+    def test_herdr_to_tmux_handoff_surviving_descendant_stays_pending(self):
+        source, old = self.tmux_handoff_fixture(backend='herdr', detached=True)
+        stopped = Path(source['create']['receipt']).with_suffix('.stopped')
+        args = self.reverse_handoff(source['dispatch'])
+        first = self.cli(*args)
+        self.assert_reverse_pending(args, first, source)
+        self.assertFalse(self.handoff_worker_alive(old))
+        self.assertTrue(self.handoff_worker_alive(old['detached']))
+        self.assertFalse(stopped.exists())
+        print(json.dumps({'survivingDetachedDescendant':True, 'audit':first['audit'],
+                          'tmuxSubmissions':0}))
+
+    def test_herdr_to_tmux_handoff_lost_close_keeps_original_audit(self):
+        effects = []
+        refused = []
+        def read_frame(stream):
+            frame = stream.readline()
+            if json.loads(frame)['method'] != 'pane.close':
+                return frame
+            self.assertTrue(self.handoff_worker_alive(old))
+            for callback in (('ask', 'must stay fenced'), ('done', '--report', source['report'])):
+                result = subprocess.run(
+                    [live.DRIVER, *callback, '--attempt', source['attempt']],
+                    env=worker_env, text=True, capture_output=True, timeout=2)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn('handoff is closing the old execution', result.stderr)
+                refused.append(callback[0])
+            return frame
+
+        def lose(request, response):
+            if request['method'] == 'pane.close':
+                effects.append(request['params']['pane_id'])
+                return None
+            return response
+        with self.service.fault_proxy(lose, read_frame=read_frame) as proxy:
+            source, old = self.tmux_handoff_fixture(backend='herdr', endpoint=proxy)
+            worker_env = {k:v for k,v in self.env.items() if k != 'WFC_CONTROLLER_TOKEN'} | old['callback']
+            Path(source['report']).write_text('completion must stay fenced')
+            args = self.reverse_handoff(source['dispatch'])
+            first = self.cli(*args)
+            view = self.assert_reverse_pending(args, first, source)
+            event, close = view['audit']
+            self.assertEqual((event['id'], event['phase'], close['result']),
+                             (first['audit'], 'closing', 'uncertain'))
+            self.assertEqual(effects, [source['backendHandle']['pane']])
+            self.assertEqual(refused, ['ask', 'done'])
+            self.assertFalse(any(message['type'] in ('question', 'done') for message in view['messages']))
+            print(json.dumps({'lostCloseReply':True, 'audit':first['audit'],
+                              'closeCalls':len(effects), 'refusedCallbacks':refused,
+                              'tmuxSubmissions':0}))
+
+    def test_herdr_to_tmux_handoff_mismatched_stop_stays_pending(self):
+        stopped = None
+        def change(request, response):
+            if request['method'] == 'pane.close':
+                live.wait_for(stopped.is_file)
+                marker = json.loads(stopped.read_bytes())
+                marker['attempt'] = 'a-' + '0'*32
+                substitute = stopped.with_suffix('.fixture')
+                substitute.write_text(json.dumps(marker))
+                substitute.replace(stopped)
+            return response
+        with self.service.fault_proxy(change) as proxy:
+            source, old = self.tmux_handoff_fixture(backend='herdr', endpoint=proxy)
+            stopped = Path(source['create']['receipt']).with_suffix('.stopped')
+            args = self.reverse_handoff(source['dispatch'])
+            first = self.cli(*args)
+            view = self.assert_reverse_pending(args, first, source)
+            event, close = view['audit']
+            self.assertEqual((event['id'], close['result']), (first['audit'], 'completed'))
+            self.assertFalse(self.handoff_worker_alive(old))
+            print(json.dumps({'mismatchedStop':True, 'closeCompleted':True,
+                              'audit':first['audit'], 'tmuxSubmissions':0}))
+
     def test_dispatch_current_execution_done_and_close(self):
         self.dispatch()
-        self.env['WFC_HERDR_ENDPOINT'] = '/missing/different.sock'
+        self.env['WFC_HERDR_ENDPOINT'] = str(self.root/'different.sock')
         view = self.status()
         self.assertTrue(view['backendAlive'])
         self.assertNotIn('workerCallbackHash', self.row)
@@ -988,6 +1495,9 @@ for line in sys.stdin:
             other, sibling_pid = self.sibling()
             first = self.cli('close', self.dispatch_id)
             self.assertEqual(first['result'], 'uncertain')
+            if forward:
+                receipt = Path(self.h['receipt'])
+                live.wait_for(lambda: json.loads(receipt.read_bytes())['category'] == 'process_exited')
             view = self.status()
             self.assertTrue(view['closePending'])
             self.assertEqual(view['status'], 'unknown')
@@ -1385,13 +1895,35 @@ Path('done-received').write_bytes(reply)
             self.assert_pending_views('unknown')
             (self.root/'exit-main').touch()
             live.wait_for(lambda: self.status()['launch'].get('exitCode') == 17)
-        self.assert_pending_views(pending_status)
+        view = self.assert_pending_views(pending_status)
+        if not worker_first:
+            self.assertEqual(view['launch']['exitCode'], 17)
+            # Ensure the overlap is exercised even if CI ran the worker
+            # beyond the short startup window before releasing it.
+            path = self.handoff_record(self.row)
+            original = json.loads(path.read_bytes())
+            event, = original['audit']
+            history = view['messages']
+            if not any(message.get('kind') == 'startup_failure' for message in history):
+                notice = {'kind':'startup_failure', 'type':'exited', 'messageId':'fixture-old-startup',
+                          'dispatch':self.dispatch_id, 'round':self.row['round'], 'attempt':self.row['attempt'],
+                          'fault':{'category':'process_exited', 'exitCode':17}}
+                history = [*history, notice]
+                original['messages'] = [*original.get('messages', []), notice]
+                path.write_text(json.dumps(original))
+            pending = self.assert_pending_views('unknown')
+            self.assertEqual(pending['messages'], history)
+            self.assertEqual(pending['audit'], [event])
         live.wait_for(lambda: self.cli('close', self.dispatch_id)['result'] == 'completed')
         final = self.status()
         self.assertFalse(final['closePending'])
         self.assertEqual(final['status'], 'failed' if worker_first else 'cancelled')
         if worker_first:
             self.assertEqual(final['worker']['exit_code'], 17)
+        else:
+            self.assertEqual(final['launch']['exitCode'], 17)
+            self.assertEqual(final['messages'], history)
+            self.assertEqual(final['audit'][0]['id'], event['id'])
         self.assertEqual(len(calls), 0 if worker_first else 1)
 
     def test_writer_survives_pane_close(self):

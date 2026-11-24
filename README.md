@@ -162,6 +162,12 @@ wfc wait --scope team-a --timeout 30
 
 Linux 的 `wfc handoff DISPATCH --host HOST [--task PATH --report PATH] [--model MODEL]` 支持同一仍在运行的原生 tmux 服务内切换宿主。未完成的任务在同一轮换 attempt，已完成的任务需要一对新路径才开启下一轮。新报告须留在原报告目录且此前未用过。交接记录保留旧宿主、旧模型和旧回执，替换 worker 使用自己的回调凭据。旧会话关停和原监督进程的全树退出回执都获证后，才提交一次新启动。缺少这份退出回执的旧启动需要先对账。若关停或启动结果失联，同一交接保持待核对，重试返回原审计，现有回收和接管入口保留围栏。
 
+首轮未完成的原生 tmux 派工可用 `wfc handoff DISPATCH --host HOST --backend herdr --herdr-endpoint /path/to/herdr.sock` 交给 Herdr。派工须处于无主 scope。关闭前会核验目标 Herdr 服务，派出时再次核对同一进程身份。原 tmux 的关闭与进程树停止凭据都齐全后，才会在 Herdr 创建工作区和启动 worker。重复调用原命令会复取同一次交接，目标失回执后保持待核对。
+
+无主 scope 内首轮未完成的原生 Herdr 派工可用 `WFC_TMUX_SOCKET=/path/to/tmux.sock wfc handoff DISPATCH --host HOST --backend tmux` 切到已有的 tmux 服务。先核对原 Herdr 的启动记录和目标会话名，随后验证同次关闭和全进程树停止凭据。未具备监督记录的旧启动，以及关闭或全树退出结果不明的交接，都保留原交接号待核对，目标端不启动。
+
+如果只读预检缺少原启动的全进程树监督凭据，同一请求会返回原诊断号，原 worker 仍可提问和提交完成回执。真正登记关闭后，原 worker 的新回调受交接围栏约束。派工从 Herdr 切到 tmux 后，现有的 Herdr 派工锁会在再次进入 Herdr 的预检中安全拒绝请求。自动重用该锁和按 attempt 区分旧关闭记录留待后续支持。
+
 外部投递结果为 `unknown` 时，先核实对方确已收到，再用下面的命令记录证据。
 
 ```sh

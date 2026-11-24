@@ -144,10 +144,33 @@ fn record<'a>(snapshot: &'a Value, list: &str, key: &str, id: &str) -> Result<Op
 }
 
 impl Handle {
+    /// Read-only capability and peer probe for a caller planning a later create.
+    pub fn probe_service(endpoint: &Path) -> Result<Process> {
+        let rpc = Session::open(endpoint, None)?;
+        let snapshot = rpc.snapshot()?;
+        if !["workspaces", "panes", "tabs"]
+            .iter()
+            .all(|key| snapshot[*key].is_array())
+        {
+            return Err(Failure::refused("incomplete Herdr target snapshot"));
+        }
+        Ok(rpc.service)
+    }
+
     /// Call once for a reserved create. Failure after workspace creation keeps
     /// the last checkpoint pending. Only observation may be retried.
     pub fn create(
         endpoint: &Path,
+        attempt: &str,
+        launch: &Launch,
+        save: impl FnMut(&Self) -> std::io::Result<()>,
+    ) -> Result<Self> {
+        Self::create_with_service(endpoint, None, attempt, launch, save)
+    }
+
+    pub fn create_with_service(
+        endpoint: &Path,
+        expected: Option<&Process>,
         attempt: &str,
         launch: &Launch,
         mut save: impl FnMut(&Self) -> std::io::Result<()>,
@@ -175,7 +198,7 @@ impl Handle {
             writers: vec![],
             stopped_evidence: None,
         };
-        let rpc = Session::open(endpoint, None)?;
+        let rpc = Session::open(endpoint, expected)?;
         handle.service = Some(rpc.service.clone());
         checkpoint(&handle)?;
         let created = rpc.call(
