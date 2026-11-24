@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Run from the fixed product checkout on the Linux runner.
+set -euo pipefail
+
+group=${1:?test group required}
+case "$group" in
+    close-identity)
+        fixture=tools/check_tmux.py
+        selectors=(
+            Backend.test_public_close_waits_for_unknown_identity_stop_proof
+            Backend.test_public_close_keeps_session_only_for_old_missing_identity_field
+            Backend.test_read_only_unowned_close_replays_confirmed_archive
+            Backend.test_lost_close_confirmation
+            Backend.test_public_handoff_switches_host_once_in_the_same_round
+            Backend.test_public_handoff_never_launches_while_the_original_writer_survives
+        )
+        ;;
+    handoff-startup)
+        fixture=tools/check_tmux.py
+        selectors=(Backend.test_public_handoff_preserves_startup_notice_and_original_close)
+        ;;
+    host-resume)
+        fixture=tests/public_host_resume.py
+        selectors=(
+            PublicHostResume.test_opencode_adopts_original_session_and_commits_one_next_task
+            PublicHostResume.test_claude_retries_when_initial_launch_receipt_could_not_be_created
+        )
+        ;;
+    private-startup)
+        fixture=tests/startup_failure.py
+        selectors=(StartupFailure.test_private_opencode_startup_failure_and_retry)
+        ;;
+    *)
+        printf 'Unknown test group %s\n' "$group" >&2
+        exit 2
+        ;;
+esac
+
+scratch=$(mktemp -d /tmp/wfc-resume-XXXXXXXX)
+cleanup() {
+    local status=$? removed=no
+    trap - EXIT
+    if rm -rf -- "$scratch" && [[ ! -e "$scratch" && ! -L "$scratch" ]]; then
+        removed=yes
+    else
+        status=1
+    fi
+    printf '%s exit=%s group_root_removed=%s\n' "$group" "$status" "$removed" |
+        tee -a "$EVIDENCE/results.log"
+    exit "$status"
+}
+trap cleanup EXIT
+
+test "$(id -u)" -ne 0
+test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+binary=$(realpath "target/$TARGET/release/wfc")
+python=$(command -v python3)
+reaper=$(realpath ../ci/tools/ci/resume/reap.py)
+runner=$(realpath ../ci/tools/ci/resume/run.py)
+version=$("$binary" --version)
+printf 'fixture=%s binary=%s\n%s\n' "$fixture" "$binary" "$version"
+[[ "$version" == *"(Rust, $TARGET, release, build $PRODUCT_SHA)" ]]
+sha256sum --check --strict "$EVIDENCE/elf.sha256"
+sha256sum "$binary"
+
+mkdir -- "$scratch/home" "$scratch/codex" "$scratch/state" "$scratch/tmp"
+printf 'HOME=%s CODEX_HOME=%s WFC_STATE=%s TMPDIR=%s WFC_TMUX_SOCKET=%s\n' \
+    "$scratch/home" "$scratch/codex" "$scratch/state" "$scratch/tmp" "$scratch/tmux.sock"
+status=0
+env -i PATH="$PATH" LC_ALL=C.UTF-8 TERM=xterm-256color PYTHONUTF8=1 \
+    HOME="$scratch/home" CODEX_HOME="$scratch/codex" WFC_STATE="$scratch/state" \
+    TMPDIR="$scratch/tmp" WFC_TMUX_SOCKET="$scratch/tmux.sock" \
+    "$python" -Bu "$reaper" "$scratch" "$EVIDENCE/$group-processes.log" \
+    timeout --kill-after=10s 4m "$python" -Bu "$runner" \
+    "$scratch" "$fixture" "$binary" "$EVIDENCE/$group-observations.log" "${selectors[@]}" || status=$?
+sha256sum --check --strict "$EVIDENCE/elf.sha256"
+exit "$status"
