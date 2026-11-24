@@ -244,7 +244,7 @@ for line in sys.stdin:
         self.driver('close','completed')
 
     @contextlib.contextmanager
-    def fault_proxy(self, change, *, read_frame=None):
+    def fault_proxy(self, change, *, read_frame=None, respond_before_forward=None):
         endpoint = self.root / 'proxy.sock'
         errors = []
         stop = threading.Event()
@@ -265,8 +265,10 @@ for line in sys.stdin:
                             if frame is None:
                                 continue
                             req = json.loads(frame)
-                            response = json.loads(exchange(self.endpoint,req))
-                            reply = change(req,response)
+                            reply = respond_before_forward(req) if respond_before_forward else None
+                            if reply is None:
+                                response = json.loads(exchange(self.endpoint,req))
+                                reply = change(req,response)
                             if reply is not None:
                                 conn.sendall(json.dumps(reply).encode()+b'\n')
                 except Exception as err:

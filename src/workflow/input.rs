@@ -264,6 +264,11 @@ impl<'a> Request<'a> {
             worker
         };
 
+        // The scope lock prevents this scope's owner from changing across
+        // observation and send. Recheck its clock at the first socket write.
+        let herdr_owners = herdr_input
+            .then(|| controller::Owners::read(&state))
+            .transpose()?;
         let (mut next, index, text, generation) = {
             let inbox = messages::Inbox::open(&state)?;
             let generation = authorized_generation(&state, scope, token.as_deref(), operation)?;
@@ -397,9 +402,13 @@ impl<'a> Request<'a> {
                         );
                     }
                 } else {
-                    ensure!(
+                    let current_generation = if let Some(owners) = &herdr_owners {
+                        owner_generation(owners, scope, token.as_deref(), operation)?
+                    } else {
                         authorized_generation(&state, scope, token.as_deref(), operation)?
-                            == generation,
+                    };
+                    ensure!(
+                        current_generation == generation,
                         "scope owner changed before input"
                     );
                 }
@@ -423,10 +432,12 @@ impl<'a> Request<'a> {
             } else {
                 wfc_herdr::CodexInput::Nudge
             };
-            target.submit(action, &text, || {
-                check_boundary(PrepareText)
-                    .and_then(|()| check_boundary(Text))
-                    .map_err(|error| std::io::Error::other(error.to_string()))
+            target.submit(action, &text, |boundary| {
+                let boundary = match boundary {
+                    wfc_herdr::InputBoundary::Prepare => PrepareText,
+                    wfc_herdr::InputBoundary::Send => Text,
+                };
+                check_boundary(boundary).map_err(|error| std::io::Error::other(error.to_string()))
             })
         } else {
             backend::submit_checked(&state, &current, &text, true, &mut check_boundary)
@@ -604,9 +615,16 @@ fn authorized_generation(
     token: Option<&str>,
     operation: &str,
 ) -> Result<Value> {
-    let owners = controller::Owners::read(state)?;
-    owners.require(scope, token, operation)?;
-    Ok(owners.public(scope)?.unwrap_or(Value::Null)["generation"].clone())
+    owner_generation(&controller::Owners::read(state)?, scope, token, operation)
+}
+
+fn owner_generation(
+    owners: &controller::Owners,
+    scope: &str,
+    token: Option<&str>,
+    operation: &str,
+) -> Result<Value> {
+    Ok(json!(owners.authorized_generation(scope, token, operation)?))
 }
 
 fn lock_input(

@@ -456,6 +456,45 @@ for line in sys.stdin:
             self.assertEqual(writes, ['pane.send_input'])
             self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
 
+    def test_continue_retries_after_herdr_rejects_input_without_enqueueing(self):
+        rejected, forwarded = [], []
+
+        def refuse_first(request):
+            if request['method'] == 'pane.send_input' and not rejected:
+                rejected.append(request['id'])
+                return {'id': request['id'], 'error': {
+                    'code': 'pane_send_failed', 'message': 'test queue did not accept input',
+                }}
+
+        def count(request, response):
+            if request['method'] in ('pane.send_input', 'pane.send_keys'):
+                forwarded.append((request['method'], request['id'], request['params']['pane_id']))
+            return response
+
+        with self.service.fault_proxy(count, respond_before_forward=refuse_first) as proxy:
+            first, report, options = self.setup_continue_project(proxy)
+            original_report = (self.root/'report.md').read_bytes()
+            self.cli(*options, error='Herdr did not enqueue worker input')
+            view = self.status()
+            self.assertEqual((view['round'], view['attempt'], view['state']), (1, self.row['attempt'], 'done'))
+            self.assertEqual(view['rounds'][0]['result']['messageId'], first['messageId'])
+            self.assertEqual(view['audit'][-1]['result'], 'definitely-not-sent')
+            self.assertEqual((self.root/'report.md').read_bytes(), original_report)
+            self.assertFalse((self.root/'inputs').exists())
+            self.assertFalse(report.exists())
+            self.assertEqual(forwarded, [])
+
+            retried = self.cli(*options)
+            self.assertEqual((retried['round'], retried['result']), (2, 'accepted'))
+            self.assertEqual(self.cli(*options), {**retried, 'duplicate': True})
+            method, request_id, pane = forwarded[0]
+            self.assertEqual((len(forwarded), method, pane), (1, 'pane.send_input', self.h['pane']))
+            self.assertEqual(len(rejected), 1)
+            self.assertNotEqual(request_id, rejected[0])
+            brief, = (self.root/'inputs').read_text().splitlines()
+            self.assertIn(retried['attempt'], brief)
+            self.assertEqual(self.cli('close', self.dispatch_id)['result'], 'completed')
+
     def test_continue_does_not_resend_after_lost_herdr_input_receipt(self):
         writes = []
 

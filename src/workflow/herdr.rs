@@ -15,7 +15,7 @@ use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use wfc_herdr::{CodexInput, FailureKind, Handle, Launch, Mapping, Process};
+use wfc_herdr::{CodexInput, FailureKind, Handle, InputBoundary, Launch, Mapping, Process};
 
 pub const USAGE: &str = "wfc herdr-reconcile DISPATCH --pane P --terminal T --actor NAME --evidence TEXT [--workspace W] [--old-writer-evidence TEXT] [--owner-token TOKEN]";
 pub(super) const APPENDED_USER_ENTRY: &str = "herdr-appended-user-entry";
@@ -798,7 +798,7 @@ impl InputTarget {
         &mut self,
         action: CodexInput,
         text: &str,
-        check: impl FnOnce() -> io::Result<()>,
+        mut check: impl FnMut(InputBoundary) -> io::Result<()>,
     ) -> Value {
         let writer = &self.writer;
         let mut late_writers = None;
@@ -812,11 +812,13 @@ impl InputTarget {
                 late_writers = Some(observed.writers.clone());
                 Err(io::Error::other("Herdr pane writers changed before input"))
             },
-            || {
-                if !writer.alive().map_err(io::Error::other)? {
+            |boundary| {
+                if boundary == InputBoundary::Prepare
+                    && !writer.alive().map_err(io::Error::other)?
+                {
                     return Err(io::Error::other("original Herdr worker stopped"));
                 }
-                check()
+                check(boundary)
             },
         );
         if let Some(writers) = late_writers {

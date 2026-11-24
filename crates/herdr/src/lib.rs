@@ -133,14 +133,22 @@ pub enum CodexInput {
     Nudge,
 }
 
-const INVALID: Failure = Failure::unknown("incomplete Herdr observation");
+#[derive(PartialEq, Eq)]
+pub enum InputBoundary {
+    Prepare,
+    Send,
+}
 
-fn observe_after_input_check<T>(
+const INVALID: Failure = Failure::unknown("incomplete Herdr observation");
+const RECENT_LINES: u32 = 200;
+const NUDGE_HISTORY_LINES: u32 = 1000;
+
+fn after_input_check<T>(
     check: impl FnOnce() -> std::io::Result<()>,
-    observe: impl FnOnce() -> Result<T>,
+    next: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     check().map_err(|_| Failure::unsent("Herdr input precondition changed"))?;
-    observe()
+    next()
 }
 
 fn field<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
@@ -453,21 +461,29 @@ impl Handle {
     }
 
     pub fn read(&self) -> Result<Screen> {
-        self.read_screen("text")
+        self.read_screen("recent", "text", RECENT_LINES)
     }
 
     fn read_ansi(&self) -> Result<Screen> {
-        self.read_screen("ansi")
+        self.read_screen("recent", "ansi", RECENT_LINES)
     }
 
-    fn read_screen(&self, format: &str) -> Result<Screen> {
+    fn read_nudge_history(&self) -> Result<Screen> {
+        self.read_screen("recent", "text", NUDGE_HISTORY_LINES)
+    }
+
+    fn read_visible(&self) -> Result<Screen> {
+        self.read_screen("visible", "text", NUDGE_HISTORY_LINES)
+    }
+
+    fn read_screen(&self, source: &str, format: &str, lines: u32) -> Result<Screen> {
         let rpc = self.session()?;
         self.guarded(&rpc, false)?;
-        let data = rpc.call("pane.read",json!({"pane_id":self.pane,"source":"recent","format":format,"strip_ansi":format != "ansi","lines":200}))?;
+        let data = rpc.call("pane.read",json!({"pane_id":self.pane,"source":source,"format":format,"strip_ansi":format != "ansi","lines":lines}))?;
         if data["read"]["pane_id"].as_str() != self.pane.as_deref()
             || data["read"]["workspace_id"].as_str() != self.workspace.as_deref()
-            || (format == "ansi"
-                && (data["read"]["format"] != "ansi" || data["read"]["source"] != "recent"))
+            || data["read"]["format"] != format
+            || data["read"]["source"] != source
         {
             return Err(INVALID);
         }
@@ -534,7 +550,7 @@ impl Handle {
         host: &str,
         mut save: impl FnMut(&Self) -> std::io::Result<()>,
     ) -> Result<()> {
-        let before = self.send_to_empty_box(text, host, None, &mut save, || Ok(()))?;
+        let (before, _) = self.send_to_empty_box(text, host, None, &mut save, |_| Ok(()))?;
         screen::confirm_reply(self, text, &before, host, &mut save).map_err(Failure::after_effect)
     }
 
@@ -546,16 +562,12 @@ impl Handle {
         writer: &Process,
         action: CodexInput,
         mut save: impl FnMut(&Self) -> std::io::Result<()>,
-        before_write: impl FnOnce() -> std::io::Result<()>,
+        check: impl FnMut(InputBoundary) -> std::io::Result<()>,
     ) -> Result<()> {
-        let before = self.send_to_empty_box(
-            text,
-            "codex",
-            Some((writer, action)),
-            &mut save,
-            before_write,
-        )?;
-        screen::confirm_codex_input(self, action, text, &before).map_err(Failure::after_effect)
+        let (before, visible_copies) =
+            self.send_to_empty_box(text, "codex", Some((writer, action)), &mut save, check)?;
+        screen::confirm_codex_input(self, action, text, &before, visible_copies)
+            .map_err(Failure::after_effect)
     }
 
     fn send_to_empty_box(
@@ -564,31 +576,49 @@ impl Handle {
         host: &str,
         worker_input: Option<(&Process, CodexInput)>,
         save: &mut impl FnMut(&Self) -> std::io::Result<()>,
-        before_write: impl FnOnce() -> std::io::Result<()>,
-    ) -> Result<Screen> {
+        mut check: impl FnMut(InputBoundary) -> std::io::Result<()>,
+    ) -> Result<(Screen, Option<usize>)> {
         // The caller may wait for the ledger. Observe the pane only after that
         // check, with the original scope and execution locks still held.
-        let (before, rpc) = observe_after_input_check(before_write, || {
-            let before = self.read()?;
-            if screen::read_only(&before.text) {
-                return Err(Failure::refused("worker input is paused"));
-            }
-            screen::require_empty_reply_box(self, &before, host)?;
-            let rpc = if let Some((writer, action)) = worker_input {
-                screen::check_codex_input(action, &before, text)?;
-                let rpc = self.session()?;
-                self.require_foreground_writer(&rpc, writer, save)?;
-                rpc
-            } else {
-                self.prepare_send(true, save)?
-            };
-            Ok((before, rpc))
-        })
+        let nudge = matches!(worker_input, Some((_, CodexInput::Nudge)));
+        let (before, visible_copies, rpc) = after_input_check(
+            || check(InputBoundary::Prepare),
+            || {
+                let before = self.read()?;
+                if screen::read_only(&before.text) {
+                    return Err(Failure::refused("worker input is paused"));
+                }
+                let visible_copies = if nudge {
+                    screen::nudge_visible_copies(
+                        text,
+                        &before,
+                        &self.read_nudge_history()?,
+                        &self.read_visible()?,
+                    )
+                } else {
+                    None
+                };
+                screen::require_empty_reply_box(self, &before, host)?;
+                let rpc = if let Some((writer, action)) = worker_input {
+                    screen::check_codex_input(action, &before, text)?;
+                    let rpc = self.session()?;
+                    self.require_foreground_writer(&rpc, writer, save)?;
+                    rpc
+                } else {
+                    self.prepare_send(true, save)?
+                };
+                Ok((before, visible_copies, rpc))
+            },
+        )
         .map_err(Failure::before_effect)?;
         // An incomplete response to the input call may be post-effect.
         let params = json!({"pane_id":self.pane,"text":text,"keys":["Enter"]});
-        rpc.send_reply(params)?;
-        Ok(before)
+        if worker_input.is_some() {
+            rpc.send_worker_input(params, || check(InputBoundary::Send))?;
+        } else {
+            rpc.send_reply(params)?;
+        }
+        Ok((before, visible_copies))
     }
 
     /// Close only the bound pane. Persist all observed writers before closing,
@@ -757,7 +787,7 @@ mod tests {
     #[test]
     fn input_authorization_precedes_final_observation() {
         let order = RefCell::new(Vec::new());
-        let observed = super::observe_after_input_check(
+        let observed = super::after_input_check(
             || {
                 order.borrow_mut().push("ledger and owner");
                 Ok(())
@@ -769,7 +799,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(observed, "fresh observation");
-        assert_eq!(*order.borrow(), ["ledger and owner", "pane and foreground"]);
+        super::after_input_check(
+            || {
+                order.borrow_mut().push("owner at send");
+                Ok(())
+            },
+            || {
+                order.borrow_mut().push("first write");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *order.borrow(),
+            [
+                "ledger and owner",
+                "pane and foreground",
+                "owner at send",
+                "first write"
+            ]
+        );
+    }
+
+    #[test]
+    fn input_write_is_skipped_when_final_authorization_rejects() {
+        let denied = super::after_input_check::<()>(
+            || Err(std::io::Error::other("owner authorization declined")),
+            || panic!("a rejected authorization must not reach the write"),
+        )
+        .unwrap_err();
+        assert_eq!(denied.kind, super::FailureKind::DefinitelyNotSent);
     }
 }
 
