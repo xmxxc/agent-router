@@ -208,7 +208,7 @@ def rejects_receipt_history(binary, root, source):
         rejects_incomplete_confirmation(binary, root, source, case, mutation, (), diagnostic)
 
 
-def verify_managed_herdr_binding(binary, root, source, work, backend):
+def verify_herdr_binding(binary, root, source, work, backend):
     herdr_source = root / "herdr-binding-source"
     herdr_source.mkdir()
     database = Path(shutil.copyfile(source / "router.db", herdr_source / "router.db"))
@@ -238,29 +238,57 @@ def verify_managed_herdr_binding(binary, root, source, work, backend):
                            'fixture-herdr-operator',?,12.125,12.25)""",
                    (HERDR_BOUND, HERDR_ATTEMPT, "another-old-fixture", evidence))
         body = post(db, 85, HERDR_BOUND, "controller", "done", completion, state="processed", version=3)
-    before = snapshot(herdr_source)
-    target = root / "herdr-binding-native"
-    proof = proof_for(root / "herdr-binding-proof.json", database, target)
-    imported = output(run(binary, root, target, *import_args(herdr_source, proof)))
-    assert digest(Path(imported["backup"]).read_bytes()) == before["router.db"][1]
-    view, _ = lookup(binary, root, target, HERDR_BOUND)
-    assert (view["status"], view["legacyBackend"], view["backendAlive"], view["controllerOwner"]["generation"]) == (
-        "completed", "herdr", False, 4)
-    audit, = view["legacyAudit"]
-    assert (audit["id"], audit["operation"], audit["result"], audit["round"], audit["attempt"]) == (
-        12, "backend_reconcile", "accepted", 1, HERDR_ATTEMPT)
-    assert (audit["ownerGeneration"], audit["resolutionOwnerGeneration"], audit["resolution_owner_generation"]) == (
-        3, None, None)
-    assert (audit["resolver_actor"], audit["resolution_evidence"], audit["resolved_at"]) == (
-        "fixture-herdr-operator", evidence, 12.25)
-    assert {"owner_token", "ownerTokenRecorded"}.isdisjoint(audit)
-    done, = view["messages"]
-    assert (done["id"], done["messageId"], done["to"], done["body"], done["bodyHash"]) == (
-        85, identifier(85), "controller", body, digest(body.encode()))
-    assert snapshot(herdr_source) == before
-    print(json.dumps({"managedHerdrAudit": 12, "ownerGeneration": 3, "resolutionOwnerGeneration": None,
-                      "importedGeneration": 4, "sourceAndBackup": before["router.db"][1]}), flush=True)
 
+    def verify_archive(binding_source, case, operation_generation, imported_generation):
+        before = snapshot(binding_source)
+        target = root / f"{case}-native"
+        proof = proof_for(root / f"{case}-proof.json", binding_source / "router.db", target)
+        if imported_generation is None:
+            details = json.loads(proof.read_text())
+            del details["ownerReplacements"][OTHER]
+            proof.write_text(json.dumps(details))
+        imported = output(run(binary, root, target, *import_args(binding_source, proof)))
+        assert digest(Path(imported["backup"]).read_bytes()) == before["router.db"][1]
+        view, _ = lookup(binary, root, target, HERDR_BOUND)
+        assert (view["status"], view["legacyBackend"], view["backendAlive"]) == ("completed", "herdr", False)
+        assert view.get("controllerOwner", {}).get("generation") == imported_generation
+        audit, = view["legacyAudit"]
+        assert (audit["id"], audit["operation"], audit["result"], audit["round"], audit["attempt"]) == (
+            12, "backend_reconcile", "accepted", 1, HERDR_ATTEMPT)
+        assert (audit["ownerGeneration"], audit["resolutionOwnerGeneration"], audit["resolution_owner_generation"]) == (
+            operation_generation, None, None)
+        assert all(audit[field] is None for field in ("fromAttempt", "toAttempt", "fromHost", "toHost"))
+        assert (audit["resolver_actor"], audit["resolution_evidence"], audit["created"], audit["resolved_at"]) == (
+            "fixture-herdr-operator", evidence, 12.125, 12.25)
+        assert {"owner_token", "ownerTokenRecorded"}.isdisjoint(audit)
+        done, = view["messages"]
+        assert (done["id"], done["messageId"], done["to"], done["body"], done["bodyHash"]) == (
+            85, identifier(85), "controller", body, digest(body.encode()))
+        assert snapshot(binding_source) == before
+        audit_kind = "managedHerdrAudit" if operation_generation is not None else "unmanagedHerdrAudit"
+        print(json.dumps({audit_kind: 12, "fixture": case, "ownerGeneration": operation_generation,
+                          "resolutionOwnerGeneration": None, "importedGeneration": imported_generation,
+                          "sourceAndBackup": before["router.db"][1]}), flush=True)
+
+    verify_archive(herdr_source, "herdr-binding", 3, 4)
+    unowned_source = root / "herdr-unmanaged-source"
+    later_owner_source = root / "herdr-later-owner-source"
+    for binding_source, case, imported_generation in (
+        (unowned_source, "herdr-unmanaged", None),
+        (later_owner_source, "herdr-later-owner", 2),
+    ):
+        binding_source.mkdir()
+        copy = Path(shutil.copyfile(database, binding_source / "router.db"))
+        with closing(sqlite3.connect(copy)) as db, db:
+            db.execute("UPDATE lifecycle_event SET owner_generation=NULL, owner_token=NULL WHERE id=12")
+            if imported_generation is None:
+                db.execute("DELETE FROM controller_owner WHERE scope=?", (OTHER,))
+            else:
+                # The first owner was acquired after the binding settled at 12.25.
+                db.execute("UPDATE controller_owner SET generation=1, updated=13 WHERE scope=?", (OTHER,))
+        verify_archive(binding_source, case, None, imported_generation)
+
+    migration_diagnostic = "settled legacy Herdr backend_reconcile has unexpected migration fields"
     for case, mutation, operands, diagnostic in (
         ("backend", "UPDATE dispatch SET backend='tmux' WHERE id=?", (HERDR_BOUND,),
          "incomplete settled legacy Herdr backend_reconcile"),
@@ -291,8 +319,32 @@ def verify_managed_herdr_binding(binary, root, source, work, backend):
          "managed legacy lifecycle resolution lacks owner generation"),
         ("resume", "UPDATE lifecycle_event SET operation='resume' WHERE id=12", (),
          "managed legacy lifecycle resolution lacks owner generation"),
+        ("migration", "UPDATE lifecycle_event SET from_attempt=? WHERE id=12", (HERDR_ATTEMPT,),
+         migration_diagnostic),
     ):
         rejects_incomplete_confirmation(binary, root, herdr_source, f"herdr-{case}", mutation, operands, diagnostic)
+
+    for case, mutation, operands, diagnostic in (
+        ("round", "UPDATE lifecycle_event SET round=2 WHERE id=12", (), "unverified legacy Herdr binding attempt"),
+        ("attempt", "UPDATE lifecycle_event SET attempt='a-000000000099' WHERE id=12", (),
+         "unverified legacy Herdr binding attempt"),
+        ("evidence", "UPDATE lifecycle_event SET resolution_evidence=NULL WHERE id=12", (),
+         "resolution_evidence"),
+        ("credential", "UPDATE lifecycle_event SET owner_token='fixture-operation-owner' WHERE id=12", (),
+         "managed legacy lifecycle operation lacks owner generation"),
+        ("generation", "UPDATE lifecycle_event SET owner_generation=1 WHERE id=12", (),
+         "managed legacy Herdr backend_reconcile lacks an owner credential"),
+        ("resolution", "UPDATE lifecycle_event SET resolution_owner_generation=1 WHERE id=12", (),
+         "managed legacy lifecycle operation lacks owner generation"),
+        ("from-attempt", "UPDATE lifecycle_event SET from_attempt=? WHERE id=12", (HERDR_ATTEMPT,),
+         migration_diagnostic),
+        ("to-attempt", "UPDATE lifecycle_event SET to_attempt=? WHERE id=12", (HERDR_ATTEMPT,),
+         migration_diagnostic),
+        ("from-host", "UPDATE lifecycle_event SET from_host='codex' WHERE id=12", (), migration_diagnostic),
+        ("to-host", "UPDATE lifecycle_event SET to_host='claude' WHERE id=12", (), migration_diagnostic),
+    ):
+        rejects_incomplete_confirmation(binary, root, later_owner_source, f"herdr-unmanaged-{case}",
+                                        mutation, operands, diagnostic)
 
 
 def lookup(binary, root, target, dispatch):
@@ -642,7 +694,7 @@ def fixture(binary, schema, root, version, backend, combined_only):
                                     rejects_inconsistent_ledger, binary, root, source, scenario))
         checks.append(run_group(version, "owner-confirmations", rejects_owner_history, binary, root, source))
         checks.append(run_group(version, "receipt-confirmations", rejects_receipt_history, binary, root, source))
-        checks.append(run_group(version, "managed-herdr-binding", verify_managed_herdr_binding,
+        checks.append(run_group(version, "managed-herdr-binding", verify_herdr_binding,
                                 binary, root, source, work, backend))
         checks.append(run_group(version, "reclaim-history", verify_reclaimed, binary, root, source))
     published = run_group(version, "publish-and-backup", verify_publication, binary, root, source, target, original)

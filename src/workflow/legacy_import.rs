@@ -287,7 +287,7 @@ fn assignments(
             .get_mut(id)
             .with_context(|| format!("legacy audit has no dispatch {id}"))?;
         let scope = text(row, "scope")?;
-        check_audit_generations(row, &event, owners.get(scope).copied()).with_context(|| {
+        check_lifecycle_audit(row, &event, owners.get(scope).copied()).with_context(|| {
             format!(
                 "legacy scope {scope} dispatch {id} lifecycle audit {}",
                 event["id"]
@@ -311,7 +311,11 @@ fn assignments(
     Ok(records)
 }
 
-fn check_audit_generations(record: &Value, event: &Value, current: Option<&Value>) -> Result<()> {
+fn check_lifecycle_audit(record: &Value, event: &Value, current: Option<&Value>) -> Result<()> {
+    let backend_reconcile = event["operation"] == "backend_reconcile";
+    if backend_reconcile {
+        check_settled_herdr_binding(record, event)?;
+    }
     let generation = |key: &str| {
         if event[key].is_null() {
             return Ok(None);
@@ -324,8 +328,8 @@ fn check_audit_generations(record: &Value, event: &Value, current: Option<&Value
     };
     let operation = generation("ownerGeneration")?;
     let resolution = generation("resolutionOwnerGeneration")?;
-    let backend_reconcile = event["operation"] == "backend_reconcile";
-    if event["ownerTokenRecorded"] == 1 || (backend_reconcile && resolution.is_some()) {
+    let token_recorded = event["ownerTokenRecorded"] == 1;
+    if token_recorded || (backend_reconcile && resolution.is_some()) {
         ensure!(
             operation.is_some(),
             "managed legacy lifecycle operation lacks owner generation"
@@ -340,43 +344,49 @@ fn check_audit_generations(record: &Value, event: &Value, current: Option<&Value
             "current legacy owner generation {current} precedes lifecycle generation {latest}"
         );
     }
-    if let Some(operation) = operation {
-        if let Some(resolution) = resolution {
-            ensure!(
-                resolution >= operation,
-                "legacy resolution owner generation precedes the operation"
-            );
-        }
-        if backend_reconcile {
-            check_settled_herdr_binding(record, event)?;
-            ensure!(
-                resolution.is_none(),
-                "settled legacy Herdr backend_reconcile has an unexpected resolution owner generation"
-            );
-        } else if !event["resolver_actor"].is_null() {
-            ensure!(
-                resolution.is_some(),
-                "managed legacy lifecycle resolution lacks owner generation"
-            );
-        }
+    if let (Some(operation), Some(resolution)) = (operation, resolution) {
+        ensure!(
+            resolution >= operation,
+            "legacy resolution owner generation precedes the operation"
+        );
+    }
+    if backend_reconcile {
+        // A scope can acquire an owner after the binding was recorded.
+        ensure!(
+            operation.is_none() || token_recorded,
+            "managed legacy Herdr backend_reconcile lacks an owner credential"
+        );
+        ensure!(
+            resolution.is_none(),
+            "settled legacy Herdr backend_reconcile has an unexpected resolution owner generation"
+        );
+    } else if operation.is_some() && !event["resolver_actor"].is_null() {
+        ensure!(
+            resolution.is_some(),
+            "managed legacy lifecycle resolution lacks owner generation"
+        );
     }
     Ok(())
 }
 
 fn check_settled_herdr_binding(record: &Value, event: &Value) -> Result<()> {
-    // Frozen Python #39/#40 recorded the owner on the accepted binding event
-    // inside the same transaction as settlement. There was no second owner.
+    // Frozen Python #39/#40 recorded and settled this binding in one transaction.
     ensure!(
         record["legacyBackend"] == "herdr"
             && event["result"] == "accepted"
             && event["diagnostic"] == "explicit Herdr unit binding"
-            && event["ownerTokenRecorded"] == 1
             && event["round"].is_u64()
             && event["attempt"].is_string()
             && text(event, "resolver_actor").is_ok()
             && event["created"].is_number()
             && event["resolved_at"].is_number(),
         "incomplete settled legacy Herdr backend_reconcile"
+    );
+    ensure!(
+        ["fromAttempt", "toAttempt", "fromHost", "toHost"]
+            .iter()
+            .all(|field| event[*field].is_null()),
+        "settled legacy Herdr backend_reconcile has unexpected migration fields"
     );
     matching_round(record, event, None).context("unverified legacy Herdr binding attempt")?;
     let evidence: Value = serde_json::from_str(text(event, "resolution_evidence")?)
