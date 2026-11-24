@@ -1,8 +1,10 @@
 """Linux integration: python3 tests/herdr_public.py HERDR WFC [-v]."""
+import ctypes
 import fcntl
 import json
 import os
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import unittest
@@ -279,18 +281,120 @@ while not (directory / (attempt + ".quit")).exists() and time.monotonic() < dead
     def test_tmux_to_herdr_handoff_does_not_retry_after_layout_reply_loss(self):
         source, _ = self.tmux_handoff_fixture()
         archive, stopped = self.handoff_source_evidence(source)
+        assignment = self.handoff_record(source)
+        launches = assignment.parent.parent / 'launches'
         effects = []
+        layout = {}
+        # Passively observe the private descriptor's lifetime. Its first
+        # open is creation, and the supervisor must open it again to start.
+        in_open, in_close_write, in_delete, in_overflow = 0x20, 0x08, 0x200, 0x4000
+        libc = ctypes.CDLL(None, use_errno=True)
+        watch = libc.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
+        watch_error = None
+        if watch < 0:
+            watch_error = ctypes.get_errno()
+        elif libc.inotify_add_watch(watch, os.fsencode(launches), in_open | in_close_write | in_delete) < 0:
+            watch_error = ctypes.get_errno()
+            os.close(watch)
+            watch = -1
+        else:
+            self.addCleanup(os.close, watch)
+
+        def descriptor_events(launch_id):
+            if watch < 0 or launch_id is None:
+                return {'watchError':watch_error, 'events':[]}
+            try:
+                pending = os.read(watch, 16 * 1024)
+            except BlockingIOError:
+                pending = b''
+            except OSError as error:
+                return {'watchError':error.errno, 'events':[]}
+            header = struct.Struct('=iIII')
+            target = os.fsencode(launch_id + '.spec')
+            events = []
+            offset = 0
+            while offset + header.size <= len(pending):
+                _, mask, _, length = header.unpack_from(pending, offset)
+                offset += header.size
+                name = pending[offset:offset+length].split(b'\0', 1)[0]
+                offset += length
+                if mask & in_overflow:
+                    events.append('overflow')
+                if name == target:
+                    for bit, event in ((in_open, 'open'), (in_close_write, 'close-write'),
+                                       (in_delete, 'unlink')):
+                        if mask & bit:
+                            events.append(event)
+            return {'events':events, 'readLimitReached':len(pending) == 16 * 1024}
+
+        def launch_observation():
+            row = json.loads(assignment.read_bytes())
+            audit = (row.get('audit') or [{}])[-1]
+            create = row.get('create') or {}
+            handle = row.get('backendHandle') or {}
+            observation = {'backend':row['backend'], 'attempt':row['attempt'],
+                           'audit':audit.get('id'), 'phase':audit.get('phase'),
+                           'auditResult':audit.get('result'), 'createResult':create.get('result'),
+                           'boundWorkspace':handle.get('workspace'), 'boundPane':handle.get('pane'),
+                           'sourceClosePresent':archive.is_file(), 'sourceStopPresent':stopped.is_file()}
+            if row['backend'] == 'herdr' and create.get('receipt'):
+                receipt = Path(create['receipt'])
+                if receipt.parent == launches and receipt.suffix == '.json':
+                    observation.update(launchId=receipt.stem,
+                                       descriptorPresent=receipt.with_suffix('.spec').is_file(),
+                                       treeStopped=receipt.with_suffix('.stopped').is_file())
+                    if receipt.is_file() and not receipt.is_symlink():
+                        raw = json.loads(receipt.read_bytes())
+                        observation['receipt'] = {key:raw[key] for key in ('category', 'pid', 'exitCode')
+                                                  if key in raw}
+            # Never read the credential-bearing launch descriptor or worker trace.
+            return observation
+
+        def observed_launch():
+            try:
+                return launch_observation()
+            except Exception as error:
+                return {'observationError':type(error).__name__}
+
         def lose(request, response):
             if request['method'] in ('workspace.create', 'layout.apply'):
                 self.assertTrue(archive.is_file() and stopped.is_file())
                 effects.append(request['method'])
-            return None if request['method'] == 'layout.apply' else response
+            if request['method'] == 'layout.apply':
+                # Preserve the reply-loss cut without reading files or
+                # making another RPC before dropping the response.
+                try:
+                    result = response.get('result') or {}
+                    pane = (result.get('layout') or {}).get('focused_pane_id')
+                    candidate = request['params']['root']['command'][-1]
+                    launch_id = candidate if isinstance(candidate, str) and len(candidate) == 32 else None
+                    layout.update(pane=pane, resultType=result.get('type'), launchId=launch_id,
+                                  serverError=(response.get('error') or {}).get('code'))
+                except Exception as error:
+                    layout['replyObservationError'] = type(error).__name__
+                return None
+            return response
 
         with self.service.fault_proxy(lose) as proxy:
             args = self.target_handoff(proxy)
             result = self.cli(*args)
             self.assertEqual(result['result'], 'uncertain', result)
-            new = self.handoff_trace(result['attempt'])
+            try:
+                new = self.handoff_trace(result['attempt'])
+            except AssertionError:
+                diagnostic = {'handoff':result, 'effects':effects, 'layoutReply':layout,
+                              'atTraceTimeout':observed_launch()}
+                launch_id = layout.get('launchId') or diagnostic['atTraceTimeout'].get('launchId')
+                diagnostic['descriptor'] = descriptor_events(launch_id)
+                if layout.get('pane') is not None:
+                    try:
+                        snapshot = self.service.api('session.snapshot')['snapshot']
+                        diagnostic['layoutPanePresent'] = any(
+                            pane['pane_id'] == layout['pane'] for pane in snapshot['panes'])
+                    except Exception as error:
+                        diagnostic['serviceObservationError'] = type(error).__name__
+                print(json.dumps({'layoutReplyLossDiagnostic':diagnostic}), flush=True)
+                raise
             self.assertTrue(self.handoff_worker_alive(new))
             for replay in (args, self.target_handoff(self.service.endpoint)):
                 pending = self.cli(*replay)
@@ -303,6 +407,7 @@ while not (directory / (attempt + ".quit")).exists() and time.monotonic() < dead
             self.assertEqual(len(list(self.handoff_traces.glob('*.json'))), 2)
             print(json.dumps({'lostLayoutReply':True, 'audit':result['audit'],
                               'attempt':result['attempt'], 'effects':effects,
+                              'descriptor':descriptor_events(layout.get('launchId')),
                               'changedEndpointStillPending':True}))
 
     def test_tmux_to_herdr_handoff_reports_unconfirmed_zero_exit_once(self):

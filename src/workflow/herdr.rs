@@ -1169,9 +1169,10 @@ mod tests {
             std::fs::create_dir_all(receipt.parent().unwrap())?;
             std::fs::create_dir_all(assignment.parent().unwrap())?;
             let row = json!({"dispatch":dispatch,"attempt":attempt,"round":1,"role":"worker",
-                "scope":"fixture-scope","cwd":state,"report":state.join("report"),"host":"codex",
+                "scope":"fixture-scope","cwd":state,"report":state.join("report"),"host":"codex","backend":"herdr",
                 "create":{"result":"uncertain","receipt":receipt}});
             write_json(&assignment, &row, None)?;
+            let original_assignment = std::fs::read(&assignment)?;
             write_json(&receipt, &started_receipt(), None)?;
             let first = host_launch::read_receipt(&receipt).context("missing fixture receipt")?;
             let terminal = json!({"category":"process_exited","exitCode":0,
@@ -1212,6 +1213,7 @@ mod tests {
             super::super::startup::unconfirmed_zero(&state, &row, launch, &after_prefill);
             assert_eq!(super::super::messages::history(&state, dispatch)?, notices);
             assert_eq!(read_record(&assignment)?, row);
+            assert_eq!(std::fs::read(&assignment)?, original_assignment);
             assert_eq!(host_launch::read_receipt(&receipt), Some(terminal));
             Ok(())
         })();
