@@ -1445,6 +1445,9 @@ while not (directory / (attempt + ".quit")).exists() and time.monotonic() < dead
             other, sibling_pid = self.sibling()
             first = self.cli('close', self.dispatch_id)
             self.assertEqual(first['result'], 'uncertain')
+            if forward:
+                receipt = Path(self.h['receipt'])
+                live.wait_for(lambda: json.loads(receipt.read_bytes())['category'] == 'process_exited')
             view = self.status()
             self.assertTrue(view['closePending'])
             self.assertEqual(view['status'], 'unknown')
@@ -1842,13 +1845,35 @@ Path('done-received').write_bytes(reply)
             self.assert_pending_views('unknown')
             (self.root/'exit-main').touch()
             live.wait_for(lambda: self.status()['launch'].get('exitCode') == 17)
-        self.assert_pending_views(pending_status)
+        view = self.assert_pending_views(pending_status)
+        if not worker_first:
+            self.assertEqual(view['launch']['exitCode'], 17)
+            # Ensure the overlap is exercised even if CI ran the worker
+            # beyond the short startup window before releasing it.
+            path = self.handoff_record(self.row)
+            original = json.loads(path.read_bytes())
+            event, = original['audit']
+            history = view['messages']
+            if not any(message.get('kind') == 'startup_failure' for message in history):
+                notice = {'kind':'startup_failure', 'type':'exited', 'messageId':'fixture-old-startup',
+                          'dispatch':self.dispatch_id, 'round':self.row['round'], 'attempt':self.row['attempt'],
+                          'fault':{'category':'process_exited', 'exitCode':17}}
+                history = [*history, notice]
+                original['messages'] = [*original.get('messages', []), notice]
+                path.write_text(json.dumps(original))
+            pending = self.assert_pending_views('unknown')
+            self.assertEqual(pending['messages'], history)
+            self.assertEqual(pending['audit'], [event])
         live.wait_for(lambda: self.cli('close', self.dispatch_id)['result'] == 'completed')
         final = self.status()
         self.assertFalse(final['closePending'])
         self.assertEqual(final['status'], 'failed' if worker_first else 'cancelled')
         if worker_first:
             self.assertEqual(final['worker']['exit_code'], 17)
+        else:
+            self.assertEqual(final['launch']['exitCode'], 17)
+            self.assertEqual(final['messages'], history)
+            self.assertEqual(final['audit'][0]['id'], event['id'])
         self.assertEqual(len(calls), 0 if worker_first else 1)
 
     def test_writer_survives_pane_close(self):
