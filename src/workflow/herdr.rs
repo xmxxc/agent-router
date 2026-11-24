@@ -412,19 +412,18 @@ fn launch_into(
         Err(e) => json!(e),
     };
     answer["receipt"] = json!(files.receipt);
-    if expected_service.is_some() {
-        return Ok(answer);
-    }
     if !unit.row["backendHandle"].is_null() {
-        let mut next = unit.row.clone();
-        next["create"] = answer.clone();
-        unit.save(next)?;
+        if expected_service.is_none() {
+            let mut next = unit.row.clone();
+            next["create"] = answer.clone();
+            unit.save(next)?;
+        }
         if answer["result"] != "accepted" {
             if let Some(terminal) = host_launch::read_receipt(&files.receipt) {
                 super::startup::unconfirmed_zero(state, &unit.row, &files.id, &terminal);
             }
         }
-    } else if !unit.path.try_exists()? {
+    } else if expected_service.is_none() && !unit.path.try_exists()? {
         // No checkpoint means the provider never issued workspace.create.
         std::fs::remove_file(&files.receipt)?;
         std::fs::remove_file(unit.path.with_extension("herdr-lock"))?;
@@ -439,7 +438,7 @@ pub(super) struct OfflineResume<'a> {
 
 impl<'a> OfflineResume<'a> {
     pub(super) fn verify(state: &'a Path, row: &Value) -> Result<(Self, Value, Value)> {
-        let unit = lock_close(state, row)?;
+        let mut unit = lock_close(state, row)?;
         ensure!(unit.row == *row, "Herdr assignment changed before resume");
         ensure!(
             row["create"]["result"] == "accepted" && row["pendingInput"] == false,
@@ -464,7 +463,7 @@ impl<'a> OfflineResume<'a> {
             .clone()
             .context("missing original Herdr service")?;
         ensure!(
-            handle.confirm_closed(|_| Ok(()))?,
+            handle.confirm_closed(|h| unit.checkpoint(h))?,
             "original Herdr pane or writers are still present"
         );
         let inspection = json!({"result":"accepted","alive":false,"owned":true});
