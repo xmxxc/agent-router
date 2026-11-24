@@ -137,7 +137,7 @@ impl<'a> Request<'a> {
             });
         if let Some(index) = replay {
             let mut event = current["audit"][index].clone();
-            let inbox = messages::Inbox::open(&state)?;
+            let mut inbox = messages::Inbox::open(&state)?;
             authorized_generation(&state, scope, token.as_deref(), operation)?;
             let mut receipt = inbox.worker_input_receipt(&current, &event)?;
             if receipt.is_none()
