@@ -868,7 +868,7 @@ pub(super) fn herdr_close_blocks_callback(state: &Path, row: &Value) -> Result<b
 
 #[cfg(target_os = "linux")]
 pub(super) fn verify_herdr_close_target(row: &Value, event: &Value) -> Result<()> {
-    let current = &row["backendHandle"];
+    let current = super::herdr::bound_record(row).context("close intent target changed")?;
     let target = &event["target"];
     ensure!(
         [
@@ -884,10 +884,7 @@ pub(super) fn verify_herdr_close_target(row: &Value, event: &Value) -> Result<()
         ]
         .iter()
         .all(|&k| target[k] == current[k])
-            && same_execution(row, event)
-            && same_execution(row, current)
-            && current["endpoint"] == row["endpoint"]
-            && current["receipt"] == row["create"]["receipt"],
+            && same_execution(row, event),
         "close intent target changed"
     );
     let (archived, known) = target["writerProcesses"]

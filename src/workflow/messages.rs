@@ -933,8 +933,14 @@ fn check_snapshot_size(size: usize) -> Result<()> {
 }
 
 fn continued_input_binding(row: &Value, event: &Value) -> Option<Value> {
+    let supported = match row["backend"].as_str() {
+        Some("tmux") => true,
+        #[cfg(target_os = "linux")]
+        Some("herdr") => super::herdr::bound_record(row).is_ok(),
+        _ => false,
+    };
     (row["host"] == "codex"
-        && row["backend"] == "tmux"
+        && supported
         && super::assignment::unresolved_handoff(row).is_none()
         && event["operation"] == "continue"
         && event["round"] == row["round"]
@@ -1365,8 +1371,9 @@ impl Inbox {
                     .get("continuedInputCallback")
                     .is_some_and(|saved| {
                         saved == &proof
-                            // Earlier binaries stored only the reference digest.
-                            || (event["result"] == "uncertain" && saved == &proof["referenceHash"])
+                            // Older continuations stored only the authenticated reference digest.
+                            || (event["result"] == "uncertain"
+                                && saved == &proof["referenceHash"])
                     })
         }))
     }
@@ -1415,6 +1422,17 @@ impl Inbox {
             .additional_fields
             .get("inputEvidence")
             .and_then(Value::as_str);
+        let herdr_proof = super::herdr::CONTINUE_INPUT_EVIDENCE;
+        if proof == Some(herdr_proof) {
+            let valid = row["backend"] == "herdr"
+                && matches!(input, WorkerInput::Continue { .. })
+                && super::herdr::bound_record(row).is_ok()
+                && (event["result"] == "pending"
+                    || (event["result"] == "accepted"
+                        && event["message"] == message.id
+                        && event["inputEvidence"] == herdr_proof));
+            return Ok(valid.then(|| (message.id, json!(herdr_proof))));
+        }
         use crate::tmux::APPENDED_USER_ENTRY;
         match (event["result"].as_str(), proof) {
             (Some("pending"), Some(APPENDED_USER_ENTRY)) => {
@@ -1452,7 +1470,10 @@ impl Inbox {
         ensure!(
             event["inputEvidence"] == crate::tmux::APPENDED_USER_ENTRY
                 || (event["operation"] == "continue"
-                    && event["inputEvidence"] == CONTINUED_INPUT_CALLBACK),
+                    && (event["inputEvidence"] == CONTINUED_INPUT_CALLBACK
+                        || (event["inputEvidence"] == super::herdr::CONTINUE_INPUT_EVIDENCE
+                            && row["backend"] == "herdr"
+                            && super::herdr::bound_record(row).is_ok()))),
             "missing worker input evidence"
         );
         let worker = Identity::deserialize(row).context("read worker input identity")?;
