@@ -83,7 +83,7 @@ jobs:
           sha256sum tests/bundled_handoff.py tools/check_bundled_resume.py tools/check_bundled_default.sh \
             tools/check_bundled_startup.py tests/check_codex.py tools/check_codex.py tests/startup_failure.py \
             ../handoff-ci/tools/ci/bundled-combination.sh ../ci/tools/ci/linux-candidate-hosted.sh
-      - name: Verify and download the original package after the clean guest passed
+      - name: Verify and download the package from the original build
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -104,7 +104,7 @@ jobs:
             job("package") as $package
             | job("Downloaded bundled lifecycle in the offline clean Jammy guest") as $guest
             | job("Downloaded bundled lifecycle on a delegated hosted VM") as $delegated
-            | select($package.conclusion == "success" and $guest.conclusion == "success")
+            | select($package.conclusion == "success" and $delegated.conclusion == "success")
             | {package_job:$package.id, clean_guest_job:$guest.id, clean_guest:$guest.conclusion,
                delegated_job:$delegated.id, delegated_conclusion:$delegated.conclusion}
           '
@@ -141,5 +141,12 @@ jobs:
       - name: Recheck the changed public routes and ordinary user receipts
         working-directory: product
         run: |
+          resume_tools="$RUNNER_TEMP/wfc-reviewed-resume-tools"
+          mkdir -m 700 "$resume_tools"
+          for file in check_bundled_resume.py check_codex.py; do
+            git show "$RESUME_SOURCE:tools/$file" > "$resume_tools/$file"
+          done
+          printf 'resume_fixture_source=%s\n' "$RESUME_SOURCE"
+          sha256sum "$resume_tools/"*.py
           bash ../ci/tools/ci/linux-candidate-hosted.sh "$RUNNER_TEMP/wfc-candidate-package/unpacked/wfc" \
-            "$ELF_SHA256" "$GITHUB_WORKSPACE/handoff-ci/tools/ci/bundled-combination.sh" "$PRODUCT_SHA"
+            "$ELF_SHA256" "$GITHUB_WORKSPACE/handoff-ci/tools/ci/bundled-combination.sh" "$PRODUCT_SHA" "$resume_tools/check_bundled_resume.py"

@@ -1,0 +1,12 @@
+name: Linux candidate same-download acceptance
+on:
+  push:
+    branches: [rust-router/24-linux-download-candidate-consume]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  candidate:
+    uses: ./.github/workflows/linux-package-candidate-hosted.yml

@@ -7,6 +7,7 @@ binary=$(realpath -e -- "$1")
 expected=$2
 handoff_recipe=$(realpath -e -- "$3")
 product=$4
+resume_fixture=$(realpath -e -- "$5")
 [[ "$expected" =~ ^[0-9a-f]{64}$ && "$product" =~ ^[0-9a-f]{40}$ &&
    "${binary##*/}" == wfc && "$(id -u)" -gt 0 ]]
 package=$(dirname -- "$binary")
@@ -69,7 +70,7 @@ emit_once() {
 }
 
 sha='[0-9a-f]{64}'
-run_fixture public-resume /usr/bin/python3 -Bu tools/check_bundled_resume.py "$binary"
+run_fixture public-resume /usr/bin/python3 -Bu "$resume_fixture" "$binary"
 emit_once "BUNDLED_RESUME_SOURCE_STOPPED $sha $sha $sha"
 emit_once "BUNDLED_RESUME_REPLACEMENT_ONCE $sha $sha"
 emit_once 'BUNDLED_RESUME_DONE_ACK [1-9][0-9]* 3'
