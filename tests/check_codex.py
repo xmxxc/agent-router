@@ -1,15 +1,20 @@
 """Use the downloaded WFC and a controlled Codex stand-in with a fictional profile."""
+from contextlib import redirect_stdout
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
+import runpy
 import signal
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 CHECKER = Path(__file__).resolve().parents[1] / 'tools/check_codex.py'
 WFC = Path(sys.argv.pop(1)).resolve(strict=True)
@@ -23,7 +28,11 @@ host = Path(__file__).resolve()
 root, mode = host.parent, host.name
 if sys.argv[1:] == ['--version']:
     if mode == 'cancel-version':
-        (root / 'version').touch()
+        child = subprocess.Popen(['/usr/bin/sleep', '60'])
+        stat = Path(f'/proc/{child.pid}/stat').read_text().rsplit(') ', 1)[1].split()
+        pending = root / 'version.pending'
+        pending.write_text(f'{child.pid} {stat[19]}')
+        pending.rename(root / 'version')
         time.sleep(60)
     print('codex-cli controlled')
     sys.exit()
@@ -60,6 +69,24 @@ else:
 (root / 'running').touch()
 time.sleep(60)
 """
+
+
+def probe_child_running(marker):
+    pid, start = marker.read_text().split()
+    try:
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    return fields[19] == start and fields[0] not in ('Z', 'X')
+
+
+def wait_for_probe_exit(marker):
+    deadline = time.monotonic() + 2
+    while probe_child_running(marker):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(.02)
+    return True
 
 
 class Checker(unittest.TestCase):
@@ -126,15 +153,31 @@ class Checker(unittest.TestCase):
             self.assertIsNone(closed['unit'])
         else:
             self.assertRegex(closed['unit'], r'^wfc-bundled-[0-9a-f-]+\.service$')
+        return dispatch, closed
 
     def test_original_done_ack_and_close(self):
         rc, rows, err = self.run_case('good')
         self.assertEqual(rc, 0, err)
         message, = [r for r in rows if 'messageId' in r]
         self.assertEqual((message['state'], message['statusVersion']), ('processed', 3))
-        self.assertGreater(message['message'], 0)
-        self.check_close(rows)
+        self.assertIs(type(message['message']), int)
+        self.assertTrue(0 < message['message'] < 2**64)
+        dispatch, closed = self.check_close(rows)
         self.assertEqual(rows[-1], {'result': 'BUNDLED_CODEX_SMOKE_PASS', 'binarySha256': ELF_SHA256})
+        self.assertRegex(dispatch['dispatch'], r'^d-[0-9a-f]{32}$')
+        self.assertRegex(dispatch['attempt'], r'^a-[0-9a-f]{32}$')
+        self.assertRegex(dispatch['scope'], r'^codex-smoke-[0-9a-f]{32}$')
+        self.assertRegex(dispatch['ticketSha256'], r'^[0-9a-f]{64}$')
+        self.assertRegex(message['messageId'], r'^m-[0-9a-f]{32}$')
+        self.assertEqual(message['attempt'], dispatch['attempt'])
+        self.assertEqual(message['receivedState'], 'received')
+        receipt = {'mode': 'explicit' if DELEGATION in self.env else 'user-service', 'binarySha256': ELF_SHA256,
+                   'dispatch': dispatch['dispatch'], 'scope': dispatch['scope'], 'round': 1,
+                   'attempt': dispatch['attempt'], 'number': message['message'], 'messageId': message['messageId'],
+                   'received': message['receivedState'], 'ack': message['state'],
+                   'ackVersion': message['statusVersion'], 'launchTicketSha256': dispatch['ticketSha256'],
+                   'closeTicketSha256': closed['ticketSha256'], 'cleanup': closed['cleanup']}
+        print('BUNDLED_CODEX_RECEIPT ' + json.dumps(receipt, separators=(',', ':')), flush=True)
 
     def test_wrong_body_and_missing_receipt(self):
         rc, rows, err = self.run_case('wrong')
@@ -155,6 +198,7 @@ class Checker(unittest.TestCase):
     def test_terminate_before_dispatch(self):
         rc, rows, _ = self.run_case('cancel-version', cancel_at='version')
         self.assertEqual((rc, rows), (128 + signal.SIGTERM, []))
+        self.assertTrue(wait_for_probe_exit(self.root / 'version'))
 
     def test_terminate_with_live_worker(self):
         rc, rows, _ = self.run_case('cancel-running', cancel_at='running')
@@ -187,6 +231,133 @@ class Checker(unittest.TestCase):
             msg, = run('wait', '--scope', launch['scope'], '--dispatch', launch['dispatch'], '--timeout', '0')['messages']
             self.assertEqual((msg['attempt'], Path(msg['report']).read_text()), (launch['attempt'], launch['scope']))
             run('close', launch['dispatch'])
+
+
+class LostLaunchReceipt(unittest.TestCase):
+    def exercise_breakpoint(self, outcome):
+        exercise = runpy.run_path(str(CHECKER))['exercise']
+        fixture = tempfile.TemporaryDirectory(prefix='receipt-fixture-')
+        self.addCleanup(fixture.cleanup)
+        base = Path(fixture.name)
+        root = base / 'private'
+        root.mkdir()
+        delegate = base / 'delegation'
+        args = SimpleNamespace(wfc=base / 'wfc', codex=base / 'codex', codex_home=base / 'profile',
+                               model='fixture', elf_sha256='b' * 64)
+        dispatch, attempt = 'd-a1', 'a-b1'
+        ticket = dict(version=2, unit=dispatch, attempt=attempt,
+                      generation='00000000-0000-4000-8000-000000000001',
+                      nonce='00000000-0000-4000-8000-000000000002', capabilityHash='a' * 64)
+        boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        identity = {key: dict(boot=boot, pid=2**30 + index, start_ticks=10)
+                    for index, key in enumerate(('guardian', 'service', 'kernel', 'worker'))}
+        identity['containment'] = dict(kind='cgroup-v2', device=1, inode=2,
+                                       path=str(delegate / 'wfc-00000000-0000-4000-8000-000000000003'))
+        proof = dict(proves='execution-empty', state='closed', identity=identity)
+        calls = []
+        row = {}
+
+        def command(argv, **_):
+            op, *values = argv[1:]
+            if op == '--version':
+                return 0, 'codex-cli controlled' if argv[0] != args.wfc else 'wfc 0 (Rust, fixture)'
+            calls.append((op, *values) if op != 'dispatch' else (op,))
+            if op == 'dispatch':
+                options = dict(zip(values[::2], map(str, values[1::2])))
+                row.update(dispatch=dispatch, attempt=attempt, scope=options['--scope'],
+                           cwd=str(root / 'worker cwd'), task=options['--task'], report=options['--report'],
+                           host='codex', backend='bundled', round=1, createPending=True, backendHandle=ticket,
+                           backendObservation={'result': 'uncertain', 'ticket': ticket})
+                if outcome == 'empty-output':
+                    return 0, ''
+                if outcome == 'conflicting-launch':
+                    return 0, json.dumps(dict(dispatch=dispatch, attempt='a-b2'))
+                raise RuntimeError('smoke command timed out')
+            if op == 'status':
+                if values:
+                    self.assertEqual(values, ['--dispatch', dispatch])
+                    closed = dict(row, backendAlive=False, backendObservation={
+                        'ticket': ticket, 'cleanup': 'confirmed', 'proof': proof})
+                    return 0, json.dumps({'dispatches': [closed]})
+                if outcome == 'no-assignment':
+                    return 0, '{"dispatches":[]}'
+                if outcome == 'ambiguous':
+                    return 0, json.dumps({'dispatches': [row, dict(row, dispatch='d-a2')]})
+                if outcome == 'wrong-scope':
+                    row['scope'] = 'another scope'
+                if outcome == 'unknown-ticket':
+                    row['backendObservation'] = {'result': 'uncertain'}
+                if outcome == 'conflicting-ticket':
+                    row['backendHandle'] = dict(ticket, generation='00000000-0000-4000-8000-000000000004')
+                return 0, json.dumps({'dispatches': [row]})
+            self.assertEqual((op, values), ('close', [dispatch]))
+            close_ticket = dict(ticket, attempt='a-b2') if outcome == 'wrong-close-proof' else ticket
+            return 0, json.dumps(dict(operation='close', result='completed', cleanup='confirmed',
+                                      dispatch=dispatch, attempt=attempt, round=1, ticket=close_ticket,
+                                      proof=proof))
+
+        output = io.StringIO()
+        with patch.dict(exercise.__globals__, run_command=command), redirect_stdout(output):
+            with self.assertRaises((RuntimeError, json.JSONDecodeError)):
+                exercise(args, root, delegate, lambda: False)
+        return calls, root, [json.loads(line) for line in output.getvalue().splitlines()]
+
+    def test_bound_reservation_closes_once_without_a_launch_receipt(self):
+        for outcome in ('timeout', 'empty-output'):
+            with self.subTest(outcome=outcome):
+                calls, root, records = self.exercise_breakpoint(outcome)
+                self.assertEqual(calls, [('dispatch',), ('status',), ('close', 'd-a1'),
+                                         ('status', '--dispatch', 'd-a1')])
+                self.assertFalse(root.exists())
+                self.assertEqual(records[-1]['cleanup'], 'confirmed')
+
+    def test_unknown_or_mismatched_reservation_is_retained_without_close(self):
+        for outcome in ('no-assignment', 'ambiguous', 'wrong-scope', 'unknown-ticket',
+                        'conflicting-ticket', 'conflicting-launch'):
+            with self.subTest(outcome=outcome):
+                calls, root, records = self.exercise_breakpoint(outcome)
+                self.assertEqual(calls, [('dispatch',), ('status',)])
+                self.assertTrue(root.is_dir())
+                self.assertEqual(records[-1]['cleanup'], 'unconfirmed')
+                self.assertTrue(records[-1]['reason'])
+
+    def test_mismatched_close_proof_is_retained_without_retry(self):
+        calls, root, records = self.exercise_breakpoint('wrong-close-proof')
+        self.assertEqual(calls, [('dispatch',), ('status',), ('close', 'd-a1')])
+        self.assertTrue(root.is_dir())
+        self.assertEqual(records[-1]['cleanup'], 'unconfirmed')
+
+
+class VersionProbe(unittest.TestCase):
+    def test_cancel_stops_its_version_query_group(self):
+        run_command = runpy.run_path(str(CHECKER))['run_command']
+        with tempfile.TemporaryDirectory(prefix='probe-fixture-') as tmp:
+            root = Path(tmp)
+            host = root / 'cancel-version'
+            host.write_text(FIXTURE)
+            host.chmod(0o700)
+            marker = root / 'version'
+            with self.assertRaisesRegex(RuntimeError, 'smoke interrupted'):
+                run_command([host, '--version'], cwd=root, env={'PATH': '/usr/bin:/bin'},
+                            timeout=3, cancel=marker.is_file, version_probe=True)
+            self.assertTrue(wait_for_probe_exit(marker))
+
+
+class WorkerArguments(unittest.TestCase):
+    def test_compares_only_the_expected_startup_fields(self):
+        match = runpy.run_path(str(CHECKER))['worker_arguments_match']
+        with tempfile.TemporaryDirectory(prefix='argv-fixture-') as tmp:
+            proc = Path(tmp)
+            (proc / 'exe').symlink_to('/usr/bin/true')
+            (proc / 'cmdline').write_bytes(
+                b'/usr/bin/python3\0/private/Codex CLI\0-m\0fixture\0- a\0never\0plain (dispatch d-01)\0')
+            allowed = ('/private/Codex CLI',)
+            refs = ('(dispatch d-01)',)
+            self.assertFalse(match(proc, allowed, ['-m', 'fixture', '-a', 'never'], refs))
+            (proc / 'cmdline').write_bytes(
+                b'/usr/bin/python3\0/private/Codex CLI\0-m\0fixture\0-a\0never\0plain (dispatch d-01)\0')
+            self.assertTrue(match(proc, allowed, ['-m', 'fixture', '-a', 'never'], refs))
+            self.assertFalse(match(proc, allowed, ['-m', 'fixture', '-a', 'never'], ('(dispatch d-02)',)))
 
 
 if __name__ == '__main__':
