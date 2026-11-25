@@ -1,0 +1,20 @@
+[Unit]
+Description=Check the disposable Linux guest runtime
+After=local-fs.target
+OnSuccess=poweroff.target
+OnFailure=poweroff.target
+
+[Service]
+Type=oneshot
+User=wfc-guest
+Delegate=yes
+NoNewPrivileges=yes
+TimeoutStartSec=45s
+TimeoutStopSec=5s
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/ttyS0
+ExecStart=/bin/bash /usr/local/libexec/wfc-guest-preflight.sh
+
+[Install]
+WantedBy=multi-user.target
