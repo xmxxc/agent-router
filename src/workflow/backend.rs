@@ -2,7 +2,10 @@
 #[cfg(target_os = "linux")]
 mod bundled;
 #[cfg(target_os = "linux")]
-pub(super) use bundled::submit_reply as submit_bundled_reply;
+pub(super) use bundled::{
+    submit_nudge as submit_bundled_nudge, submit_reply as submit_bundled_reply,
+    APPENDED_USER_ENTRY as BUNDLED_APPENDED_USER_ENTRY,
+};
 
 use super::{host::Launch, valid_identity, write_json};
 use anyhow::{bail, ensure, Context, Result};

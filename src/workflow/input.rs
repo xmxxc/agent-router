@@ -101,6 +101,13 @@ impl<'a> Request<'a> {
             "offline legacy assignment has no input target"
         );
         let require_host = |row: &Value, replay: Option<usize>| -> Result<()> {
+            if row["backend"] == "bundled" {
+                ensure!(
+                    operation == "nudge" && row["host"] == "codex",
+                    "bundled input requires a Codex nudge"
+                );
+                return Ok(());
+            }
             ensure!(
                 row["backend"] == "tmux"
                     && (row["host"] == "codex"
@@ -126,6 +133,7 @@ impl<'a> Request<'a> {
         let (_scope, _execution) =
             lock_input(&state, &original, scope, token.as_deref(), operation)?;
         let mut current = super::read_record(&path)?;
+        let bundled = current["backend"] == "bundled";
         ensure!(
             record_scope(&current) == Some(scope),
             "scope changed while waiting for input"
@@ -134,7 +142,8 @@ impl<'a> Request<'a> {
         ensure!(
             ["host", "backend", "executionId", "tmuxSocket", "create"]
                 .iter()
-                .all(|key| current[*key] == original[*key]),
+                .all(|key| current[*key] == original[*key])
+                && (!bundled || current["backendHandle"] == original["backendHandle"]),
             "execution changed while waiting for input"
         );
         let same_round =
@@ -203,10 +212,18 @@ impl<'a> Request<'a> {
         ensure!(
             current["controllerOwner"].is_null()
                 && assignment::identified(&current)
-                && current["executionId"].is_string()
-                && current["tmuxSocket"].as_str().is_some_and(|socket| Path::new(socket).is_absolute())
                 && current["create"]["result"] == "accepted"
-                && current["create"]["receipt"].is_string(),
+                && if bundled {
+                    let ticket = &current["create"]["ticket"];
+                    ticket.is_object()
+                        && ticket["unit"] == current["dispatch"]
+                        && ticket["attempt"] == current["attempt"]
+                        && current["backendHandle"] == *ticket
+                } else {
+                    current["executionId"].is_string()
+                        && current["tmuxSocket"].as_str().is_some_and(|socket| Path::new(socket).is_absolute())
+                        && current["create"]["receipt"].is_string()
+                },
             "input requires a confirmed native launch; verify the original execution before retrying"
         );
         ensure!(
@@ -225,10 +242,14 @@ impl<'a> Request<'a> {
         );
         ensure!(
             observed["owned"] == true
-                && observed["workerBound"] == true
-                && observed["executionId"] == current["executionId"]
-                && observed["receipt"] == current["create"]["receipt"]
-                && worker["state"] == "running",
+                && worker["state"] == "running"
+                && if bundled {
+                    observed["ticket"] == current["create"]["ticket"]
+                } else {
+                    observed["workerBound"] == true
+                        && observed["executionId"] == current["executionId"]
+                        && observed["receipt"] == current["create"]["receipt"]
+                },
             "execution is not a verified writable worker"
         );
         let legacy_callback = operation == "continue"
@@ -238,7 +259,7 @@ impl<'a> Request<'a> {
             backend::verify_legacy_worker_callback(&state, self.dispatch, &observed)?;
         }
 
-        let (mut next, index, text, generation) = {
+        let (mut next, index, text, generation, earlier_reminders) = {
             let inbox = messages::Inbox::open(&state)?;
             let generation = authorized_generation(&state, scope, token.as_deref(), operation)?;
             ensure!(
@@ -247,6 +268,19 @@ impl<'a> Request<'a> {
             );
             let history =
                 view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
+            let earlier_reminders = if bundled {
+                history
+                    .iter()
+                    .filter(|message| {
+                        message["type"] == "nudge"
+                            && message["attempt"] == current["attempt"]
+                            && message["round"] == current["round"]
+                            && message["text"].as_str() == nudge.as_deref()
+                    })
+                    .count()
+            } else {
+                0
+            };
             let mut projected = current.clone();
             projected["worker"] = worker.clone();
             view::project(&mut projected, &history, Some(true), false)?;
@@ -327,61 +361,87 @@ impl<'a> Request<'a> {
             let index = audit.len();
             audit.push(event);
             save(&state, &path, &next)?;
-            (next, index, text, generation)
+            (next, index, text, generation, earlier_reminders)
         };
 
+        let prepare = || -> Result<()> {
+            let inbox = messages::Inbox::open(&state)?;
+            ensure!(
+                !inbox.unresolved_reply(&current, None)?,
+                "reply is pending or uncertain on this execution; verify it before input"
+            );
+            ensure!(
+                super::read_record(&path)? == next,
+                "assignment changed before input"
+            );
+            let history =
+                view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
+            let mut projected = current.clone();
+            projected["worker"] = worker.clone();
+            view::project(&mut projected, &history, Some(true), false)?;
+            if operation == "nudge" {
+                ensure!(
+                    matches!(projected["state"].as_str(), Some("working" | "asking")),
+                    "current round is no longer writable; use continue after completion"
+                );
+            } else {
+                ensure!(
+                    projected["state"] == "done",
+                    "continue lost its completed base round"
+                );
+            }
+            Ok(())
+        };
+        let check_write = || -> Result<()> {
+            ensure_state_writable(&state)?;
+            ensure!(
+                authorized_generation(&state, scope, token.as_deref(), operation)? == generation,
+                "scope owner changed before input"
+            );
+            Ok(())
+        };
         let mut first_write_error = None;
-        let answer = backend::submit_checked(&state, &current, &text, true, &mut |boundary| {
-            use crate::tmux::InputBoundary::{Enter, PrepareEnter, PrepareText, Text};
-            let check = || -> Result<()> {
-                if matches!(boundary, PrepareText | PrepareEnter) {
-                    let inbox = messages::Inbox::open(&state)?;
-                    ensure!(
-                        !inbox.unresolved_reply(&current, None)?,
-                        "reply is pending or uncertain on this execution; verify it before input"
-                    );
-                    ensure!(
-                        super::read_record(&path)? == next,
-                        "assignment changed before input"
-                    );
-                    let history =
-                        view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
-                    let mut projected = current.clone();
-                    projected["worker"] = worker.clone();
-                    view::project(&mut projected, &history, Some(true), false)?;
-                    if operation == "nudge" {
-                        ensure!(
-                            matches!(projected["state"].as_str(), Some("working" | "asking")),
-                            "current round is no longer writable; use continue after completion"
-                        );
-                    } else {
-                        ensure!(
-                            projected["state"] == "done",
-                            "continue lost its completed base round"
-                        );
-                    }
-                } else {
-                    ensure_state_writable(&state)?;
-                    ensure!(
-                        authorized_generation(&state, scope, token.as_deref(), operation)?
-                            == generation,
-                        "scope owner changed before input"
-                    );
+        let answer = if bundled {
+            let result = backend::submit_bundled_nudge(
+                &state,
+                &current,
+                &text,
+                earlier_reminders,
+                || {
+                    prepare()?;
+                    check_write()
+                },
+                &check_write,
+            );
+            match result {
+                Err(error) if error.is::<controller::ControllerError>() => {
+                    let diagnostic = format!("{error:#}");
+                    first_write_error = Some(error);
+                    Ok(json!({"result":"definitely-not-sent","diagnostic":diagnostic}))
                 }
-                Ok(())
-            };
-            check().map_err(|error| {
-                let diagnostic = format!("{error:#}");
-                let result = match boundary {
-                    PrepareText | Text => {
-                        first_write_error = Some(error);
-                        "definitely-not-sent"
-                    }
-                    PrepareEnter | Enter => "uncertain",
+                other => other,
+            }
+        } else {
+            backend::submit_checked(&state, &current, &text, true, &mut |boundary| {
+                use crate::tmux::InputBoundary::{Enter, PrepareEnter, PrepareText, Text};
+                let check = if matches!(boundary, PrepareText | PrepareEnter) {
+                    prepare()
+                } else {
+                    check_write()
                 };
-                json!({"result":result, "diagnostic":diagnostic})
+                check.map_err(|error| {
+                    let diagnostic = format!("{error:#}");
+                    let result = match boundary {
+                        PrepareText | Text => {
+                            first_write_error = Some(error);
+                            "definitely-not-sent"
+                        }
+                        PrepareEnter | Enter => "uncertain",
+                    };
+                    json!({"result":result, "diagnostic":diagnostic})
+                })
             })
-        })
+        }
         .unwrap_or_else(|error| json!({"result":"uncertain","diagnostic":format!("{error:#}")}));
         let diagnostic = answer["diagnostic"]
             .as_str()

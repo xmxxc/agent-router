@@ -1,7 +1,7 @@
 //! Bind backend operations to the assignment. A durable close intent turns
 //! concurrent requests and retries after a lost reply into receipt reads.
 mod input;
-pub(in crate::workflow) use input::submit_reply;
+pub(in crate::workflow) use input::{submit_nudge, submit_reply, APPENDED_USER_ENTRY};
 
 use super::{closed_path, write_json, Launch};
 use crate::workflow::{assignment, controller, messages, record_scope};

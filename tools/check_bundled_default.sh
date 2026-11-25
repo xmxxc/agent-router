@@ -8,7 +8,7 @@ delegation=${WFC_TEST_DELEGATION-}
 export PATH=/usr/bin:/bin
 case "$mode" in
     ordinary) ;;
-    delegated|reply)
+    delegated|reply|nudge)
         if [ -z "$delegation" ]; then
             echo "BUNDLED_DELEGATION_UNVERIFIED no authorized runner delegation"
             exit 0
@@ -28,7 +28,7 @@ case "$mode" in
         ;;
     *) exit 2 ;;
 esac
-if [ "$mode" = reply ]; then
+if [ "$mode" = reply ] || [ "$mode" = nudge ]; then
     composer=$(realpath -e "$(dirname "$0")/../crates/herdr/tests/composer.py")
 fi
 
@@ -79,9 +79,11 @@ for i in $(seq 300); do
 done
 HOST
 chmod +x host
-if [ "$mode" = reply ]; then
-    jq -n --arg composer "$composer" '{hosts:{codex:{command:["/usr/bin/timeout", "30s",
-        "/usr/bin/python3", $composer, "one", "--submit-first", "--reply-worker", "bundled-paste"]}}}' > launch.json
+if [ "$mode" = reply ] || [ "$mode" = nudge ]; then
+    fixture=bundled-paste
+    if [ "$mode" = nudge ]; then fixture=bundled-nudge; fi
+    jq -n --arg composer "$composer" --arg fixture "$fixture" '{hosts:{codex:{command:["/usr/bin/timeout", "30s",
+        "/usr/bin/python3", $composer, "one", "--submit-first", "--reply-worker", $fixture]}}}' > launch.json
 else
     jq -n --arg host "$work/host" '{hosts:{codex:{command:[$host]}}}' > launch.json
 fi
@@ -104,6 +106,13 @@ if [ "$mode" = ordinary ]; then
 fi
 
 export WFC_BUNDLED_CGROUP_ROOT="$delegation"
+if [ "$mode" = nudge ]; then
+    owner=$("$binary" owner acquire --scope fixture --owner fixture-controller)
+    WFC_CONTROLLER_TOKEN=$(printf '%s\n' "$owner" | jq -er '.token')
+    owner_generation=$(printf '%s\n' "$owner" | jq -er '.generation | select(type=="number")')
+    export WFC_CONTROLLER_TOKEN
+    unset owner
+fi
 dispatch > created
 id=$(jq -er '.dispatch' created)
 jq -e '.backend=="bundled" and .create.result=="accepted"
@@ -120,6 +129,8 @@ if [ "$mode" = reply ]; then
         sleep .05
     done
     qid=$(jq -er '.message' question.json)
+fi
+if [ "$mode" = reply ] || [ "$mode" = nudge ]; then
     jq -c '{op:"read",ticket:.create.ticket}' created > viewport-query
     read_viewport() {
         "$binary" --bundled "$WFC_STATE" < viewport-query > viewport
@@ -138,9 +149,40 @@ if [ "$mode" = reply ]; then
     test "$ready" = yes
     sequence=$(jq -er '.last_input | select(type=="number")' viewport)
     expected_sequence=$((sequence + 2))
+    require_one_submission() {
+        read_viewport
+        jq -e --argjson expected "$expected_sequence" '.last_input==$expected' viewport >/dev/null
+    }
+fi
+if [ "$mode" = nudge ]; then
+    notice='ordinary reminder'
+    nudge() { "$binary" nudge "$id" --text "$notice" --message-id original-reminder; }
+    nudge > nudged
+    require_one_submission
+    jq -e --slurpfile create created '.result=="accepted" and .operation=="nudge"
+        and .dispatch==$create[0].dispatch and .round==$create[0].round and .attempt==$create[0].attempt
+        and (.message | type=="number" and .>0) and (.audit | startswith("i-"))' nudged
+    jq -e '.data.text | contains("› [router] Message from the controller: ordinary reminder")' viewport >/dev/null
+    nudge > repeat-nudge
+    jq -e --slurpfile first nudged '. == ($first[0] + {duplicate:true})' repeat-nudge
+    require_one_submission
+    "$binary" status --dispatch "$id" > after-nudge
+    jq -e --slurpfile create created --slurpfile receipt nudged --arg notice "$notice" --argjson owner "$owner_generation" '
+        .dispatches[0] | .state=="working" and .backendAlive==true and .backendHandle==$create[0].create.ticket
+        and ([.audit[] | select(.operation=="nudge")] | length==1 and
+            (.[0] | .id==$receipt[0].audit and .message==$receipt[0].message and .result=="accepted" and .ownerGeneration==$owner))
+        and ([.messages[] | select(.type=="nudge")] | length==1 and (.[0] |
+            .id==$receipt[0].message and .dispatch==$create[0].dispatch and .round==$create[0].round
+            and .attempt==$create[0].attempt and .text==$notice and .inputEvidence=="bundled-appended-user-entry"))' after-nudge
+    printf '[router] Message from the controller: %s\n' "$notice" > expected
+    cmp expected accepted
+    test ! -e external-called
+    echo BUNDLED_NUDGE_RECEIPT_PASS
+    exit 0
+fi
+if [ "$mode" = reply ]; then
     "$binary" reply "$qid" confirmed > answered
-    read_viewport
-    jq -e --argjson expected "$expected_sequence" '.last_input==$expected' viewport >/dev/null
+    require_one_submission
     jq -e --slurpfile question question.json --arg id "$id" '
         .replied==$question[0].message and .dispatch==$id' answered
     "$binary" status --dispatch "$id" > after-reply
@@ -152,8 +194,7 @@ if [ "$mode" = reply ]; then
             and (.id | type=="number" and .>0) and (.messageId | startswith("m-")))' after-reply
     if "$binary" reply "$qid" repeated > duplicate 2>&1; then exit 1; fi
     grep -F 'already answered' duplicate
-    read_viewport
-    jq -e --argjson expected "$expected_sequence" '.last_input==$expected' viewport >/dev/null
+    require_one_submission
     "$binary" status --dispatch "$id" > after-repeat
     jq -e --slurpfile first after-reply '
         [.dispatches[0].messages[] | select(.type=="reply")] ==

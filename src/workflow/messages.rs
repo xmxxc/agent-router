@@ -1356,11 +1356,15 @@ impl Inbox {
 
     #[cfg(target_os = "linux")]
     pub(super) fn unresolved_reply(&self, row: &Value, except: Option<&str>) -> Result<bool> {
-        if row["backend"] != "tmux" {
+        if !matches!(row["backend"].as_str(), Some("tmux" | "bundled")) {
             return Ok(false);
         }
         let physical = super::backend::execution_row(row)?;
-        let launch_round = physical["round"].as_u64();
+        let launch_round = if row["backend"] == "tmux" {
+            physical["round"].as_u64()
+        } else {
+            None
+        };
         Ok(self.messages.iter().any(|message| {
             message.worker.dispatch == row["dispatch"]
                 && except != Some(message.message_id.as_str())
@@ -1470,9 +1474,15 @@ impl Inbox {
             .get("inputEvidence")
             .and_then(Value::as_str);
         use crate::tmux::APPENDED_USER_ENTRY;
+        let bundled_entry = row["backend"] == "bundled"
+            && matches!(input, WorkerInput::Nudge { .. })
+            && proof == Some(super::backend::BUNDLED_APPENDED_USER_ENTRY);
+        let tmux_entry = proof == Some(APPENDED_USER_ENTRY);
         match (event["result"].as_str(), proof) {
-            (Some("pending"), Some(APPENDED_USER_ENTRY)) => {
-                Ok(Some((message.id, json!(APPENDED_USER_ENTRY))))
+            (Some("pending"), Some(evidence))
+                if bundled_entry || (tmux_entry && row["backend"] != "bundled") =>
+            {
+                Ok(Some((message.id, json!(evidence))))
             }
             (Some("pending" | "uncertain"), Some(CONTINUED_INPUT_CALLBACK))
                 if matches!(input, WorkerInput::Continue { .. })
@@ -1480,13 +1490,13 @@ impl Inbox {
             {
                 Ok(Some((message.id, json!(CONTINUED_INPUT_CALLBACK))))
             }
-            (
-                Some("accepted"),
-                Some(evidence @ (APPENDED_USER_ENTRY | CONTINUED_INPUT_CALLBACK)),
-            ) if event["message"] == message.id
-                && event["inputEvidence"] == evidence
-                && (evidence != CONTINUED_INPUT_CALLBACK
-                    || matches!(input, WorkerInput::Continue { .. })) =>
+            (Some("accepted"), Some(evidence))
+                if event["message"] == message.id
+                    && event["inputEvidence"] == evidence
+                    && (tmux_entry
+                        || bundled_entry
+                        || (evidence == CONTINUED_INPUT_CALLBACK
+                            && matches!(input, WorkerInput::Continue { .. }))) =>
             {
                 Ok(Some((message.id, json!(evidence))))
             }
@@ -1504,9 +1514,14 @@ impl Inbox {
     #[cfg(target_os = "linux")]
     pub(super) fn publish_worker_input(&mut self, row: &Value, event: &Value) -> Result<u64> {
         ensure!(
-            event["inputEvidence"] == crate::tmux::APPENDED_USER_ENTRY
-                || (event["operation"] == "continue"
-                    && event["inputEvidence"] == CONTINUED_INPUT_CALLBACK),
+            if row["backend"] == "bundled" {
+                event["operation"] == "nudge"
+                    && event["inputEvidence"] == super::backend::BUNDLED_APPENDED_USER_ENTRY
+            } else {
+                event["inputEvidence"] == crate::tmux::APPENDED_USER_ENTRY
+                    || (event["operation"] == "continue"
+                        && event["inputEvidence"] == CONTINUED_INPUT_CALLBACK)
+            },
             "missing worker input evidence"
         );
         let worker = Identity::deserialize(row).context("read worker input identity")?;

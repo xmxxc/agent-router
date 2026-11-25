@@ -10,16 +10,18 @@ import tty
 
 reply_worker = '--reply-worker' in sys.argv[2:]
 reply_mode = sys.argv[sys.argv.index('--reply-worker') + 1] if reply_worker else None
+bundled_nudge = reply_mode == 'bundled-nudge'
 if not reply_worker:
     while not Path('show-history').exists():
         time.sleep(.02)
 tty.setraw(0)
 if reply_worker:
     wfc, attempt = os.environ['WFC_BIN'], os.environ['WFC_ATTEMPT']
-    receipt = subprocess.check_output([wfc, 'ask', 'One controlled question?',
-                                       '--attempt', attempt, '--message-id', 'reply-question'])
-    Path('question.tmp').write_bytes(receipt)
-    Path('question.tmp').rename('question.json')
+    if not bundled_nudge:
+        receipt = subprocess.check_output([wfc, 'ask', 'One controlled question?',
+                                           '--attempt', attempt, '--message-id', 'reply-question'])
+        Path('question.tmp').write_bytes(receipt)
+        Path('question.tmp').rename('question.json')
 else:
     os.write(1, b'old history\r\n' * 260)
 draft = {
@@ -45,10 +47,11 @@ disabled = reply_mode in ('disabled', 'claude-disabled')
 image = reply_mode in ('codex-image', 'codex-image-unstyled')
 accepted = False
 submit_first = '--submit-first' in sys.argv[2:]
-bundled_paste = reply_mode == 'bundled-paste'
+bundled_paste = reply_mode == 'bundled-paste' or bundled_nudge
 paste_begin, paste_end = b'\x1b[200~', b'\x1b[201~'
 paste_frame = bytearray()
 pasted_at = None
+submitted = b''
 
 
 def draw():
@@ -100,6 +103,10 @@ def draw():
     prompt_style = b'\x1b[2m' if disabled else b'\x1b[1m'
     background = b'\x1b[48;2;20;30;40m' if reply_mode in ('codex-footer', 'codex-image') else b''
     history = b''
+    if bundled_nudge:
+        history = '› Initial controlled bundled assignment\r\n\r\n'.encode()
+        if submitted:
+            history += '› '.encode() + submitted + b'\r\n\r\n'
     if upstream:
         history = b'older transcript\r\n'
         if reply_mode != 'codex-footer':
@@ -172,6 +179,8 @@ while True:
         else:
             with Path('accepted' if reply_worker else 'events').open('ab') as log:
                 log.write(draft + b'\n')
+            if bundled_nudge:
+                submitted = draft
             accepted = True
             draft = b'Ask Codex to do anything' if reply_mode == 'plain-after-send' else b''
     else:
