@@ -22,6 +22,12 @@ tty.setraw(0)
 if reply_worker:
     wfc, attempt = os.environ['WFC_BIN'], os.environ['WFC_ATTEMPT']
     if not (bundled_nudge or bundled_continue):
+        if reply_mode == 'bundled-paste':
+            # The driver signals after public dispatch confirms the guardian's readiness.
+            while not Path('ask-ready').exists():
+                if Path('finish').exists():
+                    raise SystemExit(0)
+                time.sleep(.02)
         receipt = subprocess.check_output([wfc, 'ask', 'One controlled question?',
                                            '--attempt', attempt, '--message-id', 'reply-question'])
         Path('question.tmp').write_bytes(receipt)

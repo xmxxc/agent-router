@@ -203,6 +203,8 @@ stop_input_worker() {
     id=
 }
 if [ "$mode" = reply ]; then
+    # The public dispatch and the checks above have confirmed this execution.
+    touch ask-ready
     for i in $(seq 200); do
         [ ! -f question.json ] || break
         sleep .05
