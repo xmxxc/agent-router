@@ -1004,13 +1004,22 @@ fn status_with_history(
             )?,
         };
         let messages = view::merged_history(record, messages)?;
+        // Active unknown receipts remain visible for operator resolution.
+        let boundary = messages::message_boundary(
+            &dir,
+            record["dispatch"].as_str().context("missing dispatch")?,
+        );
         undelivered.extend(
             messages
                 .iter()
                 .filter(|m| {
                     m["legacyArchiveOnly"] != true
+                        && m["legacyDeliveryHeld"] != true
                         && m["to"] == "controller"
                         && (m["state"] == "unsent" || m["state"] == "unknown")
+                        && boundary
+                            .refusal(m["round"].as_u64(), m["attempt"].as_str())
+                            .is_none()
                 })
                 .cloned(),
         );

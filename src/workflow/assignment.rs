@@ -58,6 +58,7 @@ pub(super) fn identified(row: &Value) -> bool {
 }
 
 pub(super) const TMUX_HISTORY_ONLY: &str = "tmux assignment history is read-only";
+pub(super) const UNVERIFIED_ASSIGNMENT: &str = "cannot verify assignment publication identity";
 
 pub(super) fn tmux_history(row: &Value) -> bool {
     row["backend"] == "tmux"
@@ -75,6 +76,108 @@ pub(super) fn tmux_history(row: &Value) -> bool {
 pub(super) fn require_not_tmux_history(row: &Value) -> Result<()> {
     ensure!(!tmux_history(row), "{TMUX_HISTORY_ONLY}");
     Ok(())
+}
+
+#[derive(Default)]
+pub(super) enum MessageBoundary {
+    #[default]
+    Open,
+    Retired,
+    Unverified,
+    RetiredAttempts(Vec<(u64, String)>),
+}
+
+impl MessageBoundary {
+    pub(super) fn for_record(row: &Value) -> Self {
+        if tmux_history(row) {
+            return Self::Retired;
+        }
+        if !row["publicationDiagnostic"].is_null() {
+            return Self::Unverified;
+        }
+        let retired = retired_attempts(row);
+        if retired.is_empty() {
+            Self::Open
+        } else {
+            Self::RetiredAttempts(retired)
+        }
+    }
+
+    pub(super) fn refusal(
+        &self,
+        round: Option<u64>,
+        attempt: Option<&str>,
+    ) -> Option<&'static str> {
+        match self {
+            Self::Retired => Some(TMUX_HISTORY_ONLY),
+            Self::Unverified => Some(UNVERIFIED_ASSIGNMENT),
+            Self::RetiredAttempts(retired)
+                if retired
+                    .iter()
+                    .any(|(r, a)| round == Some(*r) && attempt == Some(a.as_str())) =>
+            {
+                Some(TMUX_HISTORY_ONLY)
+            }
+            _ => None,
+        }
+    }
+}
+
+fn receipt_attempt<'a>(round: &Value, attempt: &'a Value) -> Option<(u64, &'a str)> {
+    let round = round.as_u64().filter(|round| *round > 0)?;
+    let attempt = attempt.as_str().filter(|id| valid_identity(id, "a-"))?;
+    Some((round, attempt))
+}
+
+fn retired_attempts(row: &Value) -> Vec<(u64, String)> {
+    let current = receipt_attempt(&row["round"], &row["attempt"]);
+    let mut retired = BTreeSet::new();
+    for event in row["audit"].as_array().into_iter().flatten().rev() {
+        let op = event["operation"].as_str();
+        // Older continue events carry their dispatch through the enclosing row.
+        if event["dispatch"] != row["dispatch"]
+            && !(op == Some("continue") && event["dispatch"].is_null())
+        {
+            continue;
+        }
+        let Some(target) = receipt_attempt(&event["round"], &event["attempt"]) else {
+            continue;
+        };
+        if op != Some("continue") && event["toAttempt"] != event["attempt"] {
+            continue;
+        }
+        let from_round = if op == Some("resume") && event["fromRound"].is_null() {
+            // A resume can open the next round, so the target round is not evidence.
+            let mut rounds = row["rounds"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|round| round["attempt"] == event["fromAttempt"]);
+            match (rounds.next(), rounds.next()) {
+                (Some(round), None) => &round["round"],
+                _ => continue,
+            }
+        } else {
+            &event["fromRound"]
+        };
+        let Some(source) = receipt_attempt(from_round, &event["fromAttempt"]) else {
+            continue;
+        };
+        if source == target || current == Some(source) {
+            continue;
+        }
+        let tmux_handoff = op == Some("handoff") && event["fromBackend"] == "tmux";
+        let same_backend = event["fromBackend"].is_null()
+            && (matches!(op, Some("continue" | "resume"))
+                || (op == Some("handoff") && event["target"].is_null()));
+        if tmux_handoff || (same_backend && retired.contains(&target)) {
+            retired.insert(source);
+        }
+    }
+    retired
+        .into_iter()
+        .map(|(round, attempt)| (round, attempt.to_owned()))
+        .collect()
 }
 
 pub(super) fn has_tmux_history(dir: &Path, id: &str) -> Result<bool> {
@@ -122,6 +225,15 @@ pub(super) fn handoff_blocks_old_writer(row: &Value) -> bool {
     unresolved_handoff(row).is_some_and(|event| event["fromAttempt"] == row["attempt"])
 }
 
+pub(super) fn valid_reservation(row: &Value) -> bool {
+    identified(row)
+        && row["publicationDiagnostic"].is_null()
+        && (row["backend"] != "tmux"
+            || row["executionId"].is_null()
+            || row["executionId"] == row["attempt"])
+        && (row["host"].is_string() || row["worker"].is_object())
+}
+
 #[cfg(target_os = "linux")]
 pub(super) fn unresolved_lifecycle(row: &Value) -> Option<&Value> {
     row["audit"].as_array()?.iter().rev().find(|event| {
@@ -146,16 +258,9 @@ pub(super) fn public_record(dir: &Path, id: &str) -> Result<Option<Value>> {
         }
     };
     row["createPending"] = json!(true);
-    if row["publicationDiagnostic"].is_null() {
-        if !identified(&row)
-            || (row["backend"] == "tmux"
-                && !row["executionId"].is_null()
-                && row["executionId"] != row["attempt"])
-            || (!row["host"].is_string() && !row["worker"].is_object())
-        {
-            row["publicationDiagnostic"] =
-                json!("pending assignment lacks a verifiable execution identity");
-        }
+    if row["publicationDiagnostic"].is_null() && !valid_reservation(&row) {
+        row["publicationDiagnostic"] =
+            json!("pending assignment lacks a verifiable execution identity");
     }
     Ok(Some(row))
 }
@@ -264,5 +369,49 @@ mod tests {
             hosted["backend"] = json!(backend);
             assert!(require_not_tmux_history(&hosted).is_ok());
         }
+    }
+
+    #[test]
+    fn handoff_receipts_are_classified_by_original_round_and_attempt() {
+        let dispatch = "d-00000031";
+        let first = "a-000000000030";
+        let previous = "a-000000000031";
+        let current = "a-000000000032";
+        let older_herdr = "a-000000000029";
+        let mut row = json!({"dispatch":dispatch,"round":2,"attempt":current,"backend":"herdr",
+            "rounds":[{"round":1,"attempt":first},{"round":1,"attempt":previous}],
+            "audit":[
+                {"operation":"handoff","dispatch":dispatch,"fromBackend":"herdr",
+                 "fromRound":1,"fromAttempt":older_herdr,"round":1,"attempt":first,"toAttempt":first},
+                {"operation":"resume","dispatch":dispatch,
+                 "fromAttempt":first,"round":1,"attempt":previous,"toAttempt":previous},
+                {"operation":"handoff","dispatch":dispatch,"fromBackend":"tmux",
+                 "fromRound":1,"fromAttempt":previous,"round":2,"attempt":current,"toAttempt":current}]});
+        for backend in ["herdr", "bundled"] {
+            row["backend"] = json!(backend);
+            let boundary = MessageBoundary::for_record(&row);
+            assert_eq!(
+                boundary.refusal(Some(1), Some(previous)),
+                Some(TMUX_HISTORY_ONLY)
+            );
+            assert_eq!(boundary.refusal(Some(2), Some(previous)), None);
+            assert_eq!(
+                boundary.refusal(Some(1), Some(first)),
+                Some(TMUX_HISTORY_ONLY)
+            );
+            assert_eq!(boundary.refusal(Some(1), Some(older_herdr)), None);
+            assert_eq!(boundary.refusal(Some(1), Some(current)), None);
+            assert_eq!(boundary.refusal(Some(2), Some(current)), None);
+        }
+        row["audit"][2]["dispatch"] = json!("d-00000032");
+        assert_eq!(
+            MessageBoundary::for_record(&row).refusal(Some(1), Some(previous)),
+            None
+        );
+        row["publicationDiagnostic"] = json!("identity unavailable");
+        assert_eq!(
+            MessageBoundary::for_record(&row).refusal(Some(2), Some(current)),
+            Some(UNVERIFIED_ASSIGNMENT)
+        );
     }
 }

@@ -1,7 +1,7 @@
 //! Receipt transitions and operator evidence. The caller holds the inbox lock
 //! from lookup until the updated receipt and its evidence are published.
 use super::{options, Inbox, Message};
-use crate::workflow::{controller, reject_tmux_history, writable_state_dir};
+use crate::workflow::{controller, writable_state_dir};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -170,7 +170,7 @@ impl<'a> Confirm<'a> {
             m.is_controller_message() && (Some(m.id) == numeric || m.message_id == self.id)
         };
         if let Some(message) = Inbox::snapshot(&state)?.into_iter().find(&matches) {
-            reject_tmux_history(&state, &message.worker.dispatch)?;
+            message.worker.require_message_access(&state)?;
         }
         let mut inbox = Inbox::open(&state)?;
         let index = inbox
@@ -180,7 +180,7 @@ impl<'a> Confirm<'a> {
             .with_context(|| format!("no controller message with id {}", self.id))?;
         let (earlier, tail) = inbox.messages.split_at_mut(index);
         let message = &mut tail[0];
-        reject_tmux_history(&state, &message.worker.dispatch)?;
+        message.worker.require_message_access(&state)?;
         let operation = match &self.action {
             Confirmation::Ack { .. } => "ack",
             Confirmation::Resolve { .. } => "resolve",
@@ -220,7 +220,7 @@ impl Confirmation<'_> {
                 if message.delivery.state == State::Processed {
                     return Ok(true);
                 }
-                message.delivery.advance(State::Processed)?;
+                message.advance_delivery(State::Processed)?;
             }
             Self::Resolve { claim, body_hash } => {
                 let matches_body = message.matches_hash(body_hash);
@@ -240,7 +240,7 @@ impl Confirmation<'_> {
                     "resolve requires unknown"
                 );
                 ensure!(matches_body, "body hash does not match the stored receipt");
-                message.delivery.advance(State::Received)?;
+                message.advance_delivery(State::Received)?;
                 message.body_hash = Some(body_hash.to_owned());
                 message.resolution = Some(Resolution {
                     claim,

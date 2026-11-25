@@ -7,10 +7,14 @@ mod registration;
 pub use registration::waiters;
 
 use super::{
+    message_boundary,
     recovery::{GenerationStamps, Generations, Scan, Stamp},
     spaced_json, Identity, Inbox, State,
 };
-use crate::workflow::{controller, ensure_state_writable, worker_owner, writable_state_dir};
+use crate::workflow::{
+    assignment::MessageBoundary, controller, ensure_state_writable, worker_owner,
+    writable_state_dir,
+};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
@@ -411,7 +415,7 @@ struct AssignmentProof {
     stamps: Option<GenerationStamps>,
     identity: Option<(String, u64)>,
     damaged: bool,
-    archived: bool,
+    boundary: MessageBoundary,
 }
 
 struct ScopeAssignments {
@@ -442,7 +446,7 @@ impl ScopeAssignments {
 
     fn permits(&self, dir: &Path, worker: &Identity) -> bool {
         if let Some(proof) = self.proofs.get(&worker.dispatch) {
-            if proof.archived
+            if worker.refusal(&proof.boundary).is_some()
                 || proof.damaged
                 || !proof
                     .stamps
@@ -499,9 +503,10 @@ fn scope_assignments(
             Some(proof) => proof,
             None => {
                 let generations = Generations::read(&dir, &id);
-                let archived = generations
+                let boundary = generations
                     .assigned()
-                    .is_some_and(crate::workflow::assignment::tmux_history);
+                    .map(MessageBoundary::for_record)
+                    .unwrap_or_default();
                 for row in generations.rows() {
                     if !crate::workflow::assignment::tmux_history(row)
                         && !row["controllerOwner"].is_null()
@@ -539,7 +544,7 @@ fn scope_assignments(
                     stamps: stamps.filter(|_| unchanged),
                     identity,
                     damaged: !unchanged || generations.damaged,
-                    archived,
+                    boundary,
                 }
             }
         };
@@ -550,6 +555,8 @@ fn scope_assignments(
 }
 
 fn settle(inbox: &mut Inbox, batch: &[Value], received: bool) -> Result<()> {
+    let dir = inbox.dir.join("dispatches");
+    let mut boundaries = HashMap::new();
     let mut changed = false;
     for (m, claim) in inbox.messages.iter_mut().filter_map(|m| {
         batch
@@ -562,7 +569,13 @@ fn settle(inbox: &mut Inbox, batch: &[Value], received: bool) -> Result<()> {
             && claim["messageId"] == m.message_id
             && claim["dispatch"] == m.worker.dispatch
         {
-            m.delivery.advance(if received {
+            let boundary = boundaries
+                .entry(m.worker.dispatch.clone())
+                .or_insert_with(|| message_boundary(&dir, &m.worker.dispatch));
+            if m.worker.refusal(boundary).is_some() {
+                continue;
+            }
+            m.advance_delivery(if received {
                 State::Received
             } else {
                 State::Unsent
@@ -579,6 +592,53 @@ fn settle(inbox: &mut Inbox, batch: &[Value], received: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_claim_leaves_retired_attempt_receipts_untouched() -> Result<()> {
+        let state = env::temp_dir().join(format!("wfc-relay-history-{}", uuid::Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let dispatch = "d-00000031";
+            let previous = "a-000000000031";
+            let current = "a-000000000032";
+            let dir = state.join("dispatches");
+            fs::create_dir_all(&dir)?;
+            let assignment = json!({"dispatch":dispatch,"round":1,"attempt":current,
+                "host":"codex","role":"fixture","scope":dispatch,"backend":"herdr",
+                "audit":[{"operation":"handoff","dispatch":dispatch,"fromBackend":"tmux",
+                          "fromRound":1,"fromAttempt":previous,"round":1,
+                          "attempt":current,"toAttempt":current}]});
+            let previous_message = json!({"dispatch":dispatch,"round":1,"attempt":previous,
+                "role":"fixture","id":1,"messageId":"m-legacy","received":false,"report":"old"});
+            let current_message = json!({"dispatch":dispatch,"round":1,"attempt":current,
+                "role":"fixture","scope":dispatch,"id":2,"messageId":"m-current",
+                "state":"unsent","statusVersion":1,"report":"new"});
+            fs::write(
+                dir.join(format!("{dispatch}.json")),
+                serde_json::to_vec(&assignment)?,
+            )?;
+            let ledger = state.join("messages.json");
+            fs::write(
+                &ledger,
+                serde_json::to_vec(&[&previous_message, &current_message])?,
+            )?;
+
+            let assignments =
+                scope_assignments(&state, None, None, || false)?.context("missing proof")?;
+            let mut inbox = Inbox::open(&state)?;
+            let (batch, _) =
+                claim_batch(&mut inbox, None, &assignments, 16_384, &mut HashSet::new())?
+                    .context("missing current claim")?;
+            assert_eq!(batch.len(), 1);
+            assert_eq!(batch[0]["messageId"], "m-current");
+            settle(&mut inbox, &batch, true)?;
+            let saved: Vec<Value> = serde_json::from_slice(&fs::read(ledger)?)?;
+            assert_eq!(saved[0], previous_message);
+            assert_eq!(saved[1]["state"], "received");
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(state);
+        result
+    }
 
     #[test]
     fn startup_relay_rechecks_legacy_owner_proof_under_transport_lock() -> Result<()> {

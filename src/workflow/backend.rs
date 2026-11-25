@@ -461,6 +461,9 @@ pub(super) fn publish_unconfirmed_tmux_exit(
     row: &Value,
     ledger: Option<super::messages::PublishLock>,
 ) -> Result<()> {
+    if super::assignment::tmux_history(row) {
+        return Ok(());
+    }
     if let Some(receipt) = verified_unconfirmed_tmux_receipt(state, row)? {
         super::startup::unconfirmed_tmux_exit(
             state,
@@ -770,6 +773,40 @@ fn exited(evidence: &Value) -> Option<Value> {
         .then(|| json!({"state":"exited", "exit_code":code, "signal":null}))
 }
 
+fn bound_close_launch<'a>(
+    row: &'a Value,
+    saved: &'a Value,
+    known: Option<&'a str>,
+) -> Option<&'a str> {
+    match saved.get("launchId") {
+        Some(launch) => launch.as_str().filter(|id| {
+            valid_launch(id)
+                && match known {
+                    Some(known) => *id == known,
+                    None if row["executionId"].is_null() => {
+                        let bound = saved["legacyExecutionId"].as_str();
+                        bound.is_some()
+                            && legacy_selector(row).ok() == bound
+                            && legacy_launch_hint(row)
+                                .is_ok_and(|hint| hint.is_none_or(|hint| hint == *id))
+                    }
+                    None => {
+                        saved["executionId"] == row["attempt"]
+                            && row["executionId"] == row["attempt"]
+                    }
+                }
+        }),
+        // R3 kept the binding only in the immutable create reply.
+        None if ["dispatch", "round", "attempt"]
+            .iter()
+            .all(|k| !row[*k].is_null() && row["create"][*k] == row[*k]) =>
+        {
+            known
+        }
+        None => None,
+    }
+}
+
 // The close effect describes the session. Its supervisor can still publish
 // a process exit later. Both archived reads and close replays use this view.
 fn closed_worker(
@@ -782,44 +819,23 @@ fn closed_worker(
     let worker = &saved["worker"];
     if saved["closeEffect"] == "session_closed" && worker["state"] == "cancelled" {
         let known = receipt_id(row)?;
-        let id = match saved.get("launchId") {
-            Some(launch) => launch.as_str().filter(|id| {
-                valid_launch(id)
-                    && match known {
-                        Some(known) => *id == known,
-                        None if row["executionId"].is_null() => {
-                            let bound = saved["legacyExecutionId"].as_str();
-                            bound.is_some()
-                                && legacy_selector(row).ok() == bound
-                                && legacy_launch_hint(row)
-                                    .is_ok_and(|hint| hint.is_none_or(|hint| hint == *id))
-                        }
-                        None => {
-                            saved["executionId"] == row["attempt"]
-                                && row["executionId"] == row["attempt"]
-                        }
-                    }
-            }),
-            // R3 kept the launch binding only in the immutable create reply.
-            None if ["dispatch", "round", "attempt"]
-                .iter()
-                .all(|k| !row[*k].is_null() && row["create"][*k] == row[*k]) =>
+        let mut id = bound_close_launch(row, saved, known);
+        // R2 had only an unscoped create reply. Active replay must verify its selector.
+        if id.is_none()
+            && saved.get("launchId").is_none()
+            && known.is_some()
+            && row["round"] == 1
+            && row["executionId"].is_null()
+        {
+            if !inspect_legacy {
+                return Ok(None);
+            }
+            if existing(state, row, "inspect", read_only)
+                .is_ok_and(|reply| reply["result"] == "accepted" && reply["alive"] == false)
             {
-                known
+                id = known;
             }
-            // R2 embedded the original, unscoped create reply in the assignment.
-            // Verify its selector with the backend before enriching an R3 archive.
-            None if known.is_some() && row["round"] == 1 && row["executionId"].is_null() => {
-                if !inspect_legacy {
-                    return Ok(None);
-                }
-                match existing(state, row, "inspect", read_only) {
-                    Ok(reply) if reply["result"] == "accepted" && reply["alive"] == false => known,
-                    _ => None,
-                }
-            }
-            None => None,
-        };
+        }
         if let Some(exit) = exited(&private_receipt(state, id)?) {
             return Ok(Some(exit));
         }
@@ -973,13 +989,14 @@ pub(super) fn observe_with_mode(
             json!({"state":"unknown"})
         };
         if let Ok(physical) = execution_row(row) {
-            if let Ok(Some(saved)) = archive(state, &physical) {
-                copy_close_fields(&saved, &mut inspection);
-                if archived_exit(&saved) || confirmed(&physical, &saved) {
+            let saved = archive(state, &physical).ok().flatten();
+            if let Some(saved) = &saved {
+                copy_close_fields(saved, &mut inspection);
+                if archived_exit(saved) || confirmed(&physical, saved) {
                     worker = saved["worker"].clone();
                 }
             }
-            if let Some(exit) = recorded_tmux_exit(state, &physical) {
+            if let Some(exit) = recorded_tmux_exit(state, &physical, saved.as_ref()) {
                 worker = exit;
             }
         }
@@ -999,8 +1016,14 @@ pub(super) fn observe_with_mode(
     observe_tmux(state, physical.as_ref(), read_only)
 }
 
-fn recorded_tmux_exit(state: &Path, row: &Value) -> Option<Value> {
-    let launch = receipt_id(row).ok()??;
+fn recorded_tmux_exit(state: &Path, row: &Value, saved: Option<&Value>) -> Option<Value> {
+    let known = receipt_id(row).ok()?;
+    let closed = saved.filter(|saved| {
+        saved["closeEffect"] == "session_closed" && saved["worker"]["state"] == "cancelled"
+    });
+    let launch = closed
+        .and_then(|saved| bound_close_launch(row, saved, known))
+        .or_else(|| known.filter(|_| closed.is_none() || same_execution(row, &row["create"])))?;
     let receipt = private_receipt(state, Some(launch)).ok()?;
     if receipt.get("launchId").is_some_and(|id| id != launch)
         || ["dispatch", "executionId", "attempt"]
@@ -1292,7 +1315,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn startup_terminal_notice_requires_the_selected_launch_and_outcome() -> Result<()> {
+    fn archived_startup_terminal_evidence_does_not_publish() -> Result<()> {
         let state = std::env::temp_dir().join(format!("wfc-tmux-startup-{}", uuid::Uuid::new_v4()));
         let result = (|| -> Result<()> {
             let launch = "0123456789abcdef0123456789abcdef";
@@ -1318,7 +1341,7 @@ mod tests {
             ] {
                 row["create"] = answer.clone();
                 row["create"][field] = value;
-                publish_unconfirmed_tmux_exit(&state, &row, None)?;
+                assert!(verified_unconfirmed_tmux_receipt(&state, &row)?.is_none());
             }
             for (field, value) in [
                 ("exitCode", json!(17)),
@@ -1330,18 +1353,16 @@ mod tests {
             ] {
                 row["create"] = answer.clone();
                 row["create"][field] = value;
-                assert!(publish_unconfirmed_tmux_exit(&state, &row, None).is_err());
+                assert!(verified_unconfirmed_tmux_receipt(&state, &row).is_err());
             }
             assert!(super::super::messages::history(&state, dispatch)?.is_empty());
             row["create"] = answer;
-            let ledger = super::super::messages::lock_for_private_publish(&state)?;
-            publish_unconfirmed_tmux_exit(&state, &row, Some(ledger))?;
-            let history = super::super::messages::history(&state, dispatch)?;
-            assert_eq!(history.len(), 1);
-            assert!(history[0]["fault"]["exitCode"].is_null());
-            assert_eq!(history[0]["fault"]["signal"], 15);
-            assert_eq!(history[0]["fault"]["pid"], 123);
-            assert_eq!(history[0]["fault"]["launchId"], launch);
+            assert_eq!(
+                verified_unconfirmed_tmux_receipt(&state, &row)?,
+                Some(evidence)
+            );
+            publish_unconfirmed_tmux_exit(&state, &row, None)?;
+            assert!(super::super::messages::history(&state, dispatch)?.is_empty());
             Ok(())
         })();
         let _ = std::fs::remove_dir_all(state);

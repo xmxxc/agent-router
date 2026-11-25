@@ -13,14 +13,14 @@ use receipt::{Delivery, Resolution, State};
 pub use reply::{Reply, REPLY_USAGE};
 
 use super::{
-    controller, ensure_state_writable, git_snapshot::Snapshot, reject_tmux_history,
-    resolve_report_path, valid_id, writable_state_dir,
+    assignment::MessageBoundary, controller, ensure_state_writable, git_snapshot::Snapshot,
+    reject_tmux_history, resolve_report_path, valid_id, writable_state_dir,
 };
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -185,6 +185,43 @@ impl Identity {
             ("round".into(), json!(self.round)),
         ])
     }
+
+    fn refusal(&self, boundary: &MessageBoundary) -> Option<&'static str> {
+        boundary.refusal(Some(self.round), Some(&self.attempt))
+    }
+
+    fn require_message_access(&self, state: &Path) -> Result<()> {
+        if let Some(reason) =
+            self.refusal(&message_boundary(&state.join("dispatches"), &self.dispatch))
+        {
+            anyhow::bail!("{reason}");
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn message_boundary(dir: &Path, dispatch: &str) -> MessageBoundary {
+    if !valid_id(dispatch) {
+        // Orphan receipts can predate the public assignment ID format.
+        return MessageBoundary::Open;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let generations = recovery::Generations::read(dir, dispatch);
+        if generations.damaged {
+            return MessageBoundary::Unverified;
+        }
+        generations
+            .assigned()
+            .map(MessageBoundary::for_record)
+            .unwrap_or_default()
+    }
+    #[cfg(not(target_os = "linux"))]
+    match super::assignment::public_record(dir, dispatch) {
+        Ok(Some(row)) => MessageBoundary::for_record(&row),
+        Ok(None) => MessageBoundary::Open,
+        Err(_) => MessageBoundary::Unverified,
+    }
 }
 
 #[derive(Deserialize)]
@@ -335,6 +372,8 @@ struct Message {
     // Keep additive fields when rewriting a receipt from a newer publisher.
     #[serde(flatten)]
     additional_fields: Map<String, Value>,
+    #[serde(skip)]
+    original_row: Option<Value>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
@@ -502,6 +541,7 @@ impl Message {
             resolution: None,
             created_at: Some(receipt::timestamp()),
             additional_fields: Map::new(),
+            original_row: None,
         }
     }
 
@@ -537,6 +577,7 @@ impl Message {
         if let Some(proof) = proof {
             self.additional_fields
                 .insert("continuedInputCallback".into(), proof);
+            self.original_row = None;
         }
     }
 
@@ -761,8 +802,14 @@ impl Message {
         Value::Object(view)
     }
 
-    fn claim(&mut self, state: State) -> Result<()> {
+    fn advance_delivery(&mut self, state: State) -> Result<()> {
         self.delivery.advance(state)?;
+        self.original_row = None;
+        Ok(())
+    }
+
+    fn claim(&mut self, state: State) -> Result<()> {
+        self.advance_delivery(state)?;
         if self.body_hash.is_none() {
             self.body_hash = Some(self.computed_hash());
         }
@@ -783,6 +830,13 @@ pub(super) struct Inbox {
     messages: Vec<Message>,
     // The lock lives on a stable file because save replaces the data file.
     lock: PublishLock,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum StoredMessage<'a> {
+    Original(&'a Value),
+    Current(&'a Message),
 }
 
 #[cfg(target_os = "linux")]
@@ -1021,25 +1075,30 @@ impl Inbox {
         let path = dir.join("messages.json");
         match File::open(&path) {
             Ok(file) => {
-                let mut messages: Vec<Message> = serde_json::from_reader(BufReader::new(file))
+                let rows: Vec<Value> = serde_json::from_reader(BufReader::new(file))
                     .context("read controller messages")?;
                 // The first scoped wait on an unclaimed pre-snapshot completion
                 // supplies an unknown Git snapshot. Preserve an already bound
                 // body (including the earlier four-field form) byte for byte.
-                for m in &mut messages {
-                    ensure!(m.valid_payload(), "invalid message payload");
-                    if m.is_done()
-                        && m.delivery.legacy_unclaimed
-                        && m.body_hash.is_none()
-                        && m.worker.scope.is_none()
-                        && !m.additional_fields.contains_key("head")
-                        && !m.additional_fields.contains_key("dirty")
-                    {
-                        m.additional_fields.insert("head".into(), Value::Null);
-                        m.additional_fields.insert("dirty".into(), Value::Null);
-                    }
-                }
-                Ok(messages)
+                rows.into_iter()
+                    .map(|row| {
+                        let mut m =
+                            Message::deserialize(&row).context("read controller message")?;
+                        ensure!(m.valid_payload(), "invalid message payload");
+                        if m.is_done()
+                            && m.delivery.legacy_unclaimed
+                            && m.body_hash.is_none()
+                            && m.worker.scope.is_none()
+                            && !m.additional_fields.contains_key("head")
+                            && !m.additional_fields.contains_key("dirty")
+                        {
+                            m.additional_fields.insert("head".into(), Value::Null);
+                            m.additional_fields.insert("dirty".into(), Value::Null);
+                        }
+                        m.original_row = Some(row);
+                        Ok(m)
+                    })
+                    .collect()
             }
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e.into()),
@@ -1080,27 +1139,17 @@ impl Inbox {
         state: State,
     ) -> Result<Vec<Value>> {
         let dir = self.dir.join("dispatches");
-        let mut archived = HashMap::new();
+        let mut boundaries = HashMap::new();
         let mut batch = Vec::new();
         for m in self.messages.iter_mut().filter(|m| {
             m.claimable()
                 && dispatch.is_none_or(|id| id == m.worker.dispatch)
                 && scope.is_none_or(|scope| scope == m.worker.scope())
         }) {
-            let is_archived = match archived.entry(m.worker.dispatch.clone()) {
-                Entry::Occupied(entry) => *entry.get(),
-                Entry::Vacant(entry) => {
-                    let history_only =
-                        match super::assignment::has_tmux_history(&dir, &m.worker.dispatch) {
-                            Ok(value) => value,
-                            Err(error) if dispatch.is_some() => return Err(error),
-                            // Keep this entry untouched and allow other dispatches to deliver.
-                            Err(_) => true,
-                        };
-                    *entry.insert(history_only)
-                }
-            };
-            if !is_archived {
+            let boundary = boundaries
+                .entry(m.worker.dispatch.clone())
+                .or_insert_with(|| message_boundary(&dir, &m.worker.dispatch));
+            if m.worker.refusal(boundary).is_none() {
                 m.claim(state)?;
                 batch.push(m.view());
             }
@@ -1559,7 +1608,17 @@ impl Inbox {
     }
 
     fn save(&self) -> Result<()> {
-        self.save_with(|writer| Ok(serde_json::to_writer(writer, &self.messages)?))
+        self.save_with(|writer| Ok(serde_json::to_writer(writer, &self.stored_messages())?))
+    }
+
+    fn stored_messages(&self) -> Vec<StoredMessage<'_>> {
+        self.messages
+            .iter()
+            .map(|m| match &m.original_row {
+                Some(original) => StoredMessage::Original(original),
+                None => StoredMessage::Current(m),
+            })
+            .collect()
     }
 
     fn save_with(
@@ -1588,8 +1647,7 @@ mod startup_recovery_tests {
     use super::*;
 
     #[test]
-    fn startup_recovery_rejects_replaced_assignment_and_preserves_existing_question() -> Result<()>
-    {
+    fn startup_recovery_preserves_retired_question() -> Result<()> {
         let state = env::temp_dir().join(format!("wfc-startup-recovery-{}", Uuid::new_v4()));
         let result = (|| -> Result<()> {
             let dispatch = "d-aabbccdd";
@@ -1616,35 +1674,9 @@ mod startup_recovery_tests {
                     "dispatch":dispatch,"round":round,"attempt":attempt,"exitCode":17,"receipt":receipt}});
             super::super::write_json(&path, &row, None)?;
             let mut scan = recovery::Scan::default();
-            let mut read = |scope| scan.batch(&state, Some(dispatch), Some(scope), recovery::SLICE);
-            assert!(read("wrong-scope").is_empty());
-            let lost = read(scope);
-            assert_eq!(lost.len(), 1);
-            let mut replaced = row.clone();
-            replaced["attempt"] = json!("a-aaaaaaaaaaaa");
-            super::super::write_json(&path, &replaced, None)?;
-            let mut inbox = Inbox::open(&state)?;
-            inbox.recover_startups(&mut scan, lost)?;
-            assert!(inbox.messages.is_empty());
-            drop(inbox);
-
-            super::super::write_json(&path, &row, None)?;
-            let lost = scan.batch(&state, Some(dispatch), Some(scope), recovery::SLICE);
-            assert_eq!(lost.len(), 1);
-            let pending = path.with_extension("pending");
-            super::super::write_json(&pending, &replaced, None)?;
-            let mut inbox = Inbox::open(&state)?;
-            inbox.recover_startups(&mut scan, lost)?;
-            assert!(inbox.messages.is_empty());
-            drop(inbox);
             assert!(scan
                 .batch(&state, Some(dispatch), Some(scope), recovery::SLICE)
                 .is_empty());
-            fs::write(&pending, b"{")?;
-            assert!(scan
-                .batch(&state, Some(dispatch), Some(scope), recovery::SLICE)
-                .is_empty());
-            super::super::write_json(&pending, &row, None)?;
             super::super::write_json(
                 &state.join("messages.json"),
                 &json!([{
@@ -1655,12 +1687,14 @@ mod startup_recovery_tests {
                 None,
             )?;
             let recovered = scan.batch(&state, Some(dispatch), Some(scope), recovery::SLICE);
-            assert_eq!(recovered.len(), 1);
+            assert!(recovered.is_empty());
+            let before = fs::read(state.join("messages.json"))?;
             let mut inbox = Inbox::open(&state)?;
             inbox.recover_startups(&mut scan, recovered)?;
             assert_eq!(inbox.messages.len(), 1);
             assert_eq!(inbox.messages[0].message_id, "m-question");
             assert_eq!(inbox.messages[0].view()["type"], "question");
+            assert_eq!(fs::read(state.join("messages.json"))?, before);
             Ok(())
         })();
         let _ = fs::remove_dir_all(state);
@@ -1675,6 +1709,7 @@ pub(super) fn publish_startup_failure(
     attempt: &str,
     failure: &super::startup::Failure<'_>,
 ) -> Result<()> {
+    reject_tmux_history(state, dispatch)?;
     publish_startup_failure_locked(state, dispatch, attempt, failure, lock_for_publish(state)?)
 }
 
@@ -1695,6 +1730,7 @@ pub(super) fn publish_startup_failure_locked(
     let (file, path) = super::assignment::open_assignment(&dir, dispatch)?;
     let row = super::decode_record(file, &path)?;
     let assignment = Assignment::deserialize(&row)?;
+    assignment.worker.require_message_access(state)?;
     ensure!(
         row["legacyArchived"] != true
             && assignment.worker.attempt == attempt
@@ -1763,7 +1799,7 @@ impl Reclaimed {
         let mut inbox = Inbox::open(state)?;
         check_ledger_replacement(state)?;
         self.append(&mut inbox)?;
-        let bytes = serde_json::to_vec(&inbox.messages)?;
+        let bytes = serde_json::to_vec(&inbox.stored_messages())?;
         check_snapshot_size(bytes.len())?;
         let pending = inbox.dir.join("messages.pending");
         let mut file = Inbox::open_pending(&pending)?;
@@ -1783,7 +1819,7 @@ impl Reclaimed {
     pub(super) fn publish(self, state: &Path) -> Result<u64> {
         let mut inbox = Inbox::open(state)?;
         let id = self.append(&mut inbox)?;
-        let bytes = serde_json::to_vec(&inbox.messages)?;
+        let bytes = serde_json::to_vec(&inbox.stored_messages())?;
         check_snapshot_size(bytes.len())?;
         inbox
             .save_with(|writer| Ok(writer.write_all(&bytes)?))
@@ -1811,6 +1847,7 @@ impl Reclaimed {
                 ("type".into(), json!("reclaimed")),
                 ("tmux".into(), self.tmux.clone()),
             ]),
+            original_row: None,
         });
         Ok(id)
     }
@@ -2159,7 +2196,10 @@ impl<'a> Wait<'a> {
     pub fn run(self) -> Result<Vec<Value>> {
         let state = writable_state_dir()?;
         if let Some(dispatch) = self.dispatch {
-            reject_tmux_history(&state, dispatch)?;
+            let boundary = message_boundary(&state.join("dispatches"), dispatch);
+            if let Some(reason) = boundary.refusal(None, None) {
+                anyhow::bail!("{reason}");
+            }
         }
         let token = controller::token(self.owner_token);
         let start = Instant::now();

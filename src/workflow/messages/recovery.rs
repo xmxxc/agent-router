@@ -1,7 +1,7 @@
 //! Recover the selected tmux startup result through the ordinary inbox.
 mod progress;
 
-use super::{Assignment, Identity, Inbox};
+use super::{message_boundary, Assignment, Identity, Inbox};
 use crate::workflow::{assignment, backend, decode_record, startup, valid_id};
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -105,12 +105,16 @@ impl Generations {
         let mut damaged = pending.is_err() || published.is_err();
         let pending = pending.ok().flatten();
         let published = published.ok().flatten();
+        damaged |= pending
+            .as_ref()
+            .is_some_and(|generation| !assignment::valid_reservation(&generation.row));
         if let (Some(a), Some(b)) = (&pending, &published) {
             damaged |= [
                 "attempt",
                 "round",
                 "scope",
                 "controllerOwner",
+                "backend",
                 "executionId",
             ]
             .iter()
@@ -309,7 +313,11 @@ impl Inbox {
             let worker = &candidate.assignment.worker;
             // Both versions (including an absent reservation) must still
             // match. A changed record can be inspected in the next sweep.
-            if !candidate.stamps.current(&dir, &worker.dispatch) {
+            if !candidate.stamps.current(&dir, &worker.dispatch)
+                || worker
+                    .refusal(&message_boundary(&dir, &worker.dispatch))
+                    .is_some()
+            {
                 continue;
             }
             if absent {
@@ -347,7 +355,7 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn startup_recovery_advances_past_history_in_small_slices() -> Result<()> {
+    fn startup_recovery_skips_retired_attempts_in_small_slices() -> Result<()> {
         let state = std::env::temp_dir().join(format!("wfc-startup-slices-{}", Uuid::new_v4()));
         let result = (|| {
             let dir = state.join("dispatches");
@@ -407,57 +415,44 @@ mod tests {
                 .collect();
             write(&state.join("messages.json"), json!(history))?;
 
+            let before = fs::read(state.join("messages.json"))?;
             let mut scan = Scan::default();
             assert!(scan.read(&state, None, Some(scope), || false, 2).is_empty());
             assert!(!scan.in_progress());
-            let mut inbox = Inbox::open(&state)?;
             let mut clock_checks = 0;
-            let timed_slice = scan.read(
-                &state,
-                None,
-                Some(scope),
-                || {
-                    clock_checks += 1;
-                    clock_checks <= 3
-                },
-                16,
-            );
-            assert_eq!(timed_slice.len(), 2);
-            inbox.recover_startups(&mut scan, timed_slice)?;
-            assert_eq!(inbox.messages.len(), prefix.len());
+            assert!(scan
+                .read(
+                    &state,
+                    None,
+                    Some(scope),
+                    || {
+                        clock_checks += 1;
+                        clock_checks <= 3
+                    },
+                    16
+                )
+                .is_empty());
+            assert_eq!(clock_checks, 4);
             for _ in 0..2 {
-                let slice = scan.read(&state, None, Some(scope), || true, 2);
-                assert_eq!(slice.len(), 2);
-                inbox.recover_startups(&mut scan, slice)?;
-                assert_eq!(inbox.messages.len(), prefix.len());
+                assert!(scan.in_progress());
+                assert!(scan.read(&state, None, Some(scope), || true, 2).is_empty());
             }
             assert!(scan.in_progress());
             let slice = scan.read(&state, None, Some(scope), || true, 2);
-            assert_eq!(slice.len(), 1);
-            inbox.recover_startups(&mut scan, slice)?;
+            assert!(slice.is_empty());
             assert!(!scan.in_progress());
-            let messages = inbox.claim(None, Some(scope), super::super::State::Received)?;
-            assert_eq!(messages.len(), 1);
-            assert_eq!(messages[0]["dispatch"], target.as_str());
-            assert_eq!(messages[0]["fault"]["exitCode"], 17);
-            let message_id = messages[0]["messageId"].clone();
-
-            // The next sweep sees the same stamps and does not reopen those
-            // records; a fresh process can discover them but the ledger wins.
-            assert!(scan.read(&state, None, Some(scope), || true, 7).is_empty());
-            drop(inbox);
-            let mut restarted = Scan::default();
-            let slice = restarted.read(&state, Some(target), Some(scope), || true, 2);
             let mut inbox = Inbox::open(&state)?;
-            inbox.recover_startups(&mut restarted, slice)?;
-            assert_eq!(inbox.messages.len(), order.len());
-            assert_eq!(
-                inbox.messages.last().unwrap().message_id,
-                message_id.as_str().unwrap()
-            );
+            inbox.recover_startups(&mut scan, slice)?;
+            assert_eq!(inbox.messages.len(), prefix.len());
             assert!(inbox
                 .claim(None, Some(scope), super::super::State::Received)?
                 .is_empty());
+
+            let mut restarted = Scan::default();
+            assert!(restarted
+                .read(&state, Some(target), Some(scope), || true, 2)
+                .is_empty());
+            assert_eq!(fs::read(state.join("messages.json"))?, before);
             Ok(())
         })();
         let _ = fs::remove_dir_all(state);

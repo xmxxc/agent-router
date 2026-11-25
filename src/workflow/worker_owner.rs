@@ -1,6 +1,6 @@
 //! One detached wfc owns and reaps one Linux worker tree.
 use super::{
-    controller, ensure_state_writable, messages, read_record, record_scope, state_dir, valid_id,
+    controller, ensure_state_writable, messages, read_record, record_scope, valid_id,
     valid_identity, writable_state_dir,
 };
 use anyhow::{bail, ensure, Context, Result};
@@ -355,16 +355,36 @@ fn claim_process_identity() -> Result<File> {
     Ok(process)
 }
 
+fn require_worker_reservation(record: &Value, attempt: &str) -> Result<()> {
+    super::assignment::require_not_tmux_history(record)?;
+    ensure!(
+        super::assignment::valid_reservation(record) && record["attempt"] == attempt,
+        "dispatch identity mismatch"
+    );
+    ensure!(
+        record["round"] == 1
+            && record["legacyArchived"] != true
+            && ["backend", "host", "create", "executionId"]
+                .iter()
+                .all(|key| record[*key].is_null())
+            && record["worker"] == json!({"state":"running"}),
+        "worker owner requires an ordinary command reservation"
+    );
+    Ok(())
+}
+
 fn supervise(args: &[OsString]) -> Result<()> {
     let (program, argv) = args.split_first().context("missing worker program")?;
-    let dir = state_dir()?.join("dispatches");
+    let state = writable_state_dir()?;
+    let dir = state.join("dispatches");
     let id = std::env::var("WFC_DISPATCH")?;
     ensure!(valid_id(&id), "invalid dispatch ID");
     let pending = dir.join(format!("{id}.pending"));
     let record = read_record(&pending)?;
+    require_worker_reservation(&record, &std::env::var("WFC_ATTEMPT")?)?;
     ensure!(
-        record["attempt"] == std::env::var("WFC_ATTEMPT")?,
-        "dispatch identity mismatch"
+        !dir.join(format!("{id}.json")).try_exists()?,
+        "dispatch already published"
     );
     let path = owner_path(&dir, &record)?;
     let _process_identity = claim_process_identity()?;
@@ -382,9 +402,8 @@ fn supervise(args: &[OsString]) -> Result<()> {
         fs::remove_file(path)?;
         return Err(err.into());
     }
-    let state = dir.parent().context("missing state directory")?;
     let startup = super::startup::Startup::new(
-        state,
+        &state,
         &id,
         record["attempt"].as_str().context("missing attempt")?,
         None,
@@ -584,6 +603,23 @@ fn exit_pending(pid: i32) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reservation_requires_an_ordinary_command_generation() {
+        let attempt = "a-123456789abc";
+        let row = json!({"dispatch":"d-00000031","attempt":attempt,"round":1,
+                         "worker":{"state":"running"}});
+        assert!(require_worker_reservation(&row, attempt).is_ok());
+        for backend in ["tmux", "herdr", "bundled"] {
+            let mut hosted = row.clone();
+            hosted["backend"] = json!(backend);
+            assert!(require_worker_reservation(&hosted, attempt).is_err());
+        }
+        let mut legacy = row.clone();
+        legacy["host"] = json!("codex");
+        assert!(require_worker_reservation(&legacy, attempt).is_err());
+        assert!(require_worker_reservation(&row, "a-aaaaaaaaaaaa").is_err());
+    }
 
     #[test]
     fn startup_observes_natural_exit_during_controlled_publication() -> Result<()> {
