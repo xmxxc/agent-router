@@ -1,0 +1,8 @@
+29613dea0458f2dc2741685d93e1ed0b591ac72c2efac08367547102ab718503  tests/legacy_offline_import.py
+c5e3198844de5b964ee31b1a46fde195ff967d96784ebbc579be9bcd55863582  tests/legacy_public.py
+3ca0f7a432947084ddb3543acdd029e3a7e29a410142d4c34f50f4e3755b25d9  crates/legacy-state/src/schema.sql
+4bc36be17e3e6151e6386d3856e95e840e3d5d0f8f8e5478eec8a3a40d50e4f3  tools/check_bundled_default.sh
+1af83776598d58c03dcd177d233e6e7b8c89eaf58d4bea0e732128110e308679  crates/herdr/tests/composer.py
+17e88863f3600672ab49182f217281b6fc4d3c762bde361935e436a95214d05c  ../native-input/vendor/zlib-1.3.1.tar.gz
+1dbd30afd7032267b593e0ae7b48db8231687cb2c072e79b3e4b2bf676665737  ../ci/tools/ci/bundled-migrated-ask-reply/probe.py
+6232baa7b431469a2377fe23db5e932c3e0571fba3b280c1bd3015a0b6907091  ../ci/tools/ci/bundled-migrated-ask-reply/run.sh
