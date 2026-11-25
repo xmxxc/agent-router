@@ -37,6 +37,19 @@ pub(super) fn reserve(dir: &Path, id: &str, row: &Value) -> Result<PathBuf> {
     Ok(pending)
 }
 
+pub(super) fn finish_publication(pending: &Path) -> Result<()> {
+    match fs::remove_file(pending) {
+        Ok(()) => (),
+        // A continuation can finish the same publication after seeing its
+        // accepted record, while the original dispatcher is still returning.
+        Err(error) if error.kind() == ErrorKind::NotFound => (),
+        Err(error) => return Err(error.into()),
+    }
+    #[cfg(target_os = "linux")]
+    super::messages::sync_directory(pending.parent().context("missing dispatch directory")?)?;
+    Ok(())
+}
+
 // Capture the pending handle first. A concurrent promotion either leaves that
 // handle readable or supplies the published generation on the second open.
 pub(super) fn open_assignment(dir: &Path, id: &str) -> std::io::Result<(File, PathBuf)> {

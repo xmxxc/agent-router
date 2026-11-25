@@ -434,6 +434,9 @@ impl<'a> Request<'a> {
             let index = audit.len();
             audit.push(event);
             recovery::stage(&current, &mut next, &staged_proof, index)?;
+            if operation == "continue" {
+                inbox.finish_continue_publication(self.dispatch, &current, token.as_deref())?;
+            }
             save(&state, &path, &next)?;
             (next, index, text, generation, earlier_reminders)
         };

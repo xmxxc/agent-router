@@ -388,9 +388,7 @@ impl<'a> Dispatch<'a> {
                     write_json(&published, &record, None).with_context(|| {
                         format!("could not publish launch evidence for {dispatch}; retaining its pending assignment")
                     })?;
-                    fs::remove_file(&pending)?;
-                    #[cfg(target_os = "linux")]
-                    messages::sync_directory(&records)?;
+                    assignment::finish_publication(&pending)?;
                 }
                 ensure!(
                     accepted,
