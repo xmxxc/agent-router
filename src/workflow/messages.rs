@@ -1906,9 +1906,10 @@ impl<'a> Done<'a> {
         // Publish after the same execution lock used for controller input.
         // The first check and Git probe hold neither lock while waiting.
         #[cfg(target_os = "linux")]
-        let _execution = (initial_row["backend"] == "tmux" && initial_row["host"].is_string())
-            .then(|| super::assignment::close_lock(&state, &initial_row))
-            .transpose()?;
+        let _execution = (matches!(initial_row["backend"].as_str(), Some("tmux" | "bundled"))
+            && initial_row["host"].is_string())
+        .then(|| super::assignment::close_lock(&state, &initial_row))
+        .transpose()?;
         let (current, row, mut inbox, duplicate, key) = check()?;
         ensure!(
             initial.worker.round == current.worker.round
@@ -2052,7 +2053,8 @@ impl<'a> Ask<'a> {
         drop(inbox);
         let hosted = row["host"].is_string();
         let controlled = cfg!(target_os = "linux") && !hosted && row["worker"].is_object();
-        let _close_lock = (row["backend"] == "tmux" || controlled)
+        let _close_lock = (matches!(row["backend"].as_str(), Some("tmux" | "bundled"))
+            || controlled)
             .then(|| super::assignment::close_lock(&state, &row))
             .transpose()?;
         let blocked = if replay.is_some() {

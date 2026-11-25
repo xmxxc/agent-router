@@ -165,7 +165,10 @@ impl<'a> Reply<'a> {
                         "endpoint"
                     ]
                     .iter()
-                    .all(|key| row["backendHandle"][*key] == current["backendHandle"][*key]),
+                    .all(|key| row["backendHandle"][*key] == current["backendHandle"][*key])
+                    && (row["backend"] != "bundled"
+                        || (row["create"] == current["create"]
+                            && row["backendHandle"] == current["backendHandle"])),
                 "assignment changed while waiting for input"
             );
             if first {
@@ -291,6 +294,12 @@ fn submit(
         // execution is busy, release the scope so takeover can proceed.
         if let Some(_scope_lock) = controller::try_scope_lock(state, scope)? {
             controller::Owners::read(state)?.require(scope, token, "reply")?;
+            let check_write = || {
+                crate::workflow::ensure_state_writable(state)
+                    .and_then(|()| controller::Owners::read(state))
+                    .and_then(|owners| owners.require(scope, token, "reply"))
+                    .map(|_| ())
+            };
             match row["backend"].as_str() {
                 Some("tmux") => {
                     if let Some(_input_lock) = assignment::try_reply_lock(state, row)? {
@@ -305,10 +314,7 @@ fn submit(
                                 let check = match boundary {
                                     PrepareText => begin(true),
                                     PrepareEnter => begin(false),
-                                    Text | Enter => crate::workflow::ensure_state_writable(state)
-                                        .and_then(|()| controller::Owners::read(state))
-                                        .and_then(|owners| owners.require(scope, token, "reply"))
-                                        .map(|_| ()),
+                                    Text | Enter => check_write(),
                                 };
                                 check.map_err(|error| {
                                 let diagnostic = format!("{error:#}");
@@ -324,6 +330,17 @@ fn submit(
                             return Err(error);
                         }
                         return outcome;
+                    }
+                }
+                Some("bundled") => {
+                    if let Some(_input_lock) = assignment::try_reply_lock(state, row)? {
+                        return backend::submit_bundled_reply(
+                            state,
+                            row,
+                            text,
+                            &mut begin,
+                            check_write,
+                        );
                     }
                 }
                 Some("herdr") => {

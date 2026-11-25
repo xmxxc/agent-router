@@ -8,7 +8,7 @@ delegation=${WFC_TEST_DELEGATION-}
 export PATH=/usr/bin:/bin
 case "$mode" in
     ordinary) ;;
-    delegated)
+    delegated|reply)
         if [ -z "$delegation" ]; then
             echo "BUNDLED_DELEGATION_UNVERIFIED no authorized runner delegation"
             exit 0
@@ -28,6 +28,9 @@ case "$mode" in
         ;;
     *) exit 2 ;;
 esac
+if [ "$mode" = reply ]; then
+    composer=$(realpath -e "$(dirname "$0")/../crates/herdr/tests/composer.py")
+fi
 
 work=$(mktemp -d)
 id=
@@ -76,7 +79,12 @@ for i in $(seq 300); do
 done
 HOST
 chmod +x host
-jq -n --arg host "$work/host" '{hosts:{codex:{command:[$host]}}}' > launch.json
+if [ "$mode" = reply ]; then
+    jq -n --arg composer "$composer" '{hosts:{codex:{command:["/usr/bin/timeout", "30s",
+        "/usr/bin/python3", $composer, "one", "--submit-first", "--reply-worker", "normal"]}}}' > launch.json
+else
+    jq -n --arg host "$work/host" '{hosts:{codex:{command:[$host]}}}' > launch.json
+fi
 
 dispatch() {
     "$binary" dispatch --host codex --label fixture --cwd . --task task --report report --scope fixture "$@"
@@ -97,14 +105,54 @@ fi
 
 export WFC_BUNDLED_CGROUP_ROOT="$delegation"
 dispatch > created
-id=$(jq -er 'select(.backend=="bundled" and .create.result=="accepted"
+id=$(jq -er '.dispatch' created)
+jq -e '.backend=="bundled" and .create.result=="accepted"
     and .create.ticket.unit==.dispatch and .create.ticket.attempt==.attempt
-    and .backendHandle==.create.ticket and .tmuxSocket==null) | .dispatch' created)
+    and .backendHandle==.create.ticket and .tmuxSocket==null' created
 unset WFC_BUNDLED_CGROUP_ROOT
 "$binary" status --dispatch "$id" > running
 jq -e --slurpfile create created '.dispatches[0] | .backend=="bundled"
     and .worker.state=="running" and .backendAlive==true
     and .backendHandle==$create[0].create.ticket' running
+if [ "$mode" = reply ]; then
+    for i in $(seq 200); do
+        [ ! -f question.json ] || break
+        sleep .05
+    done
+    qid=$(jq -er '.message' question.json)
+    jq -c '{op:"read",ticket:.create.ticket}' created > viewport-query
+    ready=
+    for i in $(seq 40); do
+        "$binary" --bundled "$WFC_STATE" < viewport-query > viewport
+        jq -e '.result=="accepted" and .data.screen=="Primary"' viewport >/dev/null
+        if jq -e '.data.text | contains("Ask Codex to do anything")' viewport >/dev/null; then
+            ready=yes
+            break
+        fi
+        sleep .05
+    done
+    test "$ready" = yes
+    "$binary" reply "$qid" confirmed > answered
+    jq -e --slurpfile question question.json --arg id "$id" '
+        .replied==$question[0].message and .dispatch==$id' answered
+    if "$binary" reply "$qid" repeated > duplicate 2>&1; then exit 1; fi
+    grep -F 'already answered' duplicate
+    "$binary" status --dispatch "$id" > after-reply
+    jq -e --slurpfile created created --slurpfile question question.json '
+        [.dispatches[0].messages[] | select(.type=="reply")] | length==1 and
+        (.[0] | .inputResult=="accepted" and .to==$question[0].message
+            and .questionMessageId==$question[0].messageId and .dispatch==$created[0].dispatch
+            and .attempt==$created[0].attempt and .round==$created[0].round)' after-reply
+    printf '[router] Answer to question %s: confirmed\n' "$qid" > expected
+    cmp expected accepted
+    "$binary" close "$id" > closed
+    jq -e --slurpfile created created '.result=="completed" and .cleanup=="confirmed"
+        and .ticket==$created[0].create.ticket' closed
+    test ! -e external-called
+    id=
+    echo BUNDLED_REPLY_RECEIPT_PASS
+    exit 0
+fi
 touch report-now
 for i in $(seq 200); do
     [ ! -f reported ] || break

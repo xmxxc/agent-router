@@ -8,7 +8,7 @@ mod rpc;
 mod screen;
 pub use process::Process;
 use rpc::Session;
-pub use screen::{classify_reply_capture, ReplyBox};
+pub use screen::{classify_reply_capture, reply_input_paused, ReplyBox};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};

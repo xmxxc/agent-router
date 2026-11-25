@@ -220,7 +220,7 @@ pub fn serve(spec: &Value, store: Store) -> Result<u8> {
                             ("input", json!({"text":req["text"]}))
                         }
                         "resize" => ("resize", json!({"cols":req["cols"],"rows":req["rows"]})),
-                        _ => ("read", json!({})),
+                        _ => ("read", json!({"styled":req["styled"] == true})),
                     };
                     let answer = kernel.call(kernel_op, data)?;
                     if answer["ok"] == true {
