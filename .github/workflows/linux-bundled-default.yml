@@ -1,0 +1,94 @@
+name: Linux bundled default dispatch
+on:
+  push:
+    branches: [rust-router/linux-33-default-bundled-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  default-dispatch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      WFC_BUILD_ID: 2a2c8128e5e73193d9b224bd73f56b70c7248db2
+      PRODUCT_TREE: 66f5f58c642974726405e0e9b102f33c1933264a
+      PRODUCT_PARENT: e9d0d2fdffb56fa0d6e9cf1aca515a0e223c5f58
+      NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+      EVIDENCE: ${{ github.workspace }}/bundled-default-evidence
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - name: Record the hosted run
+        run: |
+          mkdir -p "$EVIDENCE"
+          printf 'workflow %s\nrun %s attempt %s\nproduct %s\n' \
+            "$GITHUB_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$WFC_BUILD_ID" \
+            | tee "$EVIDENCE/run.log"
+          uname -a | tee -a "$EVIDENCE/run.log"
+          echo 'UNVERIFIED: delegated bundled lifecycle requires an already authorized dedicated cgroup v2 runner.' \
+            | tee "$EVIDENCE/delegation.log" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.WFC_BUILD_ID }}
+          path: product
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.NATIVE_INPUT_SHA }}
+          path: native-input
+          sparse-checkout: vendor/zlib-1.3.1.tar.gz
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        with:
+          version: '0.16.0'
+      - name: Verify product provenance and prepare the pinned build
+        working-directory: product
+        run: |
+          test "$(git rev-parse HEAD)" = "$WFC_BUILD_ID"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          test "$(git show -s --format=%P HEAD)" = "$PRODUCT_PARENT"
+          test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
+          git log -1 --format='product %H tree %T parent %P' | tee "$EVIDENCE/product.log"
+          sha256sum --check --strict vendor/INPUTS.sha256 | tee "$EVIDENCE/inputs.log"
+          rustup toolchain install 1.96.1 --profile minimal
+          { rustc -vV; cargo --version; zig version; } | tee "$EVIDENCE/toolchain.log"
+          python tools/prepare.py --zlib-archive ../native-input/vendor/zlib-1.3.1.tar.gz \
+            2>&1 | tee "$EVIDENCE/prepare.log"
+          cargo build --release --locked --bin wfc 2>&1 | tee "$EVIDENCE/build.log"
+          install -m 0500 target/release/wfc "$EVIDENCE/wfc"
+          version=$("$EVIDENCE/wfc" --version)
+          [[ "$version" == *"(Rust, x86_64-unknown-linux-gnu, release, build $WFC_BUILD_ID)" ]]
+          printf '%s\n' "$version" | tee "$EVIDENCE/version.log"
+          (cd "$EVIDENCE" && sha256sum wfc | tee binary.sha256)
+      - name: Exercise default dispatch with ordinary directories
+        working-directory: product
+        run: |
+          env -i PATH=/usr/bin:/bin TMPDIR="$RUNNER_TEMP" \
+            /bin/sh tools/check_bundled_default.sh "$EVIDENCE/wfc" ordinary \
+            2>&1 | tee "$EVIDENCE/ordinary.log"
+          grep -Fx BUNDLED_DEFAULT_ORDINARY_PASS "$EVIDENCE/ordinary.log"
+      - name: Checksum the artifact
+        if: ${{ always() }}
+        run: |
+          cd "$EVIDENCE"
+          if [ -f binary.sha256 ]; then
+            sha256sum --check --strict binary.sha256
+          fi
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+            | LC_ALL=C sort -z | xargs -0 -r sha256sum > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() }}
+        with:
+          name: bundled-default-${{ env.WFC_BUILD_ID }}-ci-${{ github.workflow_sha }}-attempt-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 14
