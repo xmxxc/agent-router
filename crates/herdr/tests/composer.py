@@ -1,25 +1,31 @@
 """Raw PTY fixture with scrollback, a wrapped draft and two adjacent footer lines."""
+import json
 import os
+import re
 import select
 import subprocess
 import sys
 from pathlib import Path
 import time
+import textwrap
 import tty
 
 
 reply_worker = '--reply-worker' in sys.argv[2:]
 reply_mode = sys.argv[sys.argv.index('--reply-worker') + 1] if reply_worker else None
+bundled_nudge = reply_mode == 'bundled-nudge'
+bundled_continue = reply_mode == 'bundled-continue'
 if not reply_worker:
     while not Path('show-history').exists():
         time.sleep(.02)
 tty.setraw(0)
 if reply_worker:
     wfc, attempt = os.environ['WFC_BIN'], os.environ['WFC_ATTEMPT']
-    receipt = subprocess.check_output([wfc, 'ask', 'One controlled question?',
-                                       '--attempt', attempt, '--message-id', 'reply-question'])
-    Path('question.tmp').write_bytes(receipt)
-    Path('question.tmp').rename('question.json')
+    if not (bundled_nudge or bundled_continue):
+        receipt = subprocess.check_output([wfc, 'ask', 'One controlled question?',
+                                           '--attempt', attempt, '--message-id', 'reply-question'])
+        Path('question.tmp').write_bytes(receipt)
+        Path('question.tmp').rename('question.json')
 else:
     os.write(1, b'old history\r\n' * 260)
 draft = {
@@ -45,6 +51,34 @@ disabled = reply_mode in ('disabled', 'claude-disabled')
 image = reply_mode in ('codex-image', 'codex-image-unstyled')
 accepted = False
 submit_first = '--submit-first' in sys.argv[2:]
+bundled_paste = reply_mode == 'bundled-paste' or bundled_nudge or bundled_continue
+paste_begin, paste_end = b'\x1b[200~', b'\x1b[201~'
+paste_frame = bytearray()
+pasted_at = None
+submitted = b''
+next_round = None
+
+
+def format_brief(text):
+    width = os.get_terminal_size(0).columns - 2
+    return '\r\n  '.join(textwrap.wrap(text.decode(), width)).encode()
+
+
+def complete_round(name, report, target, reference=None):
+    report = Path(report)
+    report.write_text(f'{name} report from the original pane\n')
+    args = [wfc, 'done', '--report', report, '--attempt', target, '--message-id', name]
+    if reference:
+        args += ['--callback-ref', reference]
+    result = subprocess.run(args, capture_output=True)
+    if result.returncode:
+        raise SystemExit('controlled bundled completion failed')
+    receipt = json.loads(result.stdout)
+    receipt = {key: receipt[key] for key in ('message', 'messageId', 'state', 'statusVersion')}
+    receipt.update(pid=os.getpid(), attempt=target)
+    pending = Path(name + '.tmp')
+    pending.write_text(json.dumps(receipt))
+    pending.replace(Path(name + '.json'))
 
 
 def draw():
@@ -76,7 +110,8 @@ def draw():
         os.write(1, b'\x1b[2J\x1b[H' + background + glyph + draft.replace(b'\n', b'\r\n') +
                  reset + b'\r\n' + footer.encode() + b'\r\n')
         return
-    body = draft.replace(b' tail ', b'\n  tail ').replace(b'\n', b'\r\n')
+    body = (format_brief(draft) if bundled_continue else
+            draft.replace(b' tail ', b'\n  tail ').replace(b'\n', b'\r\n'))
     if protect_draft:
         body += '\r\n  tail · value'.encode()
     elif reply_worker and not body:
@@ -96,6 +131,11 @@ def draw():
     prompt_style = b'\x1b[2m' if disabled else b'\x1b[1m'
     background = b'\x1b[48;2;20;30;40m' if reply_mode in ('codex-footer', 'codex-image') else b''
     history = b''
+    if bundled_nudge or bundled_continue:
+        history = '› Initial controlled bundled assignment\r\n\r\n'.encode()
+        if submitted:
+            entry = format_brief(submitted) if bundled_continue else submitted
+            history += '› '.encode() + entry + b'\r\n\r\n'
     if upstream:
         history = b'older transcript\r\n'
         if reply_mode != 'codex-footer':
@@ -107,10 +147,21 @@ def draw():
              b' ' + body + footer.encode())
 
 
+if bundled_paste:
+    os.write(1, b'\x1b[?2004h')
 draw()
 drop_next_enter = not submit_first or reply_mode == 'exact-reply'
 while True:
     if reply_worker:
+        if bundled_continue:
+            if Path('finish').exists():
+                break
+            if Path('finish-first').exists():
+                Path('finish-first').unlink()
+                complete_round('first', os.environ['WFC_REPORT'], attempt)
+            if next_round and Path('finish-next').exists():
+                Path('finish-next').unlink()
+                complete_round('second', *next_round)
         if Path('clear-draft').exists():
             Path('clear-draft').unlink()
             draft = b''
@@ -132,6 +183,26 @@ while True:
     key = os.read(0, 1)
     if not key:
         break
+    if bundled_paste:
+        if pasted_at is None:
+            if key in (b'\r', b'\n'):
+                raise SystemExit('Enter arrived before the bracketed paste ended')
+            paste_frame += key
+            if len(paste_frame) <= len(paste_begin) and not paste_begin.startswith(paste_frame):
+                raise SystemExit('reply did not start with a bracketed paste')
+            if paste_frame.endswith(paste_end):
+                draft = bytes(paste_frame[len(paste_begin):-len(paste_end)])
+                pasted_at = time.monotonic_ns()
+                draw()
+            continue
+        if key != b'\r' or accepted:
+            raise SystemExit('unexpected bytes after the bracketed paste')
+        elapsed_ns = time.monotonic_ns() - pasted_at
+        # PTY reads can be scheduled later than the acknowledged write.
+        # Allow 50 ms of receiver-side slack while rejecting the old 300 ms delay.
+        if elapsed_ns < 450_000_000:
+            raise SystemExit('Enter arrived during the paste settling window')
+        Path('paste-enter-ns').write_text(f'{elapsed_ns}\n')
     if key in (b'\r', b'\n'):
         if reply_mode == 'always-drop':
             pass
@@ -144,8 +215,17 @@ while True:
         elif drop_next_enter:
             drop_next_enter = False
         else:
-            with Path('accepted' if reply_worker else 'events').open('ab') as log:
-                log.write(draft + b'\n')
+            if bundled_continue:
+                match = re.search(r'''Run "\$WFC_BIN" done --report '([^']+)' --attempt (a-[0-9a-f]+) --callback-ref ([0-9a-f]{64})\. ''',
+                                  draft.decode())
+                if not draft.startswith(b'[router] New task for you (dispatch ') or not match:
+                    raise SystemExit('controlled pane did not receive a complete next-round brief')
+                next_round = match.groups()
+            else:
+                with Path('accepted' if reply_worker else 'events').open('ab') as log:
+                    log.write(draft + b'\n')
+            if bundled_nudge or bundled_continue:
+                submitted = draft
             accepted = True
             draft = b'Ask Codex to do anything' if reply_mode == 'plain-after-send' else b''
     else:

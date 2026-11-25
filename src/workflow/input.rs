@@ -1,4 +1,8 @@
 //! Public input to the existing worker, with round changes committed before typing.
+mod recovery;
+#[cfg(test)]
+mod tests;
+
 use super::{
     assignment, backend, controller, ensure_state_writable, messages, record_scope, view,
     writable_state_dir, write_json,
@@ -16,9 +20,10 @@ use std::{
 use uuid::Uuid;
 
 pub const CONTINUE_USAGE: &str =
-    "wfc continue DISPATCH --task FILE --report FILE [--owner-token TOKEN]";
+    "wfc continue DISPATCH --task FILE --report FILE [--owner-token TOKEN] [--no-send-proof PROOF]";
 pub const NUDGE_USAGE: &str =
-    "wfc nudge DISPATCH --text TEXT [--message-id KEY] [--owner-token TOKEN]";
+    "wfc nudge DISPATCH --text TEXT [--message-id KEY] [--owner-token TOKEN] [--no-send-proof PROOF]";
+pub(super) const NO_SEND_RECOVERY: &str = "bundledNoSendRecovery";
 
 pub fn usage(name: &str) -> &'static str {
     if name == "continue" {
@@ -57,38 +62,51 @@ pub struct Request<'a> {
     dispatch: &'a str,
     token: Option<&'a str>,
     key: Option<&'a str>,
+    no_send_proof: Option<&'a str>,
     action: Action<'a>,
 }
 
 impl<'a> Request<'a> {
     pub fn parse(name: &str, args: &'a [OsString]) -> Result<Self> {
         let mut dispatch = None;
-        let (token, key, action) = if name == "continue" {
-            let [token, task, report] = messages::options(
+        let (token, key, no_send_proof, action) = if name == "continue" {
+            let [token, task, report, proof] = messages::options(
                 args,
-                ["--owner-token", "--task", "--report"],
+                ["--owner-token", "--task", "--report", "--no-send-proof"],
                 Some((&mut dispatch, "dispatch ID")),
             )?;
             (
                 token,
                 None,
+                proof,
                 Action::Continue {
                     task: Path::new(task.context("missing --task")?),
                     report: Path::new(report.context("missing --report")?),
                 },
             )
         } else {
-            let [token, text, key] = messages::options(
+            let [token, text, key, proof] = messages::options(
                 args,
-                ["--owner-token", "--text", "--message-id"],
+                ["--owner-token", "--text", "--message-id", "--no-send-proof"],
                 Some((&mut dispatch, "dispatch ID")),
             )?;
             ensure!(
                 key.is_none_or(|key| !key.trim().is_empty() && !key.chars().any(char::is_control)),
                 "invalid --message-id"
             );
-            (token, key, Action::Nudge(text.context("missing --text")?))
+            (
+                token,
+                key,
+                proof,
+                Action::Nudge(text.context("missing --text")?),
+            )
         };
+        ensure!(
+            no_send_proof.is_none_or(
+                |proof| proof.len() == 64 && proof.bytes().all(|byte| byte.is_ascii_hexdigit())
+            ),
+            "invalid --no-send-proof"
+        );
         let dispatch = dispatch
             .filter(|id| super::valid_id(id))
             .context("invalid or missing dispatch ID")?;
@@ -96,31 +114,49 @@ impl<'a> Request<'a> {
             dispatch,
             token,
             key,
+            no_send_proof,
             action,
         })
     }
 
     pub fn run(self) -> Result<Value> {
+        self.run_in(
+            writable_state_dir()?,
+            backend::observe,
+            submit_bundled,
+            verify_bundled_ticket,
+        )
+    }
+
+    fn run_in(
+        self,
+        state: PathBuf,
+        observe: impl FnOnce(&Path, &mut Value) -> Result<(Value, Value)>,
+        send_bundled: impl FnOnce(
+            BundledSend<'_>,
+            &mut dyn FnMut() -> Result<()>,
+            &dyn Fn() -> Result<()>,
+        ) -> (Result<Value>, bool),
+        verify_ticket: impl FnOnce(&Path, &Value) -> Result<()>,
+    ) -> Result<Value> {
         let operation = self.action.name();
-        let state = writable_state_dir()?;
         let dir = state.join("dispatches");
         let path = dir.join(format!("{}.json", self.dispatch));
-        let original = assignment::public_record(&dir, self.dispatch)?
-            .with_context(|| format!("unknown dispatch {}", self.dispatch))?;
+        let read_assignment = || messages::read_callback_record(&dir, self.dispatch);
+        let original = read_assignment()?;
         assignment::require_not_tmux_history(&original)?;
         ensure!(
             original["legacyArchived"] != true,
             "offline legacy assignment has no input target"
         );
-        let require_host = |row: &Value, replay: Option<usize>| -> Result<()> {
-            ensure!(
-                row["backend"] == "tmux"
-                    && (row["host"] == "codex"
-                        || replay.is_some_and(|index| row["audit"][index]["result"] == "accepted")),
-                "{operation} is unavailable for this backend"
-            );
-            Ok(())
-        };
+        ensure!(
+            original["backend"] == "bundled",
+            "{operation} is unavailable for this backend"
+        );
+        ensure!(
+            original["host"] == "codex",
+            "bundled input requires a Codex assignment"
+        );
         let scope = record_scope(&original).context("invalid dispatch scope")?;
         let token = controller::token(self.token);
         controller::Owners::read(&state)?.require(scope, token.as_deref(), operation)?;
@@ -130,23 +166,27 @@ impl<'a> Request<'a> {
         };
         let original_unresolved = assignment::input_unresolved(&original);
         let initial_replay = replay_index(&original, &self.action, nudge.as_deref(), self.key)?;
-        require_host(&original, initial_replay)?;
         ensure!(
-            !original_unresolved || initial_replay.is_some(),
+            !original_unresolved || initial_replay.is_some() || self.no_send_proof.is_some(),
             "input is pending or uncertain; verify the prior input before retrying"
         );
         let (_scope, _execution) =
             lock_input(&state, &original, scope, token.as_deref(), operation)?;
-        let mut current = super::read_record(&path)?;
+        let mut current = read_assignment()?;
+        assignment::require_not_tmux_history(&current)?;
         ensure!(
             record_scope(&current) == Some(scope),
             "scope changed while waiting for input"
         );
         controller::Owners::read(&state)?.require(scope, token.as_deref(), operation)?;
         ensure!(
-            ["host", "backend", "executionId", "tmuxSocket", "create"]
+            ["host", "backend", "create"]
                 .iter()
-                .all(|key| current[*key] == original[*key]),
+                .all(|key| current[*key] == original[*key])
+                // The first continuation records executionId while a retry
+                // may still hold a snapshot of the original logical round.
+                && backend::bundled_input_ticket(&current)?
+                    == backend::bundled_input_ticket(&original)?,
             "execution changed while waiting for input"
         );
         let same_round =
@@ -160,12 +200,55 @@ impl<'a> Request<'a> {
                         && event["fromRound"] == original["round"]
                         && event["fromAttempt"] == original["attempt"])
             });
-        require_host(&current, replay)?;
         ensure!(
             assignment::unresolved_handoff(&current).is_none()
                 || replay.is_some_and(|index| current["audit"][index]["result"] == "accepted"),
             "handoff is unresolved; reconcile the original execution before input"
         );
+        if let Some(proof) = self.no_send_proof {
+            ensure!(
+                same_round,
+                "zero-send recovery requires the original bundled input"
+            );
+            let (mut restored, mut event) = recovery::restore(current.clone(), proof)?;
+            ensure!(
+                event["operation"] == operation
+                    && match &self.action {
+                        Action::Nudge(_) =>
+                            event["requestKey"] == json!(self.key)
+                                && event["text"].as_str() == nudge.as_deref(),
+                        Action::Continue { task, report } =>
+                            same_continue_paths(&event, task, report),
+                    },
+                "zero-send proof requires the original input request"
+            );
+            let ticket = backend::bundled_input_ticket(&current)?;
+            ensure!(
+                ticket == backend::bundled_input_ticket(&restored)?,
+                "zero-send proof does not match the original bundled execution"
+            );
+            verify_ticket(&state, ticket)?;
+            let _inbox = messages::Inbox::open(&state)?;
+            let history =
+                view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
+            ensure!(
+                !recovery::history_conflicts(&event, &history)?,
+                "worker history conflicts with zero-send proof; keep the input pending"
+            );
+            event["result"] = json!("definitely-not-sent");
+            event["inputEvidence"] = json!("bundled-first-write-blocked");
+            event["diagnostic"] = json!("bundled input was blocked before its first write");
+            *restored["audit"]
+                .as_array_mut()
+                .and_then(|events| events.last_mut())
+                .context("missing pending input audit")? = event.clone();
+            authorized_generation(&state, scope, token.as_deref(), operation)?;
+            save(&state, &path, &restored)?;
+            return Ok(
+                json!({"dispatch":self.dispatch,"operation":operation,"result":"definitely-not-sent",
+                "round":restored["round"],"attempt":restored["attempt"],"audit":event["id"]}),
+            );
+        }
         if let Some(index) = replay {
             let mut event = current["audit"][index].clone();
             let mut inbox = messages::Inbox::open(&state)?;
@@ -197,6 +280,10 @@ impl<'a> Request<'a> {
                     .context("invalid input audit")?
                     .remove("diagnostic");
                 current["audit"][index] = event.clone();
+                current
+                    .as_object_mut()
+                    .context("invalid input assignment")?
+                    .remove(NO_SEND_RECOVERY);
                 save(&state, &path, &current)?;
             } else {
                 messages::sync_directory(&dir).context("sync the settled worker input")?;
@@ -215,17 +302,15 @@ impl<'a> Request<'a> {
         ensure!(
             current["controllerOwner"].is_null()
                 && assignment::identified(&current)
-                && current["executionId"].is_string()
-                && current["tmuxSocket"].as_str().is_some_and(|socket| Path::new(socket).is_absolute())
-                && current["create"]["result"] == "accepted"
-                && current["create"]["receipt"].is_string(),
+                && current["create"]["result"] == "accepted",
             "input requires a confirmed native launch; verify the original execution before retrying"
         );
+        let bundled_ticket = backend::bundled_input_ticket(&current)?;
         ensure!(
             backend::archive(&state, &current)?.is_none(),
             "execution resources are closing or closed; use resume for an exited worker"
         );
-        let (worker, observed) = backend::observe(&state, &mut current.clone())?;
+        let (worker, observed) = observe(&state, &mut current.clone())?;
         ensure!(
             observed["result"] == "accepted",
             "could not verify the live execution: {}",
@@ -237,20 +322,13 @@ impl<'a> Request<'a> {
         );
         ensure!(
             observed["owned"] == true
-                && observed["workerBound"] == true
-                && observed["executionId"] == current["executionId"]
-                && observed["receipt"] == current["create"]["receipt"]
-                && worker["state"] == "running",
+                && worker["state"] == "running"
+                && observed["ticket"] == *bundled_ticket,
             "execution is not a verified writable worker"
         );
-        let legacy_callback = operation == "continue"
-            && current[controller::CALLBACK_HASH].is_null()
-            && current[controller::CALLBACK_REF_HASH].is_null();
-        if legacy_callback {
-            backend::verify_legacy_worker_callback(&state, self.dispatch, &observed)?;
-        }
 
-        let (mut next, index, text, generation) = {
+        let staged_proof = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let (mut next, index, text, generation, earlier_reminders) = {
             let inbox = messages::Inbox::open(&state)?;
             let generation = authorized_generation(&state, scope, token.as_deref(), operation)?;
             ensure!(
@@ -259,6 +337,18 @@ impl<'a> Request<'a> {
             );
             let history =
                 view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
+            let earlier_reminders = if operation == "nudge" {
+                history
+                    .iter()
+                    .filter(|message| {
+                        message["type"] == "nudge"
+                            && message["inputEvidence"] == backend::BUNDLED_APPENDED_USER_ENTRY
+                            && message["text"].as_str() == nudge.as_deref()
+                    })
+                    .count()
+            } else {
+                0
+            };
             let mut projected = current.clone();
             projected["worker"] = worker.clone();
             view::project(&mut projected, &history, Some(true), false)?;
@@ -274,7 +364,7 @@ impl<'a> Request<'a> {
                     );
                     let (task, report) = next_paths(&current, &projected, &history, task, report)?;
                     ensure!(
-                        legacy_callback || current[controller::CALLBACK_HASH]
+                        current[controller::CALLBACK_HASH]
                             .as_str()
                             .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())),
                         "original worker has no independent callback credential; verify its launch before continuing"
@@ -284,8 +374,7 @@ impl<'a> Request<'a> {
                         .and_then(|value| value.checked_add(1))
                         .context("invalid next round")?;
                     let attempt = format!("a-{}", Uuid::new_v4().simple());
-                    let reference = (!legacy_callback)
-                        .then(|| format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()));
+                    let reference = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
                     let created = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
                     next["rounds"] = projected["rounds"].clone();
                     next["rounds"].as_array_mut().context("invalid round history")?.push(json!({
@@ -294,13 +383,10 @@ impl<'a> Request<'a> {
                     }));
                     next["round"] = json!(round);
                     next["attempt"] = json!(attempt);
+                    next["executionId"] = bundled_ticket["attempt"].clone();
                     next["task"] = json!(task);
                     next["report"] = json!(report);
-                    if let Some(reference) = &reference {
-                        next[controller::CALLBACK_REF_HASH] = json!(messages::body_hash(reference));
-                    } else {
-                        event["legacyOwnerCallback"] = json!(true);
-                    }
+                    next[controller::CALLBACK_REF_HASH] = json!(messages::body_hash(&reference));
                     event["task"] = json!(task);
                     event["report"] = json!(report);
                     continued_brief(
@@ -308,7 +394,7 @@ impl<'a> Request<'a> {
                         &task,
                         &report,
                         &attempt,
-                        reference.as_deref(),
+                        Some(reference.as_str()),
                     )
                 }
                 Action::Nudge(_) => {
@@ -338,62 +424,71 @@ impl<'a> Request<'a> {
                 .context("invalid input audit")?;
             let index = audit.len();
             audit.push(event);
+            recovery::stage(&current, &mut next, &staged_proof, index)?;
             save(&state, &path, &next)?;
-            (next, index, text, generation)
+            (next, index, text, generation, earlier_reminders)
         };
 
+        let prepare = || -> Result<()> {
+            let inbox = messages::Inbox::open(&state)?;
+            ensure!(
+                !inbox.unresolved_reply(&current, None)?,
+                "reply is pending or uncertain on this execution; verify it before input"
+            );
+            ensure!(
+                read_assignment()? == next,
+                "assignment changed before input"
+            );
+            let history =
+                view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
+            let mut projected = current.clone();
+            projected["worker"] = worker.clone();
+            view::project(&mut projected, &history, Some(true), false)?;
+            if operation == "nudge" {
+                ensure!(
+                    matches!(projected["state"].as_str(), Some("working" | "asking")),
+                    "current round is no longer writable; use continue after completion"
+                );
+            } else {
+                ensure!(
+                    projected["state"] == "done",
+                    "continue lost its completed base round"
+                );
+            }
+            Ok(())
+        };
+        let check_write = || -> Result<()> {
+            ensure_state_writable(&state)?;
+            ensure!(
+                authorized_generation(&state, scope, token.as_deref(), operation)? == generation,
+                "scope owner changed before input"
+            );
+            Ok(())
+        };
         let mut first_write_error = None;
-        let answer = backend::submit_checked(&state, &current, &text, true, &mut |boundary| {
-            use InputBoundary::{Enter, PrepareEnter, PrepareText, Text};
-            let check = || -> Result<()> {
-                if matches!(boundary, PrepareText | PrepareEnter) {
-                    let inbox = messages::Inbox::open(&state)?;
-                    ensure!(
-                        !inbox.unresolved_reply(&current, None)?,
-                        "reply is pending or uncertain on this execution; verify it before input"
-                    );
-                    ensure!(
-                        super::read_record(&path)? == next,
-                        "assignment changed before input"
-                    );
-                    let history =
-                        view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
-                    let mut projected = current.clone();
-                    projected["worker"] = worker.clone();
-                    view::project(&mut projected, &history, Some(true), false)?;
-                    if operation == "nudge" {
-                        ensure!(
-                            matches!(projected["state"].as_str(), Some("working" | "asking")),
-                            "current round is no longer writable; use continue after completion"
-                        );
-                    } else {
-                        ensure!(
-                            projected["state"] == "done",
-                            "continue lost its completed base round"
-                        );
-                    }
-                } else {
-                    ensure_state_writable(&state)?;
-                    ensure!(
-                        authorized_generation(&state, scope, token.as_deref(), operation)?
-                            == generation,
-                        "scope owner changed before input"
-                    );
-                }
-                Ok(())
-            };
-            check().map_err(|error| {
+        let mut prepare = || {
+            prepare()?;
+            check_write()
+        };
+        let (result, bundled_frame_may_have_written) = send_bundled(
+            BundledSend {
+                state: &state,
+                row: &current,
+                operation,
+                text: &text,
+                earlier_reminders,
+            },
+            &mut prepare,
+            &check_write,
+        );
+        let answer = match result {
+            Err(error) if error.is::<controller::ControllerError>() => {
                 let diagnostic = format!("{error:#}");
-                let result = match boundary {
-                    PrepareText | Text => {
-                        first_write_error = Some(error);
-                        "definitely-not-sent"
-                    }
-                    PrepareEnter | Enter => "uncertain",
-                };
-                json!({"result":result, "diagnostic":diagnostic})
-            })
-        })
+                first_write_error = Some(error);
+                Ok(json!({"result":"definitely-not-sent","diagnostic":diagnostic}))
+            }
+            other => other,
+        }
         .unwrap_or_else(|error| json!({"result":"uncertain","diagnostic":format!("{error:#}")}));
         let diagnostic = answer["diagnostic"]
             .as_str()
@@ -406,7 +501,27 @@ impl<'a> Request<'a> {
             }
             _ => "uncertain",
         };
-        let mut inbox = messages::Inbox::open(&state)?;
+        if bundled_frame_may_have_written && outcome == "definitely-not-sent" {
+            outcome = "uncertain";
+        }
+        let audit_id = next["audit"][index]["id"].clone();
+        let zero_proof = recovery::proof_after_refusal(
+            Some(&staged_proof),
+            !bundled_frame_may_have_written,
+            outcome,
+        );
+        let staged = zero_proof.map(|_| next.clone());
+        let settlement_error = |error, outcome| {
+            let proof = zero_proof.filter(|_| {
+                outcome == "definitely-not-sent"
+                    && staged.as_ref().is_some_and(|before| {
+                        super::read_record(&path).is_ok_and(|saved| saved == *before)
+                    })
+            });
+            recovery::settlement_error(error, proof, self.dispatch, &audit_id)
+        };
+        let mut inbox =
+            messages::Inbox::open(&state).map_err(|error| settlement_error(error, outcome))?;
         let saved = super::read_record(&path)?;
         ensure!(
             saved["attempt"] == next["attempt"]
@@ -450,7 +565,10 @@ impl<'a> Request<'a> {
         } else {
             audit[index] = event.clone();
         }
-        save(&state, &path, &next)?;
+        next.as_object_mut()
+            .context("invalid input assignment")?
+            .remove(NO_SEND_RECOVERY);
+        save(&state, &path, &next).map_err(|error| settlement_error(error, outcome))?;
         if let Some(error) = first_write_error {
             return Err(error);
         }
@@ -459,6 +577,47 @@ impl<'a> Request<'a> {
         }
         Ok(input_response(self.dispatch, &event, false))
     }
+}
+
+struct BundledSend<'a> {
+    state: &'a Path,
+    row: &'a Value,
+    operation: &'a str,
+    text: &'a str,
+    earlier_reminders: usize,
+}
+
+fn submit_bundled(
+    send: BundledSend<'_>,
+    prepare: &mut dyn FnMut() -> Result<()>,
+    check_write: &dyn Fn() -> Result<()>,
+) -> (Result<Value>, bool) {
+    if send.operation == "continue" {
+        backend::submit_bundled_continue(send.state, send.row, send.text, prepare, check_write)
+    } else {
+        backend::submit_bundled_nudge(
+            send.state,
+            send.row,
+            send.text,
+            send.earlier_reminders,
+            prepare,
+            check_write,
+        )
+    }
+}
+
+fn verify_bundled_ticket(state: &Path, ticket: &Value) -> Result<()> {
+    let unit = ticket["unit"]
+        .as_str()
+        .context("missing original bundled unit")?;
+    let selected = crate::bundled::lookup_assignment(state, unit, &ticket["attempt"])?;
+    ensure!(
+        selected["result"] == "accepted"
+            && selected["ticket"] == *ticket
+            && matches!(selected["phase"].as_str(), Some("ready" | "cleaned")),
+        "zero-send proof no longer identifies the original bundled execution"
+    );
+    Ok(())
 }
 
 fn input_response(dispatch: &str, event: &Value, duplicate: bool) -> Value {
@@ -514,26 +673,28 @@ fn replay_index(
             && event["round"] == row["round"]
             && event["attempt"] == row["attempt"]
             && match action {
-                Action::Continue { task, report } => {
-                    let resolved = task.canonicalize().or_else(|error| {
-                        if error.kind() == ErrorKind::NotFound {
-                            canonical_parent_path(task)
-                        } else {
-                            Err(error)
-                        }
-                    });
-                    resolved
-                        .ok()
-                        .and_then(|path| path_text(path).ok())
-                        .is_some_and(|task| event["task"] == task)
-                        && canonical_parent_path(report)
-                            .ok()
-                            .and_then(|path| path_text(path).ok())
-                            .is_some_and(|report| event["report"] == report)
-                }
+                Action::Continue { task, report } => same_continue_paths(event, task, report),
                 Action::Nudge(_) => false,
             }
     }))
+}
+
+fn same_continue_paths(event: &Value, task: &Path, report: &Path) -> bool {
+    let resolved = task.canonicalize().or_else(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            canonical_parent_path(task)
+        } else {
+            Err(error)
+        }
+    });
+    resolved
+        .ok()
+        .and_then(|path| path_text(path).ok())
+        .is_some_and(|task| event["task"] == task)
+        && canonical_parent_path(report)
+            .ok()
+            .and_then(|path| path_text(path).ok())
+            .is_some_and(|report| event["report"] == report)
 }
 
 fn nudge_text(text: &str) -> Result<String> {

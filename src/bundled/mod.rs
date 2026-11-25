@@ -275,6 +275,15 @@ fn service_changed() -> Value {
 
 // The flag records whether the authenticated request frame may have left the client.
 fn rpc(store: &Store, ready: &Value, req: &Value) -> (Value, bool) {
+    rpc_before_send(store, ready, req, || true)
+}
+
+fn rpc_before_send(
+    store: &Store,
+    ready: &Value,
+    req: &Value,
+    before_send: impl FnOnce() -> bool,
+) -> (Value, bool) {
     if store::process_state(&ready["service"]) != "alive" {
         return (service_changed(), false);
     }
@@ -300,6 +309,9 @@ fn rpc(store: &Store, ready: &Value, req: &Value) -> (Value, bool) {
         let id = fresh();
         frame["id"] = json!(id);
         let bytes = wire::encode(&frame)?;
+        if !before_send() {
+            return Ok(json!({"result":"definitely-not-sent"}));
+        }
         sent = true;
         stream.write_bytes(&bytes, end)?;
         let reply = stream.read(wire::LIMIT, end)?;
@@ -361,6 +373,111 @@ fn unit_lock_file(state: &Path, name: &str) -> Result<(PathBuf, File)> {
         .open(unit.join("lock"))?;
     ensure!(guard.metadata()?.is_file(), "invalid unit lock");
     Ok((unit, guard))
+}
+
+/// The caller holds the workflow's scope and attempt locks. This lock also
+/// excludes the existing private bundled caller while observing and writing.
+pub(crate) struct InputSession {
+    store: Store,
+    ready: Value,
+    _guard: File,
+}
+
+impl InputSession {
+    pub(crate) fn open(state: &Path, ticket: &Value, identity: &Value) -> Result<Self> {
+        let (unit, guard) = open_write_unit(state, field(ticket, "unit")?)?;
+        let (_, store) = store::current(&unit)?.context("missing current bundled execution")?;
+        ensure!(
+            ticket["version"] == 2 && store.ticket == *ticket && store::ordered(&unit, &store)?,
+            "bundled input requires the registered current execution"
+        );
+        ensure!(
+            fs::symlink_metadata(store.run.join("cleanup.json"))
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+            "bundled execution already has cleanup evidence"
+        );
+        let ready = store.signed("ready")?;
+        ensure!(
+            identity.is_object()
+                && ready == *identity
+                && store::process_state(&ready["worker"]) == "alive",
+            "bundled execution identity is not a verified live worker"
+        );
+        Ok(Self {
+            store,
+            ready,
+            _guard: guard,
+        })
+    }
+
+    pub(crate) fn read(&self) -> Result<Value> {
+        let (answer, _) = rpc(
+            &self.store,
+            &self.ready,
+            &json!({"op":"read","ticket":self.store.ticket,"styled":true}),
+        );
+        let data = &answer["data"];
+        ensure!(
+            answer["result"] == "accepted"
+                && data["exit"].is_null()
+                && data["read_error"].is_null()
+                && data["eof"] == false
+                && data["screen"] == "Primary",
+            "bundled worker does not have a verified live primary viewport"
+        );
+        Ok(answer)
+    }
+
+    /// The second field says whether the operation frame may have left the client.
+    pub(crate) fn input(
+        &self,
+        prior: u64,
+        text: &str,
+        check_write: impl FnOnce() -> Result<()>,
+    ) -> (Result<Value>, bool) {
+        let Some(seq) = prior.checked_add(1) else {
+            return (
+                Ok(
+                    json!({"result":"definitely-not-sent","diagnostic":"bundled input sequence exhausted"}),
+                ),
+                false,
+            );
+        };
+        if store::process_state(&self.ready["worker"]) != "alive" {
+            return (
+                Ok(
+                    json!({"result":"definitely-not-sent","diagnostic":"bundled worker changed before input"}),
+                ),
+                false,
+            );
+        }
+        let mut authorization = Ok(());
+        let (reply, sent) = rpc_before_send(
+            &self.store,
+            &self.ready,
+            &json!({"op":"input","ticket":self.store.ticket,"seq":seq,"text":text}),
+            || {
+                authorization = check_write();
+                authorization.is_ok()
+            },
+        );
+        if let Err(error) = authorization {
+            return (Err(error), sent);
+        }
+        let answer = if !sent {
+            json!({"result":"definitely-not-sent","diagnostic":"bundled input frame was not sent"})
+        } else if reply["result"] == "accepted"
+            && reply["last_input"] == seq
+            && reply["data"]["written"] == true
+        {
+            reply
+        } else if reply["result"] == "refused" {
+            json!({"result":"refused","diagnostic":"bundled runtime refused the input sequence"})
+        } else {
+            json!({"result":"uncertain","diagnostic":"bundled runtime did not confirm the input frame"})
+        };
+        (Ok(answer), sent)
+    }
 }
 
 /// The flag authorizes withdrawing this call's intent for an exact, unsent close.
@@ -611,7 +728,9 @@ fn operate(state: &Path, req: &Value) -> Result<Value> {
 }
 
 pub(crate) fn assignment_ready(state: &Path, unit: &str, row: &Value) -> Result<bool> {
-    let (path, _unit) = open_unit(state, unit)?;
+    // Callback publication holds the Inbox lock. Input holds the unit lock
+    // across its Inbox checks, so read the signed evidence without waiting.
+    let (path, _guard) = unit_lock_file(state, unit)?;
     let Some((_, store)) = store::current(&path)? else {
         return Ok(false);
     };
@@ -620,7 +739,10 @@ pub(crate) fn assignment_ready(state: &Path, unit: &str, row: &Value) -> Result<
             .into_iter()
             .all(|ticket| ticket.is_null() || ticket == &store.ticket)
         && store::ordered(&path, &store)?
-        && store.signed("ready").is_ok())
+        && store.signed("ready").is_ok()
+        // Do not accept evidence from a generation replaced during the read.
+        && store::current(&path)?
+            .is_some_and(|(_, selected)| selected.ticket == store.ticket))
 }
 
 pub fn run(stage: &str, selected: Option<&Path>) -> Result<u8> {

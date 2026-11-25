@@ -718,7 +718,8 @@ fn verify_index(mut record: Value, store: &Store) -> Result<Value> {
     Ok(record)
 }
 
-// Called with the unit lock held. Only a unit containing the lock alone is new.
+// Mutating callers hold the unit lock. Unlocked readers must recheck the
+// selected ticket before relying on receipts. Only a unit containing the lock alone is new.
 pub fn current(unit: &Path) -> Result<Option<(Value, Store)>> {
     let path = unit.join("current.json");
     if fs::symlink_metadata(&path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {

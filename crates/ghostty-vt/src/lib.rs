@@ -359,6 +359,30 @@ impl Terminal {
         end: (u16, u32),
         rectangle: bool,
     ) -> Result<String, Error> {
+        self.format_viewport(
+            start,
+            end,
+            rectangle,
+            ffi::GhosttyFormatterFormat_GHOSTTY_FORMATTER_FORMAT_PLAIN,
+        )
+    }
+
+    pub fn read_styled_viewport(&self, end: (u16, u32)) -> Result<String, Error> {
+        self.format_viewport(
+            (0, 0),
+            end,
+            false,
+            ffi::GhosttyFormatterFormat_GHOSTTY_FORMATTER_FORMAT_VT,
+        )
+    }
+
+    fn format_viewport(
+        &self,
+        start: (u16, u32),
+        end: (u16, u32),
+        rectangle: bool,
+        emit: ffi::GhosttyFormatterFormat,
+    ) -> Result<String, Error> {
         let start = ghostty_viewport_point(start.0, start.1);
         let end = ghostty_viewport_point(end.0, end.1);
         let mut start_ref = ffi::GhosttyGridRef {
@@ -383,7 +407,7 @@ impl Terminal {
         let mut formatter: ffi::GhosttyFormatter = ptr::null_mut();
         let options = ffi::GhosttyFormatterTerminalOptions {
             size: mem::size_of::<ffi::GhosttyFormatterTerminalOptions>(),
-            emit: ffi::GhosttyFormatterFormat_GHOSTTY_FORMATTER_FORMAT_PLAIN,
+            emit,
             unwrap: true,
             trim: true,
             extra: ffi::GhosttyFormatterTerminalExtra {

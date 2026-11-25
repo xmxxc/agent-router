@@ -33,6 +33,11 @@ fn refusals(text: &str) -> usize {
         .count()
 }
 
+/// Compare a new capture with the earlier refusal count for the same composer.
+pub fn reply_input_paused(earlier: &str, current: &str) -> bool {
+    read_only(current) || refusals(current) > refusals(earlier)
+}
+
 fn compact(text: &str) -> String {
     text.split_whitespace().collect()
 }
@@ -436,7 +441,7 @@ pub(super) fn confirm_reply(
     let sample = |handle: &Handle| {
         sleep(Duration::from_millis(300));
         let screen = handle.read()?;
-        if read_only(&screen.text) || refusals(&screen.text) > refusals(&before.text) {
+        if reply_input_paused(&before.text, &screen.text) {
             return Err(Failure::unknown("worker refused or paused input"));
         }
         match observe_herdr_reply_box(handle, &screen, host)? {

@@ -70,9 +70,11 @@ wfc close "$dispatch"
 
 Herdr 首轮派发、底层输入测试和补绑使用独立 Rust 状态目录中的无主 scope。若随后认领该 scope，回复和关闭须使用当前 owner 凭据。状态目录中出现 Python `router.db` 时，Herdr 操作须先完成旧库和 owner 身份迁移。受控服务联验可用 `python3 tests/herdr_public.py /path/to/herdr target/release/wfc -v PublicLifecycle.test_reclaim_uses_verified_herdr_close_and_keeps_sibling`。通过 `--herdr-backend` 向同一 `wfc` 的标准输入提供 `{"op":"submit","dispatch":"…","round":1,"attempt":"…","text":"…"}`，可验证投递认领与回执丢失后的处理。
 
-总控用 `wfc reply MESSAGE "回答"` 将回复送入原 worker 的 Herdr 会话。`MESSAGE` 是原生 Rust 问题的数字编号。受管 scope 可用 `--owner-token` 或控制器环境中的当前凭据。用 `wfc status --dispatch ID` 查看回复及其诊断。回复明确未送时可重试。输入可能已送达时，账本会保留回复占用，后续调用会拒绝再次发送。
+总控用 `wfc reply MESSAGE "回答"` 将回复送入原 worker 的会话。`MESSAGE` 是原生 Rust 问题的数字编号。受管 scope 可用 `--owner-token` 或控制器环境中的当前凭据。用 `wfc status --dispatch ID` 查看回复及其诊断。回复明确未送时可重试。输入可能已送达时，账本会保留回复占用，后续调用会拒绝再次发送。
 
 Herdr 公开回复要求先从原 pane 核实当前宿主的聊天输入框可写且为空。可识别的布局包括 Codex、OpenCode 默认会话输入框和 Claude Code 经典输入栏。已有草稿或无法核实的布局会给出明确未送的诊断。
+
+bundled 回复适用于当前 Codex 会话中可识别的输入框。先在原票据的主屏确认空框，粘贴后核对完整单行草稿，再发送一次 Enter。两次读屏都确认输入框恢复为空才记为已接受。
 
 `--launch-config` 优先于 `WFC_LAUNCH_CONFIG`。启动参数依次为宿主的 `runtime` 数组、`command` 数组、wfc 为本次任务生成的 Codex 参数。路径含空格时直接写在同一个 JSON 字符串中。例如 npm 安装的 Codex 可以指定 Node 和脚本各自的绝对路径。
 
@@ -132,7 +134,15 @@ wfc wait --scope team-a --timeout 30
 
 `ask` 把问题交给派发所属的总控组。`--options` 按逗号拆分并去掉空项，省略时为空列表。显式提供 `--attempt` 时，相同问题和选项重试会取回原编号。也可用 `--message-id` 自定键，同一派发内用同一键提交不同内容会报冲突。任务存活并等待答复时，状态显示 `asking` 和 `waiting-human`。
 
-旧输入和交接的审计仍可通过 `wfc status --dispatch ID` 查回。新的 bundled `reply`、`nudge`、`continue` 和跨后端交接由后续适配接入。
+在 Linux 可用 `wfc nudge DISPATCH --text TEXT [--message-id KEY]` 提醒当前仍在处理任务的 Codex worker，适用于 bundled。bundled 在原终端的空输入框发送单行提醒，看到原对话保留且出现新用户消息后才发放回执。省略 `--message-id` 时，每次合法调用都是一条新提醒，可以主动再次发送同文。需要在返回丢失或结算报错后精确取回回执时，从首次发送起为该意图使用同一个键。同一派发内，同键同正文会取回原数字 `message`，同键不同正文会报冲突。发送结果仍待核对时，只有匹配且已证实送达的收据可以用于补结算。另一条输入待核对时，已有的确认键仍可只读取回原号，新输入会继续受阻。
+
+已完成的 bundled Codex worker 仍在线时，可用 `wfc continue DISPATCH --task FILE --report FILE` 给原终端下一项任务。原运行票据与历史回报保留，新一轮使用新的 attempt 和回调引用。新报告须用原报告目录中的新路径。原输入框须为空，且画面能完整核对本次指令。相同任务和报告路径重取本轮回执，待核输入不会重发。
+
+bundled Codex 提醒或续派若明确未写出首帧、账本暂时无法结算，且原待核记录仍完整，错误会附带 `noSendProof`。恢复合法写权限后，当前 owner 可用原参数加 `--no-send-proof PROOF`，把原审计结算为 `definitely-not-sent`。这一步只结算记录。缺少证明、执行身份变化、账本已有对应正文或新轮回调时，原输入继续待核。
+
+旧同文或旧拒收从滚动历史重现时，画面可能和一次实际新输入相同。此时命令会保留待核，`wfc status --dispatch ID` 的 `audit` 可以查看原轮次及诊断，重试不会再发键。若续派的 worker 已用该轮的 `--callback-ref` 成功发问或回报，可以用原 `continue` 参数重取同一输入的回执。
+
+旧输入及交接回执仍可用 `wfc status --dispatch ID` 查看。
 
 在已认领的组中，worker 可用启动时分配的独立回调凭据发问或回报。总控兼容入口使用当前租约的凭据。`ask` 与 `done` 均接受显式的 `--owner-token`。
 

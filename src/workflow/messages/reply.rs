@@ -4,7 +4,7 @@ use super::{
     State,
 };
 use crate::workflow::{
-    assignment, controller, herdr, legacy_view_state, writable_state_dir, StateView,
+    assignment, backend, controller, herdr, legacy_view_state, writable_state_dir, StateView,
 };
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
@@ -153,11 +153,8 @@ impl<'a> Reply<'a> {
                 [
                     "host",
                     "backend",
-                    "tmuxSocket",
                     "endpoint",
                     "executionId",
-                    "legacyWorkerPane",
-                    "legacyLaunchId"
                 ]
                 .iter()
                 .all(|key| row[*key] == current[*key])
@@ -171,7 +168,10 @@ impl<'a> Reply<'a> {
                         "endpoint"
                     ]
                     .iter()
-                    .all(|key| row["backendHandle"][*key] == current["backendHandle"][*key]),
+                    .all(|key| row["backendHandle"][*key] == current["backendHandle"][*key])
+                    && (row["backend"] != "bundled"
+                        || (row["create"] == current["create"]
+                            && row["backendHandle"] == current["backendHandle"])),
                 "assignment changed while waiting for input"
             );
             if first {
@@ -298,7 +298,24 @@ fn submit(
         // execution is busy, release the scope so takeover can proceed.
         if let Some(_scope_lock) = controller::try_scope_lock(state, scope)? {
             controller::Owners::read(state)?.require(scope, token, "reply")?;
+            let check_write = || {
+                crate::workflow::ensure_state_writable(state)
+                    .and_then(|()| controller::Owners::read(state))
+                    .and_then(|owners| owners.require(scope, token, "reply"))
+                    .map(|_| ())
+            };
             match row["backend"].as_str() {
+                Some("bundled") => {
+                    if let Some(_input_lock) = assignment::try_reply_lock(state, row)? {
+                        return backend::submit_bundled_reply(
+                            state,
+                            row,
+                            text,
+                            &mut begin,
+                            check_write,
+                        );
+                    }
+                }
                 Some("herdr") => {
                     if let Some(result) =
                         herdr::try_submit_reply(state, row, message_id, text, &mut || begin(true))?

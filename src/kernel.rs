@@ -251,12 +251,19 @@ fn handle(
     ensure!(string(v, "nonce")? == unit.nonce, "wrong_nonce");
     unit.poll()?;
     match op {
-        "read" => Ok(Some(json!({
-            "text": unit.terminal.read_text_viewport((0, 0), (unit.cols - 1, u32::from(unit.rows - 1)), false)?,
-            "screen": format!("{:?}", unit.terminal.active_screen()?),
-            "cols": unit.cols, "rows": unit.rows, "eof": unit.eof, "read_error": unit.read_error,
-            "exit": unit.exit.as_ref().map(|s| json!({"code": s.exit_code(), "signal": s.signal()}))
-        }))),
+        "read" => {
+            let end = (unit.cols - 1, u32::from(unit.rows - 1));
+            let mut snapshot = json!({
+                "text": unit.terminal.read_text_viewport((0, 0), end, false)?,
+                "screen": format!("{:?}", unit.terminal.active_screen()?),
+                "cols": unit.cols, "rows": unit.rows, "eof": unit.eof, "read_error": unit.read_error,
+                "exit": unit.exit.as_ref().map(|s| json!({"code": s.exit_code(), "signal": s.signal()}))
+            });
+            if v["styled"] == true {
+                snapshot["styled"] = json!(unit.terminal.read_styled_viewport(end)?);
+            }
+            Ok(Some(snapshot))
+        }
         "input" => {
             ensure!(unit.exit.is_none(), "unit_exited");
             let text = string(v, "text")?;

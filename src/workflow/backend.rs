@@ -1,6 +1,12 @@
 //! Public lifecycle clients for hosted workers.
 #[cfg(target_os = "linux")]
 mod bundled;
+#[cfg(target_os = "linux")]
+pub(super) use bundled::{
+    registered_ticket as bundled_input_ticket, submit_continue as submit_bundled_continue,
+    submit_nudge as submit_bundled_nudge, submit_reply as submit_bundled_reply,
+    APPENDED_USER_ENTRY as BUNDLED_APPENDED_USER_ENTRY,
+};
 
 use super::{host::Launch, valid_identity};
 #[cfg(all(test, target_os = "linux"))]
@@ -16,11 +22,14 @@ use std::{
 // Public assignments published with the session-aware tmux protocol.
 pub(super) const LAUNCH_PROTOCOL: u64 = 8;
 
-// Continue changes the public round without changing the tmux writer or its
+// Continue changes the public round without changing the writer or its
 // launch receipt. All native lifecycle operations still name that execution.
 pub(super) fn execution_row(row: &Value) -> Result<Cow<'_, Value>> {
     let execution = &row["executionId"];
-    if row["backend"] != "tmux" || execution.is_null() || execution == &row["attempt"] {
+    if !matches!(row["backend"].as_str(), Some("tmux" | "bundled"))
+        || execution.is_null()
+        || execution == &row["attempt"]
+    {
         return Ok(Cow::Borrowed(row));
     }
     let create = &row["create"];
@@ -31,6 +40,11 @@ pub(super) fn execution_row(row: &Value) -> Result<Cow<'_, Value>> {
             && create["attempt"] == *execution
             && create["result"] == "accepted"
             && create["dispatch"] == row["dispatch"]
+            && (row["backend"] != "bundled"
+                || (create["ticket"].is_object()
+                    && create["ticket"]["unit"] == row["dispatch"]
+                    && create["ticket"]["attempt"] == *execution
+                    && row["backendHandle"] == create["ticket"]))
             && create["round"]
                 .as_u64()
                 .zip(row["round"].as_u64())
@@ -136,26 +150,6 @@ fn legacy_launch_hint(row: &Value) -> Result<Option<&str>> {
         "conflicting legacy launch hints"
     );
     Ok(hint.or(id))
-}
-
-#[cfg(target_os = "linux")]
-pub(super) fn submit_checked(
-    _state: &Path,
-    _row: &Value,
-    _text: &str,
-    _confirm_transcript: bool,
-    _check: &mut dyn FnMut(super::input::InputBoundary) -> std::result::Result<(), Value>,
-) -> Result<Value> {
-    bail!(super::assignment::TMUX_HISTORY_ONLY)
-}
-
-#[cfg(target_os = "linux")]
-pub(super) fn verify_legacy_worker_callback(
-    _state: &Path,
-    _dispatch: &str,
-    _observed: &Value,
-) -> Result<()> {
-    bail!(super::assignment::TMUX_HISTORY_ONLY)
 }
 
 pub(super) fn receipt_id(row: &Value) -> Result<Option<&str>> {
@@ -534,8 +528,9 @@ pub(super) fn require_callback_start(_state: &Path, _row: &Value) -> Result<()> 
     #[cfg(target_os = "linux")]
     if _row["backend"] == "bundled" && _row["bundledStartupCommit"] == true {
         let id = _row["dispatch"].as_str().context("missing bundled dispatch ID")?;
+        let execution = execution_row(_row)?;
         ensure!(
-            crate::bundled::assignment_ready(_state, id, _row).unwrap_or(false),
+            crate::bundled::assignment_ready(_state, id, &execution).unwrap_or(false),
             "bundled startup has not committed ready for this attempt"
         );
     }
