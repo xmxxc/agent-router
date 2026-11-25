@@ -49,7 +49,7 @@ impl Fixture {
 
     fn assignment(&self, attempt: &str) -> Value {
         json!({
-            "host": "claude", "backend": "tmux", "dispatch": "d-12345678",
+            "host": "claude", "backend": "bundled", "dispatch": "d-12345678",
             "round": 1, "attempt": attempt,
             "cwd": self.0, "label": "Claude worker"
         })
@@ -106,6 +106,37 @@ fn submit(f: &Fixture, record: &Value, launch: &Launch, event: &Value) -> Result
         launch.env[TOKEN].as_str().unwrap(),
         serde_json::to_vec(event).unwrap().as_slice(),
     )
+}
+
+#[test]
+fn retired_tmux_hook_preserves_archived_assignment() {
+    let f = Fixture::new();
+    let attempt = "a-123456789abc";
+    let mut row = f.assignment(attempt);
+    row["backend"] = json!("tmux");
+    f.publish(&mut row, &mut f.launch());
+    let path = f.0.join("dispatches/d-12345678.json");
+    let mut active = row.clone();
+    active["backend"] = json!("bundled");
+    let pending = path.with_extension("pending");
+    let sentinel = f.0.join("messages.lock");
+    fs::remove_file(&sentinel).unwrap();
+    for (published, reservation, diagnostic) in [
+        (&row, None, workflow::assignment::TMUX_HISTORY_ONLY),
+        (&active, Some(&row), workflow::assignment::UNVERIFIED_ASSIGNMENT),
+    ] {
+        workflow::write_json(&path, published, None).unwrap();
+        if let Some(reservation) = reservation {
+            workflow::write_json(&pending, reservation, None).unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+        let reserved = fs::read(&pending).ok();
+        let error = record_start(&f.0, "d-12345678", attempt, "", &b"{}"[..]).unwrap_err();
+        assert_eq!(error.to_string(), diagnostic);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::read(&pending).ok(), reserved);
+        assert!(!sentinel.exists());
+    }
 }
 
 #[test]
@@ -535,7 +566,7 @@ fn retry_cancellation_marker_cannot_override_terminal_launch_evidence() {
     let cancellation = json!({"category":"not_started","launchId":launch,
         "dispatch":dispatch,"executionId":attempt,"closeOperationId":null});
     let outcome = json!({"category":"not_started","cancellationEvidence":marker});
-    let proofs = crate::tmux::launch::NonStartProofs::read(&f.0, dispatch).unwrap();
+    let proofs = crate::workflow::legacy_tmux::NonStartProofs::read(&f.0, dispatch).unwrap();
     let verified = || proofs.verify(attempt, &outcome).is_ok();
     workflow::write_json(&marker, &cancellation, None).unwrap();
     assert!(verified());
@@ -669,6 +700,7 @@ fn hook_conflict_after_preparation_blocks_resume_publication() {
             "a-123456789abc",
             start.env[TOKEN].as_str().unwrap(),
             serde_json::from_value(conflict).unwrap(),
+            None,
         )
         .unwrap_err();
         assert!(err

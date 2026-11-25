@@ -4,7 +4,7 @@ use super::{
     State,
 };
 use crate::workflow::{
-    assignment, backend, controller, herdr, legacy_view_state, writable_state_dir, StateView,
+    assignment, controller, herdr, legacy_view_state, writable_state_dir, StateView,
 };
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
@@ -299,40 +299,6 @@ fn submit(
         if let Some(_scope_lock) = controller::try_scope_lock(state, scope)? {
             controller::Owners::read(state)?.require(scope, token, "reply")?;
             match row["backend"].as_str() {
-                Some("tmux") => {
-                    if let Some(_input_lock) = assignment::try_reply_lock(state, row)? {
-                        ensure!(
-                            backend::archive(state, row)?.is_none(),
-                            "execution resources are closing or closed"
-                        );
-                        use crate::tmux::InputBoundary::{Enter, PrepareEnter, PrepareText, Text};
-                        let mut authorization_error = None;
-                        let outcome =
-                            backend::submit_checked(state, row, text, false, &mut |boundary| {
-                                let check = match boundary {
-                                    PrepareText => begin(true),
-                                    PrepareEnter => begin(false),
-                                    Text | Enter => crate::workflow::ensure_state_writable(state)
-                                        .and_then(|()| controller::Owners::read(state))
-                                        .and_then(|owners| owners.require(scope, token, "reply"))
-                                        .map(|_| ()),
-                                };
-                                check.map_err(|error| {
-                                let diagnostic = format!("{error:#}");
-                                let first = matches!(boundary, PrepareText | Text);
-                                if first && error.is::<controller::ControllerError>() {
-                                    authorization_error = Some(error);
-                                }
-                                json!({"result":if first {"definitely-not-sent"} else {"uncertain"},
-                                    "diagnostic":diagnostic})
-                            })
-                            });
-                        if let Some(error) = authorization_error {
-                            return Err(error);
-                        }
-                        return outcome;
-                    }
-                }
                 Some("herdr") => {
                     if let Some(result) =
                         herdr::try_submit_reply(state, row, message_id, text, &mut || begin(true))?

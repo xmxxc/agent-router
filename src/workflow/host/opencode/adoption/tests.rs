@@ -1,7 +1,7 @@
 use super::*;
 use crate::workflow::host::Options;
 use rusqlite::{params, Connection};
-use std::os::unix::fs::PermissionsExt;
+use std::{env, os::unix::fs::PermissionsExt};
 use uuid::Uuid;
 
 const DISPATCH: &str = "d-33333333333333333333333333333333";

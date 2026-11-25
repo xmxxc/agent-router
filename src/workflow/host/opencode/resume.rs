@@ -3,13 +3,13 @@ use super::{
     adoption, launch_directory, open_read_only, read_session, saved_proof, store_directory,
     verify_opening, StorageSource,
 };
-use crate::workflow::{assignment, controller, host::Launch, messages};
+use crate::workflow::{host::Launch, messages};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    env, fs,
-    io::{self, Read},
+    fs,
+    io::Read,
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -259,63 +259,4 @@ fn query_delivery(state: &Path, row: &Value, brief: &str) -> Result<bool> {
     )?;
     ensure!(count < 2, "more than one committed OpenCode resume brief");
     Ok(count == 1)
-}
-
-fn claim() -> Result<()> {
-    let state = PathBuf::from(env::var_os("WFC_STATE").context("missing state")?);
-    adoption::require_private_state(&state)?;
-    let token = env::var(controller::WORKER_CALLBACK)?;
-    let capability = env::var("WFC_OPENCODE_ADOPTION")?;
-    let mut input = Vec::new();
-    io::stdin()
-        .lock()
-        .take(MAX_PLAN + 1)
-        .read_to_end(&mut input)?;
-    ensure!(
-        input.len() as u64 <= MAX_PLAN,
-        "OpenCode resume receipt too large"
-    );
-    let receipt: Session = serde_json::from_slice(&input)?;
-    ensure!(
-        env::var("WFC_DISPATCH")? == receipt.dispatch
-            && env::var("WFC_ATTEMPT")? == receipt.attempt
-            && env::var("WFC_ROUND")? == receipt.round
-            && env::var_os("OPENCODE_DB").is_some_and(|db| Path::new(&db) == receipt.database)
-            && env::current_dir()? == receipt.cwd,
-        "OpenCode resume environment changed"
-    );
-    let dir = receipt.directory(&state)?;
-    let _ledger = messages::lock_for_private_publish(&state)?;
-    store_directory(&dir)?;
-    adoption::verify_capability(&dir, &capability)?;
-    let plan: Plan = read_private(&dir.join("resume.json"))?;
-    let permit: Permit = read_private(&dir.join("permitted"))?;
-    ensure!(
-        permit.plan_sha256 == plan_hash(&plan)?,
-        "OpenCode resume plan was not approved"
-    );
-    let (row, path) = adoption::read_assignment(&state, &receipt.dispatch)?;
-    ensure!(
-        !token.is_empty()
-            && path.extension().is_some_and(|ext| ext == "json")
-            && row[controller::CALLBACK_HASH] == messages::body_hash(&token)
-            && plan.launch == receipt
-            && Session::from_row(&state, &row)? == receipt
-            && assignment::resume_audit(&row).is_some_and(|audit| audit["result"] == "pending"),
-        "OpenCode resume does not own this assignment"
-    );
-    ensure!(
-        !query_delivery(&state, &row, &plan.brief)?,
-        "brief already exists"
-    );
-    ensure!(
-        chrono::Utc::now().timestamp_millis() < permit.expires_at,
-        "OpenCode input window closed"
-    );
-    adoption::write_private(&dir.join("claimed"), &serde_json::to_vec(&receipt)?)?;
-    messages::sync_directory(&dir)
-}
-
-pub(crate) fn resume_ready() -> bool {
-    claim().is_ok()
 }

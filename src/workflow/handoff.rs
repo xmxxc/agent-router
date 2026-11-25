@@ -760,38 +760,6 @@ fn scope_binding(row: &Value, audit: &Value) -> Value {
     binding
 }
 
-pub(crate) enum TmuxTarget {
-    OriginalServer(String),
-    Pinned { socket: PathBuf, service: Value },
-}
-
-pub(crate) fn require_launch(
-    state: &Path,
-    dispatch: &str,
-    attempt: &str,
-    audit: usize,
-) -> Result<TmuxTarget> {
-    let (event, previous) = verify_launch(state, dispatch, attempt, audit, "tmux")?;
-    if event["fromBackend"] == "herdr" {
-        ensure!(
-            event["target"]["backend"] == "tmux" && event["target"]["service"].is_object(),
-            "tmux handoff target changed"
-        );
-        let socket = event["target"]["endpoint"]
-            .as_str()
-            .map(PathBuf::from)
-            .filter(|socket| socket.is_absolute())
-            .context("missing pinned tmux endpoint")?;
-        Ok(TmuxTarget::Pinned {
-            socket,
-            service: event["target"]["service"].clone(),
-        })
-    } else {
-        ensure!(event["target"].is_null(), "tmux handoff target changed");
-        Ok(TmuxTarget::OriginalServer(previous))
-    }
-}
-
 pub(super) fn require_herdr_launch(
     state: &Path,
     row: &Value,

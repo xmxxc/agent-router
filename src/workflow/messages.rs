@@ -217,6 +217,14 @@ pub(super) fn message_boundary(dir: &Path, dispatch: &str) -> MessageBoundary {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn read_callback_record(dir: &Path, dispatch: &str) -> Result<Value> {
+    ensure!(valid_id(dispatch), "invalid dispatch ID");
+    recovery::Generations::read(dir, dispatch)
+        .into_assigned()?
+        .with_context(|| format!("open dispatch {dispatch}: missing assignment"))
+}
+
 #[derive(Deserialize)]
 struct Assignment {
     #[serde(flatten)]
@@ -235,9 +243,7 @@ impl Assignment {
     fn read(state: &Path, dispatch: &str) -> Result<(Self, Value)> {
         let dir = state.join("dispatches");
         #[cfg(target_os = "linux")]
-        let row = recovery::Generations::read(&dir, dispatch)
-            .into_assigned()?
-            .with_context(|| format!("open dispatch {dispatch}: missing assignment"))?;
+        let row = read_callback_record(&dir, dispatch)?;
         #[cfg(not(target_os = "linux"))]
         let row = {
             let (file, path) = super::assignment::open_assignment(&dir, dispatch)
@@ -413,6 +419,8 @@ enum MessageKind {
     Nudge,
 }
 
+#[cfg(target_os = "linux")]
+pub(super) const APPENDED_USER_ENTRY: &str = "appended-user-entry";
 #[cfg(target_os = "linux")]
 pub(super) const CONTINUED_INPUT_CALLBACK: &str = "authenticated-round-callback";
 
@@ -1582,7 +1590,6 @@ impl Inbox {
             .additional_fields
             .get("inputEvidence")
             .and_then(Value::as_str);
-        use crate::tmux::APPENDED_USER_ENTRY;
         match (event["result"].as_str(), proof) {
             (Some("pending"), Some(APPENDED_USER_ENTRY)) => {
                 Ok(Some((message.id, json!(APPENDED_USER_ENTRY))))
@@ -1617,7 +1624,7 @@ impl Inbox {
     #[cfg(target_os = "linux")]
     pub(super) fn publish_worker_input(&mut self, row: &Value, event: &Value) -> Result<u64> {
         ensure!(
-            event["inputEvidence"] == crate::tmux::APPENDED_USER_ENTRY
+            event["inputEvidence"] == APPENDED_USER_ENTRY
                 || (event["operation"] == "continue"
                     && event["inputEvidence"] == CONTINUED_INPUT_CALLBACK),
             "missing worker input evidence"

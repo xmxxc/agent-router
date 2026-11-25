@@ -319,12 +319,6 @@ impl Running<'_> {
         None
     }
 
-    pub(crate) fn tmux_exit_evidence(self, status: ExitStatus) -> Value {
-        // Only create can tell whether this launch passed final confirmation.
-        json!({"pid":self.pid,"processStart":self.process_start,
-            "exitCode":status.code(),"signal":status.signal()})
-    }
-
     fn publish_exit(&self, status: ExitStatus) {
         self.startup.publish(Failure {
             category: "process_exited",

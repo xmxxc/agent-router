@@ -2,15 +2,15 @@
 #[cfg(target_os = "linux")]
 mod bundled;
 
-use super::{host::Launch, valid_identity, write_json};
+use super::{host::Launch, valid_identity};
+#[cfg(all(test, target_os = "linux"))]
+use super::write_json;
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
     borrow::Cow,
-    env,
     fs::File,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
 };
 
 // Public assignments published with the session-aware tmux protocol.
@@ -50,91 +50,11 @@ pub(super) fn execution_row(row: &Value) -> Result<Cow<'_, Value>> {
     Ok(Cow::Owned(physical))
 }
 
+// The old branch shapes remain available to the caller until host handoff,
+// resume and input can use a supported backend. No transport is installed here.
 #[cfg(target_os = "linux")]
-pub fn tmux_socket() -> Result<PathBuf> {
-    let socket = env::var_os("WFC_TMUX_SOCKET")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var("TMUX")
-                .ok()
-                .and_then(|v| v.rsplitn(3, ',').nth(2).map(PathBuf::from))
-        })
-        .unwrap_or_else(|| {
-            PathBuf::from(env::var_os("TMUX_TMPDIR").unwrap_or_else(|| "/tmp".into()))
-                .join(format!("tmux-{}", unsafe { libc::getuid() }))
-                .join("default")
-        });
-    std::path::absolute(socket).context("resolve tmux socket")
-}
-
-fn call(state: &Path, row: &Value, mut request: Value) -> Result<Value> {
-    ensure!(
-        row["backend"] == "tmux",
-        "{} backend adapter is unavailable in this build",
-        row["backend"]
-    );
-    request["dispatch"] = row["dispatch"].clone();
-    let mut command = Command::new(env::current_exe()?);
-    super::controller::strip_credentials(&mut command);
-    // Pass the native path separately. The child must inherit the original
-    // WFC_STATE selection to recheck the Python path after its backend lock.
-    command.arg("--tmux-backend").arg(state);
-    if let Some(socket) = row["tmuxSocket"].as_str() {
-        command.env("WFC_TMUX_SOCKET", socket);
-    }
-    let child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-    let mut child = match child {
-        Err(error) if request["op"] == "submit" => {
-            return Ok(
-                json!({"result":"definitely-not-sent","category":"input_not_delivered",
-                "diagnostic":format!("could not start tmux backend: {error}")}),
-            );
-        }
-        other => other?,
-    };
-    let sent = serde_json::to_writer(
-        child.stdin.take().context("missing backend input")?,
-        &request,
-    );
-    // Once the pipe has been offered the request, a failed wait/read cannot
-    // establish that the backend did nothing. Keep the caller's assignment.
-    let out = match child.wait_with_output() {
-        Ok(out) => out,
-        Err(e) => {
-            return Ok(
-                json!({"result":"uncertain","diagnostic":format!("could not collect tmux backend response: {e}")}),
-            )
-        }
-    };
-    if out.status.code() == Some(2)
-        && out.stdout.is_empty()
-        && out.stderr.strip_suffix(b"\n") == Some(crate::UNEXPECTED_ARGUMENTS.as_bytes())
-    {
-        bail!("tmux backend is unavailable in this build (requires #31)");
-    }
-    if sent.is_err() || !out.status.success() {
-        return Ok(
-            json!({"result":"uncertain","diagnostic":"tmux backend did not confirm the request"}),
-        );
-    }
-    let reply: Option<Value> = serde_json::from_slice(&out.stdout).ok();
-    match reply {
-        Some(reply)
-            if matches!(
-                reply["result"].as_str(),
-                Some("accepted" | "refused" | "definitely-not-sent" | "uncertain")
-            ) || (matches!(request["op"].as_str(), Some("close" | "revoke"))
-                && reply["result"] == "completed") =>
-        {
-            Ok(reply)
-        }
-        _ => Ok(json!({"result":"uncertain","diagnostic":"invalid tmux backend response"})),
-    }
+pub(super) fn tmux_socket() -> Result<PathBuf> {
+    bail!(super::assignment::TMUX_HISTORY_ONLY)
 }
 
 pub fn create(state: &Path, row: &Value, launch: Launch, _owner: Option<&str>) -> Result<Value> {
@@ -152,69 +72,27 @@ pub fn create(state: &Path, row: &Value, launch: Launch, _owner: Option<&str>) -
 
 #[cfg(target_os = "linux")]
 pub(super) fn create_for_handoff(
-    state: &Path,
-    row: &Value,
-    audit: usize,
-    launch: Launch,
+    _state: &Path,
+    _row: &Value,
+    _audit: usize,
+    _launch: Launch,
 ) -> Result<Value> {
-    call(
-        state,
-        row,
-        json!({"op":"create","executionId":row["executionId"],"handoffAudit":audit,
-            "cwd":row["cwd"],"label":row["label"],"argv":launch.argv,"env":launch.env}),
-    )
+    bail!(super::assignment::TMUX_HISTORY_ONLY)
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn handoff_target(state: &Path, row: &Value) -> Result<Value> {
-    let reply = call(state, row, json!({"op":"handofftarget"}))?;
-    ensure!(
-        reply["result"] == "accepted" && reply["service"].is_object(),
-        "cannot verify the target tmux service: {}",
-        reply["diagnostic"]
-    );
-    Ok(reply["service"].clone())
+pub(super) fn handoff_target(_state: &Path, _row: &Value) -> Result<Value> {
+    bail!(super::assignment::TMUX_HISTORY_ONLY)
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn resume(state: &Path, row: &Value, launch: Launch) -> Result<Value> {
-    // The OpenCode TUI owns submission after it proves adoption and claims
-    // the brief. Use tmux for launch only on this public path.
-    let host = (row["host"] != "opencode").then_some(&row["host"]);
-    call(
-        state,
-        row,
-        json!({"op":"resume","executionId":row["executionId"],"cwd":row["cwd"],
-            "label":row["label"],"argv":launch.argv,"env":launch.env,"host":host,
-            "probe_read_only":true}),
-    )
+pub(super) fn resume(_state: &Path, _row: &Value, _launch: Launch) -> Result<Value> {
+    bail!(super::assignment::TMUX_HISTORY_ONLY)
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn observe_for_resume(state: &Path, row: &Value) -> Result<(Value, Value)> {
-    if super::assignment::resume_audit(row)
-        .is_some_and(|event| event["launchResult"] == "definitely-not-sent")
-    {
-        // A proven spawn refusal may have no keyed worker receipt. Still
-        // require the backend to confirm the protected session slot is absent.
-        let inspection = call(state, row, json!({"op":"inspect"}))?;
-        let worker_state = if inspection["result"] == "accepted" && inspection["alive"] == false {
-            "not_started"
-        } else {
-            "unknown"
-        };
-        return Ok((json!({"state":worker_state}), inspection));
-    }
-    let (worker, inspection) = observe(state, &mut row.clone())?;
-    if inspection["alive"] == false {
-        // An archived execution can be absent while its original name is
-        // occupied. Check the slot before recording a new attempt.
-        let slot = call(state, row, json!({"op":"inspect"}))?;
-        if slot["result"] != "accepted" || slot["alive"] != false {
-            return Ok((worker, slot));
-        }
-    }
-    Ok((worker, inspection))
+pub(super) fn observe_for_resume(_state: &Path, _row: &Value) -> Result<(Value, Value)> {
+    bail!(super::assignment::TMUX_HISTORY_ONLY)
 }
 
 fn close_operation(row: &Value) -> Result<String> {
@@ -260,102 +138,24 @@ fn legacy_launch_hint(row: &Value) -> Result<Option<&str>> {
     Ok(hint.or(id))
 }
 
-fn existing(state: &Path, row: &Value, op: &str, read_only: bool) -> Result<Value> {
-    let mut request = json!({"op":op});
-    if read_only {
-        request["readOnly"] = json!(true);
-    }
-    call(state, row, existing_request(row, request)?)
-}
-
 #[cfg(target_os = "linux")]
 pub(super) fn submit_checked(
-    state: &Path,
-    row: &Value,
-    text: &str,
-    confirm_transcript: bool,
-    check: &mut dyn FnMut(crate::tmux::InputBoundary) -> std::result::Result<(), Value>,
+    _state: &Path,
+    _row: &Value,
+    _text: &str,
+    _confirm_transcript: bool,
+    _check: &mut dyn FnMut(super::input::InputBoundary) -> std::result::Result<(), Value>,
 ) -> Result<Value> {
-    ensure!(row["backend"] == "tmux", "input requires a tmux worker");
-    let row = execution_row(row)?;
-    let request = existing_request(
-        row.as_ref(),
-        json!({"op":"submit","text":text,"host":row["host"],"confirm_reply":true,
-            "confirm_transcript":confirm_transcript}),
-    )?;
-    crate::tmux::execute_checked(
-        state,
-        serde_json::from_value(request)?,
-        row["tmuxSocket"].as_str(),
-        check,
-    )
+    bail!(super::assignment::TMUX_HISTORY_ONLY)
 }
 
 #[cfg(target_os = "linux")]
 pub(super) fn verify_legacy_worker_callback(
-    state: &Path,
-    dispatch: &str,
-    observed: &Value,
+    _state: &Path,
+    _dispatch: &str,
+    _observed: &Value,
 ) -> Result<()> {
-    let verify = || -> Result<()> {
-        let launch = observed["launchId"]
-            .as_str()
-            .filter(|id| valid_launch(id))
-            .context("missing launch ID")?;
-        let receipt = private_receipt(state, Some(launch))?;
-        let pid = receipt["pid"]
-            .as_u64()
-            .filter(|pid| *pid > 0)
-            .context("missing worker PID")?;
-        ensure!(receipt["category"] == "started", "worker no longer running");
-        let env = std::fs::read(format!("/proc/{pid}/environ"))?;
-        let field = |prefix: &[u8]| {
-            env.split(|b| *b == 0)
-                .find_map(|entry| entry.strip_prefix(prefix))
-        };
-        ensure!(
-            field(b"WFC_STATE=") == Some(state.canonicalize()?.as_os_str().as_encoded_bytes())
-                && field(b"WFC_DISPATCH=") == Some(dispatch.as_bytes()),
-            "original worker environment does not identify this execution"
-        );
-        ensure!(
-            env.split(|b| *b == 0).all(|entry| {
-                entry
-                    .strip_prefix(b"WFC_WORKER_CALLBACK=")
-                    .is_none_or(|secret| secret.is_empty())
-            }),
-            "original worker has a callback credential absent from the assignment"
-        );
-        Ok(())
-    };
-    verify().context("verify the original worker callback authorization before continuing")
-}
-
-fn existing_request(row: &Value, mut request: Value) -> Result<Value> {
-    let attempt = row["attempt"]
-        .as_str()
-        .filter(|v| valid_identity(v, "a-"))
-        .context("missing existing execution identity")?;
-    if !row["executionId"].is_null() {
-        ensure!(
-            row["executionId"] == attempt,
-            "execution identity does not match this attempt"
-        );
-        request["executionId"] = json!(attempt);
-    } else {
-        request["legacyExecutionId"] = json!(legacy_selector(row)?);
-        if let Some(pane) = row.get("legacyWorkerPane") {
-            request["legacyWorkerPane"] = pane.clone();
-        }
-        if let Some(hint) = legacy_launch_hint(row)? {
-            request["legacyLaunchId"] = json!(hint);
-        }
-    }
-    if matches!(request["op"].as_str(), Some("close" | "revoke")) {
-        request["closeOperationId"] = json!(close_operation(row)?);
-    }
-    request["dispatch"] = row["dispatch"].clone();
-    Ok(request)
+    bail!(super::assignment::TMUX_HISTORY_ONLY)
 }
 
 pub(super) fn receipt_id(row: &Value) -> Result<Option<&str>> {
@@ -396,64 +196,6 @@ fn valid_launch(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-
-// The service resolves a lost create response using the execution registered
-// before launch. Only read the receipt under this state for that exact launch.
-fn inspect_launch<'a>(
-    state: &Path,
-    row: &'a Value,
-    inspection: &'a Value,
-) -> Result<Option<&'a str>> {
-    let known = receipt_id(row)?;
-    // Session reachability and a verified historical launch are independent.
-    let historical = inspection["result"] == "uncertain" && !inspection["launchId"].is_null();
-    if inspection["result"] != "accepted" && !historical {
-        return Ok(known);
-    }
-    if row["executionId"].is_null() {
-        let selector = legacy_selector(row)?;
-        if inspection["launchId"].is_null() {
-            ensure!(
-                row["createPending"] != true
-                    || known.is_some()
-                    || (row["legacyWorkerPane"].is_string() && inspection["workerBound"] == true),
-                "missing verified launch or worker for legacy reservation"
-            );
-            ensure!(
-                legacy_launch_hint(row)?.is_none() || known.is_some(),
-                "unconfirmed legacy launch hint"
-            );
-            return Ok(known);
-        }
-        ensure!(
-            inspection["legacyExecutionId"] == selector,
-            "inspection identifies another legacy execution"
-        );
-    } else {
-        ensure!(
-            inspection["executionId"] == row["attempt"] && row["executionId"] == row["attempt"],
-            "inspection identifies another attempt"
-        );
-    }
-    let id = inspection["launchId"]
-        .as_str()
-        .filter(|id| valid_launch(id))
-        .context("missing original launch identity")?;
-    ensure!(
-        known.is_none_or(|known| known == id)
-            && legacy_launch_hint(row)?.is_none_or(|hint| hint == id),
-        "inspection identifies another launch"
-    );
-    let path = state
-        .canonicalize()?
-        .join("launches")
-        .join(format!("{id}.json"));
-    ensure!(
-        inspection["receipt"].as_str().map(Path::new) == Some(path.as_path()),
-        "unexpected launch receipt path"
-    );
-    Ok(Some(id))
 }
 
 fn private_receipt(state: &Path, launch: Option<&str>) -> Result<Value> {
@@ -507,7 +249,7 @@ pub(super) fn verified_unconfirmed_tmux_receipt(
         "unexpected early-exit receipt path"
     );
     let receipt =
-        crate::tmux::launch::read_receipt(&path).context("missing verified early-exit receipt")?;
+        super::legacy_tmux::read_receipt(&path).context("missing verified early-exit receipt")?;
     ensure!(
         receipt["launchId"] == id
             && receipt["category"] == "process_exited"
@@ -645,36 +387,6 @@ fn matches_revocation(row: &Value, fact: &Value) -> bool {
         && fact["category"] == "not_started"
 }
 
-fn revocation_reply(state: &Path, row: &Value, answer: &Value) -> Result<Option<Value>> {
-    (answer["category"] == "not_started")
-        .then(|| revocation(state, row, answer))
-        .transpose()
-}
-
-fn revocation(state: &Path, row: &Value, answer: &Value) -> Result<Value> {
-    ensure!(
-        matches_revocation(row, answer),
-        "close uncertain: cancellation does not identify this reservation"
-    );
-    let stem = answer["launchId"].as_str().context("missing launchId")?;
-    let prefix = state.canonicalize()?.join("launches").join(stem);
-    let path = Path::new(
-        answer["cancellationEvidence"]
-            .as_str()
-            .context("missing cancellation evidence")?,
-    );
-    ensure!(
-        path == prefix.with_extension("json") || path == prefix.with_extension("revoked"),
-        "unexpected cancellation evidence path"
-    );
-    let fact: Value = serde_json::from_reader(File::open(path)?)?;
-    ensure!(
-        matches_revocation(row, &fact) && fact["launchId"] == stem,
-        "close uncertain: cancellation receipt mismatch"
-    );
-    Ok(fact)
-}
-
 fn saved_revocation<'a>(row: &Value, saved: &'a Value) -> Option<&'a Value> {
     let fact = &saved["revocation"];
     (saved["worker"] == json!({"state":"not_started"})
@@ -684,10 +396,6 @@ fn saved_revocation<'a>(row: &Value, saved: &'a Value) -> Option<&'a Value> {
         && saved["executionId"] == row["attempt"]
         && receipt_id(row).is_ok_and(|known| known.is_none_or(|id| fact["launchId"] == id)))
     .then_some(fact)
-}
-
-fn supports_session_confirmation(row: &Value) -> bool {
-    row["tmuxLaunchProtocol"] == LAUNCH_PROTOCOL
 }
 
 fn revocation_close_effect(receipt: &Value) -> bool {
@@ -716,63 +424,6 @@ fn confirmed(row: &Value, saved: &Value) -> bool {
         Some("session_closed") => archived_exit(saved) || saved["worker"]["state"] == "cancelled",
         _ => false,
     }
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn registered_tmux_round(
-    state: &Path,
-    dispatch: &str,
-    attempt: &str,
-    launch: &str,
-) -> Option<u64> {
-    let row = super::assignment::public_record(&state.join("dispatches"), dispatch).ok()??;
-    let row = execution_row(&row).ok()?;
-    let expected = state.join("launches").join(format!("{launch}.json"));
-    if row["backend"] != "tmux"
-        || row["dispatch"] != dispatch
-        || row["attempt"] != attempt
-        || row["executionId"] != attempt
-        || receipt_id(row.as_ref()).ok()? != Some(launch)
-        || row["create"]["receipt"].as_str().map(Path::new) != Some(expected.as_path())
-    {
-        return None;
-    }
-    row["round"].as_u64().filter(|round| *round > 0)
-}
-
-fn require_archived_worker_tree(
-    state: &Path,
-    row: &Value,
-    saved: &Value,
-    remember: bool,
-) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    if saved_revocation(row, saved).is_none() {
-        let launch = receipt_id(row)?.or_else(|| {
-            (row["executionId"] == row["attempt"]
-                && saved["executionId"] == row["attempt"]
-                && close_operation(row).is_ok_and(|op| saved["closeOperationId"] == op))
-            .then(|| saved["launchId"].as_str().filter(|id| valid_launch(id)))
-            .flatten()
-        });
-        if let Some(launch) = launch {
-            let dispatch = row["dispatch"].as_str().context("missing dispatch")?;
-            if remember {
-                crate::tmux::launch::remember_unknown_close_identity(state, launch, dispatch)?;
-            }
-            ensure!(
-                crate::tmux::launch::close_worker_tree_ready(state, launch, dispatch, || Some((
-                    row["attempt"].as_str()?.to_owned(),
-                    row["round"].as_u64()?
-                )),),
-                "close uncertain: {}",
-                crate::tmux::launch::UNKNOWN_CLOSE_IDENTITY
-            );
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = (state, row, saved, remember);
-    Ok(())
 }
 
 fn exited(evidence: &Value) -> Option<Value> {
@@ -813,42 +464,6 @@ fn bound_close_launch<'a>(
         }
         None => None,
     }
-}
-
-// The close effect describes the session. Its supervisor can still publish
-// a process exit later. Both archived reads and close replays use this view.
-fn closed_worker(
-    state: &Path,
-    row: &Value,
-    saved: &Value,
-    inspect_legacy: bool,
-    read_only: bool,
-) -> Result<Option<Value>> {
-    let worker = &saved["worker"];
-    if saved["closeEffect"] == "session_closed" && worker["state"] == "cancelled" {
-        let known = receipt_id(row)?;
-        let mut id = bound_close_launch(row, saved, known);
-        // R2 had only an unscoped create reply. Active replay must verify its selector.
-        if id.is_none()
-            && saved.get("launchId").is_none()
-            && known.is_some()
-            && row["round"] == 1
-            && row["executionId"].is_null()
-        {
-            if !inspect_legacy {
-                return Ok(None);
-            }
-            if existing(state, row, "inspect", read_only)
-                .is_ok_and(|reply| reply["result"] == "accepted" && reply["alive"] == false)
-            {
-                id = known;
-            }
-        }
-        if let Some(exit) = exited(&private_receipt(state, id)?) {
-            return Ok(Some(exit));
-        }
-    }
-    Ok(Some(worker.clone()))
 }
 
 #[cfg(target_os = "linux")]
@@ -1044,8 +659,11 @@ pub(super) fn observe_with_mode(
     if row["backend"] == "herdr" {
         return super::herdr::observe(state, row, read_only);
     }
-    let physical = execution_row(row)?;
-    observe_tmux(state, physical.as_ref(), read_only)
+    let _ = read_only;
+    Ok((
+        json!({"state":"unknown"}),
+        json!({"result":"uncertain","alive":null,"diagnostic":"unsupported worker backend"}),
+    ))
 }
 
 fn recorded_tmux_exit(state: &Path, row: &Value, saved: Option<&Value>) -> Option<Value> {
@@ -1070,47 +688,6 @@ fn recorded_tmux_exit(state: &Path, row: &Value, saved: Option<&Value>) -> Optio
     exited(&receipt)
 }
 
-fn observe_tmux(state: &Path, row: &Value, read_only: bool) -> Result<(Value, Value)> {
-    let saved = archive(state, row)?.unwrap_or(Value::Null);
-    let archived = confirmed(row, &saved);
-    let archive_blocked =
-        archived && require_archived_worker_tree(state, row, &saved, false).is_err();
-    if archived && !archive_blocked {
-        let mut observation = json!({"result":"completed","alive":false});
-        copy_close_fields(&saved, &mut observation);
-        let worker = closed_worker(state, row, &saved, true, read_only)?
-            .context("missing archived worker")?;
-        return Ok((worker, observation));
-    }
-
-    let (worker, mut inspection) = inspect_worker(state, row, &saved, read_only)?;
-    let revoked = saved_revocation(row, &saved).filter(|_| worker["state"] == "not_started");
-    // A legacy release can replay an old absence from the backend's history,
-    // even if the public archive never made it to disk.
-    let legacy_absence = !supports_session_confirmation(row) && inspection["alive"] == false;
-    if archive_blocked
-        || revoked.is_some()
-        || unverified_absence(&saved)
-        || legacy_absence
-        || saved["resourceCleanup"] == "uncertain"
-    {
-        inspection["result"] = json!("uncertain");
-        if inspection["alive"] != true || inspection["owned"] != true {
-            inspection["alive"] = Value::Null;
-        }
-        inspection["resourceCleanup"] = json!("uncertain");
-        if let Some(fact) = revoked {
-            inspection["revocation"] = fact.clone();
-            inspection["closeOperationId"] = fact["closeOperationId"].clone();
-        } else if archived_exit(&saved)
-            && close_operation(row).is_ok_and(|op| saved["closeOperationId"] == op)
-        {
-            inspection["closeOperationId"] = saved["closeOperationId"].clone();
-        }
-    }
-    Ok((worker, inspection))
-}
-
 pub(super) fn copy_close_fields(saved: &Value, output: &mut Value) {
     for field in [
         "closeOperationId",
@@ -1122,56 +699,6 @@ pub(super) fn copy_close_fields(saved: &Value, output: &mut Value) {
             output[field] = value.clone();
         }
     }
-}
-
-fn inspect_worker(
-    state: &Path,
-    row: &Value,
-    saved: &Value,
-    read_only: bool,
-) -> Result<(Value, Value)> {
-    let mut inspection = existing(state, row, "inspect", read_only)
-        .unwrap_or_else(|e| json!({"result":"uncertain","diagnostic":e.to_string()}));
-    if read_only && inspection["alive"] == true && inspection["owned"] == false {
-        return Ok((json!({"state":"unknown"}), inspection));
-    }
-    let evidence = match inspect_launch(state, row, &inspection) {
-        Ok(id) => private_receipt(state, id)?,
-        Err(e) => {
-            inspection = json!({"result":"uncertain","diagnostic":e.to_string()});
-            Value::Null
-        }
-    };
-    let worker = if let Some(exit) = exited(&evidence) {
-        exit
-    } else if archived_exit(saved) || saved_revocation(row, saved).is_some() {
-        saved["worker"].clone()
-    } else if matches!(evidence["category"].as_str(), Some("started") | None)
-        && inspection["result"] == "accepted"
-        && inspection["alive"] == true
-        && inspection["owned"] == true
-        && inspection["workerBound"] == true
-    {
-        json!({"state":"running"})
-    } else {
-        json!({"state":"unknown"})
-    };
-    Ok((worker, inspection))
-}
-
-fn close_receipt(row: &Value) -> Value {
-    json!({"dispatch":row["dispatch"],"operation":"close","result":"completed","round":row["round"],"attempt":row["attempt"]})
-}
-
-fn replay(state: &Path, row: &Value, saved: &Value, inspect_legacy: bool) -> Result<Option<Value>> {
-    let Some(worker) = closed_worker(state, row, saved, inspect_legacy, false)? else {
-        return Ok(None);
-    };
-    let mut receipt = close_receipt(row);
-    receipt["worker"] = worker;
-    copy_close_fields(saved, &mut receipt);
-    receipt["diagnostic"] = json!("session was already gone");
-    Ok(Some(receipt))
 }
 
 pub(super) fn read_only_close(state: &Path, row: &Value) -> Result<Option<Value>> {
@@ -1186,16 +713,7 @@ pub(super) fn read_only_close(state: &Path, row: &Value) -> Result<Option<Value>
     if row["backend"] == "herdr" {
         return super::herdr::read_only_close(state, row);
     }
-    if row["backend"] == "tmux" {
-        let physical = execution_row(row)?;
-        let physical = physical.as_ref();
-        if let Some(saved) = archive(state, physical)?.filter(|saved| confirmed(physical, saved)) {
-            require_archived_worker_tree(state, physical, &saved, false)?;
-            return Ok(
-                replay(state, physical, &saved, false)?.map(|result| public_close(result, row))
-            );
-        }
-    }
+    let _ = state;
     Ok(None)
 }
 
@@ -1211,142 +729,9 @@ pub fn close(state: &Path, row: &Value) -> Result<Value> {
     if row["backend"] == "herdr" {
         return super::herdr::close(state, row);
     }
-    let physical = execution_row(row)?;
-    let result = close_tmux(state, physical.as_ref())?;
-    Ok(public_close(result, row))
-}
-
-fn public_close(mut result: Value, row: &Value) -> Value {
-    result["round"] = row["round"].clone();
-    result["attempt"] = row["attempt"].clone();
-    result
-}
-
-fn close_tmux(state: &Path, row: &Value) -> Result<Value> {
-    let id = row["dispatch"].as_str().context("missing dispatch")?;
-    // Archived replay works on read-only state. A first close serializes on a
-    // stable per-attempt file regardless of which publication the reader saw.
-    let saved = archive(state, row)?.unwrap_or(Value::Null);
-    let _lock;
-    let saved = if confirmed(row, &saved) {
-        saved
-    } else {
-        _lock = super::assignment::close_lock(state, row)?;
-        archive(state, row)?.unwrap_or(Value::Null)
-    };
-    if confirmed(row, &saved) {
-        require_archived_worker_tree(state, row, &saved, true)?;
-        return replay(state, row, &saved, true)?.context("missing archived close receipt");
-    }
-
-    let mut receipt = close_receipt(row);
-    let (before, observed) = inspect_worker(state, row, &saved, false)?;
-    let previous_revocation = saved_revocation(row, &saved);
-    let pending_native = (row["createPending"] == true || row["create"]["result"] == "uncertain")
-        && row["executionId"].is_string()
-        && row["executionId"] == row["attempt"]
-        && receipt_id(row)?.is_none();
-    let recovery =
-        previous_revocation.is_some() || (pending_native && observed["result"] == "uncertain");
-    ensure!(
-        observed["result"] == "accepted" || recovery,
-        "backend inspection {}: {}",
-        observed["result"],
-        observed["diagnostic"]
-    );
-    if observed["alive"] == true {
-        ensure!(
-            observed["owned"] == true,
-            "tmux session is not owned by this dispatch"
-        );
-    }
-
-    let launch = inspect_launch(state, row, &observed)?;
-    let mut answer = existing(state, row, if recovery { "revoke" } else { "close" }, false)?;
-    let mut cancellation = revocation_reply(state, row, &answer)?;
-    if let Some(previous) = previous_revocation {
-        // A legacy archive can preserve the worker fact across disconnection.
-        // A fresh keyed proof is required before retrying session cleanup.
-        ensure!(
-            cancellation.as_ref() == Some(previous) && before["state"] == "not_started",
-            "close uncertain: conflicting worker evidence"
-        );
-        if answer["result"] == "uncertain" {
-            answer = existing(state, row, "close", false)?;
-            cancellation = revocation_reply(state, row, &answer)?;
-        }
-    }
-
-    if let Some(fact) = cancellation {
-        ensure!(
-            matches!(before["state"].as_str(), Some("unknown" | "not_started"))
-                && previous_revocation.is_none_or(|previous| previous == &fact)
-                && launch.is_none_or(|id| fact["launchId"] == id),
-            "close uncertain: conflicting worker evidence"
-        );
-        let cleanup_confirmed = answer["result"] == "completed" && revocation_close_effect(&answer);
-        let mut snapshot = json!({
-            "dispatch":id, "round":row["round"], "attempt":row["attempt"],
-            "executionId":fact["executionId"], "launchId":fact["launchId"],
-            "closeOperationId":fact["closeOperationId"], "revocation":fact,
-            "worker":{"state":"not_started"},
-            "resourceCleanup":if cleanup_confirmed { "confirmed" } else { "uncertain" }
-        });
-        if cleanup_confirmed {
-            snapshot["closeEffect"] = answer["closeEffect"].clone();
-        }
-        write_json(&closed_path(state, row)?, &snapshot, None)?;
-        ensure!(
-            cleanup_confirmed,
-            "close uncertain: worker launch was revoked; tmux cleanup is unconfirmed ({})",
-            answer["diagnostic"]
-        );
-        receipt["worker"] = snapshot["worker"].clone();
-        copy_close_fields(&snapshot, &mut receipt);
-        return Ok(receipt);
-    }
-
-    ensure!(
-        answer["result"] == "completed",
-        "close {}: {}",
-        answer["result"],
-        answer["diagnostic"]
-    );
-    ensure!(
-        !recovery,
-        "close uncertain: missing verified reservation cancellation"
-    );
-    ensure!(
-        answer["closeOperationId"] == close_operation(row)?,
-        "close uncertain: backend did not confirm the close operation"
-    );
-    let worker = match answer["closeEffect"].as_str() {
-        Some("already_absent")
-            if !supports_session_confirmation(row) || unverified_absence(&saved) =>
-        {
-            bail!("close uncertain: old absence has no independently verified cleanup")
-        }
-        Some("already_absent" | "worker_exited") => {
-            if before["state"] == "exited" {
-                before
-            } else {
-                exited(&private_receipt(state, launch)?)
-                    .context("close uncertain: missing same-attempt worker exit evidence")?
-            }
-        }
-        Some("session_closed") if before["state"] == "exited" => before,
-        Some("session_closed") => json!({"state":"cancelled","exit_code":null,"signal":null}),
-        _ => bail!("close uncertain: backend did not confirm the close effect"),
-    };
-    if answer["closeEffect"] == "already_absent" {
-        receipt["diagnostic"] = json!("session was already gone");
-    }
-    let snapshot = json!({"launchId":launch, "executionId":row["executionId"], "legacyExecutionId":observed["legacyExecutionId"], "closeOperationId":answer["closeOperationId"], "dispatch":id,"round":row["round"],"attempt":row["attempt"],
-        "worker":worker,"closeEffect":answer["closeEffect"],"resourceCleanup":"confirmed"});
-    write_json(&closed_path(state, row)?, &snapshot, None)?;
-    receipt["worker"] = worker;
-    copy_close_fields(&snapshot, &mut receipt);
-    Ok(receipt)
+    let _ = state;
+    super::assignment::require_not_tmux_history(row)?;
+    bail!("unsupported worker backend")
 }
 
 #[cfg(test)]
@@ -1455,37 +840,16 @@ mod tests {
     }
 
     #[test]
-    fn recovered_launch_requires_the_registered_attempt_and_receipt_path() -> Result<()> {
-        let state = std::env::temp_dir().canonicalize()?;
+    fn archived_close_launch_requires_original_legacy_association() {
         let launch = "0123456789abcdef0123456789abcdef";
-        let row = json!({"dispatch":"d-12345678","attempt":"a-123456789abc","round":2,
-            "executionId":"a-123456789abc",
-            "create":{"result":"uncertain","dispatch":"d-12345678","attempt":"a-123456789abc","round":2}});
-        let mut answer = json!({"result":"accepted","executionId":row["attempt"],"launchId":launch,
-            "receipt":state.join("launches").join(format!("{launch}.json"))});
-        assert_eq!(inspect_launch(&state, &row, &answer)?, Some(launch));
-        answer["executionId"] = json!("a-23456789abcd");
-        assert!(inspect_launch(&state, &row, &answer).is_err());
-        answer["executionId"] = row["attempt"].clone();
-        answer["launchId"] = json!("ffffffffffffffffffffffffffffffff");
-        assert!(inspect_launch(&state, &row, &answer).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn offline_legacy_receipt_requires_a_confirmed_association() -> Result<()> {
-        let state = std::env::temp_dir().canonicalize()?;
-        let id = "0123456789abcdef0123456789abcdef";
-        let row = json!({"dispatch":"d-12345678","round":1,"attempt":"a-123456789abc","legacyLaunchId":id});
-        let mut offline = json!({"result":"uncertain"});
-        assert_eq!(inspect_launch(&state, &row, &offline)?, None);
-        offline["legacyExecutionId"] = row["attempt"].clone();
-        offline["launchId"] = json!(id);
-        offline["receipt"] = json!(state.join("launches").join(format!("{id}.json")));
-        assert_eq!(inspect_launch(&state, &row, &offline)?, Some(id));
-        offline["legacyExecutionId"] = json!("a-aaaaaaaaaaaa");
-        assert!(inspect_launch(&state, &row, &offline).is_err());
-        Ok(())
+        let mut row = json!({"attempt":"a-123456789abc","legacyLaunchId":launch});
+        let mut close = json!({"launchId":launch,"legacyExecutionId":row["attempt"]});
+        assert_eq!(bound_close_launch(&row, &close, None), Some(launch));
+        close["legacyExecutionId"] = json!("a-23456789abcd");
+        assert_eq!(bound_close_launch(&row, &close, None), None);
+        close["legacyExecutionId"] = row["attempt"].clone();
+        row["legacyLaunchId"] = json!("ffffffffffffffffffffffffffffffff");
+        assert_eq!(bound_close_launch(&row, &close, None), None);
     }
 
     #[test]

@@ -2,14 +2,10 @@
 import argparse
 from contextlib import closing
 import json
-import os
 from pathlib import Path
 import shutil
 import sqlite3
-import subprocess
-import sys
 import tempfile
-import time
 import traceback
 
 from legacy_offline_import import (
@@ -618,19 +614,11 @@ def verify_combination(binary, root, target, source, work):
     assert (archived[40]["recipient"], archived[40]["to"], archived[40]["questionMessageId"]) == (
         "worker", 39, identifier(39))
 
-    # The archive must be rejected before the transport is even selected.
-    trap_bin = root / "old-host-transport"
-    trap_bin.mkdir()
-    trap = trap_bin / "tmux"
-    trap.write_text('#!/bin/sh\n: > "$WFC_TEST_OLD_HOST_CALL"\nexit 1\n')
-    trap.chmod(0o700)
-    old_call = root / "old-host-called"
-    old_env = {"PATH": str(trap_bin), "WFC_TEST_OLD_HOST_CALL": str(old_call)}
     before = snapshot(target)
-    refusal = run(binary, root, target, "reply", "39", "archive must stay stopped", token=NEW, extra=old_env)
+    refusal = run(binary, root, target, "reply", "39", "archive must stay stopped", token=NEW)
     assert (refusal.returncode, refusal.stdout, refusal.stderr) == (
         1, "", "Error: offline legacy assignment has no writable worker\n"), refusal
-    assert not old_call.exists() and snapshot(target) == before
+    assert snapshot(target) == before
     print(json.dumps({"archivedQuestion": question["messageId"], "archivedReplySent": False,
                       "archiveRefusal": refusal.stderr.strip()}), flush=True)
 
@@ -644,79 +632,11 @@ def verify_combination(binary, root, target, source, work):
     shutil.copyfile(source / "router.db", legacy / "router.db")
     mixed_before = snapshot(legacy)
     denied(run(binary, root, target, "reply", "39", "mixed legacy state", token=NEW,
-               extra={**old_env, "WFC_STATE": "~/mixed"}), f"legacy state write blocked at {legacy / 'router.db'}.")
-    assert not old_call.exists() and snapshot(target) == before and snapshot(legacy) == mixed_before
+               extra={"WFC_STATE": "~/mixed"}), f"legacy state write blocked at {legacy / 'router.db'}.")
+    assert snapshot(target) == before and snapshot(legacy) == mixed_before
     print(json.dumps({"mixedWriteBlocked": True, "mixedSourceBeforeAfter": mixed_before["router.db"][1]}), flush=True)
 
-    fixture = work / "live"
-    fixture.mkdir()
-    socket = root / "reply.sock"
-    tmux_env = {"TERM": "xterm", "WFC_TMUX_SOCKET": str(socket)}
-    tmux_path = shutil.which("tmux", path=os.defpath)
-    assert tmux_path is not None
-    tmux = [tmux_path, "-S", str(socket), "-f", "/dev/null"]
-    composer = Path(__file__).resolve().parents[1] / "tools" / "check_tmux.py"
-    log = fixture / "input.log"
-    config = fixture / "launch.json"
-    config.write_text(json.dumps({"hosts": {"codex": {"command": [
-        sys.executable, str(composer), "--reply-worker", "empty-with-done-receipt", str(log)]}}}))
     task = work / "task.md"
-    row = None
-    try:
-        row = output(run(binary, root, target, "dispatch", "--scope", SCOPE, "--role", "worker",
-                         "--host", "codex", "--backend", "tmux", "--cwd", fixture, "--task", task,
-                         "--report", fixture / "report", "--launch-config", config, token=NEW, extra=tmux_env))
-        question_file = fixture / "question.json"
-        deadline = time.monotonic() + 10
-        while True:
-            screen = subprocess.run(tmux + ["capture-pane", "-p", "-t", f"=wfc-{row['dispatch']}:"],
-                                    capture_output=True, text=True, timeout=3)
-            if question_file.exists() and "Ask Codex to do anything" in screen.stdout:
-                break
-            assert time.monotonic() < deadline, (screen.stdout, screen.stderr)
-            time.sleep(.025)
-        question = json.loads(question_file.read_bytes())
-        assert question["message"] == 127
-        answer = output(run(binary, root, target, "reply", "127", "one native answer", token=NEW, extra=tmux_env))
-        assert answer == {"replied": 127, "dispatch": row["dispatch"]}
-        detail, undelivered = lookup(binary, root, target, row["dispatch"])
-        reply, = (item for item in detail["messages"] if item["type"] == "reply")
-        assert (reply["id"], reply["to"], reply["questionMessageId"], reply["inputResult"]) == (
-            128, 127, question["messageId"], "accepted")
-        expected = b"[router] Answer to question 127: one native answer"
-        assert (fixture / "accepted").read_bytes() == expected + b"\n"
-        events = [json.loads(line) for line in log.read_text().splitlines()]
-        assert b"".join(bytes.fromhex(event[0]) for event in events[1:]) == expected + b"\r"
-        print(json.dumps({"nativeQuestion": question["message"], "nativeReply": reply["id"],
-                          "confirmedInputCount": 1}), flush=True)
-        pending, = [item for item in detail["messages"] if item["id"] == 127]
-        assert (pending["type"], pending["messageId"], pending["state"], pending["statusVersion"],
-                pending["to"], pending["delivered"]) == (
-            "question", question["messageId"], "unsent", 1, "controller", False), pending
-        assert undelivered == [pending], undelivered
-        # Reply enters the worker's terminal. The controller receives the
-        # question in a separate step, before asking the worker to finish.
-        claim_once(binary, root, target, row, question, "question", extra=tmux_env)
-        (fixture / "finish").touch()
-        done_result = fixture / "done-result.json"
-        deadline = time.monotonic() + 16
-        while not done_result.exists():
-            assert time.monotonic() < deadline, "the synthetic worker did not report its done exit and receipt"
-            time.sleep(.025)
-        produced = json.loads(done_result.read_text())
-        print(json.dumps({"hostedDone": produced}), flush=True)
-        assert produced["exit"] == 0 and produced["stderr"] == "", produced
-        native = json.loads(produced["stdout"])
-        assert native["message"] == 129, native
-        verify_unclaimed_done(binary, root, target, row, native, fixture / "report")
-        completed = claim_once(binary, root, target, row, native, "done", extra=tmux_env)
-    finally:
-        try:
-            if row is not None:
-                output(run(binary, root, target, "close", row["dispatch"], token=NEW, extra=tmux_env))
-        finally:
-            subprocess.run(tmux + ["kill-server"], capture_output=True, timeout=5)
-
     failed = run(binary, root, target, "dispatch", "--scope", SCOPE, "--role", "worker", "--cwd", work,
                  "--task", task, "--report", work / "failed-start", "--", work / "absent-executable", token=NEW)
     print(json.dumps({"startupDispatch": {"exit": failed.returncode, "stdout": failed.stdout,
@@ -728,17 +648,16 @@ def verify_combination(binary, root, target, source, work):
                           "--timeout", "4", token=NEW))
     notice, = received["messages"]
     assert (notice["id"], notice["messageId"], notice["kind"], notice["fault"]["category"]) == (
-        130, startup["messageId"], "startup_failure", "executable_missing")
+        127, startup["messageId"], "startup_failure", "executable_missing")
     assert (notice["scope"], notice["dispatch"], notice["state"], notice["statusVersion"]) == (
         SCOPE, startup["dispatch"], "received", 2), notice
     empty = output(run(binary, root, target, "wait", "--scope", SCOPE, "--dispatch", startup["dispatch"],
                        "--timeout", "0", token=NEW), code=3)
     assert empty == {"messages": [], "timedOut": True}, empty
-    assert [item["id"] for item in ledger if item["id"] > 125] == [126, 127, 128, 129, 130]
+    assert [item["id"] for item in ledger if item["id"] > 125] == [126, 127]
     assert len({item["messageId"] for item in ledger}) == len(ledger)
     print(json.dumps({"nativeIds": [item["id"] for item in ledger if item["id"] > 125],
-                      "nativeQuestion": 127, "nativeReply": reply["id"], "nativeDone": completed["id"],
-                      "startupDiagnostic": notice["id"], "confirmedInputCount": 1}),
+                      "startupDiagnostic": notice["id"]}),
           flush=True)
 
 

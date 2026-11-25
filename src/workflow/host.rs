@@ -16,11 +16,7 @@ pub(crate) use claude::session_start as claude_session_start;
 #[cfg(target_os = "linux")]
 pub(super) mod opencode;
 #[cfg(target_os = "linux")]
-pub(crate) use opencode::adoption::first_message as opencode_first_message;
-#[cfg(target_os = "linux")]
 pub(super) use opencode::adoption::preserve_pending as preserve_opencode_adoption;
-#[cfg(target_os = "linux")]
-pub(crate) use opencode::resume::resume_ready as opencode_resume_ready;
 
 #[derive(Default)]
 pub struct Options<'a> {

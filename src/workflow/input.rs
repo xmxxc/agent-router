@@ -28,6 +28,17 @@ pub fn usage(name: &str) -> &'static str {
     }
 }
 
+// An input backend checks authorization before each write and reports when
+// text or Enter may already have reached the worker.
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Reserved for a supported public input transport.
+pub(super) enum InputBoundary {
+    PrepareText,
+    Text,
+    PrepareEnter,
+    Enter,
+}
+
 enum Action<'a> {
     Continue { task: &'a Path, report: &'a Path },
     Nudge(&'a str),
@@ -333,7 +344,7 @@ impl<'a> Request<'a> {
 
         let mut first_write_error = None;
         let answer = backend::submit_checked(&state, &current, &text, true, &mut |boundary| {
-            use crate::tmux::InputBoundary::{Enter, PrepareEnter, PrepareText, Text};
+            use InputBoundary::{Enter, PrepareEnter, PrepareText, Text};
             let check = || -> Result<()> {
                 if matches!(boundary, PrepareText | PrepareEnter) {
                     let inbox = messages::Inbox::open(&state)?;

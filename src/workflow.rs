@@ -19,8 +19,6 @@ pub mod worker_owner;
 mod assignment;
 mod backend;
 #[cfg(target_os = "linux")]
-pub(crate) use backend::registered_tmux_round;
-#[cfg(target_os = "linux")]
 pub mod handoff;
 #[cfg(target_os = "linux")]
 pub mod herdr;
@@ -29,6 +27,8 @@ pub mod host;
 pub mod input;
 #[cfg(target_os = "linux")]
 pub mod legacy_import;
+#[cfg(target_os = "linux")]
+mod legacy_tmux;
 #[cfg(target_os = "linux")]
 pub mod reclaim;
 #[cfg(target_os = "linux")]

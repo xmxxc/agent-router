@@ -1,14 +1,16 @@
 //! First-launch receipt for OpenCode 1.19.5's v1 TUI prompt path.
-use super::super::super::{assignment, controller, decode_record, messages, write_json};
-use super::{adopt_receipt, store_directory, verify_opening, OpencodeAdoption, StorageSource};
+use super::super::super::{decode_record, messages};
+#[cfg(test)]
+use super::super::super::{assignment, controller, write_json};
+use super::{store_directory, verify_opening};
+#[cfg(test)]
+use super::{adopt_receipt, OpencodeAdoption, StorageSource};
 use anyhow::{ensure, Context, Result};
-use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::{
-    env,
     ffi::OsString,
     fs::{self, Metadata, OpenOptions},
-    io::{self, ErrorKind, Read, Write},
+    io::{ErrorKind, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
@@ -18,7 +20,6 @@ const PLUGIN: &str = "wfc-adoption.mjs";
 const PLUGIN_SOURCE: &[u8] = include_bytes!("adoption.mjs");
 const CAPABILITY: &str = "wfc-adoption.capability";
 const BINDING: &str = "wfc-adoption.sha256";
-const MAX_RECEIPT: u64 = 16 * 1024;
 
 pub(super) fn require_private_state(state: &Path) -> Result<()> {
     store_directory(state).context("OpenCode adoption requires a private WFC_STATE")?;
@@ -125,8 +126,7 @@ pub(super) fn write_private(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg(test)]
 struct Receipt {
     dispatch: String,
     attempt: String,
@@ -134,41 +134,6 @@ struct Receipt {
     database: PathBuf,
     session: String,
     first_message: String,
-}
-
-fn receive() -> Result<()> {
-    let state = PathBuf::from(env::var_os("WFC_STATE").context("missing state")?);
-    let secret = controller::worker_callback().context("missing worker capability")?;
-    let capability = env::var("WFC_OPENCODE_ADOPTION")?;
-    let mut bytes = Vec::new();
-    io::stdin()
-        .lock()
-        .take(MAX_RECEIPT + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_RECEIPT,
-        "OpenCode receipt exceeds size limit"
-    );
-    let receipt: Receipt = serde_json::from_slice(&bytes)?;
-    ensure!(
-        env::var("WFC_DISPATCH").ok().as_deref() == Some(receipt.dispatch.as_str())
-            && env::var("WFC_ATTEMPT").ok().as_deref() == Some(receipt.attempt.as_str())
-            && env::var("WFC_ROUND").ok().as_deref() == Some("1")
-            && env::var_os("OPENCODE_DB").is_some_and(|path| Path::new(&path) == receipt.database)
-            && env::current_dir()? == receipt.cwd,
-        "OpenCode callback environment changed"
-    );
-    publish(
-        &state,
-        &receipt,
-        secret.to_str().context("invalid worker capability")?,
-        &capability,
-    )
-}
-
-pub(crate) fn first_message() -> bool {
-    // A hook invocation reports only success or failure to its parent.
-    receive().is_ok()
 }
 
 fn check_file(path: &Path, check: impl FnOnce(&Metadata) -> bool) -> Result<()> {
@@ -195,6 +160,7 @@ pub(super) fn check_store_files(database: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn verify_capability(directory: &Path, capability: &str) -> Result<()> {
     ensure!(
         capability.len() == 64 && capability.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -211,6 +177,7 @@ pub(super) fn verify_capability(directory: &Path, capability: &str) -> Result<()
     Ok(())
 }
 
+#[cfg(test)]
 fn publish(state: &Path, receipt: &Receipt, secret: &str, capability: &str) -> Result<()> {
     use super::super::super as workflow;
     ensure!(
@@ -285,6 +252,7 @@ fn publish(state: &Path, receipt: &Receipt, secret: &str, capability: &str) -> R
 }
 
 // The caller holds the Inbox lock and has validated the dispatch ID.
+#[cfg(test)]
 pub(super) fn read_assignment(state: &Path, dispatch: &str) -> Result<(Value, PathBuf)> {
     let dir = records_dir(state)?;
     for extension in ["json", "pending"] {

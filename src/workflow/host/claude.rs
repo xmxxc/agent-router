@@ -594,7 +594,7 @@ fn resume_source_adoption(ledger: &PublishLock, row: &Value) -> Result<(Expected
     let error = "Claude non-start audit does not verify the resume source";
     let mut create = &row["create"];
     let dispatch = field(row, "dispatch")?;
-    let launches = crate::tmux::launch::NonStartProofs::read(ledger.dir(), dispatch)?;
+    let launches = crate::workflow::legacy_tmux::NonStartProofs::read(ledger.dir(), dispatch)?;
     let mut attempt = field(row, "attempt")?;
     let mut round = row["round"].as_u64().context(error)?;
     let mut skipped = Vec::new();
@@ -772,6 +772,13 @@ fn open_binding(dir: &Path) -> Result<File> {
     Ok(file)
 }
 
+fn hook_assignment(state: &Path, dispatch: &str, attempt: &str) -> Result<Value> {
+    let row = workflow::messages::read_callback_record(&state.join("dispatches"), dispatch)?;
+    workflow::assignment::require_not_tmux_history(&row)?;
+    ensure!(row["attempt"] == attempt, "invalid Claude attempt capability");
+    Ok(row)
+}
+
 fn record_start(
     state: &Path,
     dispatch: &str,
@@ -779,6 +786,7 @@ fn record_start(
     callback: &str,
     stdin: impl Read,
 ) -> Result<()> {
+    let before = hook_assignment(state, dispatch, attempt)?;
     let mut data = Vec::new();
     stdin.take(MAX_EVENT + 1).read_to_end(&mut data)?;
     ensure!(
@@ -787,7 +795,7 @@ fn record_start(
     );
     let event: HookEvent = serde_json::from_slice(&data)?;
     let ledger = workflow::messages::lock_for_publish(state)?;
-    record_start_locked(&ledger, dispatch, attempt, callback, event)
+    record_start_locked(&ledger, dispatch, attempt, callback, event, Some(&before))
 }
 
 fn record_start_locked(
@@ -796,13 +804,18 @@ fn record_start_locked(
     attempt: &str,
     callback: &str,
     event: HookEvent,
+    before: Option<&Value>,
 ) -> Result<()> {
     let state = ledger.dir();
+    let row = hook_assignment(state, dispatch, attempt)?;
+    ensure!(
+        before.is_none_or(|before| workflow::assignment::same_publication_identity(before, &row)),
+        "{}",
+        workflow::assignment::UNVERIFIED_ASSIGNMENT
+    );
     let dir = attempt_dir(state, dispatch, attempt)?;
     let file = open_binding(&dir)?;
     let expected: Expected = serde_json::from_reader(&file)?;
-    let (row, path) = workflow::assignment::open_assignment(&state.join("dispatches"), dispatch)?;
-    let row = workflow::decode_record(row, &path)?;
     ensure!(
         !callback.is_empty()
             && row[workflow::controller::CALLBACK_HASH] == workflow::messages::body_hash(callback)
