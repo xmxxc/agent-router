@@ -18,6 +18,8 @@ import uuid
 DELEGATION = 'WFC_BUNDLED_CGROUP_ROOT'
 CGROUP = Path('/sys/fs/cgroup')
 PROCESSES = ('guardian', 'service', 'kernel', 'worker')
+TERMINAL_STATES = ('closed', 'exited', 'faulted', 'startup-aborted')
+REFUSED_TICKET = 'product refused the original bundled ticket'
 
 
 def check(condition, reason):
@@ -155,19 +157,43 @@ def recovered_receipt(row, partial):
     observation = row.get('backendObservation')
     check(isinstance(observation, dict) and observation.get('scope') != 'execution',
           'product did not confirm a binding for the private assignment')
+    result = observation.get('result')
+    create = row.get('create') or {}
+    partial_create = (partial.get('create') or {}) if isinstance(partial, dict) else {}
+    check('refused' not in (result, row.get('backendResult'), create.get('result'),
+                            partial_create.get('result')),
+          REFUSED_TICKET)
     ticket = observation.get('ticket')
     check_ticket(row, ticket)
-    create = row.get('create') or {}
     check(create.get('ticket') in (None, ticket), 'status has conflicting bundled tickets')
     if isinstance(partial, dict):
         check(all(partial.get(key) in (None, row[key]) for key in ('dispatch', 'attempt', 'round', 'scope'))
               and partial.get('backendHandle') in (None, ticket)
-              and (partial.get('create') or {}).get('ticket') in (None, ticket),
+              and partial_create.get('ticket') in (None, ticket),
               'status does not match the partial launch receipt')
-    identity = create.get('identity') if create.get('result') == 'accepted' else observation.get('startupIdentity')
-    if identity is None and isinstance(observation.get('proof'), dict):
-        identity = observation['proof'].get('identity')
-    return ticket, identity
+
+    # The product echoes the binding candidate even after a failed inspect.
+    # Require evidence from the operation, in addition to matching the ticket.
+    identity = create.get('identity') if create.get('result') == 'accepted' else None
+    if (result == 'accepted' and observation.get('owned') is True
+            and observation.get('alive') is True and row.get('backendAlive') is True):
+        return ticket, identity
+    if (result == 'uncertain' and observation.get('startup') == 'prepared'
+            and observation.get('cleanup') == 'unknown' and ticket.get('startupProtocol') == 1
+            and row.get('backendAlive') is None):
+        prepared = observation.get('startupIdentity')
+        check(isinstance(prepared, dict) and identity in (None, prepared),
+              'prepared startup lacks matching execution identity')
+        return ticket, prepared
+    if (result == 'completed' and observation.get('cleanup') == 'confirmed'
+            and observation.get('alive') is False and row.get('backendAlive') is False):
+        proof = observation.get('proof')
+        check(isinstance(proof, dict) and proof.get('proves') == 'execution-empty'
+              and proof.get('state') in TERMINAL_STATES and isinstance(proof.get('identity'), dict)
+              and identity in (None, proof['identity']),
+              'completed observation lacks matching execution proof')
+        return ticket, proof['identity']
+    raise RuntimeError('recovered ticket has no verified live, prepared or terminal evidence')
 
 
 def retired(identity, group, unit, unit_group):
@@ -223,6 +249,7 @@ def exercise(args, root, delegated, cancelled):
     config = root / 'launch config.json'
     marker = uuid.uuid4().hex
     scope = f'codex-smoke-{marker}'
+    refusal_seen = False
 
     def cmd(argv, *, timeout=15, codes=(0,), interruptible=False):
         rc, output = run_command(argv, cwd=work, env=env, timeout=timeout,
@@ -235,7 +262,12 @@ def exercise(args, root, delegated, cancelled):
         return json.loads(cmd([args.wfc, *argv], **kwargs)[1])
 
     def status(dispatch):
+        nonlocal refusal_seen
         row, = wfc('status', '--dispatch', dispatch)['dispatches']
+        observation = row.get('backendObservation') or {}
+        if row.get('backendResult') == 'refused' or observation.get('result') == 'refused':
+            refusal_seen = True
+            raise RuntimeError(REFUSED_TICKET)
         return row
 
     def lifecycle(launch, ticket, identity, resources):
@@ -305,7 +337,9 @@ def exercise(args, root, delegated, cancelled):
                receivedState=msg['state'], state=ack['state'], statusVersion=ack['statusVersion'])
 
     def cleanup(launch, binding, completed):
+        check(not refusal_seen, REFUSED_TICKET)
         recovered = binding is None
+        prior_proof = None
         if recovered:
             rows = wfc('status')['dispatches']
             check(isinstance(rows, list) and len(rows) == 1,
@@ -313,6 +347,9 @@ def exercise(args, root, delegated, cancelled):
             check_assignment(rows[0], scope, work, task, report)
             binding = recovered_receipt(rows[0], launch)
             launch = rows[0]
+            observation = launch['backendObservation']
+            if observation['result'] == 'completed':
+                prior_proof = observation['proof']
         ticket, identity = binding
         if recovered and identity is not None:
             owned_resources(ticket, identity, delegated)
@@ -322,7 +359,8 @@ def exercise(args, root, delegated, cancelled):
               and (closed['dispatch'], closed['round'], closed['attempt'], closed['ticket']) ==
               (launch['dispatch'], 1, launch['attempt'], ticket)
               and proof['proves'] == 'execution-empty'
-              and proof['state'] in ('closed', 'exited', 'faulted', 'startup-aborted')
+              and proof['state'] in TERMINAL_STATES
+              and (prior_proof is None or proof == prior_proof)
               and (identity is None or proof['identity'] == identity)
               and (not completed or proof['state'] == 'closed'),
               'close did not confirm the original ticket and execution')
