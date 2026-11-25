@@ -222,8 +222,13 @@ pub(super) fn worker_brief(record: &Value, opening: &str) -> Result<String> {
     let task = record["task"].as_str().context("missing task")?;
     let report = record["report"].as_str().context("missing report")?;
     let dispatch = record["dispatch"].as_str().context("missing dispatch")?;
+    let decision = if record["backend"] == "bundled" {
+        "If a decision is required, describe the blocker in your report so the controller can review it."
+    } else {
+        "If you need a decision, run \"$WFC_BIN\" ask \"<question>\" [--options a,b] --attempt \"$WFC_ATTEMPT\" and end your turn. The answer arrives as your next message."
+    };
     Ok(format!(
-        "{opening} (dispatch {dispatch}). Read and do the task in {task}. Stop any server or background process you started before reporting. Write the report to {report}. Run \"$WFC_BIN\" done --report \"$WFC_REPORT\" --attempt \"$WFC_ATTEMPT\". If you need a decision, run \"$WFC_BIN\" ask \"<question>\" [--options a,b] --attempt \"$WFC_ATTEMPT\" and end your turn. The answer arrives as your next message."
+        "{opening} (dispatch {dispatch}). Read and do the task in {task}. Stop any server or background process you started before reporting. Write the report to {report}. Run \"$WFC_BIN\" done --report \"$WFC_REPORT\" --attempt \"$WFC_ATTEMPT\". {decision}"
     ))
 }
 
@@ -628,4 +633,24 @@ pub(super) fn matches_unresolved_codex_home(saved: &Path, current: &Path) -> boo
         }
     }
     checked.as_path() == current && saved.canonicalize().is_ok_and(|path| path == checked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn bundled_opening_directs_blockers_to_the_report() -> Result<()> {
+        let mut row =
+            json!({"task":"task","report":"report","dispatch":"d-1234abcd","backend":"bundled"});
+        let brief = worker_brief(&row, FIRST_BRIEF)?;
+        assert!(brief.contains("describe the blocker in your report"));
+        assert!(brief.contains("\"$WFC_BIN\" done --report"));
+        assert!(!brief.contains("\"$WFC_BIN\" ask"));
+        assert!(!brief.contains("next message"));
+        row["backend"] = json!("herdr");
+        assert!(worker_brief(&row, FIRST_BRIEF)?.contains("\"$WFC_BIN\" ask"));
+        Ok(())
+    }
 }

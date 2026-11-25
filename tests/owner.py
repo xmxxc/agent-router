@@ -107,19 +107,30 @@ class Owner(relay.Relay):
                 self.assertEqual(json.loads(empty)["messages"], [])
                 self.assertEqual(self.data("status")["dispatches"], [])
 
+    def test_controlled_startup_failure_keeps_owner_notice_and_ack(self):
         scope = "startup-current-owner"
-        current = self.data("acquire", "--scope", scope)["token"]
-        config = self.root / "launch.json"
-        config.write_text(json.dumps(config_for(denied)))
-        env = {"WFC_CONTROLLER_TOKEN": current}
-        failed = self.run_cli(*dispatch, "--scope", scope, "--launch-config", str(config), **env)
+        previous = self.data("acquire", "--scope", scope)
+        current = self.data("takeover", "--scope", scope)
+        missing = self.root / "missing-program"
+        args = ("dispatch", "--task", "task", "--report", "task", "--role", "worker",
+                "--scope", scope, "--cwd", ".", "--", str(missing))
+        detail = self.error("stale_controller_owner", *args, WFC_CONTROLLER_TOKEN=previous["token"])
+        self.assertEqual((detail["scope"], detail["generation"]), (scope, current["generation"]))
+        env = {"WFC_CONTROLLER_TOKEN": current["token"]}
+        empty = self.cli("wait", "--scope", scope, "--timeout", "0", code=3, **env)
+        self.assertEqual(json.loads(empty)["messages"], [])
+        self.assertEqual(self.data("status")["dispatches"], [])
+
+        failed = self.run_cli(*args, **env)
         self.assertEqual(failed.returncode, 1, failed)
-        notice, = self.data("wait", "--scope", scope, "--timeout", "0", **env)["messages"]
+        notice, = self.data("wait", "--scope", scope, "--timeout", "4", **env)["messages"]
         self.assertEqual((notice["scope"], notice["round"], notice["fault"]["category"]),
-                         (scope, 1, "permission_denied"))
+                         (scope, 1, "executable_missing"))
         ack = self.data("ack", notice["messageId"], **env)
         self.assertEqual((ack["state"], ack["statusVersion"]), ("processed", 3))
-        self.assertTrue(self.data("ack", notice["messageId"], **env)["duplicate"])
+        again = self.data("ack", notice["messageId"], **env)
+        self.assertTrue(again["duplicate"])
+        self.assertEqual(again["messageId"], notice["messageId"])
         row = self.record(notice)
         self.assertEqual((row["worker"]["state"], row["attempt"]), ("not_started", notice["attempt"]))
 
@@ -375,6 +386,6 @@ while not Path("ask-exit").exists() and time.monotonic() < deadline:
 if __name__ == "__main__":
     # Inherit the controlled transport and CLI helpers, without rerunning the
     # existing Relay tests in this focused suite.
-    suite = unittest.TestSuite(Owner(name) for name in sorted(vars(Owner))
-                               if name.startswith("test_"))
+    names = sys.argv[1:] or sorted(name for name in vars(Owner) if name.startswith("test_"))
+    suite = unittest.TestSuite(Owner(name) for name in names)
     sys.exit(not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful())

@@ -4,6 +4,7 @@ mod runtime;
 mod store;
 mod wire;
 
+use crate::workflow::ensure_state_writable;
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::fs::{self, File, OpenOptions};
@@ -33,12 +34,23 @@ pub(crate) fn require_delegation() -> Result<()> {
     Ok(())
 }
 
-fn unit_dir(name: &str) -> Result<PathBuf> {
-    ensure!(store::valid_name(name), "invalid unit");
-    let state = std::env::var_os("WFC_STATE")
-        .filter(|s| !s.is_empty())
+fn native_state(selected: Option<&Path>, inherited: Option<&std::ffi::OsStr>) -> Result<PathBuf> {
+    if let Some(state) = selected {
+        ensure!(
+            state.is_absolute(),
+            "bundled backend requires an absolute native state path"
+        );
+        return Ok(state.to_owned());
+    }
+    let state = inherited
+        .filter(|path| !path.is_empty())
         .context("set WFC_STATE")?;
-    fs::create_dir_all(&state)?;
+    Ok(std::path::absolute(state)?)
+}
+
+fn unit_dir(state: &Path, name: &str) -> Result<PathBuf> {
+    ensure!(store::valid_name(name), "invalid unit");
+    fs::create_dir_all(state)?;
     let backend = fs::canonicalize(state)?.join("bundled");
     store::private_dir(&backend)?;
     let unit = backend.join(name);
@@ -46,32 +58,37 @@ fn unit_dir(name: &str) -> Result<PathBuf> {
     Ok(unit)
 }
 
-fn attached_store(spec: &Value) -> Result<Store> {
+fn attached_store(state: &Path, spec: &Value) -> Result<(Store, File)> {
     let ticket = &spec["ticket"];
-    let unit = unit_dir(field(ticket, "unit")?)?;
-    let _guard = lock(&unit)?;
+    let (unit, guard) = open_write_unit(state, field(ticket, "unit")?)?;
     let (_, store) = store::current(&unit)?.context("missing current execution")?;
     ensure!(
         store.ticket == *ticket && store::ordered(&unit, &store)?,
         "stale create"
     );
-    Ok(store)
+    Ok((store, guard))
 }
 
-fn lock(unit: &Path) -> Result<File> {
-    let lock = OpenOptions::new()
+fn create_lock_file(unit: &Path) -> Result<File> {
+    Ok(OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .custom_flags(libc::O_NOFOLLOW)
         .mode(0o600)
-        .open(unit.join("lock"))?;
-    lock.lock()?;
-    Ok(lock)
+        .open(unit.join("lock"))?)
 }
 
-fn create(req: &Value) -> Result<Value> {
+fn lock_for_write(state: &Path, file: File) -> Result<File> {
+    file.lock()?;
+    // The Python and native state can change while waiting for this lock.
+    // Recheck with the original WFC_STATE still in the process environment.
+    ensure_state_writable(state)?;
+    Ok(file)
+}
+
+fn create(state: &Path, req: &Value) -> Result<Value> {
     let unit = field(req, "unit")?;
     let attempt = field(req, "attempt")?;
     ensure!(store::valid_name(attempt), "invalid attempt");
@@ -103,8 +120,9 @@ fn create(req: &Value) -> Result<Value> {
             );
         }
     }
-    let unit_path = unit_dir(unit)?;
-    let guard = lock(&unit_path)?;
+    ensure_state_writable(state)?;
+    let unit_path = unit_dir(state, unit)?;
+    let guard = lock_for_write(state, create_lock_file(&unit_path)?)?;
     let current_path = unit_path.join("current.json");
     let current = match store::current(&unit_path) {
         Ok(current) => current,
@@ -137,7 +155,7 @@ fn create(req: &Value) -> Result<Value> {
     publish(&run.join("key.json"), &json!(token))?;
     let spec = json!({"ticket":ticket,"request":req});
     let mut cmd = store::stage_cmd("--bundled-guardian", &run, &spec, &token)?;
-    cmd.env("WFC_BUNDLED_CGROUP_ROOT", root);
+    cmd.arg(state).env("WFC_BUNDLED_CGROUP_ROOT", root);
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -255,6 +273,25 @@ fn unknown_cleanup() -> Value {
 
 // Observations open the existing unit without recreating lost directories or locks.
 fn open_unit(state: &Path, name: &str) -> Result<(PathBuf, File)> {
+    let (unit, guard) = unit_lock_file(state, name)?;
+    guard.lock_shared()?;
+    Ok((unit, guard))
+}
+
+fn open_write_unit(state: &Path, name: &str) -> Result<(PathBuf, File)> {
+    let (unit, guard) = unit_lock_file(state, name)?;
+    Ok((unit, lock_for_write(state, guard)?))
+}
+
+fn operation_unit(state: &Path, name: &str, op: &str) -> Result<(PathBuf, File)> {
+    if matches!(op, "close" | "input" | "resize" | "reconcile") {
+        open_write_unit(state, name)
+    } else {
+        open_unit(state, name)
+    }
+}
+
+fn unit_lock_file(state: &Path, name: &str) -> Result<(PathBuf, File)> {
     ensure!(store::valid_name(name), "invalid unit");
     let backend = state.join("bundled");
     store::check_private_dir(&backend)?;
@@ -265,7 +302,6 @@ fn open_unit(state: &Path, name: &str) -> Result<(PathBuf, File)> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(unit.join("lock"))?;
     ensure!(guard.metadata()?.is_file(), "invalid unit lock");
-    guard.lock_shared()?;
     Ok((unit, guard))
 }
 
@@ -274,7 +310,7 @@ fn open_unit(state: &Path, name: &str) -> Result<(PathBuf, File)> {
 pub(crate) fn assignment_operation(state: &Path, ticket: &Value, op: &str) -> (Value, bool) {
     let mut sent = false;
     let outcome = (|| -> Result<Value> {
-        let (unit, _guard) = open_unit(state, field(ticket, "unit")?)?;
+        let (unit, _guard) = operation_unit(state, field(ticket, "unit")?, op)?;
         let current = store::current(&unit).ok().flatten();
         let ordered = current
             .as_ref()
@@ -419,19 +455,17 @@ fn lookup(unit: &Path, attempt: &Value) -> Result<Value> {
     )
 }
 
-fn operate(req: &Value) -> Result<Value> {
+fn operate(state: &Path, req: &Value) -> Result<Value> {
     let op = field(req, "op")?;
     if op == "create" {
-        return create(req);
+        return create(state, req);
     }
     if op == "lookup" {
-        let unit = unit_dir(field(req, "unit")?)?;
-        let _guard = lock(&unit)?;
+        let (unit, _guard) = open_unit(state, field(req, "unit")?)?;
         return lookup(&unit, &req["attempt"]);
     }
     let ticket = &req["ticket"];
-    let unit = unit_dir(field(ticket, "unit")?)?;
-    let _guard = lock(&unit)?;
+    let (unit, _guard) = operation_unit(state, field(ticket, "unit")?, op)?;
     let (current, store) = match store::current(&unit) {
         Ok(Some(c)) => c,
         Ok(None) => bail!("unknown unit"),
@@ -475,7 +509,9 @@ fn operate(req: &Value) -> Result<Value> {
     ))
 }
 
-pub fn run(stage: &str) -> Result<u8> {
+pub fn run(stage: &str, selected: Option<&Path>) -> Result<u8> {
+    let inherited = std::env::var_os("WFC_STATE");
+    let state = native_state(selected, inherited.as_deref())?;
     let mut bytes = Vec::new();
     // Internal specs also carry the generated ticket around the caller's frame.
     let limit = wire::LIMIT + if stage == "--bundled" { 0 } else { 4096 };
@@ -485,7 +521,7 @@ pub fn run(stage: &str) -> Result<u8> {
     match stage {
         "--bundled-guardian" | "--bundled-runtime" => {
             let spec = &request["spec"];
-            let store = attached_store(spec)?;
+            let (store, guard) = attached_store(&state, spec)?;
             let grant = json!([stage, spec]);
             store::verify(
                 &store.token,
@@ -498,15 +534,17 @@ pub fn run(stage: &str) -> Result<u8> {
                 .create_new(true)
                 .mode(0o600)
                 .open(store.run.join(stage))?;
+            // The next stage also acquires this lock before consuming its grant.
+            drop(guard);
             if stage == "--bundled-guardian" {
-                runtime::guard(spec, store)?;
+                runtime::guard(&state, spec, store)?;
             } else {
                 return runtime::serve(spec, store);
             }
         }
         _ => println!(
             "{}",
-            operate(&request)
+            operate(&state, &request)
                 .unwrap_or_else(|e| json!({"result":"refused","diagnostic":e.to_string()}))
         ),
     }

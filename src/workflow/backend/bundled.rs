@@ -29,7 +29,7 @@ pub(super) fn create(state: &Path, row: &Value, mut launch: Launch) -> Result<Va
     controller::strip_credentials(&mut command);
     let mut child = command
         .arg("--bundled")
-        .env("WFC_STATE", state)
+        .arg(state)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

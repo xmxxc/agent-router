@@ -150,9 +150,12 @@ fn run() -> anyhow::Result<ExitCode> {
         }
         #[cfg(target_os = "linux")]
         Some(stage @ ("--bundled" | "--bundled-guardian" | "--bundled-runtime"))
-            if args.is_empty() =>
+            if args.len() <= 1 =>
         {
-            return Ok(ExitCode::from(bundled::run(stage)?));
+            return Ok(ExitCode::from(bundled::run(
+                stage,
+                args.first().map(Path::new),
+            )?));
         }
         #[cfg(target_os = "linux")]
         Some("--tmux-backend") if args.len() <= 1 => {

@@ -4,7 +4,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use wire::{Wire, FRAME, LIMIT, PREAUTH};
 
-pub fn guard(spec: &Value, store: Store) -> Result<()> {
+pub fn guard(state: &Path, spec: &Value, store: Store) -> Result<()> {
     let guardian = store::identity(std::process::id())?;
     let group = match group::root()
         .map_err(group::AllocationFailure::from)
@@ -25,7 +25,7 @@ pub fn guard(spec: &Value, store: Store) -> Result<()> {
         store.save_signed("starting", actual.clone())?;
         let (reader, writer) = UnixStream::pair()?;
         let mut cmd = store::stage_cmd("--bundled-runtime", &store.run, spec, &store.token)?;
-        cmd.stdout(OwnedFd::from(writer));
+        cmd.arg(state).stdout(OwnedFd::from(writer));
         let mut child = match group.launch(&mut cmd) {
             Ok(child) => child,
             Err(_) => return Ok("unstarted"),
