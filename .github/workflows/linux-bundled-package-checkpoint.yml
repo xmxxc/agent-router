@@ -1,0 +1,20 @@
+name: Pinned Linux bundled package checkpoint
+on:
+  workflow_call:
+    inputs:
+      runtime_runner:
+        description: Runner label for the clean runtime job
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  checkpoint:
+    uses: ./.github/workflows/linux-package-ci.yml
+    with:
+      product_sha: 2a2c8128e5e73193d9b224bd73f56b70c7248db2
+      product_tree: 66f5f58c642974726405e0e9b102f33c1933264a
+      product_parents: e9d0d2fdffb56fa0d6e9cf1aca515a0e223c5f58
+      runtime_runner: ${{ inputs.runtime_runner }}
