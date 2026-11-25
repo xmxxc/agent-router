@@ -42,20 +42,7 @@ pub(super) fn run(request: Handoff<'_>, state: &Path) -> Result<Value> {
                 && read_scope_binding(state, scope)? == Some(scope_binding(&row, pending)),
             "bundled handoff retry does not match the original scope binding"
         );
-        if pending["phase"] != "starting"
-            || pending["toAttempt"] != row["attempt"]
-            || pending["round"] != row["round"]
-            || row["host"] != "opencode"
-            || row["backend"] != "bundled"
-            || row["executionId"] != row["attempt"]
-            || !row["rounds"]
-                .as_array()
-                .and_then(|rounds| rounds.last())
-                .is_some_and(|round| {
-                    round["round"] == row["round"] && round["attempt"] == row["attempt"]
-                })
-            || !has_bound_stop(&row, pending)
-        {
+        if !starting_target(&row, index) {
             let mut reply = unresolved(
                 &row,
                 pending,
@@ -70,43 +57,13 @@ pub(super) fn run(request: Handoff<'_>, state: &Path) -> Result<Value> {
             }
             return Ok(reply);
         }
-        // Only read the exact pending target's signed readiness. This path
-        // never calls create, even when there is no target generation yet.
-        let _execution = assignment::close_lock(state, &row)?;
-        let Ok(receipt) = crate::bundled::handoff_launch_receipt(
-            state,
-            request.dispatch,
-            &row["attempt"],
-            &pending["close"]["ticket"],
-            &pending["close"]["proof"],
-        ) else {
-            return Ok(unresolved(
-                &row,
-                pending,
-                "bundled handoff launch remains uncertain",
-            ));
-        };
-        if !pending["launch"]["ticket"].is_null()
-            && pending["launch"]["ticket"] != receipt["ticket"]
-        {
-            return Ok(unresolved(
-                &row,
-                pending,
-                "bundled handoff launch ticket changed",
-            ));
-        }
-        let _inbox = messages::lock_for_publish(state)?;
-        ensure!(
-            owner_generation()? == generation && read()? == row,
-            "assignment or owner changed before handoff receipt recovery"
-        );
-        let mut settled = row;
-        settle_launch(&mut settled, index, receipt);
-        write_json(&path, &settled, None)?;
-        messages::sync_directory(&dir)?;
-        let mut reply = launch_response(&settled, index);
-        reply["duplicate"] = json!(true);
-        return Ok(reply);
+        return recover_launch(state, scope, &row, index, || {
+            ensure!(
+                owner_generation()? == generation,
+                "handoff owner changed before receipt recovery"
+            );
+            Ok(())
+        });
     }
     if let Some((index, event)) = bundled_event(&row)
         .filter(|(_, event)| row["host"] == "opencode" && row["attempt"] == event["toAttempt"])
@@ -363,6 +320,124 @@ pub(super) fn run(request: Handoff<'_>, state: &Path) -> Result<Value> {
     Ok(advance().unwrap_or_else(|error| unresolved(&closing, event, &error.to_string())))
 }
 
+fn starting_target(row: &Value, index: usize) -> bool {
+    let pending = &row["audit"][index];
+    pending["id"] == index + 1
+        && pending["phase"] == "starting"
+        && pending["attempt"] == row["attempt"]
+        && pending["toAttempt"] == row["attempt"]
+        && pending["fromAttempt"] != row["attempt"]
+        && pending["round"] == row["round"]
+        && pending["fromRound"] == row["round"]
+        && row["round"] == 1
+        && row["host"] == "opencode"
+        && row["backend"] == "bundled"
+        && row["executionId"] == row["attempt"]
+        && row["createPending"] != true
+        && row["rounds"]
+            .as_array()
+            .and_then(|rounds| rounds.last())
+            .is_some_and(|round| {
+                round["round"] == row["round"] && round["attempt"] == row["attempt"]
+            })
+        && has_bound_stop(row, pending)
+}
+
+pub(super) fn recover_expired(
+    state: &Path,
+    scope: &str,
+    generation: u64,
+    row: &Value,
+    index: usize,
+) -> Result<()> {
+    let pending = &row["audit"][index];
+    if pending["ownerGeneration"] != generation
+        || bundled_event(row) != Some((index, pending))
+        || assignment::unresolved_lifecycle(row) != Some(pending)
+        || !starting_target(row, index)
+    {
+        return Ok(());
+    }
+    worker_owner::validate_close(row)?;
+    recover_launch(state, scope, row, index, || {
+        let owner = controller::Owners::read(state)?
+            .public(scope)?
+            .unwrap_or(Value::Null);
+        ensure!(
+            owner["generation"] == generation && owner["active"] == false,
+            "expired handoff owner changed before receipt recovery"
+        );
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn recover_launch(
+    state: &Path,
+    scope: &str,
+    row: &Value,
+    index: usize,
+    authorize: impl FnOnce() -> Result<()>,
+) -> Result<Value> {
+    let dispatch = row["dispatch"].as_str().context("missing dispatch")?;
+    let pending = &row["audit"][index];
+    // The execution lock precedes the Inbox lock. Recovery only reads the
+    // selected generation's signed launch and the original signed close.
+    let _execution = assignment::close_lock(state, row)?;
+    let Ok(receipt) = crate::bundled::handoff_launch_receipt(
+        state,
+        dispatch,
+        &row["attempt"],
+        &pending["close"]["ticket"],
+        &pending["close"]["proof"],
+    ) else {
+        return Ok(unresolved(
+            row,
+            pending,
+            "bundled handoff launch remains uncertain",
+        ));
+    };
+    if !launch_matches(&receipt, &row["dispatch"], &row["attempt"]) {
+        return Ok(unresolved(
+            row,
+            pending,
+            "bundled handoff launch does not match the selected target",
+        ));
+    }
+    let ticket_changed = [
+        &pending["launch"]["ticket"],
+        &row["create"]["ticket"],
+        &row["backendHandle"],
+    ]
+    .into_iter()
+    .any(|ticket| !ticket.is_null() && *ticket != receipt["ticket"]);
+    let identity_changed = [&pending["launch"]["identity"], &row["create"]["identity"]]
+        .into_iter()
+        .any(|identity| !identity.is_null() && *identity != receipt["identity"]);
+    if ticket_changed || identity_changed {
+        return Ok(unresolved(
+            row,
+            pending,
+            "bundled handoff launch ticket or identity changed",
+        ));
+    }
+    let dir = state.join("dispatches");
+    let _inbox = messages::lock_for_publish(state)?;
+    authorize()?;
+    ensure!(
+        messages::read_callback_record(&dir, dispatch)? == *row
+            && read_scope_binding(state, scope)? == Some(scope_binding(row, pending)),
+        "assignment or scope changed before handoff receipt recovery"
+    );
+    let mut settled = row.clone();
+    settle_launch(&mut settled, index, receipt);
+    write_json(&dir.join(format!("{dispatch}.json")), &settled, None)?;
+    messages::sync_directory(&dir)?;
+    let mut reply = launch_response(&settled, index);
+    reply["duplicate"] = json!(true);
+    Ok(reply)
+}
+
 fn bundled_event(row: &Value) -> Option<(usize, &Value)> {
     row["audit"]
         .as_array()?
@@ -571,8 +646,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn bundled_handoff_retries_only_recover_the_same_signed_target() -> Result<()> {
+    fn pending_handoff(generation: Value) -> Result<(Fixture, Value)> {
         let state = Fixture(std::env::temp_dir().join(format!("wfc-handoff-{}", Uuid::new_v4())));
         let dir = state.0.join("dispatches");
         std::fs::create_dir_all(&dir)?;
@@ -591,13 +665,14 @@ mod tests {
         prior["create"]["ticket"] = old_ticket.clone();
         close["ticket"] = old_ticket.clone();
         close["proof"] = old_receipt["proof"].clone();
+        crate::bundled::apply_handoff_cleanup(&state_path, &old_ticket, &close["proof"])?;
         let event = json!({"id":1,"operation":"handoff","result":"pending","phase":"starting",
             "dispatch":dispatch,"round":1,"fromRound":1,"fromAttempt":prior["attempt"],
-            "toAttempt":target,"fromHost":"codex","toHost":"opencode","fromBackend":"bundled",
-            "target":{"backend":"bundled"},"requestedModel":null,"ownerGeneration":null,
+            "attempt":target,"toAttempt":target,"fromHost":"codex","toHost":"opencode","fromBackend":"bundled",
+            "target":{"backend":"bundled"},"requestedModel":null,"ownerGeneration":generation,
             "priorCreate":prior["create"],"close":close,"oldWriterStopped":true,
             "writerStopEvidence":close["proof"]});
-        let mut row = json!({"dispatch":dispatch,"attempt":target,"executionId":target,"round":1,
+        let row = json!({"dispatch":dispatch,"attempt":target,"executionId":target,"round":1,
             "scope":scope,"role":"fixture","backend":"bundled","host":"opencode",
             "audit":[event],"rounds":[{"round":1,"attempt":target,"state":"unknown"}]});
         let path = dir.join(format!("{dispatch}.json"));
@@ -607,15 +682,35 @@ mod tests {
             &scope_binding(&row, &event),
             None,
         )?;
-        let request = || Handoff {
+        Ok((state, row))
+    }
+
+    fn retry_request<'a>(dispatch: &'a str, owner_token: Option<&'a str>) -> Handoff<'a> {
+        Handoff {
             dispatch,
             host: "opencode",
             backend: "bundled",
             endpoint: None,
             next: None,
             model: None,
-            owner_token: None,
-        };
+            owner_token,
+        }
+    }
+
+    #[test]
+    fn bundled_handoff_retries_only_recover_the_same_signed_target() -> Result<()> {
+        let (state, mut row) = pending_handoff(Value::Null)?;
+        let state_path = state.0.canonicalize()?;
+        let dispatch = row["dispatch"].as_str().unwrap().to_owned();
+        let target = row["attempt"].as_str().unwrap().to_owned();
+        let scope = row["scope"].as_str().unwrap().to_owned();
+        let close = row["audit"][0]["close"].clone();
+        let prior_create = row["audit"][0]["priorCreate"].clone();
+        let old_ticket = close["ticket"].clone();
+        let path = state_path
+            .join("dispatches")
+            .join(format!("{dispatch}.json"));
+        let request = || retry_request(&dispatch, None);
         let initial = std::fs::read(&path)?;
         for _ in 0..2 {
             let retry = run(request(), &state_path)?;
@@ -624,13 +719,20 @@ mod tests {
             assert_eq!(retry["attempt"], target);
             assert_eq!(std::fs::read(&path)?, initial);
             assert_eq!(
-                crate::bundled::lookup_assignment(&state_path, dispatch, &prior["attempt"])?
+                crate::bundled::lookup_assignment(&state_path, &dispatch, &old_ticket["attempt"])?
                     ["ticket"],
                 old_ticket
             );
         }
         let (ticket, _) =
-            crate::bundled::ticket_cleanup_fixture(&state_path, dispatch, target, false)?;
+            crate::bundled::ticket_cleanup_fixture(&state_path, &dispatch, &target, false)?;
+        std::fs::remove_file(
+            state_path
+                .join("bundled")
+                .join(&dispatch)
+                .join(old_ticket["generation"].as_str().unwrap())
+                .join("superseded.json"),
+        )?;
         assert_eq!(run(request(), &state_path)?["result"], "uncertain");
         crate::bundled::bind_handoff_fixture(&state_path, &old_ticket, &ticket)?;
         row["audit"][0]["launch"] =
@@ -648,10 +750,156 @@ mod tests {
         assert_eq!(recovered["audit"], 1);
         assert_eq!(recovered["ticket"], ticket);
         assert_eq!(run(request(), &state_path)?, recovered);
-        require_scope_settled(&state_path, scope)?;
+        require_scope_settled(&state_path, &scope)?;
         let settled = super::super::super::read_record(&path)?;
         assert_eq!(settled["audit"][0]["close"], close);
-        assert_eq!(settled["audit"][0]["priorCreate"], prior["create"]);
+        assert_eq!(settled["audit"][0]["priorCreate"], prior_create);
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_handoff_owner_transition_recovers_only_the_expired_signed_attempt() -> Result<()> {
+        for action in ["acquire", "takeover"] {
+            let (state, pending) = pending_handoff(json!(7))?;
+            let state = &state.0;
+            let dispatch = pending["dispatch"].as_str().unwrap();
+            let target = pending["attempt"].as_str().unwrap();
+            let scope = pending["scope"].as_str().unwrap();
+            let original = &pending["audit"][0];
+            let old_token = "fixture-old-controller";
+            let new_token = "fixture-new-controller";
+            let owner_path = state.join("controller-owners.json");
+            let dir = state.join("dispatches");
+            let row_path = dir.join(format!("{dispatch}.json"));
+            let old = || retry_request(dispatch, Some(old_token));
+            let args = [
+                "--scope",
+                scope,
+                "--token",
+                new_token,
+                "--owner",
+                "replacement",
+            ]
+            .map(OsString::from);
+            let transition = || controller::Owner::parse(action, &args)?.run_in(state);
+            let renew_args = ["--scope", scope, "--token", old_token].map(OsString::from);
+            let renew = || controller::Owner::parse("renew", &renew_args)?.run_in(state);
+            let read_owners =
+                || -> Result<Value> { Ok(serde_json::from_slice(&std::fs::read(&owner_path)?)?) };
+            let mut owners = json!({
+                (scope): {"owner":"original","generation":7,"until":0.0,
+                    "fingerprint":messages::body_hash(old_token),"retired":[]},
+                "other-scope": {"owner":"other","generation":11,"until":0.0,
+                    "fingerprint":messages::body_hash("other-owner"),"retired":[]}
+            });
+            write_json(&owner_path, &owners, None)?;
+            assert!(run(old(), state)
+                .unwrap_err()
+                .is::<controller::ControllerError>());
+            assert!(renew().unwrap_err().is::<controller::ControllerError>());
+            assert!(transition()
+                .unwrap_err()
+                .to_string()
+                .contains("audit 1 is unresolved"));
+            assert_eq!(messages::read_callback_record(&dir, dispatch)?, pending);
+            assert_eq!(read_owners()?, owners);
+
+            let (ticket, _, identity) = crate::bundled::resume_ticket_fixture(
+                state,
+                dispatch,
+                target,
+                crate::bundled::ResumeFixture::Ready,
+                true,
+            )?;
+            let check_fenced = || -> Result<()> {
+                assert!(transition().is_err());
+                assert_eq!(messages::read_callback_record(&dir, dispatch)?, pending);
+                Ok(())
+            };
+            owners[scope]["until"] = json!(chrono::Utc::now().timestamp() + 600);
+            write_json(&owner_path, &owners, None)?;
+            check_fenced()?;
+            owners[scope]["until"] = json!(0.0);
+            owners[scope]["generation"] = json!(8);
+            write_json(&owner_path, &owners, None)?;
+            check_fenced()?;
+            owners[scope]["generation"] = json!(7);
+            write_json(&owner_path, &owners, None)?;
+
+            let unit = state.join("bundled").join(dispatch);
+            let ready = unit
+                .join(ticket["generation"].as_str().unwrap())
+                .join("startup-decision.json");
+            let cleanup = unit
+                .join(original["close"]["ticket"]["generation"].as_str().unwrap())
+                .join("cleanup.json");
+            for proof in [ready, cleanup] {
+                let signed = std::fs::read(&proof)?;
+                let mut unsigned: Value = serde_json::from_slice(&signed)?;
+                unsigned["signature"] = Value::Null;
+                write_json(&proof, &unsigned, None)?;
+                check_fenced()?;
+                std::fs::write(&proof, signed)?;
+            }
+
+            let scope_path = scope_path(state, scope);
+            let binding = scope_binding(&pending, original);
+            let mut wrong_scope = binding.clone();
+            wrong_scope["scope"] = json!("other-scope");
+            write_json(&scope_path, &wrong_scope, None)?;
+            check_fenced()?;
+            write_json(&scope_path, &binding, None)?;
+
+            let mut wrong_attempt = pending.clone();
+            wrong_attempt["audit"][0]["attempt"] = original["fromAttempt"].clone();
+            let mut wrong_ticket = pending.clone();
+            wrong_ticket["audit"][0]["launch"] =
+                json!({"result":"uncertain","ticket":{"attempt":target,"generation":"other"}});
+            let mut wrong_identity = pending.clone();
+            wrong_identity["create"] = json!({"result":"uncertain","ticket":ticket,"identity":{}});
+            for changed in [wrong_attempt, wrong_ticket, wrong_identity] {
+                write_json(&row_path, &changed, None)?;
+                assert!(transition()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("audit 1 is unresolved"));
+                assert_eq!(messages::read_callback_record(&dir, dispatch)?, changed);
+            }
+            write_json(&row_path, &pending, None)?;
+            assert_eq!(read_owners()?, owners);
+
+            assert_eq!(transition()?["generation"], 8);
+            let settled = messages::read_callback_record(&dir, dispatch)?;
+            let audit = &settled["audit"][0];
+            assert_eq!(settled["audit"].as_array().unwrap().len(), 1);
+            assert_eq!(audit["id"], 1);
+            assert_eq!(audit["ownerGeneration"], 7);
+            assert_eq!(audit["phase"], "complete");
+            assert_eq!(audit["close"], original["close"]);
+            assert_eq!(audit["priorCreate"], original["priorCreate"]);
+            assert_eq!(settled["attempt"], target);
+            assert_eq!(settled["create"]["ticket"], ticket);
+            assert_eq!(settled["create"]["identity"], identity);
+            assert_eq!(settled["create"], audit["launch"]);
+            let current_owners = read_owners()?;
+            assert_eq!(current_owners["other-scope"], owners["other-scope"]);
+            assert!(run(old(), state)
+                .unwrap_err()
+                .is::<controller::ControllerError>());
+            assert!(renew().unwrap_err().is::<controller::ControllerError>());
+            let replay = || run(retry_request(dispatch, Some(new_token)), state);
+            let receipt = replay()?;
+            assert_eq!(receipt["result"], "accepted");
+            assert_eq!(receipt["duplicate"], true);
+            assert_eq!(receipt["audit"], 1);
+            assert_eq!(receipt["ticket"], ticket);
+            assert_eq!(replay()?, receipt);
+            assert_eq!(messages::read_callback_record(&dir, dispatch)?, settled);
+            assert_eq!(
+                crate::bundled::lookup_assignment(state, dispatch, &pending["attempt"])?["ticket"],
+                ticket
+            );
+        }
         Ok(())
     }
 }

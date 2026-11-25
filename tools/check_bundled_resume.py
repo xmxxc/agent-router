@@ -14,8 +14,8 @@ from typing import NamedTuple
 import uuid
 
 from check_codex import (
-    CGROUP, PROCESSES, check, file_digest, manager_env, owned_receipt,
-    read_fixture, retired, run_command, same_process, ticket_digest, until,
+    CGROUP, PROCESSES, check, check_assignment, check_ticket, file_digest, manager_env,
+    owned_resources, read_fixture, retired, run_command, same_process, ticket_digest, until,
 )
 
 
@@ -140,11 +140,14 @@ class Fixture:
         return row
 
     def remember(self, row, phase=None):
-        check(row["task"] == str(self.task) and row["report"] == str(self.report)
-              and row["dispatch"] == self.dispatch and row["create"]["ticket"]["startupProtocol"] == 1,
-              "assignment does not match the fixture's task or managed launch")
-        execution = Execution(*owned_receipt(row, self.scope, self.work, None))
-        ticket = execution.ticket
+        check_assignment(row, self.scope, self.work, self.task, self.report)
+        create = row["create"]
+        ticket = create["ticket"]
+        check_ticket(row, ticket)
+        check(row["dispatch"] == self.dispatch and create["result"] == "accepted"
+              and ticket["startupProtocol"] == 1, "managed launch receipt does not match the fixture")
+        identity = create["identity"]
+        execution = Execution(ticket, identity, *owned_resources(ticket, identity, None))
         # Read-only native lookup checks the signed, current registration.
         # Public close is permitted only after this exact match.
         request = {"op": "lookup", "unit": self.dispatch, "attempt": row["attempt"]}

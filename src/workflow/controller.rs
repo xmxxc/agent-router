@@ -335,12 +335,20 @@ impl<'a> Owner<'a> {
 
     pub fn run(self) -> Result<Value> {
         let state = writable_state_dir()?;
-        let _scope_lock = lock_scope(&state, &self.scope)?;
-        let _ledger_lock = messages::lock_for_publish(&state)?;
-        let mut owners = Owners::read(&state)?;
-        let now = now();
-        let until = now + self.lease;
+        self.run_in(&state)
+    }
+
+    pub(super) fn run_in(self, state: &Path) -> Result<Value> {
+        let _scope_lock = lock_scope(state, &self.scope)?;
+        let ledger_lock = messages::lock_for_publish(state)?;
+        #[cfg(target_os = "linux")]
+        let mut ledger_lock = ledger_lock;
+        let mut owners = Owners::read(state)?;
+        let checked_at = now();
+        let until = checked_at + self.lease;
         let lease_until = lease_time(until)?;
+        #[cfg(target_os = "linux")]
+        let (mut until, mut lease_until) = (until, lease_until);
         let current = owners.0.get_mut(&self.scope);
         let (generation, token) = if self.action == "renew" {
             let token = self
@@ -348,9 +356,13 @@ impl<'a> Owner<'a> {
                 .map(str::to_owned)
                 .or_else(|| token(self.credential));
             let (lease, token) = match (current, token) {
-                (Some(lease), Some(token)) if lease.accepts(Some(&token), now) => (lease, token),
+                (Some(lease), Some(token)) if lease.accepts(Some(&token), checked_at) => {
+                    (lease, token)
+                }
                 (lease, _) => {
-                    return Err(stale(&self.scope, self.action, lease.as_deref(), now)?.into());
+                    return Err(
+                        stale(&self.scope, self.action, lease.as_deref(), checked_at)?.into(),
+                    );
                 }
             };
             lease.until = until;
@@ -362,8 +374,13 @@ impl<'a> Owner<'a> {
                 .unwrap_or_else(|| format!("ct-{}", Uuid::new_v4().simple()));
             let fingerprint = messages::body_hash(&token);
             let mut retired = BTreeSet::new();
+            #[cfg(target_os = "linux")]
+            let expired_generation = current
+                .as_deref()
+                .filter(|lease| lease.until <= checked_at)
+                .map(|lease| lease.generation);
             let generation = if let Some(lease) = current {
-                if self.action == "acquire" && lease.until > now {
+                if self.action == "acquire" && lease.until > checked_at {
                     return Err(ControllerError(json!({
                         "error":"scope_owned", "scope":self.scope,
                         "owner":lease.owner, "generation":lease.generation
@@ -387,7 +404,24 @@ impl<'a> Owner<'a> {
                 1
             };
             #[cfg(target_os = "linux")]
-            super::handoff::require_scope_settled(&state, &self.scope)?;
+            if let Err(unsettled) = super::handoff::require_scope_settled(state, &self.scope) {
+                let Some(expired_generation) = expired_generation else {
+                    return Err(unsettled);
+                };
+                // Recovery takes the execution lock before the Inbox. Keep
+                // the scope locked and reread other scopes after reacquiring.
+                drop(ledger_lock);
+                super::handoff::recover_expired_scope_handoff(
+                    state,
+                    &self.scope,
+                    expired_generation,
+                )?;
+                ledger_lock = messages::lock_for_publish(state)?;
+                owners = Owners::read(state)?;
+                super::handoff::require_scope_settled(state, &self.scope)?;
+                until = now() + self.lease;
+                lease_until = lease_time(until)?;
+            }
             owners.0.insert(
                 self.scope.clone(),
                 Lease {
@@ -401,7 +435,8 @@ impl<'a> Owner<'a> {
             (generation, token)
         };
         write_json(&state.join("controller-owners.json"), &json!(owners), None)?;
-        messages::sync_directory(&state)?;
+        messages::sync_directory(state)?;
+        drop(ledger_lock);
         Ok(
             json!({"scope":self.scope, "owner":self.owner, "token":token,
             "generation":generation, "leaseUntil":lease_until, "action":self.action}),

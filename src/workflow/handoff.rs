@@ -929,12 +929,9 @@ fn require_interrupt_settled(state: &Path, scope: &str) -> Result<()> {
     Ok(())
 }
 
-// Called with the scope lock. An abandoned handoff is not a new launch
-// opportunity, and an old backend could still be working on its request.
-pub(super) fn require_scope_settled(state: &Path, scope: &str) -> Result<()> {
-    require_interrupt_settled(state, scope)?;
+fn scope_handoff(state: &Path, scope: &str) -> Result<Option<(Value, usize)>> {
     let Some(binding) = read_scope_binding(state, scope)? else {
-        return Ok(());
+        return Ok(None);
     };
     ensure!(binding["scope"] == scope, "handoff order scope mismatch");
     let dispatch = binding["dispatch"]
@@ -943,12 +940,36 @@ pub(super) fn require_scope_settled(state: &Path, scope: &str) -> Result<()> {
         .context("invalid handoff order dispatch")?;
     let row = assignment::public_record(&state.join("dispatches"), dispatch)?
         .context("missing handoff order assignment")?;
-    let event = row["audit"]
+    let index = row["audit"]
         .as_array()
         .into_iter()
         .flatten()
-        .find(|event| event["operation"] == "handoff" && scope_binding(&row, event) == binding)
+        .position(|event| event["operation"] == "handoff" && scope_binding(&row, event) == binding)
         .context("handoff order identity mismatch")?;
+    Ok(Some((row, index)))
+}
+
+// Called with the scope lock and without the Inbox lock.
+pub(super) fn recover_expired_scope_handoff(
+    state: &Path,
+    scope: &str,
+    generation: u64,
+) -> Result<()> {
+    require_interrupt_settled(state, scope)?;
+    if let Some((row, index)) = scope_handoff(state, scope)? {
+        bundled::recover_expired(state, scope, generation, &row, index)?;
+    }
+    Ok(())
+}
+
+// Called with the scope lock. An abandoned handoff is not a new launch
+// opportunity, and an old backend could still be working on its request.
+pub(super) fn require_scope_settled(state: &Path, scope: &str) -> Result<()> {
+    require_interrupt_settled(state, scope)?;
+    let Some((row, index)) = scope_handoff(state, scope)? else {
+        return Ok(());
+    };
+    let event = &row["audit"][index];
     if bundled::order_had_no_backend_effect(event) {
         return Ok(());
     }
