@@ -1,21 +1,23 @@
-"""Run a real, authenticated Codex worker through a built Linux wfc and private tmux."""
+"""Check a downloaded Linux WFC with an explicitly authorized, isolated Codex home."""
 import argparse
-import ctypes
 import hashlib
 import json
-import multiprocessing
 import os
 from pathlib import Path
-import secrets
+import re
 import shutil
 import signal
+import stat
 import subprocess
+import sys
 import tempfile
 import time
+import uuid
 
 
-def digest(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+DELEGATION = 'WFC_BUNDLED_CGROUP_ROOT'
+CGROUP = Path('/sys/fs/cgroup')
+PROCESSES = ('guardian', 'service', 'kernel', 'worker')
 
 
 def check(condition, reason):
@@ -27,216 +29,349 @@ def record(**fields):
     print(json.dumps(fields, ensure_ascii=False), flush=True)
 
 
-def reap():
-    # tmux daemonizes. As the Linux subreaper we own orphaned descendants,
-    # including any helpers which outlive the closing pane.
-    children = Path('/proc/thread-self/children')
-    deadline = time.monotonic() + 8
+def until(predicate, seconds, reason):
+    deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
-        try:
-            if os.waitpid(-1, os.WNOHANG)[0]:
-                continue
-        except ChildProcessError:
-            return
-        for pid in children.read_text().split():
-            try:
-                os.kill(int(pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        result = predicate()
+        if result:
+            return result
         time.sleep(.05)
-    raise RuntimeError('test descendants still running')
+    raise RuntimeError(reason)
 
 
-def exercise(args, root):
+def read_fixture(path):
+    # The worker can only hand back a small, ordinary file at the agreed path.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        check(stat.S_ISREG(os.fstat(fd).st_mode), 'expected a fixture file')
+        body = stream.read(4097)
+    check(len(body) <= 4096, 'fixture file is too large')
+    return body
+
+
+def file_digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def manager_env():
+    runtime = Path(f'/run/user/{os.geteuid()}')
+    return {'PATH': '/usr/bin:/bin', 'XDG_RUNTIME_DIR': str(runtime),
+            'DBUS_SESSION_BUS_ADDRESS': f'unix:path={runtime}/bus'}
+
+
+def delegation():
+    check(sys.platform == 'linux' and os.geteuid() != 0, 'requires an ordinary Linux user')
+    if DELEGATION not in os.environ:
+        runtime = Path(manager_env()['XDG_RUNTIME_DIR'])
+        check((runtime / 'bus').is_socket(),
+              f'requires the current user systemd manager or an authorized {DELEGATION}')
+        return None
+    raw = os.environ[DELEGATION]
+    check(raw and Path(raw).is_absolute(), f'{DELEGATION} must be a delegated absolute path')
+    root = Path(raw).resolve(strict=True)
+    check(CGROUP in root.parents and (root / 'cgroup.controllers').is_file()
+          and (root / 'cgroup.kill').is_file() and os.access(root, os.W_OK | os.X_OK)
+          and os.access(root / 'cgroup.procs', os.W_OK),
+          f'{DELEGATION} must name a writable, authorized cgroup v2 subtree')
+    return root
+
+
+def same_process(identity):
+    try:
+        fields = Path(f"/proc/{identity['pid']}/stat").read_text().rsplit(') ', 1)[1].split()
+    except FileNotFoundError:
+        return False
+    return int(fields[19]) == identity['start_ticks']
+
+
+def owned_receipt(row, scope, work, delegated):
+    check(row['scope'] == scope and row['cwd'] == str(work)
+          and row['host'] == 'codex' and row['backend'] == 'bundled' and row['round'] == 1
+          and re.fullmatch(r'd-[0-9a-f]+', row['dispatch'])
+          and re.fullmatch(r'a-[0-9a-f]+', row['attempt']),
+          'dispatch does not match the private fixture')
+    create = row['create']
+    ticket = create['ticket']
+    check(create['result'] == 'accepted' and row['backendHandle'] == ticket
+          and ticket['unit'] == row['dispatch'] and ticket['attempt'] == row['attempt'],
+          'missing the original accepted ticket')
+    identity = create['identity']
+    if delegated is None:
+        generation = str(uuid.UUID(ticket['generation']))
+        unit = f'wfc-bundled-{generation}.service'
+        uid = os.geteuid()
+        unit_group = CGROUP / f'user.slice/user-{uid}.slice/user@{uid}.service/app.slice' / unit
+        check(identity['userService']['uid'] == uid and identity['userService']['unit'] == unit,
+              'user service does not match the original ticket')
+        parent = unit_group
+    else:
+        check(identity.get('userService') is None, 'expected the explicit delegation path')
+        unit, unit_group = None, None
+        parent = delegated
+    containment = identity['containment']
+    group = Path(containment['path'])
+    check(containment['kind'] == 'cgroup-v2' and group.parent == parent
+          and re.fullmatch(r'wfc-[0-9a-f-]{36}', group.name),
+          'unexpected containment path')
+    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    check(all(identity[key]['boot'] == boot and identity[key]['pid'] > 0
+              and identity[key]['start_ticks'] > 0 for key in PROCESSES),
+          'missing original process identities')
+    return ticket, identity, group, unit, unit_group
+
+
+def retired(identity, group, unit, unit_group):
+    if group.exists() or any(same_process(identity[key]) for key in PROCESSES):
+        return False
+    if unit is None:
+        return True
+    if unit_group.exists():
+        return False
+    result = subprocess.run(
+        ['/usr/bin/systemctl', '--user', '--no-pager', 'show', '--property=LoadState', '--value', '--', unit],
+        env=manager_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, timeout=3,
+    )
+    return result.stdout.strip() == 'not-found'
+
+
+def run_command(argv, *, cwd, env, timeout, cancel=None):
+    deadline = time.monotonic() + timeout
+    with subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                          start_new_session=True) as proc:
+        while True:
+            if cancel and cancel():
+                proc.kill()
+                proc.wait()
+                raise RuntimeError('smoke interrupted')
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                proc.wait()
+                raise RuntimeError('smoke command timed out')
+            try:
+                output, _ = proc.communicate(timeout=min(.1, remaining))
+                return proc.returncode, output.strip()
+            except subprocess.TimeoutExpired:
+                continue
+
+
+def exercise(args, root, delegated, cancelled):
     work = root / 'worker cwd'
-    work.mkdir()
     state = root / 'router state'
     report = root / 'reports' / 'result file.txt'
+    done_file = report.with_suffix('.done.json')
     task = root / 'task instructions.txt'
-    socket = root / 'tmux.sock'
     home = root / 'home'
-    codex_home = home / '.codex'
-    codex_home.mkdir(parents=True, mode=0o700)
-    if args.auth_file:
-        shutil.copyfile(args.auth_file, codex_home / 'auth.json')
+    runtime = root / 'runtime'
     executable = root / 'Codex CLI'
-    executable.symlink_to(args.codex.resolve(strict=True))
     config = root / 'launch config.json'
-    marker = secrets.token_hex(12)
-    task.write_text(
-        'The entire task is this shell command. Execute it once in the assigned cwd. '
-        'Write only this report and submit it. If the shell cannot run, stop and describe the error.\n'
-        f'printf "%s\\n" "{marker}" "$PWD" "$WFC_SAMPLE" "$WFC_RUNTIME_SAMPLE" '
-        '"$WFC_DISPATCH" "$WFC_ATTEMPT" > "$WFC_REPORT" && '
-        '"$WFC_BIN" done --report "$WFC_REPORT" --attempt "$WFC_ATTEMPT"\n',
-        encoding='utf-8')
-    env = {k: v for k, v in os.environ.items() if k.lower() in
-           ('path', 'http_proxy', 'https_proxy', 'no_proxy', 'all_proxy',
-            'ssl_cert_file', 'ssl_cert_dir')}
-    private_runtime = root / 'runtime'
-    private_runtime.mkdir(mode=0o700)
-    env.update(HOME=str(home), XDG_RUNTIME_DIR=str(private_runtime), TMPDIR=str(private_runtime),
-               LANG='C.UTF-8', TERM='xterm-256color', CODEX_HOME=str(codex_home),
-               WFC_STATE=str(state), WFC_TMUX_SOCKET=str(socket), WFC_SAMPLE='inherited',
-               WFC_PARENT_SAMPLE='inherited', WFC_SHARED_SAMPLE='inherited',
-               WFC_LAUNCH_CONFIG=str(root / 'unselected.json'))
-    if not args.auth_file:
-        key = os.environ.get('OPENAI_API_KEY')
-        check(key, 'provide --auth-file or OPENAI_API_KEY for the private Codex profile')
-        login = subprocess.run([executable, '-c', 'cli_auth_credentials_store="file"',
-                                'login', '--with-api-key'], input=key.encode(), env=env, cwd=work,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-        check(login.returncode == 0, f'private Codex login exited {login.returncode}')
-    fixed = ['-c', f'projects.{json.dumps(str(work))}.trust_level="trusted"',
-             '-c', 'tui.screen_reader_detection_done=true', '-c', 'check_for_update_on_startup=false']
-    runtime = [shutil.which('env'), '--', 'WFC_RUNTIME_SAMPLE=runtime argument']
-    config.write_text(json.dumps({
-        'env': {'WFC_SAMPLE': 'shared', 'WFC_SHARED_SAMPLE': 'shared'},
-        'hosts': {'codex': {'runtime': runtime, 'command': [str(executable), *fixed],
-                            'env': {'WFC_SAMPLE': 'host override', 'WFC_ATTEMPT': 'overridden'}}}}))
+    marker = uuid.uuid4().hex
+    scope = f'codex-smoke-{marker}'
 
-    def cmd(argv, timeout=15, codes=(0,)):
-        p = subprocess.run(argv, cwd=work, env=env, capture_output=True, text=True, timeout=timeout)
-        check(p.returncode in codes, f'{Path(argv[0]).name} {argv[1]} exited {p.returncode}')
-        return p.stdout.strip()
+    def cmd(argv, *, timeout=15, codes=(0,), interruptible=False):
+        rc, output = run_command(argv, cwd=work, env=env, timeout=timeout,
+                                 cancel=cancelled if interruptible else None)
+        check(rc in codes, f'{Path(argv[0]).name} {argv[1]} exited {rc}')
+        return rc, output
 
-    def wfc(*args_, **kwargs):
-        return json.loads(cmd([args.wfc, *args_], **kwargs))
+    def wfc(*argv, **kwargs):
+        return json.loads(cmd([args.wfc, *argv], **kwargs)[1])
 
-    tmux = ['tmux', '-f', '/dev/null', '-S', str(socket)]
-    version = cmd([executable, '--version'])
-    check(version.startswith('codex-cli '), 'expected a Codex CLI version')
-    wfc_version = cmd([args.wfc, '--version'])
-    check('(Rust,' in wfc_version, 'expected a Rust wfc executable')
-    record(codex=version, executable=str(executable.resolve()), wfc=wfc_version,
-           binarySha256=digest(args.wfc), tmux=cmd(['tmux', '-V']))
-    launch = None
-    try:
-        # Start the private server without loading the user's tmux configuration.
-        cmd([*tmux, 'new-session', '-d', '-s', 'keeper', 'sleep', 'infinity'])
-        launch = wfc('dispatch', '--host', 'codex', '--backend', 'tmux', '--cwd', work,
-                     '--task', task,
-                     '--report', report, '--scope', 'codex-smoke', '--launch-config', config,
-                     '--model', args.model, '--effort', 'low')
-        ident = launch['dispatch']
-        check(launch['create']['result'] == 'accepted' and launch['tmuxSocket'] == str(socket)
-              and launch['launchConfig'] == str(config) and launch['cwd'] == str(work)
-              and launch['report'] == str(report) and launch['scope'] == 'codex-smoke',
-              'wrong launch, report or socket')
-        pid = json.loads(Path(launch['create']['receipt']).read_bytes())['pid']
-        proc = Path('/proc') / str(pid)
-        actual = os.fsdecode((proc / 'cmdline').read_bytes()).rstrip('\0').split('\0')
-        flags = [*fixed, '--no-alt-screen', '-s', 'workspace-write', '-a', 'never',
-                 '-m', args.model, '-c', 'model_reasoning_effort=low',
-                 '--add-dir', str(state), '--add-dir', str(report.parent)]
-        check(str(executable) in actual[:-len(flags)-1] and actual[-len(flags)-1:-1] == flags
-              and ident in actual[-1], 'wrong live Codex argv')
-        check((proc / 'cwd').resolve() == work, 'wrong live cwd')
-        expected = {'WFC_PARENT_SAMPLE': 'inherited', 'WFC_SHARED_SAMPLE': 'shared',
-                    'WFC_SAMPLE': 'host override', 'WFC_RUNTIME_SAMPLE': 'runtime argument',
-                    'WFC_ATTEMPT': launch['attempt'], 'WFC_BIN': str(args.wfc)}
-        entries = (proc / 'environ').read_bytes().split(b'\0')
-        for key, value in expected.items():
-            check(os.fsencode(f'{key}={value}') in entries, f'wrong worker environment for {key}')
-        record(dispatch=ident, attempt=launch['attempt'], cwd=str(work), config=str(config),
-               socket=str(socket), runtime=runtime, command=str(executable), actualFlags=flags,
-               verifiedEnv=expected, pid=pid)
-        wait = subprocess.run([args.wfc, 'wait', '--scope', launch['scope'], '--dispatch', ident,
-                               '--timeout', str(args.timeout)], cwd=work, env=env,
-                              capture_output=True, timeout=args.timeout + 10)
-        check(wait.returncode in (0, 3), f'wfc wait exited {wait.returncode}')
-        reply = json.loads(wait.stdout)
-        if wait.returncode == 3:
+    def status(dispatch):
+        row, = wfc('status', '--dispatch', dispatch)['dispatches']
+        return row
+
+    def lifecycle(launch):
+        ticket, identity, group, unit, unit_group = owned_receipt(launch, scope, work, delegated)
+        group_stat = group.stat()
+        check((group_stat.st_dev, group_stat.st_ino) ==
+              (identity['containment']['device'], identity['containment']['inode'])
+              and all(same_process(identity[key]) for key in PROCESSES),
+              'original execution did not survive the dispatch CLI')
+        proc = Path(f"/proc/{identity['worker']['pid']}")
+        check((proc / 'cwd').resolve(strict=True) == work and
+              f'0::/{group.relative_to(CGROUP)}' in
+              (proc / 'cgroup').read_text().splitlines(), 'wrong worker cwd or cgroup')
+        check(all((Path(f"/proc/{identity[key]['pid']}/exe")).samefile(args.wfc)
+                  for key in ('guardian', 'service', 'kernel')), 'bundled processes use a different ELF')
+        if unit_group is not None:
+            guardian = Path(f"/proc/{identity['guardian']['pid']}")
+            check(f'0::/{unit_group.relative_to(CGROUP)}' in (guardian / 'cgroup').read_text().splitlines(),
+                  'guardian is outside the original user service')
+        record(dispatch=launch['dispatch'], attempt=launch['attempt'], round=1, scope=scope,
+               ticketSha256=ticket_digest(ticket), unit=unit,
+               workerPid=identity['worker']['pid'], workerStart=identity['worker']['start_ticks'])
+        check(launch['launchConfig'] == str(config) and launch['report'] == str(report),
+              'wrong launch config or report path')
+        check(not cancelled(), 'smoke interrupted')
+        # The worker can start before bundled publishes the original ready decision.
+        (work / '.dispatch-accepted').touch()
+        rc, output = cmd([args.wfc, 'wait', '--scope', scope, '--dispatch', launch['dispatch'],
+                          '--timeout', str(args.timeout)], timeout=args.timeout + 10,
+                         codes=(0, 3), interruptible=True)
+        reply = json.loads(output)
+        if rc == 3:
             check(reply == {'timedOut': True, 'messages': []}, 'invalid timeout receipt')
-            # Never export arbitrary pane text. Only name recognized conditions.
-            pane = cmd([*tmux, 'capture-pane', '-p', '-t', f'=wfc-{ident}:'], codes=(0, 1)).lower()
-            clues = [s for s in ('trust', 'sign in', 'reconnecting', 'failed', 'error', 'sandbox',
-                                  'screen reader', 'permission denied', 'upgrade', 'unauthorized')
-                     if s in pane]
-            row, = wfc('status', '--dispatch', ident)['dispatches']
-            diagnostic = 'app-server socket directory must be a user-owned directory with mode 0700'
-            # Match only the fixed host diagnostic in tool results from this private session.
-            socket_error = False
-            for rollout in (codex_home / 'sessions').rglob('*.jsonl'):
-                with rollout.open('rb') as stream:
-                    for line in stream:
-                        if diagnostic.encode() in line and b'tool_call_output' in line:
-                            socket_error = True
-            record(timedOut=True, waitExit=3, messages=len(reply['messages']),
-                   reportPresent=report.is_file(), worker=row['worker'], paneSignals=clues,
-                   hostDiagnostic=diagnostic if socket_error else None)
-            raise RuntimeError('scoped wait timed out without a worker receipt')
+            record(timedOut=True, waitExit=3, messages=0, reportPresent=report.is_file())
+            raise RuntimeError('scoped wait timed out without the original done')
         msg, = reply['messages']
         for key in ('dispatch', 'attempt', 'round', 'scope', 'role', 'report'):
             check(msg[key] == launch[key], f'wrong {key} on done receipt')
         check(msg['type'] == 'done' and msg['state'] == 'received', 'expected received done')
-        body = Path(msg['report']).read_text().splitlines()
-        check(body == [marker, str(work), 'host override', 'runtime argument', ident, launch['attempt']],
-              'report does not match task, runtime, cwd or attempt')
-        row, = wfc('status', '--dispatch', ident)['dispatches']
-        check(row['state'] == 'done' and row['rounds'][0]['result']['messageId'] == msg['messageId'],
-              'public status did not match wait receipt')
-        record(report=str(report), reportLines=body, messageId=msg['messageId'], scope=msg['scope'],
-               round=msg['round'], state=msg['state'])
+        until(done_file.is_file, 5, 'worker did not save its original done receipt')
+        done = json.loads(read_fixture(done_file))
+        check((done['message'], done['messageId'], done['duplicate']) ==
+              (msg['id'], msg['messageId'], False), 'wait did not receive the original done')
+        expected = [marker, str(work), 'inherited', 'shared', 'host override', 'runtime argument',
+                    str(args.codex_home), str(args.wfc), launch['dispatch'], launch['attempt'],
+                    args.elf_sha256]
+        check(read_fixture(report) == ('\n'.join(expected) + '\n').encode(),
+              'report does not match task, cwd, environment or ELF')
+        ack = wfc('ack', done['messageId'])
+        check((ack['message'], ack['messageId'], ack['state'], ack['statusVersion'], ack['duplicate']) ==
+              (done['message'], done['messageId'], 'processed', 3, False), 'ACK did not process original done')
+        after = status(launch['dispatch'])
+        saved, = after['messages']
+        check(after['backendHandle'] == ticket and after['backendAlive'] is True
+              and after['rounds'][-1]['result']['messageId'] == done['messageId']
+              and (saved['id'], saved['messageId'], saved['state']) ==
+              (done['message'], done['messageId'], 'processed')
+              and same_process(identity['worker']), 'original worker or result was lost')
+        record(message=done['message'], messageId=done['messageId'], attempt=launch['attempt'],
+               receivedState=msg['state'], state=ack['state'], statusVersion=ack['statusVersion'])
+
+    def cleanup(launch, completed):
+        if launch is None:
+            rows = wfc('status')['dispatches']
+            if not rows and not (state / 'bundled').exists():
+                return
+            check(len(rows) == 1, 'cannot bind cleanup to the original private assignment')
+            launch = rows[0]
+        ticket, identity, group, unit, unit_group = owned_receipt(launch, scope, work, delegated)
+        closed = wfc('close', launch['dispatch'])
+        proof = closed['proof']
+        check(closed['operation'] == 'close' and closed['result'] == 'completed' and closed['cleanup'] == 'confirmed'
+              and (closed['dispatch'], closed['round'], closed['attempt'], closed['ticket']) ==
+              (launch['dispatch'], 1, launch['attempt'], ticket)
+              and proof['proves'] == 'execution-empty' and proof['identity'] == identity
+              and (not completed or proof['state'] == 'closed'),
+              'close did not confirm the original ticket and execution')
+        after = status(launch['dispatch'])
+        check(after['backendHandle'] == ticket and after['backendAlive'] is False
+              and after['backendObservation']['cleanup'] == 'confirmed', 'public cleanup status disagreed')
+        until(lambda: retired(identity, group, unit, unit_group), 8,
+              'original processes, group or user service survived close')
+        record(closed=launch['dispatch'], attempt=launch['attempt'], ticketSha256=ticket_digest(closed['ticket']),
+               unit=unit, cleanup='confirmed', executionEmpty=True)
+
+    launch = None
+    dispatch_attempted = False
+    completed = False
+    keep = False
+    try:
+        for path in (work, report.parent, home, runtime):
+            path.mkdir(mode=0o700)
+        executable.symlink_to(args.codex)
+        task.write_text(
+            'Run only this shell command once in the assigned work directory. If it fails, stop.\n'
+            'timeout 15s /bin/sh -c \'until test -f .dispatch-accepted; do sleep 0.05; done\' && '
+            f'printf "%s\\n" "{marker}" "$PWD" "$WFC_PARENT_SAMPLE" "$WFC_SHARED_SAMPLE" '
+            '"$WFC_SAMPLE" "$WFC_RUNTIME_SAMPLE" "$CODEX_HOME" "$WFC_BIN" "$WFC_DISPATCH" '
+            '"$WFC_ATTEMPT" > "$WFC_REPORT" && '
+            'sha256sum -- "$WFC_BIN" | cut -d " " -f 1 >> "$WFC_REPORT" && '
+            'receipt="${WFC_REPORT%.txt}.done.json" && '
+            '"$WFC_BIN" done --report "$WFC_REPORT" --attempt "$WFC_ATTEMPT" > "$receipt.tmp" && '
+            'mv -- "$receipt.tmp" "$receipt"\n',
+            encoding='utf-8',
+        )
+        env = {'PATH': '/usr/bin:/bin', 'HOME': str(home), 'CODEX_HOME': str(args.codex_home),
+               'XDG_RUNTIME_DIR': str(runtime), 'TMPDIR': str(runtime), 'LC_ALL': 'C.UTF-8',
+               'TERM': 'xterm-256color', 'WFC_STATE': str(state), 'WFC_SAMPLE': 'inherited',
+               'WFC_PARENT_SAMPLE': 'inherited', 'WFC_SHARED_SAMPLE': 'inherited',
+               'WFC_LAUNCH_CONFIG': str(root / 'unselected.json')}
+        if delegated is not None:
+            env[DELEGATION] = str(delegated)
+        fixed = ['-c', f'projects.{json.dumps(str(work))}.trust_level="trusted"',
+                 '-c', 'tui.screen_reader_detection_done=true', '-c', 'check_for_update_on_startup=false']
+        config.write_text(json.dumps({
+            'env': {'WFC_SAMPLE': 'shared', 'WFC_SHARED_SAMPLE': 'shared'},
+            'hosts': {'codex': {'runtime': ['/usr/bin/env', '--', 'WFC_RUNTIME_SAMPLE=runtime argument'],
+                                'command': [str(executable), *fixed],
+                                'env': {'WFC_SAMPLE': 'host override', 'WFC_ATTEMPT': 'overridden'}}},
+        }))
+        _, version = cmd([executable, '--version'], interruptible=True)
+        check(re.fullmatch(r'codex-cli [a-zA-Z0-9.+-]+', version), 'expected a Codex CLI version')
+        _, wfc_version = cmd([args.wfc, '--version'], interruptible=True)
+        check(re.fullmatch(r'wfc [^\n]+ \(Rust, [^\n]+\)', wfc_version), 'expected a Rust wfc executable')
+        record(codex=version, binarySha256=args.elf_sha256,
+               delegation='explicit' if delegated is not None else 'user-service')
+        check(not cancelled(), 'smoke interrupted')
+        dispatch_attempted = True
+        launch = wfc('dispatch', '--host', 'codex', '--cwd', work, '--task', task, '--report', report,
+                     '--scope', scope, '--launch-config', config, '--model', args.model, '--effort', 'low')
+        lifecycle(launch)
+        completed = True
     finally:
-        try:
-            if launch:
-                closed = wfc('close', launch['dispatch'])
-                check(closed['result'] == 'completed' and closed['attempt'] == launch['attempt'],
-                      'close did not confirm this attempt')
-                after, = wfc('status', '--dispatch', closed['dispatch'])['dispatches']
-                record(closed=closed['dispatch'], result=closed['result'], worker=after['worker'],
-                       backendAlive=after['backendAlive'])
-        finally:
-            subprocess.run([*tmux, 'kill-server'], env=env, capture_output=True, timeout=10)
+        if dispatch_attempted:
+            try:
+                cleanup(launch, completed)
+            except Exception:
+                keep = True
+                record(cleanup='unconfirmed', privateFixture=str(root))
+                raise
+        if not keep:
+            shutil.rmtree(root)
+
+
+def ticket_digest(ticket):
+    return hashlib.sha256(json.dumps(ticket, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('wfc', type=Path)
+    parser = argparse.ArgumentParser(description=__doc__, epilog=(
+        'Run as an ordinary user in a dedicated test environment, with the current systemd user manager '
+        'or an authorized WFC_BUNDLED_CGROUP_ROOT. Supply an already authorized, dedicated Codex home.'))
+    parser.add_argument('wfc', type=Path, help='ELF extracted from the verified Linux package')
+    parser.add_argument('--elf-sha256', required=True, help='ELF SHA-256 from the package build')
     parser.add_argument('--codex', type=Path, required=True)
+    parser.add_argument('--codex-home', type=Path, required=True, help='existing dedicated profile directory')
     parser.add_argument('--model', required=True)
-    parser.add_argument('--auth-file', type=Path, help='copy an existing Codex login into the temporary home')
     parser.add_argument('--timeout', type=int, default=180)
     args = parser.parse_args()
-    args.wfc = args.wfc.resolve(strict=True)
-    check(args.timeout > 0, 'timeout must be positive')
-    check(ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0, 'requires Linux subreaper support')
-    config = Path(os.getenv('CODEX_HOME', Path.home() / '.codex')) / 'config.toml'
-    before = digest(config)
-    os.umask(0o077)
-    cancelled = False
+    requested_signal = None
 
-    def cancel(signum, frame):
-        nonlocal cancelled
-        cancelled = True
+    def cancel(signum, _):
+        nonlocal requested_signal
+        requested_signal = signum
 
-    # The supervisor owns the directory and adopts daemonized descendants. A
-    # TERM only sets its flag, even during fork, wait, reaping or file removal.
-    signal.signal(signal.SIGTERM, cancel)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, cancel)
     try:
-        with tempfile.TemporaryDirectory(prefix='wfc codex ') as tmp:
-            job = multiprocessing.get_context('fork').Process(target=exercise, args=(args, Path(tmp)))
-            try:
-                job.start()
-                while job.is_alive():
-                    if cancelled:
-                        job.kill()
-                    job.join(.1)
-                if job.exitcode:
-                    raise SystemExit(job.exitcode if job.exitcode > 0 else 128 - job.exitcode)
-            finally:
-                reap()
-                record(descendants='all exited')
-    finally:
-        try:
-            check(digest(config) == before, 'global Codex config changed')
-            record(globalConfigUnchanged=True)
-        finally:
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            if cancelled:
-                signal.raise_signal(signal.SIGTERM)
+        args.wfc = args.wfc.resolve(strict=True)
+        args.codex = args.codex.resolve(strict=True)
+        args.codex_home = args.codex_home.resolve(strict=True)
+        check(args.timeout > 0 and args.codex_home.is_dir(), 'requires a positive timeout and a dedicated Codex home')
+        check(args.wfc.is_file() and os.access(args.wfc, os.X_OK)
+              and file_digest(args.wfc) == args.elf_sha256, 'WFC ELF SHA-256 does not match the package')
+        check(args.codex.is_file() and os.access(args.codex, os.X_OK), 'expected an executable Codex CLI')
+        delegated = delegation()
+        os.umask(0o077)
+        root = Path(tempfile.mkdtemp(prefix='wfc codex ')).resolve()
+        exercise(args, root, delegated, lambda: requested_signal is not None)
+        check(file_digest(args.wfc) == args.elf_sha256, 'WFC ELF changed during the check')
+        if requested_signal is None:
+            record(result='BUNDLED_CODEX_SMOKE_PASS', binarySha256=args.elf_sha256)
+            return 0
+    except RuntimeError as error:
+        print(error, file=sys.stderr)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        print('invalid or unavailable smoke evidence', file=sys.stderr)
+    if requested_signal is not None:
+        return 128 + requested_signal
+    return 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

@@ -1,4 +1,4 @@
-"""Public Linux startup failure reports, delivered through the existing inbox."""
+"""Public startup reports. Bundled preflight needs a user manager or authorized delegation."""
 from contextlib import contextmanager
 import json
 import os
@@ -24,6 +24,8 @@ class StartupFailure(unittest.TestCase):
         self.state = self.cwd / "state"
         self.env = {"PATH": os.environ["PATH"], "HOME": tmp.name, "TERM": "xterm",
                     "WFC_STATE": str(self.state)}
+        if "WFC_BUNDLED_CGROUP_ROOT" in os.environ:
+            self.env["WFC_BUNDLED_CGROUP_ROOT"] = os.environ["WFC_BUNDLED_CGROUP_ROOT"]
         (self.cwd / "task").write_text("private startup fixture")
         (self.cwd / "report").write_text("done")
 
