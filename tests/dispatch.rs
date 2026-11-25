@@ -571,7 +571,6 @@ fn invalid_public_options_and_launch_config_leave_no_active_dispatch() {
         "codex",
     ];
     for (extra, code, diagnostic) in [
-        (vec!["--backend", "bundled"], 1, "unavailable"),
         (
             vec!["--herdr-endpoint", "socket"],
             2,
@@ -590,7 +589,7 @@ fn invalid_public_options_and_launch_config_leave_no_active_dispatch() {
         let out = f
             .wfc()
             .args(args)
-            .args(["--launch-config", "bad.json"])
+            .args(["--backend", "tmux", "--launch-config", "bad.json"])
             .output()
             .unwrap();
         let error = String::from_utf8_lossy(&out.stderr);

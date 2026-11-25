@@ -239,7 +239,7 @@ while time.monotonic() < deadline and not Path(attempt + '.quit').exists():
         owner = self.resume_cli("owner", "acquire", "--scope", "resume", "--owner", "one",
                                 "--token", "owner-one", "--lease", "180")
         self.assertEqual(owner["generation"], 1)
-        row = self.resume_cli("dispatch", "--host", "codex", "--scope", "resume", "--role", "worker",
+        row = self.resume_cli("dispatch", "--host", "codex", "--backend", "tmux", "--scope", "resume", "--role", "worker",
                               "--cwd", ".", "--task", "task1", "--report", "reports/r1.md", "--model",
                               "test-model", "--effort", "high", "--network", "--launch-config",
                               str(self.resume_config), WFC_OWNER_TOKEN="owner-one")
@@ -704,7 +704,7 @@ os.execv({TMUX!r}, [{TMUX!r}, *args])
         config.write_text(json.dumps({"hosts": {"codex": {"command": [
             sys.executable, "-c", "import time; time.sleep(30)",
         ]}}}))
-        worker = data("dispatch", "--scope", scope, "--host", "codex", "--cwd", ".",
+        worker = data("dispatch", "--scope", scope, "--host", "codex", "--backend", "tmux", "--cwd", ".",
                       "--task", "task", "--report", "report", "--launch-config", str(config))
         launch = Path(worker["create"]["receipt"])
         started = launch.read_bytes()
@@ -831,7 +831,7 @@ while not Path("release").exists() and time.monotonic() < deadline:
         mode = "hold" if hold_hangup else "normal"
         config.write_text(json.dumps({"hosts": {"codex": {"command": [sys.executable, "-c", script, mode]}}}))
         (self.work / "task").write_text("controlled close identity fixture")
-        result = self.reclaim_cli("dispatch", "--host", "codex", "--scope", "close-identity",
+        result = self.reclaim_cli("dispatch", "--host", "codex", "--backend", "tmux", "--scope", "close-identity",
                                   "--cwd", ".", "--task", "task", "--report", "report",
                                   "--launch-config", str(config))
         worker = json.loads(result.stdout)
@@ -981,7 +981,7 @@ subprocess.run([os.environ["WFC_BIN"], "done", "--report", "report", "--attempt"
                                       "hosts": {"codex": {"command": [sys.executable, "-c", script]}}}))
         a = wfc("acquire", "--scope", "managed", "--owner", "A")
         dispatch = wfc("dispatch", "--scope", "managed", "--owner-token", a["token"],
-                       "--host", "codex", "--cwd", ".", "--task", "task", "--report", "report",
+                       "--host", "codex", "--backend", "tmux", "--cwd", ".", "--task", "task", "--report", "report",
                        "--launch-config", str(config))
         deadline = time.monotonic() + 5
         while not (self.work / "ready").exists():
@@ -1028,7 +1028,7 @@ time.sleep(120)
             "command": [sys.executable, "-c", script, str(finished), str(question)]
         }}}))
         authorization = [] if scope is None else ["--scope", scope, "--owner-token", token]
-        result = self.reclaim_cli("dispatch", "--host", "codex", "--cwd", ".",
+        result = self.reclaim_cli("dispatch", "--host", "codex", "--backend", "tmux", "--cwd", ".",
                                   "--task", "task", "--label", label, "--report", str(report),
                                   "--launch-config", str(config), *authorization)
         row = json.loads(result.stdout)
@@ -3666,7 +3666,7 @@ sys.exit(41)
         (self.work / "task").write_text("ask the controller")
         config = self.work / "launch.json"
         config.write_text(json.dumps({"hosts": {"codex": {"command": [sys.executable, str(worker)]}}}))
-        record = cli("dispatch", "--host", "codex", "--task", "task", "--cwd", ".",
+        record = cli("dispatch", "--host", "codex", "--backend", "tmux", "--task", "task", "--cwd", ".",
                      "--report", "report", "--scope", "approval", "--launch-config", str(config))
         dispatch, attempt = record["dispatch"], record["attempt"]
         self.assertNotIn("workerCallbackHash", record)
@@ -3815,7 +3815,7 @@ time.sleep(45)
         def dispatch(scope):
             cwd = self.work / scope
             cwd.mkdir()
-            row = finish(start("dispatch", "--host", "codex", "--task", str(self.work / "task"),
+            row = finish(start("dispatch", "--host", "codex", "--backend", "tmux", "--task", str(self.work / "task"),
                                "--cwd", ".", "--report", "report", "--scope", scope,
                                "--launch-config", str(config), cwd=cwd))
             question = cwd / "question.json"
@@ -3934,7 +3934,7 @@ while (not Path(attempt + ".stop").exists() and not Path(attempt + ".root-exit")
         owner = json.loads(self.reclaim_cli("acquire", "--scope", scope, "--owner", "A").stdout)
         token = owner["token"]
         original = json.loads(self.reclaim_cli(
-            "dispatch", "--scope", scope, "--owner-token", token, "--host", "codex",
+            "dispatch", "--scope", scope, "--owner-token", token, "--host", "codex", "--backend", "tmux",
             "--cwd", ".", "--task", "handoff-task", "--report", "handoff-report",
             "--model", "original-model", "--launch-config", str(config)).stdout)
         return original, token, self.handoff_ready(original["attempt"])
@@ -4527,7 +4527,7 @@ while time.monotonic() < deadline:
             return json.loads(proc.stdout) if expected == 0 else proc.stderr
 
         owner = cli("acquire", "--scope", scope, "--owner", "A")["token"]
-        first = cli("dispatch", "--host", "codex", "--scope", scope, "--task", "task",
+        first = cli("dispatch", "--host", "codex", "--backend", "tmux", "--scope", scope, "--task", "task",
                     "--cwd", ".", "--report", "report1", "--launch-config", str(config), token=owner)
         self.await_input_value(lambda: (self.work / "worker-pid").exists())
         if legacy:

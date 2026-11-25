@@ -50,9 +50,9 @@ class StartupFailure(unittest.TestCase):
             if runtime is not None:
                 settings["runtime"] = runtime
             config.write_text(json.dumps({"hosts": {host: settings}}))
-            args += ["--host", host, "--launch-config", str(config)]
+            args += ["--host", host, "--backend", backend or "tmux", "--launch-config", str(config)]
             if backend == "herdr":
-                args += ["--backend", "herdr", "--herdr-endpoint", str(self.cwd / "unused-herdr.sock")]
+                args += ["--herdr-endpoint", str(self.cwd / "unused-herdr.sock")]
         return self.cli(*args, code=code, extra=extra)
 
     def wait(self, scope):
@@ -505,7 +505,7 @@ class StartupFailure(unittest.TestCase):
         command = [sys.executable, "-c", script, str(ready), str(release), str(gate), "done" if done else "exit"]
         config.write_text(json.dumps({"hosts": {"codex": {"command": command}}}))
         args = [BINARY, "dispatch", "--task", "task", "--cwd", ".", "--report", "report", "--scope", scope,
-                "--role", "startup-check", "--host", "codex", "--launch-config", str(config)]
+                "--role", "startup-check", "--host", "codex", "--backend", "tmux", "--launch-config", str(config)]
         env = {**self.env, "PATH": f"{shim_dir}:{self.env['PATH']}"}
         with subprocess.Popen(args, cwd=self.cwd, env=env, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, text=True) as dispatch:

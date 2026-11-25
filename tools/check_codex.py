@@ -114,7 +114,8 @@ def exercise(args, root):
     try:
         # Start the private server without loading the user's tmux configuration.
         cmd([*tmux, 'new-session', '-d', '-s', 'keeper', 'sleep', 'infinity'])
-        launch = wfc('dispatch', '--host', 'codex', '--cwd', work, '--task', task,
+        launch = wfc('dispatch', '--host', 'codex', '--backend', 'tmux', '--cwd', work,
+                     '--task', task,
                      '--report', report, '--scope', 'codex-smoke', '--launch-config', config,
                      '--model', args.model, '--effort', 'low')
         ident = launch['dispatch']

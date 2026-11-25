@@ -120,7 +120,7 @@ impl<'a> Dispatch<'a> {
                 matches!(name, "codex" | "opencode" | "claude"),
                 "invalid --host"
             );
-            let backend = string("--backend")?.unwrap_or("tmux");
+            let backend = string("--backend")?.unwrap_or("bundled");
             ensure!(
                 matches!(backend, "tmux" | "herdr" | "bundled"),
                 "invalid --backend"
@@ -246,18 +246,13 @@ impl<'a> Dispatch<'a> {
             record["effort"] = json!(host.effort);
             record["git"] = json!(host.git);
             record["network"] = json!(host.network);
-            record["tmux"] = json!(format!("wfc-{dispatch}"));
             ensure!(
                 cfg!(target_os = "linux"),
                 "public backend is unavailable on this platform"
             );
-            ensure!(
-                matches!(host.backend, "tmux" | "herdr"),
-                "{} backend adapter is unavailable in this build",
-                host.backend
-            );
             #[cfg(target_os = "linux")]
             if host.backend == "herdr" {
+                record["tmux"] = json!(format!("wfc-{dispatch}"));
                 let endpoint = host
                     .endpoint
                     .map(PathBuf::from)
@@ -273,10 +268,13 @@ impl<'a> Dispatch<'a> {
                 );
                 record["endpoint"] =
                     json!(endpoint.to_str().context("Herdr endpoint must be UTF-8")?);
-            } else {
+            } else if host.backend == "tmux" {
+                record["tmux"] = json!(format!("wfc-{dispatch}"));
                 record["tmuxSocket"] = json!(backend::tmux_socket()?);
                 record["executionId"] = record["attempt"].clone();
                 record["tmuxLaunchProtocol"] = json!(backend::LAUNCH_PROTOCOL);
+            } else {
+                crate::bundled::require_delegation()?;
             }
             match host.prepare(&state, &mut record) {
                 Ok(launch) => Some(launch),
@@ -370,6 +368,10 @@ impl<'a> Dispatch<'a> {
         let mut adoption_ledger = None;
         let result = (|| -> Result<()> {
             if let Some(launch) = launch {
+                #[cfg(target_os = "linux")]
+                if record["backend"] == "bundled" {
+                    messages::sync_directory(&records)?;
+                }
                 let answer = backend::create(&state, &record, launch);
                 #[cfg(target_os = "linux")]
                 if opencode_opening {
@@ -384,6 +386,8 @@ impl<'a> Dispatch<'a> {
                 let accepted = answer["result"] == "accepted";
                 if accepted
                     || answer["result"] == "uncertain"
+                    || (record["backend"] == "bundled"
+                        && answer["unstarted"]["group_cleanup"] == "unknown")
                     || matches!(
                         answer["category"].as_str(),
                         Some("executable_missing" | "permission_denied" | "spawn_failed")
@@ -394,6 +398,9 @@ impl<'a> Dispatch<'a> {
                     answer["dispatch"] = record["dispatch"].clone();
                     answer["attempt"] = record["attempt"].clone();
                     answer["round"] = record["round"].clone();
+                    if record["backend"] == "bundled" && answer["ticket"].is_object() {
+                        record["backendHandle"] = answer["ticket"].clone();
+                    }
                     record["create"] = answer.clone();
                     let published = records.join(format!("{dispatch}.json"));
                     write_json(&published, &record, None).with_context(|| {
@@ -401,16 +408,17 @@ impl<'a> Dispatch<'a> {
                     })?;
                     fs::remove_file(&pending)?;
                     #[cfg(target_os = "linux")]
-                    if adoption_ledger.is_some() {
+                    if record["backend"] == "bundled" || adoption_ledger.is_some() {
                         messages::sync_directory(&records)?;
                     }
                     #[cfg(target_os = "linux")]
-                    if backend::publish_unconfirmed_tmux_exit(
-                        &state,
-                        &record,
-                        adoption_ledger.take(),
-                    )
-                    .is_err()
+                    if record["backend"] == "tmux"
+                        && backend::publish_unconfirmed_tmux_exit(
+                            &state,
+                            &record,
+                            adoption_ledger.take(),
+                        )
+                        .is_err()
                     {
                         eprintln!("wfc: could not publish confirmed startup failure");
                     }
@@ -862,6 +870,13 @@ fn observe_dispatch(
             backend::observe(state, record)?
         };
         backend::copy_close_fields(&inspection, record);
+        if record["backend"] == "bundled" {
+            if record["create"].is_null() {
+                record["createPending"] = json!(true);
+            }
+            record["backendHandle"] = inspection["ticket"].clone();
+            record["backendObservation"] = inspection.clone();
+        }
         record["worker"] = worker;
         record["backendResult"] = inspection["result"].clone();
         if record["backend"] == "herdr" && inspection["diagnostic"].is_string() {
@@ -1000,6 +1015,8 @@ fn status_with_history(
         dispatches.retain(|row| {
             if row["state"] != "done"
                 || row["closePending"] == true
+                || (row["backend"] == "bundled"
+                    && (row["createPending"] == true || row["backendAlive"].is_null()))
                 || row["resourceCleanup"] == "uncertain"
                 || assignment::unresolved_resume(row).is_some()
                 || assignment::unresolved_handoff(row).is_some()

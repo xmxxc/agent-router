@@ -1,4 +1,7 @@
-//! Public lifecycle clients for tmux and Herdr.
+//! Public lifecycle clients for hosted workers.
+#[cfg(target_os = "linux")]
+mod bundled;
+
 use super::{host::Launch, valid_identity, write_json};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
@@ -136,6 +139,10 @@ fn call(state: &Path, row: &Value, mut request: Value) -> Result<Value> {
 }
 
 pub fn create(state: &Path, row: &Value, launch: Launch) -> Result<Value> {
+    #[cfg(target_os = "linux")]
+    if row["backend"] == "bundled" {
+        return bundled::create(state, row, launch);
+    }
     call(
         state,
         row,
@@ -519,7 +526,7 @@ fn script_preflight_failed(row: &Value) -> bool {
             create["category"].as_str(),
             Some("configured_script_missing" | "configured_script_permission_denied")
         )
-        && matches!(row["backend"].as_str(), Some("tmux" | "herdr"))
+        && matches!(row["backend"].as_str(), Some("tmux" | "herdr" | "bundled"))
         && row["dispatch"].as_str().is_some_and(super::valid_id)
         && super::assignment::identified(row)
         && row["scope"].as_str().is_some_and(|scope| !scope.is_empty())
@@ -883,6 +890,14 @@ fn same_execution(row: &Value, event: &Value) -> bool {
         .all(|&k| event[k] == row[k])
 }
 
+pub(super) fn close_blocks_callback(state: &Path, row: &Value) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    if row["backend"] == "bundled" {
+        return bundled::close_blocks_callback(state, row);
+    }
+    Ok(row["backend"] == "herdr" && herdr_close_blocks_callback(state, row)?)
+}
+
 pub(super) fn herdr_close_blocks_callback(state: &Path, row: &Value) -> Result<bool> {
     let latest = herdr_closes(row).rfind(|event| same_execution(row, event));
     Ok(
@@ -969,6 +984,10 @@ pub(super) fn observe_with_mode(
             row["worker"].clone(),
             json!({"result":"definitely-not-sent","alive":false}),
         ));
+    }
+    #[cfg(target_os = "linux")]
+    if row["backend"] == "bundled" {
+        return bundled::observe(state, row);
     }
     #[cfg(target_os = "linux")]
     if row["backend"] == "herdr" {
@@ -1087,6 +1106,10 @@ pub(super) fn read_only_close(state: &Path, row: &Value) -> Result<Option<Value>
         return Ok(Some(receipt));
     }
     #[cfg(target_os = "linux")]
+    if row["backend"] == "bundled" {
+        return bundled::read_only_close(state, row);
+    }
+    #[cfg(target_os = "linux")]
     if row["backend"] == "herdr" {
         return super::herdr::read_only_close(state, row);
     }
@@ -1106,6 +1129,10 @@ pub(super) fn read_only_close(state: &Path, row: &Value) -> Result<Option<Value>
 pub fn close(state: &Path, row: &Value) -> Result<Value> {
     if let Some(receipt) = script_preflight_close(row) {
         return Ok(receipt);
+    }
+    #[cfg(target_os = "linux")]
+    if row["backend"] == "bundled" {
+        return bundled::close(state, row);
     }
     #[cfg(target_os = "linux")]
     if row["backend"] == "herdr" {

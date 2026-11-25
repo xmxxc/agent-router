@@ -45,7 +45,9 @@ wfc dispatch --host codex --task task.md --cwd . --report reports/04-review/r1.m
 wfc status --active
 ```
 
-默认使用 tmux。此组合调用同一可执行文件中的 tmux 后端（#31）。宿主可选 codex、opencode 或 claude，`--launch-config` 或 `WFC_LAUNCH_CONFIG` 指向带有 env、hosts 的 JSON 配置。每个宿主可指定 command、runtime 参数数组及 env。完整参数见 `wfc dispatch --help`。bundled 后端由对应工单接入。
+Linux 宿主派发默认使用同一可执行文件中的 bundled 后端。运行前把 `WFC_BUNDLED_CGROUP_ROOT` 指向已经授权给当前用户的可写 cgroup v2 委派子树。内核须提供 `cgroup.kill`，用户须能在该委派下创建子组并把自建运行时迁入。缺少这些条件时派发会给出错误。普通目录无法充当委派子树。可按编号查询、回报和关闭。客户端重开后，查询和关闭仍按原派发号、attempt 和运行票据查证已存在的执行。
+
+宿主可选 codex、opencode 或 claude，`--launch-config` 或 `WFC_LAUNCH_CONFIG` 指向带有 env、hosts 的 JSON 配置。每个宿主可指定 command、runtime 参数数组及 env。Herdr 由 `--backend herdr` 显式选择。下面的旧 tmux 示例和隔离测试使用显式 `--backend tmux`。
 
 Linux 上，Codex、Claude 或受控 OpenCode 的 tmux worker 退出后可用 `wfc resume DISPATCH` 回到原会话，继续读同一份任务并写同一份报告。任务已完成时，用 `wfc resume DISPATCH --task task2.md --report reports/04-review/r2.md` 开下一轮。报告须在原目录，且该派发从未用过此文件名。两条路径都生成新 attempt，已认领的 scope 需要当前 owner 凭据。旧 attempt 的回执仍可在 `wfc status --dispatch DISPATCH` 查到。
 
@@ -102,7 +104,7 @@ python3 tools/check_codex.py target/x86_64-unknown-linux-gnu/release/wfc \
   --auth-file "$HOME/.codex/auth.json"
 ```
 
-回执包含 dispatch、round、attempt、host、backend、scope、role、label、tmux 和报告绝对路径。省略 scope 会分配新值，默认 role 来自报告目录名最后一个连字符后的部分。Codex 的 git/network 开关作用于宿主参数，OpenCode 和 Claude 的回执会说明这些开关的处理结果。tmux 服务地址在派发时绑定，后续查询和关闭沿用原服务。
+回执包含 dispatch、round、attempt、host、backend、scope、role、label 和报告绝对路径。tmux 兼容路径还包含会话字段。省略 scope 会分配新值，默认 role 来自报告目录名最后一个连字符后的部分。Codex 的 git/network 开关作用于宿主参数，OpenCode 和 Claude 的回执会说明这些开关的处理结果。tmux 服务地址在派发时绑定，后续查询和关闭沿用原服务。
 
 点名查询 `wfc status --dispatch ID` 返回当前 worker 进程状态、各轮任务结果及消息。接入 #6/#7 后，首条完成回报固定该轮的报告和 Git 快照，后续领取或进程退出仍能查回。已完成且会话仍存活的任务在 `status --active` 的 reclaimable 数组中。长编号和旧版短编号均可查询、关闭。
 

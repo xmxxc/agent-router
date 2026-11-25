@@ -1889,13 +1889,11 @@ impl<'a> Done<'a> {
                 receipt.is_some() || !super::assignment::handoff_blocks_old_writer(&row),
                 "attempt is no longer accepted for {dispatch}; handoff is closing the old execution"
             );
-            if receipt.is_none() && row["backend"] == "herdr" {
-                ensure!(
-                    !super::backend::herdr_close_blocks_callback(&state, &row)?,
-                    "attempt {} is no longer accepted for {dispatch}; its execution resources are closing or closed",
-                    assignment.worker.attempt
-                );
-            }
+            ensure!(
+                receipt.is_some() || !super::backend::close_blocks_callback(&state, &row)?,
+                "attempt {} is no longer accepted for {dispatch}; its execution resources are closing or closed",
+                assignment.worker.attempt
+            );
             Ok::<_, anyhow::Error>((assignment, row, inbox, receipt, key))
         };
         let (initial, initial_row, inbox, duplicate, _) = check()?;
@@ -2036,13 +2034,11 @@ impl<'a> Ask<'a> {
                     "attempt is no longer accepted for {dispatch}; handoff is closing the old execution"
                 );
                 inbox.require_question_round(&assignment, &row, attempt)?;
-                // The Herdr close intent is saved under the inbox lock.
-                if row["backend"] == "herdr" {
-                    ensure!(
-                        !super::backend::herdr_close_blocks_callback(&state, &row)?,
-                        "attempt is no longer accepted for {dispatch}; its execution resources are closing or closed"
-                    );
-                }
+                // Both backends save the close intent under the Inbox lock.
+                ensure!(
+                    !super::backend::close_blocks_callback(&state, &row)?,
+                    "attempt is no longer accepted for {dispatch}; its execution resources are closing or closed"
+                );
                 None
             };
             Ok((inbox, assignment, row, replay))
