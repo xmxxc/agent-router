@@ -158,6 +158,13 @@ fn run() -> anyhow::Result<ExitCode> {
             )?));
         }
         #[cfg(target_os = "linux")]
+        Some("--bundled-user-guardian") if args.is_empty() => {
+            return Ok(ExitCode::from(bundled::run(
+                "--bundled-user-guardian",
+                None,
+            )?));
+        }
+        #[cfg(target_os = "linux")]
         Some("--opencode-adopt") if args.is_empty() => {
             return Ok(if workflow::host::opencode_first_message() {
                 ExitCode::SUCCESS

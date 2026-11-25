@@ -239,6 +239,10 @@ impl<'a> Dispatch<'a> {
             });
             record["host"] = json!(host.name);
             record["backend"] = json!(host.backend);
+            #[cfg(target_os = "linux")]
+            if host.backend == "bundled" && std::env::var_os("WFC_BUNDLED_CGROUP_ROOT").is_none() {
+                record["bundledStartupCommit"] = json!(true);
+            }
             record["model"] = json!(host.model);
             record["effort"] = json!(host.effort);
             record["git"] = json!(host.git);
@@ -351,7 +355,7 @@ impl<'a> Dispatch<'a> {
             if let Some(launch) = launch {
                 #[cfg(target_os = "linux")]
                 messages::sync_directory(&records)?;
-                let answer = backend::create(&state, &record, launch);
+                let answer = backend::create(&state, &record, launch, token.as_deref());
                 #[cfg(target_os = "linux")]
                 if opencode_opening {
                     // The hook can publish during create. Serialize promotion

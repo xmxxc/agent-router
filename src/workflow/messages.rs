@@ -956,6 +956,17 @@ pub(super) fn lock_for_publish(dir: &Path) -> Result<PublishLock> {
     Ok(PublishLock::held(dir, lock))
 }
 
+pub(super) fn try_lock_for_publish(dir: &Path) -> Result<Option<PublishLock>> {
+    let lock = lock_file(dir)?;
+    match lock.try_lock() {
+        Ok(()) => (),
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(TryLockError::Error(error)) => return Err(error).context("lock controller messages"),
+    }
+    ensure_state_writable(dir)?;
+    Ok(Some(PublishLock::held(dir, lock)))
+}
+
 #[cfg(target_os = "linux")]
 pub(super) fn lock_for_private_publish(dir: &Path) -> Result<PublishLock> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -1165,17 +1176,9 @@ impl Inbox {
     }
 
     fn try_open(state: &Path) -> Result<Option<Self>> {
-        let lock = lock_file(state)?;
-        match lock.try_lock() {
-            Ok(()) => (),
-            Err(TryLockError::WouldBlock) => return Ok(None),
-            Err(TryLockError::Error(e)) => return Err(e).context("lock controller messages"),
-        }
-        ensure_state_writable(state)?;
-        Ok(Some(Self::read_locked(
-            state,
-            PublishLock::held(state, lock),
-        )?))
+        try_lock_for_publish(state)?
+            .map(|lock| Self::read_locked(state, lock))
+            .transpose()
     }
 
     fn claim(
@@ -1982,6 +1985,9 @@ impl<'a> Done<'a> {
                 .or_else(|| keyed_attempt.map(|id| format!("done:{dispatch}:{id}")));
             let receipt =
                 inbox.validate_done(&assignment, &row, &report, key.as_deref(), self.attempt)?;
+            if receipt.is_none() {
+                super::backend::require_callback_start(&state, &row)?;
+            }
             ensure!(
                 receipt.is_some() || !super::assignment::handoff_blocks_old_writer(&row),
                 "attempt is no longer accepted for {dispatch}; handoff is closing the old execution"
@@ -2123,6 +2129,7 @@ impl<'a> Ask<'a> {
                 inbox.sync_directory().context("sync question receipt")?;
                 Some(prior.receipt(true))
             } else {
+                super::backend::require_callback_start(&state, &row)?;
                 ensure!(
                     !super::assignment::handoff_blocks_old_writer(&row),
                     "attempt is no longer accepted for {dispatch}; handoff is closing the old execution"
