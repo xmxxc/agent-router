@@ -1,0 +1,145 @@
+name: Verify the frozen Linux download on hosted Jammy
+on:
+  workflow_call:
+
+permissions:
+  actions: read
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PRODUCT_SHA: 0b17234b994e1da4e82de2194d212e970bf31785
+  PRODUCT_TREE: fcbaa3f316184114508ec1a32647360d1ce88970
+  HANDOFF_PARENT: 706fce1970ea315d9072c7f3076120be23444ce1
+  RESUME_SOURCE: 312c4e0cef8543b7a5879775c157c2f2b271479b
+  HANDOFF_SOURCE: d8bd5213918970515fb38cad9ce1c68293754377
+  RESUME_RECIPE: 4196fd89fe30110c26b22120e8c406139be41ca8
+  HANDOFF_RECIPE: 92b7a1d84958568ecf48fdbdd506abb4d43770f6
+  INPUTS_SHA256: 0696cc6df29ee36821d20f5b721e4ce56d5374754e52f15b3ed44574953cb1ca
+  PACKAGE_RUN: '45573498035'
+  PACKAGE_ATTEMPT: '1'
+  PACKAGE_WORKFLOW_SHA: f5be975772b2b8e35760cbfd2865bed7dcd786c3
+  ARTIFACT_ID: '15003323032'
+  ARTIFACT_ZIP_SHA256: f3769038fdf26545a857bed706dfc68ab81614a35b7f41959fae75cf57815b64
+  MANIFEST_SHA256: 150f2d0cbb74824e64fa6937e68afbb8a518be0177a8cb71311b9902fc02c13a
+  PACKAGE_SHA256: bfc9176fa1b63b16158df2f00407fae86cb880742c23ea307c3c526ce1753d3a
+  ELF_SHA256: cce60c6212efe3f683e020646fe195455a1748b565fb8ca73a5b7fcf251e889f
+  LC_ALL: C.UTF-8
+
+jobs:
+  hosted_candidate:
+    name: Same downloaded ELF for resume, handoff and user service
+    runs-on: ubuntu-22.04
+    timeout-minutes: 16
+    steps:
+      - name: Check out the fixed acceptance recipe
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: ci
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Check out the frozen product fixtures
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: xmxxc/agent-router
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out the reviewed handoff evidence checker
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: xmxxc/agent-router
+          ref: ${{ env.HANDOFF_RECIPE }}
+          path: handoff-ci
+          fetch-depth: 2
+          sparse-checkout: /tools/ci/bundled-combination.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Bind the fixture sources to the frozen candidate
+        working-directory: product
+        run: |
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          test "$(git show -s --format=%P HEAD)" = "$HANDOFF_PARENT $RESUME_SOURCE"
+          git show -s --format='product=%H tree=%T parents=%P'
+          git -C ../ci show -s --format='acceptance=%H tree=%T parents=%P'
+          test "$(git -C ../handoff-ci rev-parse HEAD)" = "$HANDOFF_RECIPE"
+          test "$(git -C ../handoff-ci show -s --format=%P HEAD)" = "$HANDOFF_SOURCE"
+          git -C ../handoff-ci show -s --format='handoff_recipe=%H tree=%T parents=%P'
+          git merge-base --is-ancestor "$HANDOFF_SOURCE" "$HANDOFF_PARENT"
+          git diff --exit-code "$HANDOFF_SOURCE" HEAD -- tests/bundled_handoff.py
+          git diff --exit-code "$RESUME_SOURCE" HEAD -- tools/check_bundled_resume.py
+          git show -s --format='fixture_source=%H tree=%T parents=%P' "$HANDOFF_SOURCE" "$RESUME_SOURCE"
+          printf 'resume_recipe=%s\n' "$RESUME_RECIPE"
+          printf '%s  %s\n' "$INPUTS_SHA256" vendor/INPUTS.sha256 | sha256sum --check --strict
+          test "$(wc -l < vendor/INPUTS.sha256)" -eq 143
+          sha256sum --check --strict vendor/INPUTS.sha256
+          sha256sum tests/bundled_handoff.py tools/check_bundled_resume.py tools/check_bundled_default.sh \
+            tools/check_bundled_startup.py tests/check_codex.py tools/check_codex.py tests/startup_failure.py \
+            ../handoff-ci/tools/ci/bundled-combination.sh ../ci/tools/ci/linux-candidate-hosted.sh
+      - name: Verify and download the original package after the clean guest passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          for digest in "$ARTIFACT_ZIP_SHA256" "$MANIFEST_SHA256" "$PACKAGE_SHA256" "$ELF_SHA256"; do
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          done
+          api="repos/xmxxc/agent-router/actions"
+          attempt="$api/runs/$PACKAGE_RUN/attempts/$PACKAGE_ATTEMPT"
+          gh api "$attempt" | jq -e --arg run "$PACKAGE_RUN" --arg attempt "$PACKAGE_ATTEMPT" \
+            --arg workflow "$PACKAGE_WORKFLOW_SHA" '
+              (.id | tostring) == $run and (.run_attempt | tostring) == $attempt
+              and .head_sha == $workflow
+            ' >/dev/null
+          gh api "$attempt/jobs" | jq -cer '
+            def job($name): [.jobs[] | select(.name == ("checkpoint / checkpoint / " + $name))]
+              | if length == 1 then .[0] else error("missing unique package-path job") end;
+            job("package") as $package
+            | job("Downloaded bundled lifecycle in the offline clean Jammy guest") as $guest
+            | job("Downloaded bundled lifecycle on a delegated hosted VM") as $delegated
+            | select($package.conclusion == "success" and $guest.conclusion == "success")
+            | {package_job:$package.id, clean_guest_job:$guest.id, clean_guest:$guest.conclusion,
+               delegated_job:$delegated.id, delegated_conclusion:$delegated.conclusion}
+          '
+          artifact="$api/artifacts/$ARTIFACT_ID"
+          gh api "$artifact" | jq -e --arg id "$ARTIFACT_ID" --arg run "$PACKAGE_RUN" \
+            --arg workflow "$PACKAGE_WORKFLOW_SHA" --arg digest "$ARTIFACT_ZIP_SHA256" \
+            --arg name "linux-package-ci-$PRODUCT_SHA-$PACKAGE_ATTEMPT" '
+              (.id | tostring) == $id and .name == $name and .digest == "sha256:\($digest)"
+              and .expired == false and (.workflow_run.id | tostring) == $run
+              and .workflow_run.head_sha == $workflow
+            ' >/dev/null
+          printf 'run=%s attempt=%s package_workflow=%s artifact_id=%s zip_sha256=%s manifest_sha256=%s package_sha256=%s elf_sha256=%s\n' \
+            "$PACKAGE_RUN" "$PACKAGE_ATTEMPT" "$PACKAGE_WORKFLOW_SHA" "$ARTIFACT_ID" \
+            "$ARTIFACT_ZIP_SHA256" "$MANIFEST_SHA256" "$PACKAGE_SHA256" "$ELF_SHA256"
+          umask 077
+          checkpoint="$RUNNER_TEMP/wfc-candidate-package"
+          mkdir -p "$checkpoint/download" "$checkpoint/unpacked"
+          gh api "$artifact/zip" > "$checkpoint/artifact.zip"
+          printf '%s  %s\n' "$ARTIFACT_ZIP_SHA256" "$checkpoint/artifact.zip" | sha256sum --check --strict
+          unzip -tq "$checkpoint/artifact.zip"
+          unzip -q "$checkpoint/artifact.zip" -d "$checkpoint/download"
+          cd "$checkpoint/download"
+          archive="wfc-linux-x64-$PRODUCT_SHA.tar.gz"
+          printf '%s  %s\n' "$MANIFEST_SHA256" SHA256SUMS | sha256sum --check --strict
+          sha256sum --check --strict SHA256SUMS
+          printf '%s  %s\n' "$PACKAGE_SHA256" "$archive" | sha256sum --check --strict
+          read -r build_digest _ < binary.sha256
+          test "$build_digest" = "$ELF_SHA256"
+          tar -xzf "$archive" -C "$checkpoint/unpacked"
+          cd "$checkpoint/unpacked"
+          test "$(cat COMMIT.txt)" = "$PRODUCT_SHA"
+          sha256sum --check --strict BINARY-SHA256SUMS
+          printf '%s  wfc\n' "$ELF_SHA256" | sha256sum --check --strict
+      - name: Recheck the changed public routes and ordinary user receipts
+        working-directory: product
+        run: |
+          bash ../ci/tools/ci/linux-candidate-hosted.sh "$RUNNER_TEMP/wfc-candidate-package/unpacked/wfc" \
+            "$ELF_SHA256" "$GITHUB_WORKSPACE/handoff-ci/tools/ci/bundled-combination.sh" "$PRODUCT_SHA"
