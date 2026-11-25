@@ -142,10 +142,14 @@ pub(super) fn startup_live(context: &Value) -> Result<()> {
 }
 
 fn startup_deadline_reached(context: &Value) -> Result<bool> {
+    Ok(startup_time_remaining(context)?.is_zero())
+}
+
+pub(super) fn startup_time_remaining(context: &Value) -> Result<Duration> {
     let deadline = context["deadline"]
         .as_u64()
         .context("missing startup deadline")?;
-    Ok(unix_ms()? >= deadline)
+    Ok(Duration::from_millis(deadline.saturating_sub(unix_ms()?)).min(TIMEOUT + TIMEOUT))
 }
 
 fn own_membership(text: &str, uid: u32, unit: &str) -> Result<PathBuf> {

@@ -1033,6 +1033,7 @@ mod tests {
 
     #[test]
     fn managed_abort_retries_only_a_confirmed_preinstall_failure() -> Result<()> {
+        use super::super::runtime::{publish_cleanup, watch_startup, CleanupBinding, StartupWatch};
         use super::super::user_service::{poll_startup_with, ABORT_RETRY_DELAY};
         use std::cell::Cell;
         use std::os::unix::process::ExitStatusExt;
@@ -1088,25 +1089,52 @@ mod tests {
             let tick = Cell::new(now);
             let seen = Cell::new(0);
             let exit = ExitStatus::from_raw(0);
-            let (decision, status) = super::super::runtime::watch_startup(
+            let cleaned = Cell::new(0);
+            let outcome = watch_startup(
                 Some(now),
+                now,
                 |next| {
                     let attempt = seen.get();
                     seen.set(attempt + 1);
-                    assert!(attempt < 2, "a recovered retry must settle the decision");
-                    poll(&exited_during_delay, next, tick.get(), attempt == 0)
+                    assert!(attempt < 3, "a recovered retry must settle the decision");
+                    if attempt > 0 {
+                        assert_eq!(cleaned.get(), 1, "cleanup must precede the retry");
+                    }
+                    poll(&exited_during_delay, next, tick.get(), tick.get() == now)
                 },
                 || Ok(Some(ExitStatus::from_raw(0))),
+                || {
+                    cleaned.set(cleaned.get() + 1);
+                    Ok(())
+                },
+                || tick.get(),
                 || tick.set(tick.get() + ABORT_RETRY_DELAY),
             );
-            assert_eq!(seen.get(), 2);
-            assert_eq!(status, Some(exit));
+            let StartupWatch::Exited {
+                decision,
+                status,
+                cleanup,
+            } = outcome
+            else {
+                panic!("expected the previously observed runtime exit");
+            };
+            assert_eq!(seen.get(), 3);
+            assert_eq!(cleaned.get(), 1);
+            assert_eq!(status, exit);
             assert_eq!(decision, Some(StartupDecision::Aborted));
             assert_eq!(exited_during_delay.startup_decision(&proposed)?, decision);
-            let cleanup =
-                json!({"proves":"execution-empty","state":"startup-aborted","identity":proposed});
-            exited_during_delay.save_signed("cleanup", cleanup.clone())?;
-            assert_eq!(exited_during_delay.proof()?, cleanup);
+            let cleanup = publish_cleanup(
+                &exited_during_delay,
+                &proposed,
+                "closed",
+                CleanupBinding::Prepared(decision),
+                cleanup,
+            );
+            cleanup?;
+            assert_eq!(
+                exited_during_delay.proof()?,
+                json!({"proves":"execution-empty","state":"startup-aborted","identity":proposed})
+            );
 
             let persistent = fixture()?;
             let mut retry = Some(now);
@@ -1118,8 +1146,119 @@ mod tests {
                 assert!(persistent.proof().is_err());
             }
 
+            tick.set(now);
+            cleaned.set(0);
+            let watch = watch_startup(
+                Some(now),
+                now,
+                |next| {
+                    if tick.get() > now {
+                        assert_eq!(cleaned.get(), 1);
+                    }
+                    poll(&persistent, next, tick.get(), true)
+                },
+                || Ok(Some(exit)),
+                || {
+                    cleaned.set(cleaned.get() + 1);
+                    Ok(())
+                },
+                || tick.get(),
+                || tick.set(tick.get() + ABORT_RETRY_DELAY),
+            );
+            let StartupWatch::Exited {
+                status,
+                cleanup,
+                decision,
+            } = watch
+            else {
+                panic!("persistent failures must finish the post-exit wait");
+            };
+            assert_eq!(status, exit);
+            assert_eq!(cleaned.get(), 1);
+            assert!(tick.get() >= now + TIMEOUT);
+            assert!(tick.get() < now + TIMEOUT + ABORT_RETRY_DELAY);
+            assert_eq!(decision, None);
+            assert!(publish_cleanup(
+                &persistent,
+                &proposed,
+                "closed",
+                CleanupBinding::Prepared(decision),
+                cleanup
+            )
+            .is_err());
+            assert!(persistent.signed("cleanup").is_err());
+
+            let early_exit = fixture()?;
+            tick.set(now);
+            cleaned.set(0);
+            let startup_deadline = now + TIMEOUT + TIMEOUT;
+            let outcome = watch_startup(
+                Some(now),
+                startup_deadline,
+                |next| {
+                    if tick.get() < startup_deadline {
+                        poll_startup_with(
+                            &early_exit,
+                            &json!({"deadline":u64::MAX}),
+                            &proposed,
+                            next,
+                            tick.get(),
+                            || panic!("publisher can still be live"),
+                        )
+                    } else {
+                        assert_eq!(cleaned.get(), 1);
+                        poll(&early_exit, next, tick.get(), false)
+                    }
+                },
+                || Ok(Some(exit)),
+                || {
+                    cleaned.set(cleaned.get() + 1);
+                    Ok(())
+                },
+                || tick.get(),
+                || tick.set(tick.get() + TIMEOUT),
+            );
+            let StartupWatch::Exited {
+                cleanup, decision, ..
+            } = outcome
+            else {
+                panic!("early exit must keep waiting after cleanup");
+            };
+            assert_eq!(tick.get(), startup_deadline);
+            assert_eq!(cleaned.get(), 1);
+            assert_eq!(decision, Some(StartupDecision::Aborted));
+            publish_cleanup(
+                &early_exit,
+                &proposed,
+                "closed",
+                CleanupBinding::Prepared(decision),
+                cleanup,
+            )?;
+            assert_eq!(early_exit.proof()?["state"], "startup-aborted");
+
             let ready = fixture()?;
             ready.commit_ready(&proposed, || Ok(()))?;
+            assert!(matches!(
+                watch_startup(
+                    Some(now),
+                    now,
+                    |next| poll(&ready, next, now, true),
+                    || panic!("ready startup must return to the normal runtime wait"),
+                    || panic!("ready startup must not reclaim its group"),
+                    || now,
+                    || panic!("existing ready decision needs no retry"),
+                ),
+                StartupWatch::Decided(StartupDecision::Ready)
+            ));
+            assert!(publish_cleanup(
+                &ready,
+                &proposed,
+                "closed",
+                CleanupBinding::Prepared(Some(StartupDecision::Ready)),
+                Err(io::Error::from_raw_os_error(libc::EIO).into())
+            )
+            .is_err());
+            assert!(ready.signed("cleanup").is_err());
             for (store, decision) in [
                 (&ready, StartupDecision::Ready),
                 (&transient, StartupDecision::Aborted),

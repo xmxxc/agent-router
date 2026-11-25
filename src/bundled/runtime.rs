@@ -35,8 +35,8 @@ pub fn guard(
     if let Some(binding) = &user_service {
         actual["userService"] = binding.clone();
     }
-    let mut has_proposal = false;
-    let mut known_decision = None;
+    let mut cleanup_binding = CleanupBinding::NoProposal;
+    let mut startup_cleanup = None;
     let outcome = (|| -> Result<&str> {
         store.save_signed("starting", actual.clone())?;
         let (reader, writer) = UnixStream::pair()?;
@@ -66,9 +66,12 @@ pub fn guard(
                     Preparation::Existing | Preparation::Uncertain => None,
                 };
                 actual = proposal;
-                has_proposal = true;
-                let (decision, exited) = watch_startup(
+                let startup_deadline = Instant::now()
+                    + super::user_service::startup_time_remaining(&spec["userService"])
+                        .unwrap_or_default();
+                return match watch_startup(
                     next_abort,
+                    startup_deadline,
                     |next_abort| {
                         super::user_service::poll_startup(
                             &store,
@@ -78,13 +81,28 @@ pub fn guard(
                         )
                     },
                     || child.try_wait(),
+                    || group.clean(),
+                    Instant::now,
                     || thread::sleep(TICK),
-                );
-                known_decision = decision;
-                if decision == Some(StartupDecision::Aborted) && exited.is_none() {
-                    bail!("bundled startup was cancelled before ready");
-                }
-                return Ok(exited);
+                ) {
+                    StartupWatch::Decided(decision) => {
+                        cleanup_binding = CleanupBinding::Prepared(Some(decision));
+                        ensure!(
+                            decision == StartupDecision::Ready,
+                            "bundled startup was cancelled before ready"
+                        );
+                        Ok(None)
+                    }
+                    StartupWatch::Exited {
+                        status,
+                        cleanup,
+                        decision,
+                    } => {
+                        startup_cleanup = Some(cleanup);
+                        cleanup_binding = CleanupBinding::Prepared(decision);
+                        Ok(Some(status))
+                    }
+                };
             } else {
                 actual = proposal;
                 store.save_signed("ready", actual.clone())?;
@@ -106,7 +124,7 @@ pub fn guard(
             _ => "faulted",
         })
     })();
-    let cleanup = group.clean();
+    let cleanup = startup_cleanup.unwrap_or_else(|| group.clean());
     if matches!(outcome, Ok("unstarted")) {
         store.save_signed(
             "unstarted",
@@ -116,45 +134,90 @@ pub fn guard(
         cleanup?;
         return Ok(());
     }
+    publish_cleanup(
+        &store,
+        &actual,
+        outcome.unwrap_or("faulted"),
+        cleanup_binding,
+        cleanup,
+    )
+}
+
+pub(super) enum CleanupBinding {
+    NoProposal,
+    Prepared(Option<StartupDecision>),
+}
+
+pub(super) fn publish_cleanup(
+    store: &Store,
+    identity: &Value,
+    state: &str,
+    binding: CleanupBinding,
+    cleanup: Result<()>,
+) -> Result<()> {
     cleanup?;
-    let state = if has_proposal {
-        let decision = store.startup_decision(&actual)?;
+    let state = if let CleanupBinding::Prepared(known_decision) = binding {
+        let decision = store.startup_decision(identity)?;
         ensure!(
             known_decision.is_none_or(|known| decision == Some(known)),
             "bundled startup decision could not be reverified for cleanup"
         );
         match decision {
             Some(StartupDecision::Aborted) => "startup-aborted",
-            Some(StartupDecision::Ready) => outcome.unwrap_or("faulted"),
+            Some(StartupDecision::Ready) => state,
             None => bail!("bundled startup cleanup has no confirmed decision"),
         }
     } else {
-        outcome.unwrap_or("faulted")
+        state
     };
     store.save_signed(
         "cleanup",
-        json!({"proves":"execution-empty","state":state, "identity":actual}),
+        json!({"proves":"execution-empty","state":state,"identity":identity}),
     )
+}
+
+pub(super) enum StartupWatch {
+    Decided(StartupDecision),
+    Exited {
+        status: ExitStatus,
+        cleanup: Result<()>,
+        decision: Option<StartupDecision>,
+    },
 }
 
 pub(super) fn watch_startup(
     mut next_abort: Option<Instant>,
+    startup_deadline: Instant,
     mut poll: impl FnMut(&mut Option<Instant>) -> Result<Option<StartupDecision>>,
     mut try_wait: impl FnMut() -> io::Result<Option<ExitStatus>>,
+    clean: impl FnOnce() -> Result<()>,
+    mut now: impl FnMut() -> Instant,
     mut pause: impl FnMut(),
-) -> (Option<StartupDecision>, Option<ExitStatus>) {
-    let mut exited = None;
+) -> StartupWatch {
     loop {
         if let Ok(Some(decision)) = poll(&mut next_abort) {
-            return (Some(decision), exited);
+            return StartupWatch::Decided(decision);
         }
-        if exited.is_none() {
-            exited = try_wait().ok().flatten();
-        }
-        // A natural exit does not discard a verified, pending abort retry.
-        // Once read-only, a known exit is enough to stop waiting.
-        if exited.is_some() && next_abort.is_none() {
-            return (None, exited);
+        if let Ok(Some(status)) = try_wait() {
+            let cleanup = clean();
+            // After successful cleanup, give any verified decision retry a
+            // bounded chance to recover before service exit.
+            let deadline = now().max(startup_deadline) + TIMEOUT;
+            let mut decision = None;
+            while cleanup.is_ok() && next_abort.is_some() && now() < deadline {
+                if let Ok(Some(observed)) = poll(&mut next_abort) {
+                    decision = Some(observed);
+                    break;
+                }
+                if next_abort.is_some() {
+                    pause();
+                }
+            }
+            return StartupWatch::Exited {
+                status,
+                cleanup,
+                decision,
+            };
         }
         pause();
     }
