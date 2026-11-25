@@ -3,9 +3,13 @@ on:
   workflow_call:
     inputs:
       runtime_runner:
-        description: Runner label for the clean runtime job
+        description: Runner label for the clean runtime job when hosted delegation is off
         type: string
         required: true
+      hosted_delegated_runtime:
+        description: Use standard systemd delegation on a Jammy hosted VM
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -18,3 +22,4 @@ jobs:
       product_tree: 66f5f58c642974726405e0e9b102f33c1933264a
       product_parents: e9d0d2fdffb56fa0d6e9cf1aca515a0e223c5f58
       runtime_runner: ${{ inputs.runtime_runner }}
+      hosted_delegated_runtime: ${{ inputs.hosted_delegated_runtime }}

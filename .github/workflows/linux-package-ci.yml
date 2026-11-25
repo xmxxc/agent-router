@@ -15,6 +15,10 @@ on:
         description: GitHub-hosted label or an existing clean runner with approved delegation
         type: string
         default: ubuntu-22.04
+      hosted_delegated_runtime:
+        description: Exercise the downloaded binary in an ordinary Jammy hosted VM with systemd delegation
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -185,9 +189,9 @@ jobs:
           retention-days: 14
 
   runtime:
-    name: Accept the downloaded default bundled checkpoint
+    name: ${{ inputs.hosted_delegated_runtime && 'Downloaded bundled lifecycle on a delegated hosted VM' || 'Downloaded bundled lifecycle in a clean runtime' }}
     needs: package
-    runs-on: ${{ inputs.runtime_runner }}
+    runs-on: ${{ inputs.hosted_delegated_runtime && 'ubuntu-22.04' || inputs.runtime_runner }}
     timeout-minutes: 15
     env:
       RUNTIME_BASE: docker.io/library/ubuntu:22.04@sha256:b682e31336cc8e0a73ed91ab32b7a95e32591c5ff09994490a20accf9b3600f9
@@ -215,8 +219,20 @@ jobs:
           printf 'downloaded_artifact=%s digest=%s\n' "$ARTIFACT_ID" "$ARTIFACT_DIGEST"
           printf '%s  %s\n' "$MANIFEST_SHA256" SHA256SUMS | sha256sum --check --strict
           sha256sum --check --strict SHA256SUMS
+      - name: Exercise the downloaded binary in a delegated hosted VM
+        if: inputs.hosted_delegated_runtime
+        env:
+          MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
+        run: |
+          test "$(id -u)" -gt 0
+          unit="wfc-package-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sudo systemd-run --unit="$unit" --wait --pipe --collect \
+            --property=Type=exec --property="User=$(id -un)" --property=Delegate=yes \
+            --property=RuntimeMaxSec=120s --property=TimeoutStopSec=10s \
+            /usr/bin/bash "$GITHUB_WORKSPACE/ci/tools/check_linux_hosted_delegation.sh" \
+            "$(id -u)" "$unit" "$GITHUB_WORKSPACE/checkpoint" "$PRODUCT_SHA" "$TARGET" "$MANIFEST_SHA256"
       - name: Prepare the pinned Jammy runtime with only required libraries and jq
-        if: runner.environment == 'github-hosted'
+        if: ${{ !inputs.hosted_delegated_runtime && runner.environment == 'github-hosted' }}
         run: |
           printf 'runtime_base=%s\n' "$RUNTIME_BASE"
           docker build --platform linux/amd64 --build-arg BASE_IMAGE="$RUNTIME_BASE" \
@@ -228,7 +244,7 @@ jobs:
               && apt-get clean
           DOCKERFILE
       - name: Check the same downloaded binary in the clean hosted container
-        if: runner.environment == 'github-hosted'
+        if: ${{ !inputs.hosted_delegated_runtime && runner.environment == 'github-hosted' }}
         env:
           MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
         run: |
@@ -241,7 +257,7 @@ jobs:
             --mount "type=bind,source=$GITHUB_WORKSPACE/ci/tools/check_linux_bundled_package.sh,target=/check_linux_bundled_package.sh,readonly" \
             wfc-package-runtime /bin/bash /check_linux_runtime.sh /checkpoint "$PRODUCT_SHA" "$TARGET" "$MANIFEST_SHA256"
       - name: Exercise default dispatch in the pre-provisioned clean runtime
-        if: runner.environment == 'self-hosted'
+        if: ${{ !inputs.hosted_delegated_runtime && runner.environment == 'self-hosted' }}
         env:
           MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
         run: |

@@ -5,6 +5,7 @@ checkpoint=$(realpath -- "$1")
 product=$2
 target=$3
 manifest=$4
+mode=${5:-clean}
 tools=$(cd -- "$(dirname -- "$0")" && pwd)
 export LC_ALL=C.UTF-8
 
@@ -16,30 +17,44 @@ id
 getconf GNU_LIBC_VERSION
 dpkg-query -W libc6 libgcc-s1 libssl3 zlib1g jq
 
-for executable in python python2 python3 pypy pypy2 pypy3 tmux herdr herdr-cli herdr-kernel herdr-kernel-prototype wfc-kernel; do
-    if command -v "$executable"; then
-        printf 'Unexpected executable %s\n' "$executable" >&2
+case "$mode" in
+clean)
+    for executable in python python2 python3 pypy pypy2 pypy3 tmux herdr herdr-cli herdr-kernel herdr-kernel-prototype wfc-kernel; do
+        if command -v "$executable"; then
+            printf 'Unexpected executable %s\n' "$executable" >&2
+            exit 1
+        fi
+    done
+    dpkg-query -W -f='${db:Status-Status} ${Package}\n' | awk '
+        $1 == "installed" && $2 ~ /^(python|libpython|pypy|tmux|herdr)/ { print; found = 1 }
+        END { exit found }
+    '
+    executables=$(find /usr/bin /usr/local/bin /opt -regextype posix-extended -executable \
+        -regex '.*/((python|pypy)([0-9]+(\.[0-9]+)*)?|tmux|herdr([-_][^/]*)?|wfc-kernel)')
+    if [[ -n "$executables" ]]; then
+        printf 'Unexpected runtime files\n%s\n' "$executables" >&2
         exit 1
     fi
-done
-dpkg-query -W -f='${db:Status-Status} ${Package}\n' | awk '
-    $1 == "installed" && $2 ~ /^(python|libpython|pypy|tmux|herdr)/ { print; found = 1 }
-    END { exit found }
-'
-executables=$(find /usr/bin /usr/local/bin /opt -regextype posix-extended -executable \
-    -regex '.*/((python|pypy)([0-9]+(\.[0-9]+)*)?|tmux|herdr([-_][^/]*)?|wfc-kernel)')
-if [[ -n "$executables" ]]; then
-    printf 'Unexpected runtime files\n%s\n' "$executables" >&2
-    exit 1
-fi
-for comm in /proc/[0-9]*/comm; do
-    if { IFS= read -r process < "$comm"; } 2>/dev/null; then
-        case "$process" in
-            tmux*|herdr*) printf 'Unexpected running backend %s\n' "$process" >&2; exit 1 ;;
-        esac
-    fi
-done
-printf 'Runtime absence checks passed for Python, tmux and external Herdr.\n'
+    for comm in /proc/[0-9]*/comm; do
+        if { IFS= read -r process < "$comm"; } 2>/dev/null; then
+            case "$process" in
+                tmux*|herdr*) printf 'Unexpected running backend %s\n' "$process" >&2; exit 1 ;;
+            esac
+        fi
+    done
+    printf 'Runtime absence checks passed for Python, tmux and external Herdr.\n'
+    ;;
+hosted-delegated)
+    printf 'Coverage: bundled lifecycle on an ordinary hosted VM. Clean installation not evaluated.\n'
+    for executable in python3 tmux herdr; do
+        printf '%s=%s\n' "$executable" "$(command -v "$executable" || printf absent)"
+    done
+    ;;
+*)
+    printf 'Unknown runtime mode %s\n' "$mode" >&2
+    exit 2
+    ;;
+esac
 
 cd "$checkpoint"
 printf '%s  %s\n' "$manifest" SHA256SUMS | sha256sum --check --strict
