@@ -294,12 +294,13 @@ fn generation(worker: &Identity) -> (&str, u64, &str) {
 }
 
 impl Inbox {
-    // Continue holds both the scope and execution locks as well as this Inbox.
-    pub(in crate::workflow) fn finish_continue_publication(
+    // The caller holds the scope and execution locks as well as this Inbox.
+    pub(in crate::workflow) fn finish_hosted_publication(
         &self,
         id: &str,
         current: &Value,
         token: Option<&str>,
+        operation: &str,
     ) -> Result<()> {
         let dir = self.dir.join("dispatches");
         let generations = Generations::read(&dir, id);
@@ -351,7 +352,7 @@ impl Inbox {
         super::sync_directory(&dir)?;
         ensure_state_writable(&self.dir)?;
         let scope = record_scope(current).context("invalid dispatch scope")?;
-        controller::Owners::read(&self.dir)?.require(scope, token, "continue")?;
+        controller::Owners::read(&self.dir)?.require(scope, token, operation)?;
         ensure!(
             generations.stamps().current(&dir, id),
             "{}",

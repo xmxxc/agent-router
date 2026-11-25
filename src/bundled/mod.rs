@@ -727,6 +727,52 @@ fn operate(state: &Path, req: &Value) -> Result<Value> {
     ))
 }
 
+/// Apply only this current ticket's verified terminal proof before replacement.
+pub(crate) fn apply_handoff_cleanup(state: &Path, ticket: &Value, proof: &Value) -> Result<()> {
+    let (unit, _guard) = open_write_unit(state, field(ticket, "unit")?)?;
+    let (current, store) = store::current(&unit)?.context("missing original bundled execution")?;
+    ensure!(
+        ticket["version"] == 2
+            && store.ticket == *ticket
+            && store::ordered(&unit, &store)?
+            && store.current_proof()? == *proof,
+        "bundled handoff cleanup proof changed"
+    );
+    let applied = store.reconcile(&unit.join("current.json"), current, proof.clone())?;
+    ensure!(
+        applied["result"] == "completed" && applied["applied"] == true,
+        "bundled handoff cleanup application remains uncertain"
+    );
+    Ok(())
+}
+
+/// Read a signed launch receipt after a caller has lost the create result.
+pub(crate) fn handoff_launch_receipt(
+    state: &Path,
+    unit: &str,
+    attempt: &Value,
+    previous: &Value,
+    proof: &Value,
+) -> Result<Value> {
+    let (unit, _guard) = open_unit(state, unit)?;
+    let (_, store) = store::current(&unit)?.context("missing bundled handoff execution")?;
+    ensure!(
+        store.ticket["version"] == 2
+            && store.ticket["attempt"] == *attempt
+            && store::ordered(&unit, &store)?,
+        "bundled handoff launch is not the selected execution"
+    );
+    let prior = Store::open(&unit, previous)?;
+    ensure!(
+        prior.current_proof()? == *proof
+            && prior.signed("superseded")?["generation"] == store.ticket["generation"],
+        "bundled handoff target does not follow the verified original execution"
+    );
+    let identity = store.signed("ready")?;
+    File::open(&store.run)?.sync_all().context("sync recovered bundled handoff ready")?;
+    Ok(json!({"result":"accepted","ticket":store.ticket,"identity":identity}))
+}
+
 pub(crate) fn assignment_ready(state: &Path, unit: &str, row: &Value) -> Result<bool> {
     // Callback publication holds the Inbox lock. Input holds the unit lock
     // across its Inbox checks, so read the signed evidence without waiting.
@@ -836,6 +882,12 @@ pub(crate) fn ticket_cleanup_fixture(
         )?;
     }
     Ok((ticket, run.join("cleanup.json")))
+}
+
+#[cfg(test)]
+pub(crate) fn bind_handoff_fixture(state: &Path, previous: &Value, target: &Value) -> Result<()> {
+    let (unit, _guard) = open_write_unit(state, field(previous, "unit")?)?;
+    Store::open(&unit, previous)?.save_signed("superseded", json!({"generation":target["generation"]}))
 }
 
 #[cfg(test)]

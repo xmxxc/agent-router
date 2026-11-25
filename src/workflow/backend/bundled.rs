@@ -16,12 +16,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-pub(super) fn create(
-    state: &Path,
-    row: &Value,
-    mut launch: Launch,
-    owner: Option<&str>,
-) -> Result<Value> {
+fn launch_request(row: &Value, mut launch: Launch) -> Result<Value> {
     for (name, value) in env::vars_os() {
         let name = name
             .into_string()
@@ -33,8 +28,17 @@ pub(super) fn create(
             );
         }
     }
-    let request = json!({"op":"create","unit":row["dispatch"],"attempt":row["attempt"],
-        "cwd":row["cwd"],"argv":launch.argv,"env":launch.env});
+    Ok(json!({"op":"create","unit":row["dispatch"],"attempt":row["attempt"],
+        "cwd":row["cwd"],"argv":launch.argv,"env":launch.env}))
+}
+
+pub(super) fn create(
+    state: &Path,
+    row: &Value,
+    launch: Launch,
+    owner: Option<&str>,
+) -> Result<Value> {
+    let request = launch_request(row, launch)?;
     let answer = if row["bundledStartupCommit"] == true {
         // The original dispatch CLI is the only process that may commit ready.
         Some(crate::bundled::create(state, &request, || {
@@ -68,6 +72,18 @@ pub(super) fn create(
         create_in_backend(state, &request)?
     };
     launch_answer(answer)
+}
+
+pub(in crate::workflow) fn create_handoff<G, Check: FnOnce() -> Result<()>>(
+    state: &Path,
+    row: &Value,
+    launch: Launch,
+    previous: &Value,
+    authorize_ready: impl Fn() -> Result<Option<(G, Check)>>,
+) -> Result<Value> {
+    let mut request = launch_request(row, launch)?;
+    request["previous"] = previous.clone();
+    launch_answer(Some(crate::bundled::create(state, &request, authorize_ready)?))
 }
 
 fn create_in_backend(state: &Path, request: &Value) -> Result<Option<Value>> {

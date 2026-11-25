@@ -1,4 +1,6 @@
 //! Close a verified native writer before assigning a fresh execution.
+mod bundled;
+
 use super::{assignment, backend, controller, herdr, host, messages, view, worker_owner};
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
@@ -14,7 +16,7 @@ use std::{
 use uuid::Uuid;
 use wfc_herdr::Process;
 
-pub const USAGE: &str = "wfc handoff DISPATCH --host HOST --backend herdr --herdr-endpoint PATH [--task PATH --report PATH] [--model MODEL] [--owner-token TOKEN]\n    Replay a recorded Herdr handoff.";
+pub const USAGE: &str = "wfc handoff DISPATCH --host HOST --backend herdr --herdr-endpoint PATH [--task PATH --report PATH] [--model MODEL] [--owner-token TOKEN]\n    Replay a recorded Herdr handoff.\n    wfc handoff DISPATCH --host opencode --backend bundled [--model MODEL] [--owner-token TOKEN]";
 pub(super) const PENDING_CALLBACK_HASH: &str = "handoffCallbackHash";
 
 pub struct Handoff<'a> {
@@ -48,11 +50,11 @@ impl<'a> Handoff<'a> {
             "give both --task and --report, or neither"
         );
         ensure!(
-            backend.is_none_or(|name| name == "herdr"),
-            "--backend must be herdr"
+            backend.is_none_or(|name| matches!(name, "herdr" | "bundled")),
+            "--backend must be herdr or bundled"
         );
         ensure!(
-            (backend.is_none() && endpoint.is_none())
+            (matches!(backend, None | Some("bundled")) && endpoint.is_none())
                 || (backend == Some("herdr")
                     && endpoint.is_some_and(|socket| Path::new(socket).is_absolute())),
             "use --backend herdr with an absolute --herdr-endpoint"
@@ -64,7 +66,7 @@ impl<'a> Handoff<'a> {
             host: host
                 .filter(|name| matches!(*name, "codex" | "opencode" | "claude"))
                 .context("--host must be codex, opencode or claude")?,
-            backend: "herdr",
+            backend: backend.unwrap_or("herdr"),
             endpoint,
             next: task
                 .zip(report)
@@ -77,6 +79,9 @@ impl<'a> Handoff<'a> {
     pub fn run(self) -> Result<Value> {
         controller::require_controller("handoff")?;
         let state = super::writable_state_dir()?;
+        if self.backend == "bundled" {
+            return bundled::run(self, &state);
+        }
         let dir = state.join("dispatches");
         let path = dir.join(format!("{}.json", self.dispatch));
         let read = || {
@@ -660,6 +665,8 @@ impl<'a> Handoff<'a> {
         }
         if let Some(endpoint) = self.endpoint {
             next["endpoint"] = json!(endpoint);
+        }
+        if self.endpoint.is_some() || self.backend == "bundled" {
             let record = next.as_object_mut().unwrap();
             record.remove("tmuxSocket");
             record.remove("tmuxLaunchProtocol");
@@ -672,7 +679,20 @@ impl<'a> Handoff<'a> {
 }
 
 pub(super) fn settle_launch(row: &mut Value, index: usize, mut reply: Value) {
-    let accepted = reply["result"] == "accepted" && reply["receipt"].is_string();
+    let is_bundled = row["backend"] == "bundled";
+    let accepted = if is_bundled {
+        bundled::launch_matches(&reply, &row["dispatch"], &row["attempt"])
+    } else {
+        reply["result"] == "accepted" && reply["receipt"].is_string()
+    };
+    if is_bundled {
+        if accepted {
+            row["backendHandle"] = reply["ticket"].clone();
+            row["worker"] = json!({"state":"running"});
+        } else if reply["result"] == "accepted" {
+            reply = json!({"result":"uncertain","diagnostic":"bundled handoff launch ticket did not match"});
+        }
+    }
     for key in ["dispatch", "round", "attempt"] {
         reply[key] = row[key].clone();
     }
@@ -705,6 +725,9 @@ fn response(row: &Value, event: &Value, result: &str) -> Value {
     if !event["target"].is_null() {
         reply["backend"] = event["target"]["backend"].clone();
         reply["endpoint"] = event["target"]["endpoint"].clone();
+    }
+    if event["target"]["backend"] == "bundled" && result == "accepted" {
+        reply["ticket"] = event["launch"]["ticket"].clone();
     }
     reply
 }
@@ -926,10 +949,21 @@ pub(super) fn require_scope_settled(state: &Path, scope: &str) -> Result<()> {
         .flatten()
         .find(|event| event["operation"] == "handoff" && scope_binding(&row, event) == binding)
         .context("handoff order identity mismatch")?;
+    if bundled::order_had_no_backend_effect(event) {
+        return Ok(());
+    }
     ensure!(
         event["result"] == "accepted"
             && event["phase"] == "complete"
-            && event["launch"]["receipt"].is_string(),
+            && if event["target"]["backend"] == "bundled" {
+                bundled::has_bound_stop(&row, event)
+                    && bundled::launch_matches(&event["launch"], &row["dispatch"], &event["toAttempt"])
+                    && event["launch"]["round"] == event["round"]
+                    && event["launch"]["attempt"] == event["toAttempt"]
+                    && event["launch"]["dispatch"] == row["dispatch"]
+            } else {
+                event["launch"]["receipt"].is_string()
+            },
         "handoff audit {} is unresolved; reconcile the original execution before changing owner",
         event["id"]
     );
