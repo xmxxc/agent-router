@@ -165,17 +165,22 @@ impl<'a> Confirm<'a> {
 
     pub fn run(self) -> Result<Value> {
         let state = writable_state_dir()?;
-        let mut inbox = Inbox::open(&state)?;
         let numeric = self.id.parse::<u64>().ok();
+        let matches = |m: &Message| {
+            m.is_controller_message() && (Some(m.id) == numeric || m.message_id == self.id)
+        };
+        if let Some(message) = Inbox::snapshot(&state)?.into_iter().find(&matches) {
+            message.worker.require_message_access(&state)?;
+        }
+        let mut inbox = Inbox::open(&state)?;
         let index = inbox
             .messages
             .iter()
-            .position(|m| {
-                m.is_controller_message() && (Some(m.id) == numeric || m.message_id == self.id)
-            })
+            .position(matches)
             .with_context(|| format!("no controller message with id {}", self.id))?;
         let (earlier, tail) = inbox.messages.split_at_mut(index);
         let message = &mut tail[0];
+        message.worker.require_message_access(&state)?;
         let operation = match &self.action {
             Confirmation::Ack { .. } => "ack",
             Confirmation::Resolve { .. } => "resolve",
@@ -215,7 +220,7 @@ impl Confirmation<'_> {
                 if message.delivery.state == State::Processed {
                     return Ok(true);
                 }
-                message.delivery.advance(State::Processed)?;
+                message.advance_delivery(State::Processed)?;
             }
             Self::Resolve { claim, body_hash } => {
                 let matches_body = message.matches_hash(body_hash);
@@ -235,7 +240,7 @@ impl Confirmation<'_> {
                     "resolve requires unknown"
                 );
                 ensure!(matches_body, "body hash does not match the stored receipt");
-                message.delivery.advance(State::Received)?;
+                message.advance_delivery(State::Received)?;
                 message.body_hash = Some(body_hash.to_owned());
                 message.resolution = Some(Resolution {
                     claim,

@@ -537,10 +537,17 @@ pub(crate) fn record_created_session(args: &[std::ffi::OsString]) -> Result<()> 
             && args[7] == id,
         "invalid tmux creation identity"
     );
+    crate::workflow::ensure_no_legacy_db(state)?;
     let prefix = state.join("launches").join(id);
     let value = super::launch::read_receipt(&prefix.with_extension("submission"))
         .context("missing launch submission")?;
     let submission: super::launch::Submission = serde_json::from_value(value)?;
+    ensure!(
+        super::valid_dispatch(&submission.dispatch),
+        "invalid dispatch ID"
+    );
+    crate::workflow::reject_tmux_history(state, &submission.dispatch)?;
+    crate::workflow::ensure_state_writable(state)?;
     ensure!(
         submission.launch_id == id
             && submission.phase == super::launch::SubmissionPhase::InFlight

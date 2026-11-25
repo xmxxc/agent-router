@@ -78,6 +78,12 @@ impl<'a> Reply<'a> {
             .collect::<Vec<_>>()
             .join(" ");
         let question = self.question;
+        if let Some(original) = Inbox::snapshot(&state)?
+            .into_iter()
+            .find(|m| m.id == question && m.question_payload.is_some())
+        {
+            original.worker.require_message_access(&state)?;
+        }
         let (worker, uid, row) = {
             let mut inbox = Inbox::open(&state)?;
             let original = inbox
@@ -117,7 +123,7 @@ impl<'a> Reply<'a> {
         let mut started = false;
         let begin = |first: bool| -> Result<()> {
             let mut inbox = Inbox::open(&state)?;
-            let claim = reply_record(&mut inbox, &uid)?;
+            let claim = reply_record(&inbox, &uid)?;
             ensure!(
                 claim.input_result
                     == (if first {
@@ -251,6 +257,7 @@ impl<'a> Reply<'a> {
 fn validate(state: &Path, inbox: &Inbox, question: &Message, token: Option<&str>) -> Result<Value> {
     let worker = &question.worker;
     ensure!(valid_id(&worker.dispatch), "invalid question dispatch");
+    worker.require_message_access(state)?;
     controller::Owners::read(state)?.require(worker.scope(), token, "reply")?;
     let (assignment, row) = Assignment::read(state, &worker.dispatch)?;
     ensure!(
@@ -342,12 +349,12 @@ fn submit(
     }
 }
 
-fn reply_record<'a>(inbox: &'a mut Inbox, uid: &str) -> Result<&'a mut ReplyRecord> {
+fn reply_record<'a>(inbox: &'a Inbox, uid: &str) -> Result<&'a ReplyRecord> {
     inbox
         .messages
-        .iter_mut()
+        .iter()
         .find(|m| m.message_id == uid)
-        .and_then(|m| m.reply_payload.as_mut())
+        .and_then(|m| m.reply_payload.as_ref())
         .context("reply claim is missing")
 }
 
@@ -363,6 +370,7 @@ fn update(
         .iter_mut()
         .find(|m| m.message_id == uid)
         .context("reply claim is missing")?;
+    claim.worker.require_message_access(&inbox.dir)?;
     let reply = claim
         .reply_payload
         .as_mut()
@@ -370,7 +378,7 @@ fn update(
     reply.input_result = result;
     reply.diagnostic = diagnostic;
     reply.category = category;
-    claim.delivery.advance(match result {
+    claim.advance_delivery(match result {
         InputResult::Accepted => State::Received,
         InputResult::Uncertain => State::Unknown,
         _ => State::Unsent,

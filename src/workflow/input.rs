@@ -96,6 +96,7 @@ impl<'a> Request<'a> {
         let path = dir.join(format!("{}.json", self.dispatch));
         let original = assignment::public_record(&dir, self.dispatch)?
             .with_context(|| format!("unknown dispatch {}", self.dispatch))?;
+        assignment::require_not_tmux_history(&original)?;
         ensure!(
             original["legacyArchived"] != true,
             "offline legacy assignment has no input target"

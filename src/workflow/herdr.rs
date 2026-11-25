@@ -176,6 +176,7 @@ impl<'a> Assignment<'a> {
         ensure!(valid_id(id), "invalid dispatch ID");
         ensure_no_legacy_db(state)?;
         let row = read_record(&state.join("dispatches").join(format!("{id}.json")))?;
+        super::assignment::require_not_tmux_history(&row)?;
         let scope = record_scope(&row).context("invalid dispatch scope")?;
         let authorize = || controller::Owners::read(state)?.require(scope, None, operation);
         authorize()?;

@@ -1,7 +1,7 @@
 //! Recover the selected tmux startup result through the ordinary inbox.
 mod progress;
 
-use super::{Assignment, Identity, Inbox};
+use super::{message_boundary, Assignment, Identity, Inbox};
 use crate::workflow::{assignment, backend, decode_record, startup, valid_id};
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -105,16 +105,11 @@ impl Generations {
         let mut damaged = pending.is_err() || published.is_err();
         let pending = pending.ok().flatten();
         let published = published.ok().flatten();
+        damaged |= pending
+            .as_ref()
+            .is_some_and(|generation| !assignment::valid_reservation(&generation.row));
         if let (Some(a), Some(b)) = (&pending, &published) {
-            damaged |= [
-                "attempt",
-                "round",
-                "scope",
-                "controllerOwner",
-                "executionId",
-            ]
-            .iter()
-            .any(|&key| a.row[key] != b.row[key]);
+            damaged |= !assignment::same_publication_identity(&a.row, &b.row);
         }
         Self {
             pending,
@@ -135,6 +130,27 @@ impl Generations {
             .as_ref()
             .or(self.pending.as_ref())
             .map(|g| &g.row)
+    }
+
+    pub(super) fn into_assigned(self) -> Result<Option<Value>> {
+        anyhow::ensure!(!self.damaged, "{}", assignment::UNVERIFIED_ASSIGNMENT);
+        if let Some(published) = self.published {
+            return Ok(Some(published.row));
+        }
+        Ok(self.pending.map(|generation| {
+            let mut row = generation.row;
+            row["createPending"] = Value::Bool(true);
+            row
+        }))
+    }
+
+    pub(super) fn message_boundary(&self) -> assignment::MessageBoundary {
+        if self.damaged {
+            return assignment::MessageBoundary::Unverified;
+        }
+        self.assigned()
+            .map(|row| assignment::MessageBoundary::for_record(row, self.published.is_some()))
+            .unwrap_or_default()
     }
 
     pub(super) fn stamps(&self) -> GenerationStamps {
@@ -242,7 +258,8 @@ impl Scan {
         }
         let generations = Generations::read(dir, id);
         let row = generations.published()?;
-        if !assignment::identified(row)
+        if assignment::tmux_history(row)
+            || !assignment::identified(row)
             || row["createPending"] == true
             || !row["publicationDiagnostic"].is_null()
             || !row["controllerOwner"].is_null()
@@ -308,7 +325,11 @@ impl Inbox {
             let worker = &candidate.assignment.worker;
             // Both versions (including an absent reservation) must still
             // match. A changed record can be inspected in the next sweep.
-            if !candidate.stamps.current(&dir, &worker.dispatch) {
+            if !candidate.stamps.current(&dir, &worker.dispatch)
+                || worker
+                    .refusal(&message_boundary(&dir, &worker.dispatch))
+                    .is_some()
+            {
                 continue;
             }
             if absent {
@@ -346,7 +367,54 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn startup_recovery_advances_past_history_in_small_slices() -> Result<()> {
+    fn callback_assignment_uses_consistent_publication_generations() -> Result<()> {
+        let state =
+            std::env::temp_dir().join(format!("wfc-publication-generation-{}", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            fs::create_dir_all(&state)?;
+            let dispatch = "d-00000031";
+            let pending = state.join(format!("{dispatch}.pending"));
+            let published = state.join(format!("{dispatch}.json"));
+            let row = json!({"dispatch":dispatch,"round":1,"attempt":"a-000000000031",
+                "scope":"fixture","role":"worker","host":"codex","backend":"herdr"});
+            fs::write(&pending, serde_json::to_vec(&row)?)?;
+            let generations = Generations::read(&state, dispatch);
+            assert!(generations.message_boundary().refusal(None, None).is_none());
+            assert_eq!(generations.into_assigned()?.unwrap()["createPending"], true);
+
+            let mut current = row.clone();
+            current["create"] = json!({"result":"accepted"});
+            fs::write(&published, serde_json::to_vec(&current)?)?;
+            assert_eq!(
+                Generations::read(&state, dispatch).into_assigned()?,
+                Some(current)
+            );
+
+            for (field, value) in [
+                ("backend", json!("bundled")),
+                ("executionId", json!("a-000000000032")),
+                ("role", json!("reviewer")),
+                ("scope", json!("conflicting-publication")),
+                ("round", json!(2)),
+            ] {
+                let mut conflict = row.clone();
+                conflict[field] = value;
+                fs::write(&pending, serde_json::to_vec(&conflict)?)?;
+                let generations = Generations::read(&state, dispatch);
+                assert_eq!(
+                    generations.message_boundary().refusal(None, None),
+                    Some(assignment::UNVERIFIED_ASSIGNMENT)
+                );
+                assert!(generations.into_assigned().is_err(), "{field}");
+            }
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(state);
+        result
+    }
+
+    #[test]
+    fn startup_recovery_skips_retired_attempts_in_small_slices() -> Result<()> {
         let state = std::env::temp_dir().join(format!("wfc-startup-slices-{}", Uuid::new_v4()));
         let result = (|| {
             let dir = state.join("dispatches");
@@ -406,57 +474,44 @@ mod tests {
                 .collect();
             write(&state.join("messages.json"), json!(history))?;
 
+            let before = fs::read(state.join("messages.json"))?;
             let mut scan = Scan::default();
             assert!(scan.read(&state, None, Some(scope), || false, 2).is_empty());
             assert!(!scan.in_progress());
-            let mut inbox = Inbox::open(&state)?;
             let mut clock_checks = 0;
-            let timed_slice = scan.read(
-                &state,
-                None,
-                Some(scope),
-                || {
-                    clock_checks += 1;
-                    clock_checks <= 3
-                },
-                16,
-            );
-            assert_eq!(timed_slice.len(), 2);
-            inbox.recover_startups(&mut scan, timed_slice)?;
-            assert_eq!(inbox.messages.len(), prefix.len());
+            assert!(scan
+                .read(
+                    &state,
+                    None,
+                    Some(scope),
+                    || {
+                        clock_checks += 1;
+                        clock_checks <= 3
+                    },
+                    16
+                )
+                .is_empty());
+            assert_eq!(clock_checks, 4);
             for _ in 0..2 {
-                let slice = scan.read(&state, None, Some(scope), || true, 2);
-                assert_eq!(slice.len(), 2);
-                inbox.recover_startups(&mut scan, slice)?;
-                assert_eq!(inbox.messages.len(), prefix.len());
+                assert!(scan.in_progress());
+                assert!(scan.read(&state, None, Some(scope), || true, 2).is_empty());
             }
             assert!(scan.in_progress());
             let slice = scan.read(&state, None, Some(scope), || true, 2);
-            assert_eq!(slice.len(), 1);
-            inbox.recover_startups(&mut scan, slice)?;
+            assert!(slice.is_empty());
             assert!(!scan.in_progress());
-            let messages = inbox.claim(None, Some(scope), super::super::State::Received)?;
-            assert_eq!(messages.len(), 1);
-            assert_eq!(messages[0]["dispatch"], target.as_str());
-            assert_eq!(messages[0]["fault"]["exitCode"], 17);
-            let message_id = messages[0]["messageId"].clone();
-
-            // The next sweep sees the same stamps and does not reopen those
-            // records; a fresh process can discover them but the ledger wins.
-            assert!(scan.read(&state, None, Some(scope), || true, 7).is_empty());
-            drop(inbox);
-            let mut restarted = Scan::default();
-            let slice = restarted.read(&state, Some(target), Some(scope), || true, 2);
             let mut inbox = Inbox::open(&state)?;
-            inbox.recover_startups(&mut restarted, slice)?;
-            assert_eq!(inbox.messages.len(), order.len());
-            assert_eq!(
-                inbox.messages.last().unwrap().message_id,
-                message_id.as_str().unwrap()
-            );
+            inbox.recover_startups(&mut scan, slice)?;
+            assert_eq!(inbox.messages.len(), prefix.len());
             assert!(inbox
                 .claim(None, Some(scope), super::super::State::Received)?
                 .is_empty());
+
+            let mut restarted = Scan::default();
+            assert!(restarted
+                .read(&state, Some(target), Some(scope), || true, 2)
+                .is_empty());
+            assert_eq!(fs::read(state.join("messages.json"))?, before);
             Ok(())
         })();
         let _ = fs::remove_dir_all(state);

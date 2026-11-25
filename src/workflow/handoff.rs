@@ -87,6 +87,9 @@ impl<'a> Handoff<'a> {
                 .with_context(|| format!("unknown native dispatch {}", self.dispatch))
         };
         let initial = read()?;
+        assignment::require_not_tmux_history(&initial)?;
+        // Retire the destination before the source can be closed.
+        ensure!(self.backend != "tmux", "tmux backend is retired");
         let scope = super::record_scope(&initial).context("invalid dispatch scope")?;
         let token = controller::token(self.owner_token);
         let authorize = || -> Result<Value> {
@@ -465,7 +468,7 @@ impl<'a> Handoff<'a> {
                     ))
                 }
             }
-        } else if verified_close(&row, &receipt) {
+        } else if assignment::verified_handoff_close(&row, &receipt) {
             (receipt, closing.clone())
         } else {
             return Ok(unresolved(
@@ -717,17 +720,6 @@ fn unresolved(row: &Value, event: &Value, diagnostic: &str) -> Value {
     result
 }
 
-fn verified_close(row: &Value, closed: &Value) -> bool {
-    closed["result"] == "completed"
-        && closed["resourceCleanup"] == "confirmed"
-        && ["dispatch", "round", "attempt"]
-            .iter()
-            .all(|key| closed[*key] == row[*key])
-        && row["attempt"]
-            .as_str()
-            .is_some_and(|attempt| closed["closeOperationId"] == format!("close:{attempt}"))
-}
-
 fn writer_stopped(
     state: &Path,
     row: &Value,
@@ -868,7 +860,7 @@ fn verify_launch(
             && event["fromRound"]
                 .as_u64()
                 .is_some_and(|round| { event["writerStopEvidence"]["round"] == round.to_string() })
-            && verified_close(&previous, &event["close"]),
+            && assignment::verified_handoff_close(&previous, &event["close"]),
         "original handoff stop or close does not identify this launch"
     );
     if event["fromBackend"] == "herdr" {
