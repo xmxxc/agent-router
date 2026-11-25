@@ -148,11 +148,22 @@ def verify_mixed(binary, root):
     broken, unverified = "d-55555555", "d-66666666"
     current = "a-000000000032"
     first = "a-000000000030"
+    unproven = "a-000000000039"
     identity = dict(dispatch=dispatch, round=1, attempt=current, role="fixture", scope=dispatch)
     audit = [dict(dispatch=dispatch, operation="resume", fromAttempt=first, round=1,
                   attempt=ATTEMPT, toAttempt=ATTEMPT, result="accepted"),
              dict(dispatch=dispatch, operation="handoff", fromBackend="tmux",
                   fromRound=1, fromAttempt=ATTEMPT, round=1, attempt=current,
+                  toAttempt=current, result="accepted", phase="complete",
+                  target={"backend": "herdr"}, oldWriterStopped=True,
+                  priorCreate=dict(dispatch=dispatch, round=1, attempt=ATTEMPT,
+                                   result="accepted", receipt=f"/fixture/{LAUNCH}.json"),
+                  close=dict(dispatch=dispatch, round=1, attempt=ATTEMPT, result="completed",
+                             resourceCleanup="confirmed", closeOperationId=f"close:{ATTEMPT}"),
+                  writerStopEvidence=dict(dispatch=dispatch, round="1", attempt=ATTEMPT,
+                                          launchId=LAUNCH, writerTreeStopped=True)),
+             dict(dispatch=dispatch, operation="handoff", fromBackend="tmux",
+                  fromRound=1, fromAttempt=unproven, round=1, attempt=current,
                   toAttempt=current, result="accepted", phase="complete",
                   target={"backend": "herdr"})]
     rounds = [dict(round=1, attempt=attempt, state="unknown") for attempt in (first, ATTEMPT)]
@@ -180,8 +191,10 @@ def verify_mixed(binary, root):
     healthy = [
         message(24, state="unsent", statusVersion=1, report=str(raw)),
         message(25, state="unsent", statusVersion=1, report=str(raw)),
+        message(28, state="unsent", statusVersion=1, report=str(raw)),
     ]
     healthy[1].update(dispatch=bundled, scope=bundled)
+    healthy[2]["attempt"] = unproven
     damaged = [
         message(26, received=False, report=str(raw)),
         message(27, received=False, report=str(raw)),
@@ -189,11 +202,11 @@ def verify_mixed(binary, root):
     for row, damaged_dispatch in zip(damaged, (broken, unverified), strict=True):
         row.update(dispatch=damaged_dispatch, scope=damaged_dispatch)
     ledger = state / "messages.json"
-    save(ledger, pending + healthy + damaged)
+    save(ledger, pending + healthy[:2] + damaged + healthy[2:])
 
     selected = run(binary, root, state, "status", "--dispatch", dispatch)
-    assert [row["id"] for row in selected["dispatches"][0]["messages"]] == [21, 22, 23, 24]
-    assert [row["id"] for row in selected["undelivered"]] == [24]
+    assert [row["id"] for row in selected["dispatches"][0]["messages"]] == [21, 22, 23, 24, 28]
+    assert [row["id"] for row in selected["undelivered"]] == [24, 28]
     for damaged_dispatch in (broken, unverified):
         view = run(binary, root, state, "status", "--dispatch", damaged_dispatch)
         assert view["undelivered"] == [] and view["dispatches"][0]["messages"]
@@ -209,13 +222,50 @@ def verify_mixed(binary, root):
     assert snapshot(state) == before
 
     received = run(binary, root, state, "wait", "--timeout", "0")["messages"]
-    assert [(m["id"], m["state"]) for m in received] == [(24, "received"), (25, "received")]
+    assert [(m["id"], m["state"]) for m in received] == [(24, "received"), (25, "received"),
+                                                        (28, "received")]
     ack = run(binary, root, state, "ack", 24)
     assert ack["state"] == "processed"
     retained = json.loads(ledger.read_bytes())
-    assert retained[:3] == pending and retained[-2:] == damaged
+    assert retained[:3] == pending and retained[5:7] == damaged
     assert run(binary, root, state, "wait", "--timeout", "0", code=3)["messages"] == []
     print("mixed: retired attempts and damaged reservations preserved, active receipts delivered")
+
+
+def verify_callback_publication(binary, root):
+    state = root / "publication"
+    dispatches = state / "dispatches"
+    dispatches.mkdir(parents=True)
+    dispatch = "d-88888888"
+    attempt = "a-000000000088"
+    report = root / "publication-report.md"
+    report.write_text("ordinary fixture report", encoding="utf-8")
+    row = dict(dispatch=dispatch, round=1, attempt=attempt, scope=dispatch,
+               role="fixture", host="codex", backend="herdr", cwd=str(root), report=str(report))
+    own_identity = {"WFC_DISPATCH": dispatch, "WFC_ROUND": "1", "WFC_ATTEMPT": attempt}
+    pending = dispatches / f"{dispatch}.pending"
+    published = dispatches / f"{dispatch}.json"
+    ask = ("ask", "fixture question", "--attempt", attempt)
+    done = ("done", "--report", report, "--attempt", attempt)
+    save(published, row)
+    save(pending, dict(row, backend="bundled"))
+    before = snapshot(state)
+    for args in (ask, done):
+        diagnostic = run(binary, root, state, *args, code=1, extra=own_identity)
+        assert "cannot verify assignment publication identity" in diagnostic
+        assert snapshot(state) == before
+
+    published.unlink()
+    save(pending, row)
+    question = run(binary, root, state, *ask, extra=own_identity)
+    assert question["state"] == "unsent"
+    save(published, row)
+    completion = run(binary, root, state, *done, extra=own_identity)
+    assert completion["state"] == "unsent"
+    pending.unlink()
+    delivered = run(binary, root, state, "wait", "--dispatch", dispatch, "--timeout", "0")["messages"]
+    assert [m["messageId"] for m in delivered] == [question["messageId"], completion["messageId"]]
+    print("publication: inconsistent generations left untouched, matching callbacks delivered")
 
 
 def verify_sqlite(binary, root):
@@ -242,4 +292,5 @@ if __name__ == "__main__":
         (root / "no-commands").mkdir()
         verify_native(binary, root)
         verify_mixed(binary, root)
+        verify_callback_publication(binary, root)
         verify_sqlite(binary, root)

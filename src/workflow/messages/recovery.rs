@@ -141,6 +141,27 @@ impl Generations {
             .map(|g| &g.row)
     }
 
+    pub(super) fn into_assigned(self) -> Result<Option<Value>> {
+        anyhow::ensure!(!self.damaged, "{}", assignment::UNVERIFIED_ASSIGNMENT);
+        if let Some(published) = self.published {
+            return Ok(Some(published.row));
+        }
+        Ok(self.pending.map(|generation| {
+            let mut row = generation.row;
+            row["createPending"] = Value::Bool(true);
+            row
+        }))
+    }
+
+    pub(super) fn message_boundary(&self) -> assignment::MessageBoundary {
+        if self.damaged {
+            return assignment::MessageBoundary::Unverified;
+        }
+        self.assigned()
+            .map(|row| assignment::MessageBoundary::for_record(row, self.published.is_some()))
+            .unwrap_or_default()
+    }
+
     pub(super) fn stamps(&self) -> GenerationStamps {
         GenerationStamps {
             pending: self.pending.as_ref().map(|g| g.stamp),
@@ -353,6 +374,51 @@ mod tests {
     use super::*;
     use serde_json::json;
     use uuid::Uuid;
+
+    #[test]
+    fn callback_assignment_uses_consistent_publication_generations() -> Result<()> {
+        let state =
+            std::env::temp_dir().join(format!("wfc-publication-generation-{}", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            fs::create_dir_all(&state)?;
+            let dispatch = "d-00000031";
+            let pending = state.join(format!("{dispatch}.pending"));
+            let published = state.join(format!("{dispatch}.json"));
+            let row = json!({"dispatch":dispatch,"round":1,"attempt":"a-000000000031",
+                "scope":"fixture","host":"codex","backend":"herdr"});
+            fs::write(&pending, serde_json::to_vec(&row)?)?;
+            let generations = Generations::read(&state, dispatch);
+            assert!(generations.message_boundary().refusal(None, None).is_none());
+            assert_eq!(generations.into_assigned()?.unwrap()["createPending"], true);
+
+            let mut current = row.clone();
+            current["create"] = json!({"result":"accepted"});
+            fs::write(&published, serde_json::to_vec(&current)?)?;
+            assert_eq!(
+                Generations::read(&state, dispatch).into_assigned()?,
+                Some(current)
+            );
+
+            for (field, value) in [
+                ("backend", json!("bundled")),
+                ("scope", json!("conflicting-publication")),
+                ("round", json!(2)),
+            ] {
+                let mut conflict = row.clone();
+                conflict[field] = value;
+                fs::write(&pending, serde_json::to_vec(&conflict)?)?;
+                let generations = Generations::read(&state, dispatch);
+                assert_eq!(
+                    generations.message_boundary().refusal(None, None),
+                    Some(assignment::UNVERIFIED_ASSIGNMENT)
+                );
+                assert!(generations.into_assigned().is_err(), "{field}");
+            }
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(state);
+        result
+    }
 
     #[test]
     fn startup_recovery_skips_retired_attempts_in_small_slices() -> Result<()> {

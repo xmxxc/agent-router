@@ -88,12 +88,15 @@ pub(super) enum MessageBoundary {
 }
 
 impl MessageBoundary {
-    pub(super) fn for_record(row: &Value) -> Self {
+    pub(super) fn for_record(row: &Value, published: bool) -> Self {
         if tmux_history(row) {
             return Self::Retired;
         }
         if !row["publicationDiagnostic"].is_null() {
             return Self::Unverified;
+        }
+        if !published {
+            return Self::Open;
         }
         let retired = retired_attempts(row);
         if retired.is_empty() {
@@ -127,6 +130,57 @@ fn receipt_attempt<'a>(round: &Value, attempt: &'a Value) -> Option<(u64, &'a st
     let round = round.as_u64().filter(|round| *round > 0)?;
     let attempt = attempt.as_str().filter(|id| valid_identity(id, "a-"))?;
     Some((round, attempt))
+}
+
+pub(super) fn verified_handoff_close(row: &Value, closed: &Value) -> bool {
+    closed["result"] == "completed"
+        && closed["resourceCleanup"] == "confirmed"
+        && ["dispatch", "round", "attempt"]
+            .iter()
+            .all(|key| closed[*key] == row[*key])
+        && row["attempt"]
+            .as_str()
+            .is_some_and(|attempt| closed["closeOperationId"] == format!("close:{attempt}"))
+}
+
+fn published_handoff_from_tmux(
+    row: &Value,
+    event: &Value,
+    source: (u64, &str),
+    target: (u64, &str),
+    target_backend: &str,
+) -> bool {
+    if !matches!(
+        (event["phase"].as_str(), event["result"].as_str()),
+        (Some("starting"), Some("pending" | "uncertain")) | (Some("complete"), Some("accepted"))
+    ) || event["oldWriterStopped"] != true
+    {
+        return false;
+    }
+    let is_current_target = receipt_attempt(&row["round"], &row["attempt"]) == Some(target);
+    let published_target = if is_current_target {
+        row["backend"] == target_backend
+    } else {
+        row["rounds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|round| receipt_attempt(&round["round"], &round["attempt"]) == Some(target))
+    };
+    if !published_target {
+        return false;
+    }
+    let prior = json!({"dispatch":row["dispatch"], "round":source.0,"attempt":source.1,
+        "executionId":source.1,"create":event["priorCreate"]});
+    let stop = &event["writerStopEvidence"];
+    verified_handoff_close(&prior, &event["close"])
+        && event["priorCreate"]["result"] == "accepted"
+        && stop["writerTreeStopped"] == true
+        && stop["dispatch"] == row["dispatch"]
+        && stop["attempt"] == source.1
+        && stop["round"] == source.0.to_string()
+        && super::backend::receipt_id(&prior)
+            .is_ok_and(|launch| launch.is_some_and(|launch| stop["launchId"] == launch))
 }
 
 fn retired_attempts(row: &Value) -> Vec<(u64, String)> {
@@ -166,11 +220,31 @@ fn retired_attempts(row: &Value) -> Vec<(u64, String)> {
         if source == target || current == Some(source) {
             continue;
         }
-        let tmux_handoff = op == Some("handoff") && event["fromBackend"] == "tmux";
-        let same_backend = event["fromBackend"].is_null()
-            && (matches!(op, Some("continue" | "resume"))
-                || (op == Some("handoff") && event["target"].is_null()));
-        if tmux_handoff || (same_backend && retired.contains(&target)) {
+        let retired_source = match op {
+            Some("handoff")
+                if event["fromBackend"] == "tmux" && event["target"]["backend"] == "herdr" =>
+            {
+                published_handoff_from_tmux(row, event, source, target, "herdr")
+            }
+            Some("handoff")
+                if event["fromBackend"].is_null()
+                    && event["target"].is_null()
+                    && retired.contains(&target) =>
+            {
+                published_handoff_from_tmux(row, event, source, target, "tmux")
+            }
+            Some("continue" | "resume")
+                if event["fromBackend"].is_null() && retired.contains(&target) =>
+            {
+                event["result"] == "accepted"
+                    && !matches!(
+                        event["launchResult"].as_str(),
+                        Some("refused" | "definitely-not-sent")
+                    )
+            }
+            _ => false,
+        };
+        if retired_source {
             retired.insert(source);
         }
     }
@@ -371,47 +445,118 @@ mod tests {
         }
     }
 
-    #[test]
-    fn handoff_receipts_are_classified_by_original_round_and_attempt() {
+    fn tmux_handoff_history() -> Value {
         let dispatch = "d-00000031";
         let first = "a-000000000030";
         let previous = "a-000000000031";
         let current = "a-000000000032";
         let older_herdr = "a-000000000029";
-        let mut row = json!({"dispatch":dispatch,"round":2,"attempt":current,"backend":"herdr",
-            "rounds":[{"round":1,"attempt":first},{"round":1,"attempt":previous}],
-            "audit":[
-                {"operation":"handoff","dispatch":dispatch,"fromBackend":"herdr",
-                 "fromRound":1,"fromAttempt":older_herdr,"round":1,"attempt":first,"toAttempt":first},
-                {"operation":"resume","dispatch":dispatch,
-                 "fromAttempt":first,"round":1,"attempt":previous,"toAttempt":previous},
-                {"operation":"handoff","dispatch":dispatch,"fromBackend":"tmux",
-                 "fromRound":1,"fromAttempt":previous,"round":2,"attempt":current,"toAttempt":current}]});
-        for backend in ["herdr", "bundled"] {
-            row["backend"] = json!(backend);
-            let boundary = MessageBoundary::for_record(&row);
-            assert_eq!(
-                boundary.refusal(Some(1), Some(previous)),
-                Some(TMUX_HISTORY_ONLY)
-            );
-            assert_eq!(boundary.refusal(Some(2), Some(previous)), None);
-            assert_eq!(
-                boundary.refusal(Some(1), Some(first)),
-                Some(TMUX_HISTORY_ONLY)
-            );
-            assert_eq!(boundary.refusal(Some(1), Some(older_herdr)), None);
-            assert_eq!(boundary.refusal(Some(1), Some(current)), None);
-            assert_eq!(boundary.refusal(Some(2), Some(current)), None);
-        }
-        row["audit"][2]["dispatch"] = json!("d-00000032");
+        let launch = "1".repeat(32);
+        json!({"dispatch":dispatch,"round":2,"attempt":current,"backend":"herdr",
+        "rounds":[{"round":1,"attempt":first},{"round":1,"attempt":previous},
+                  {"round":2,"attempt":current}],
+        "audit":[
+            {"operation":"handoff","dispatch":dispatch,"fromBackend":"herdr",
+             "fromRound":1,"fromAttempt":older_herdr,"round":1,"attempt":first,"toAttempt":first},
+            {"operation":"resume","dispatch":dispatch,"result":"accepted",
+             "fromAttempt":first,"round":1,"attempt":previous,"toAttempt":previous},
+            {"operation":"handoff","dispatch":dispatch,"fromBackend":"tmux",
+             "fromRound":1,"fromAttempt":previous,"round":2,"attempt":current,"toAttempt":current,
+             "target":{"backend":"herdr"},"phase":"complete","result":"accepted","oldWriterStopped":true,
+             "priorCreate":{"dispatch":dispatch,"round":1,"attempt":previous,"result":"accepted",
+                            "receipt":format!("/fixture/{launch}.json")},
+             "close":{"dispatch":dispatch,"round":1,"attempt":previous,"result":"completed",
+                      "resourceCleanup":"confirmed","closeOperationId":format!("close:{previous}")},
+             "writerStopEvidence":{"dispatch":dispatch,"round":"1","attempt":previous,
+                                   "launchId":launch,"writerTreeStopped":true}}
+        ]})
+    }
+
+    #[test]
+    fn handoff_receipts_are_classified_by_original_round_and_attempt() {
+        let first = "a-000000000030";
+        let previous = "a-000000000031";
+        let current = "a-000000000032";
+        let mut row = tmux_handoff_history();
+        let boundary = MessageBoundary::for_record(&row, true);
         assert_eq!(
-            MessageBoundary::for_record(&row).refusal(Some(1), Some(previous)),
-            None
+            boundary.refusal(Some(1), Some(previous)),
+            Some(TMUX_HISTORY_ONLY)
         );
+        assert_eq!(boundary.refusal(Some(2), Some(previous)), None);
+        assert_eq!(
+            boundary.refusal(Some(1), Some(first)),
+            Some(TMUX_HISTORY_ONLY)
+        );
+        assert_eq!(boundary.refusal(Some(1), Some("a-000000000029")), None);
+        assert_eq!(boundary.refusal(Some(2), Some(current)), None);
+
+        let bundled = "a-000000000033";
+        row["backend"] = json!("bundled");
+        row["round"] = json!(3);
+        row["attempt"] = json!(bundled);
+        let boundary = MessageBoundary::for_record(&row, true);
+        assert_eq!(
+            boundary.refusal(Some(1), Some(first)),
+            Some(TMUX_HISTORY_ONLY)
+        );
+        assert_eq!(boundary.refusal(Some(3), Some(bundled)), None);
         row["publicationDiagnostic"] = json!("identity unavailable");
         assert_eq!(
-            MessageBoundary::for_record(&row).refusal(Some(2), Some(current)),
+            MessageBoundary::for_record(&row, true).refusal(Some(3), Some(bundled)),
             Some(UNVERIFIED_ASSIGNMENT)
         );
+    }
+
+    #[test]
+    fn handoff_archive_requires_a_published_target_and_proven_stop() {
+        let attempt = "a-000000000031";
+        let earlier = "a-000000000030";
+        let mut row = tmux_handoff_history();
+        let refused = |record: &Value| {
+            MessageBoundary::for_record(record, true).refusal(Some(1), Some(attempt))
+        };
+
+        row["audit"][2]["phase"] = json!("starting");
+        for result in ["pending", "uncertain"] {
+            row["audit"][2]["result"] = json!(result);
+            assert_eq!(refused(&row), Some(TMUX_HISTORY_ONLY));
+        }
+        assert_eq!(
+            MessageBoundary::for_record(&row, false).refusal(Some(1), Some(attempt)),
+            None
+        );
+        for (field, value) in [
+            ("dispatch", json!("d-00000032")),
+            ("phase", json!("closing")),
+            ("result", json!("refused")),
+            ("oldWriterStopped", json!(false)),
+            ("close", Value::Null),
+            ("writerStopEvidence", Value::Null),
+        ] {
+            let mut invalid = row.clone();
+            invalid["audit"][2][field] = value;
+            assert_eq!(refused(&invalid), None, "{field}");
+        }
+        let mut invalid = row.clone();
+        invalid["audit"][2]["writerStopEvidence"]["launchId"] = json!("0".repeat(32));
+        assert_eq!(refused(&invalid), None);
+        invalid = row.clone();
+        invalid["audit"][2]["close"]["closeOperationId"] = json!("close:other");
+        assert_eq!(refused(&invalid), None);
+        invalid = row.clone();
+        invalid["audit"][2]["attempt"] = json!("a-000000000039");
+        invalid["audit"][2]["toAttempt"] = json!("a-000000000039");
+        assert_eq!(refused(&invalid), None);
+
+        for result in ["refused", "definitely-not-sent", "pending"] {
+            row["audit"][1]["result"] = json!(result);
+            let boundary = MessageBoundary::for_record(&row, true);
+            assert_eq!(
+                boundary.refusal(Some(1), Some(attempt)),
+                Some(TMUX_HISTORY_ONLY)
+            );
+            assert_eq!(boundary.refusal(Some(1), Some(earlier)), None);
+        }
     }
 }

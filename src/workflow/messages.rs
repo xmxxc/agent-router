@@ -207,18 +207,11 @@ pub(super) fn message_boundary(dir: &Path, dispatch: &str) -> MessageBoundary {
     }
     #[cfg(target_os = "linux")]
     {
-        let generations = recovery::Generations::read(dir, dispatch);
-        if generations.damaged {
-            return MessageBoundary::Unverified;
-        }
-        generations
-            .assigned()
-            .map(MessageBoundary::for_record)
-            .unwrap_or_default()
+        recovery::Generations::read(dir, dispatch).message_boundary()
     }
     #[cfg(not(target_os = "linux"))]
     match super::assignment::public_record(dir, dispatch) {
-        Ok(Some(row)) => MessageBoundary::for_record(&row),
+        Ok(Some(row)) => MessageBoundary::for_record(&row, row["createPending"] != true),
         Ok(None) => MessageBoundary::Open,
         Err(_) => MessageBoundary::Unverified,
     }
@@ -241,13 +234,26 @@ struct Assignment {
 impl Assignment {
     fn read(state: &Path, dispatch: &str) -> Result<(Self, Value)> {
         let dir = state.join("dispatches");
-        let (file, path) = super::assignment::open_assignment(&dir, dispatch)
-            .with_context(|| format!("open dispatch {dispatch}"))?;
-        let mut row = super::decode_record(file, &path)?;
-        if path.extension().is_some_and(|ext| ext == "pending") {
-            row["createPending"] = json!(true);
-        }
+        #[cfg(target_os = "linux")]
+        let row = recovery::Generations::read(&dir, dispatch)
+            .into_assigned()?
+            .with_context(|| format!("open dispatch {dispatch}: missing assignment"))?;
+        #[cfg(not(target_os = "linux"))]
+        let row = {
+            let (file, path) = super::assignment::open_assignment(&dir, dispatch)
+                .with_context(|| format!("open dispatch {dispatch}"))?;
+            let mut row = super::decode_record(file, &path)?;
+            if path.extension().is_some_and(|ext| ext == "pending") {
+                row["createPending"] = json!(true);
+            }
+            row
+        };
         super::assignment::require_not_tmux_history(&row)?;
+        ensure!(
+            row["publicationDiagnostic"].is_null(),
+            "{}",
+            super::assignment::UNVERIFIED_ASSIGNMENT
+        );
         let assignment = Self::deserialize(&row).context("read worker assignment identity")?;
         ensure!(row["legacyArchived"] != true, "offline legacy assignment has no writable worker");
         ensure!(
@@ -255,6 +261,25 @@ impl Assignment {
             "controller owner authorization required for {dispatch}"
         );
         Ok((assignment, row))
+    }
+
+    fn open_for_callback(
+        state: &Path,
+        dispatch: &str,
+        attempt: Option<&str>,
+        reference: Option<&str>,
+    ) -> Result<(Inbox, Self, Value)> {
+        // Check before creating the ledger lock, then reselect under the lock.
+        // A matching reservation may be promoted between the two reads.
+        let (before, _) = Self::current(state, dispatch, attempt, reference)?;
+        let inbox = Inbox::open(state)?;
+        let (assignment, row) = Self::current(state, dispatch, attempt, reference)?;
+        ensure!(
+            before.worker == assignment.worker,
+            "{}",
+            super::assignment::UNVERIFIED_ASSIGNMENT
+        );
+        Ok((inbox, assignment, row))
     }
 
     fn current(
@@ -1910,12 +1935,10 @@ impl<'a> Done<'a> {
         let dispatch = env::var("WFC_DISPATCH")
             .context("run done inside a dispatched worker (WFC_DISPATCH)")?;
         ensure!(valid_id(&dispatch), "invalid dispatch ID");
-        reject_tmux_history(&state, &dispatch)?;
         let token = controller::token(self.owner_token);
         let check = || {
-            let inbox = Inbox::open(&state)?;
-            let (assignment, row) =
-                Assignment::current(&state, &dispatch, self.attempt, self.reference)?;
+            let (inbox, assignment, row) =
+                Assignment::open_for_callback(&state, &dispatch, self.attempt, self.reference)?;
             assignment.authorize_callback(
                 &state,
                 token.as_deref(),
@@ -2035,7 +2058,6 @@ impl<'a> Ask<'a> {
         let dispatch = env::var("WFC_DISPATCH")
             .context("run ask inside a dispatched worker (WFC_DISPATCH)")?;
         ensure!(valid_id(&dispatch), "invalid dispatch ID");
-        reject_tmux_history(&state, &dispatch)?;
         let payload = Question {
             text: self.question.to_owned(),
             options: self
@@ -2053,9 +2075,8 @@ impl<'a> Ask<'a> {
             .or_else(|| attempt.map(|id| format!("ask:{dispatch}:{id}:{}", payload.key_suffix())));
         let token = controller::token(self.owner_token);
         let check = || -> Result<_> {
-            let inbox = Inbox::open(&state)?;
-            let (assignment, row) =
-                Assignment::current(&state, &dispatch, attempt, self.reference)?;
+            let (inbox, assignment, row) =
+                Assignment::open_for_callback(&state, &dispatch, attempt, self.reference)?;
             if self.attempt == Some("") && controller::worker_callback().is_some() {
                 return Err(controller::invalid_worker_callback("ask").into());
             }

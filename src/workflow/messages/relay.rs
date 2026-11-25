@@ -503,10 +503,7 @@ fn scope_assignments(
             Some(proof) => proof,
             None => {
                 let generations = Generations::read(&dir, &id);
-                let boundary = generations
-                    .assigned()
-                    .map(MessageBoundary::for_record)
-                    .unwrap_or_default();
+                let boundary = generations.message_boundary();
                 for row in generations.rows() {
                     if !crate::workflow::assignment::tmux_history(row)
                         && !row["controllerOwner"].is_null()
@@ -600,13 +597,21 @@ mod tests {
             let dispatch = "d-00000031";
             let previous = "a-000000000031";
             let current = "a-000000000032";
+            let launch = "1".repeat(32);
             let dir = state.join("dispatches");
             fs::create_dir_all(&dir)?;
             let assignment = json!({"dispatch":dispatch,"round":1,"attempt":current,
                 "host":"codex","role":"fixture","scope":dispatch,"backend":"herdr",
                 "audit":[{"operation":"handoff","dispatch":dispatch,"fromBackend":"tmux",
                           "fromRound":1,"fromAttempt":previous,"round":1,
-                          "attempt":current,"toAttempt":current}]});
+                          "attempt":current,"toAttempt":current,"target":{"backend":"herdr"},
+                          "phase":"complete","result":"accepted","oldWriterStopped":true,
+                          "priorCreate":{"dispatch":dispatch,"round":1,"attempt":previous,
+                                         "result":"accepted","receipt":format!("/fixture/{launch}.json")},
+                          "close":{"dispatch":dispatch,"round":1,"attempt":previous,"result":"completed",
+                                   "resourceCleanup":"confirmed","closeOperationId":format!("close:{previous}")},
+                          "writerStopEvidence":{"dispatch":dispatch,"round":"1","attempt":previous,
+                                                "launchId":launch,"writerTreeStopped":true}}]});
             let previous_message = json!({"dispatch":dispatch,"round":1,"attempt":previous,
                 "role":"fixture","id":1,"messageId":"m-legacy","received":false,"report":"old"});
             let current_message = json!({"dispatch":dispatch,"round":1,"attempt":current,
