@@ -2,8 +2,11 @@
 mod progress;
 
 use super::{message_boundary, Assignment, Identity, Inbox};
-use crate::workflow::{assignment, backend, decode_record, startup, valid_id};
-use anyhow::{Context, Result};
+use crate::workflow::{
+    assignment, backend, controller, decode_record, ensure_state_writable, record_scope, startup,
+    valid_id,
+};
+use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
@@ -291,6 +294,72 @@ fn generation(worker: &Identity) -> (&str, u64, &str) {
 }
 
 impl Inbox {
+    // Continue holds both the scope and execution locks as well as this Inbox.
+    pub(in crate::workflow) fn finish_continue_publication(
+        &self,
+        id: &str,
+        current: &Value,
+        token: Option<&str>,
+    ) -> Result<()> {
+        let dir = self.dir.join("dispatches");
+        let generations = Generations::read(&dir, id);
+        ensure!(
+            generations.published() == Some(current),
+            "{}",
+            assignment::UNVERIFIED_ASSIGNMENT
+        );
+        let Some(pending) = &generations.pending else {
+            return Ok(());
+        };
+        let reserved = &pending.row;
+        let create = &current["create"];
+        // Launch evidence and ledger history belong to the published record.
+        // Apart from those additions, require the whole original reservation.
+        let published_only = ["create", "backendHandle", "audit", "rounds", "messages"];
+        ensure!(
+            current["round"] == 1
+                && current["publicationDiagnostic"].is_null()
+                && current["created"].is_number()
+                && reserved["worker"] == serde_json::json!({"state":"running"})
+                && current["worker"]["state"] == "running"
+                && reserved["createPending"].is_null()
+                && reserved["host"] == current["host"]
+                && reserved[controller::CALLBACK_HASH] == current[controller::CALLBACK_HASH]
+                && create["result"] == "accepted"
+                && ["dispatch", "round", "attempt"]
+                    .iter()
+                    .all(|&key| create[key] == current[key])
+                && ["scope", "role", "cwd", "task", "report"]
+                    .iter()
+                    .all(|&key| reserved[key].as_str().is_some_and(|s| !s.is_empty()))
+                && reserved.as_object().is_some_and(|fields| fields
+                    .iter()
+                    .all(|(key, value)| !published_only.contains(&key.as_str())
+                        && (key == "worker" || current.get(key) == Some(value))))
+                && current
+                    .as_object()
+                    .is_some_and(|fields| fields
+                        .iter()
+                        .all(|(key, value)| published_only.contains(&key.as_str())
+                            || key == "worker"
+                            || reserved.get(key) == Some(value))),
+            "{}",
+            assignment::UNVERIFIED_ASSIGNMENT
+        );
+        // The launcher may have stopped before syncing its published entry.
+        // Make that entry durable before removing the original reservation.
+        super::sync_directory(&dir)?;
+        ensure_state_writable(&self.dir)?;
+        let scope = record_scope(current).context("invalid dispatch scope")?;
+        controller::Owners::read(&self.dir)?.require(scope, token, "continue")?;
+        ensure!(
+            generations.stamps().current(&dir, id),
+            "{}",
+            assignment::UNVERIFIED_ASSIGNMENT
+        );
+        assignment::finish_publication(&dir.join(format!("{id}.pending")))
+    }
+
     pub(super) fn recover_startups(
         &mut self,
         scan: &mut Scan,
