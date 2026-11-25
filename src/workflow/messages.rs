@@ -936,6 +936,11 @@ impl PublishLock {
     }
 
     #[cfg(target_os = "linux")]
+    pub(super) fn unresolved_resume_reply(&self, row: &Value) -> Result<bool> {
+        Inbox::find_unresolved_reply(&Inbox::snapshot(self.dir())?, row, None)
+    }
+
+    #[cfg(target_os = "linux")]
     pub(super) fn release_for_bundled_close(&self) -> Result<()> {
         Ok(self._file.unlock()?)
     }
@@ -1482,12 +1487,21 @@ impl Inbox {
 
     #[cfg(target_os = "linux")]
     pub(super) fn unresolved_reply(&self, row: &Value, except: Option<&str>) -> Result<bool> {
+        Self::find_unresolved_reply(&self.messages, row, except)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn find_unresolved_reply(
+        messages: &[Message],
+        row: &Value,
+        except: Option<&str>,
+    ) -> Result<bool> {
         if !matches!(row["backend"].as_str(), Some("tmux" | "bundled")) {
             return Ok(false);
         }
         let physical = super::backend::execution_row(row)?;
         let launch_round = physical["round"].as_u64();
-        Ok(self.messages.iter().any(|message| {
+        Ok(messages.iter().any(|message| {
             message.worker.dispatch == row["dispatch"]
                 && except != Some(message.message_id.as_str())
                 && message.reply_payload.as_ref().is_some_and(|reply| {

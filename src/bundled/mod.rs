@@ -353,6 +353,35 @@ fn open_write_unit(state: &Path, name: &str) -> Result<(PathBuf, File)> {
     Ok((unit, lock_for_write(state, guard)?))
 }
 
+pub(crate) fn apply_resume_cleanup(state: &Path, ticket: &Value, expected: &Value) -> Result<()> {
+    let (unit, _guard) = open_write_unit(state, field(ticket, "unit")?)?;
+    let (current, store) = store::current(&unit)?.context("missing original bundled execution")?;
+    ensure!(
+        &store.ticket == ticket && ticket["version"] == 2 && store::ordered(&unit, &store)?,
+        "bundled execution changed before resume"
+    );
+    let proof = store.current_proof()?;
+    ensure!(
+        &proof == expected && matches!(proof["state"].as_str(), Some("closed" | "exited")),
+        "original bundled cleanup could not be verified"
+    );
+    let applied = store.reconcile(&unit.join("current.json"), current, proof)?;
+    ensure!(
+        applied["result"] == "completed",
+        "original bundled cleanup is not settled"
+    );
+    Ok(())
+}
+
+pub(crate) fn confirm_resume_start(state: &Path, ticket: &Value, identity: &Value) -> Result<bool> {
+    let (unit, _guard) = open_unit(state, field(ticket, "unit")?)?;
+    let (_, store) = store::current(&unit)?.context("missing bundled replacement")?;
+    Ok(identity.is_object()
+        && &store.ticket == ticket
+        && store::ordered(&unit, &store)?
+        && store.signed("ready")? == *identity)
+}
+
 fn operation_unit(state: &Path, name: &str, op: &str) -> Result<(PathBuf, File)> {
     if matches!(op, "close" | "input" | "resize" | "reconcile") {
         open_write_unit(state, name)
@@ -811,12 +840,28 @@ pub(crate) fn ticket_cleanup_fixture(
     attempt: &str,
     cleaned: bool,
 ) -> Result<(Value, PathBuf)> {
+    let (ticket, cleanup, _) = resume_ticket_fixture(state, unit, attempt, cleaned, false)?;
+    Ok((ticket, cleanup))
+}
+
+#[cfg(test)]
+pub(crate) fn resume_ticket_fixture(
+    state: &Path,
+    unit: &str,
+    attempt: &str,
+    cleaned: bool,
+    managed: bool,
+) -> Result<(Value, PathBuf, Value)> {
     let unit_path = unit_dir(state, unit)?;
-    create_lock_file(&unit_path)?;
+    let _guard = lock_for_write(state, create_lock_file(&unit_path)?)?;
+    let previous = store::current(&unit_path)?;
     let token = fresh();
     let generation = fresh();
-    let ticket = json!({"version":2,"unit":unit,"attempt":attempt,"generation":generation,
+    let mut ticket = json!({"version":2,"unit":unit,"attempt":attempt,"generation":generation,
         "nonce":fresh(),"capabilityHash":store::digest(token.as_bytes())});
+    if managed {
+        ticket["startupProtocol"] = json!(1);
+    }
     let run = unit_path.join(generation);
     store::private_dir(&run)?;
     publish(&run.join("key.json"), &json!(token))?;
@@ -824,18 +869,30 @@ pub(crate) fn ticket_cleanup_fixture(
     let process = store::identity(std::process::id())?;
     let index = json!({"ticket":ticket,"applied":false,"creator":process,"pending_until_ms":1});
     store::publish_current(&run.join("index.json"), index.clone(), &store)?;
+    if let Some((current, prior)) = previous {
+        ensure!(
+            prior.replaceable(&current),
+            "fixture requires applied cleanup"
+        );
+        prior.save_signed("superseded", json!({"generation":ticket["generation"]}))?;
+    }
     store::publish_current(&unit_path.join("current.json"), index, &store)?;
     let ready = json!({"guardian":process,"service":process,"kernel":process,"worker":process,
         "endpoint":42,"kernel_generation":fresh(),
         "containment":{"kind":"cgroup-v2","path":"/fixture","device":1,"inode":2}});
-    store.save_signed("ready", ready.clone())?;
+    if managed {
+        store.save_signed("prepared", ready.clone())?;
+        store.commit_ready(&ready, || Ok(()))?;
+    } else {
+        store.save_signed("ready", ready.clone())?;
+    }
     if cleaned {
         store.save_signed(
             "cleanup",
             json!({"state":"closed","proves":"execution-empty","identity":ready}),
         )?;
     }
-    Ok((ticket, run.join("cleanup.json")))
+    Ok((ticket, run.join("cleanup.json"), ready))
 }
 
 #[cfg(test)]

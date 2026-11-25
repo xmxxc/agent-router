@@ -19,22 +19,10 @@ use std::{
 pub(super) fn create(
     state: &Path,
     row: &Value,
-    mut launch: Launch,
+    launch: Launch,
     owner: Option<&str>,
 ) -> Result<Value> {
-    for (name, value) in env::vars_os() {
-        let name = name
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("invalid environment name"))?;
-        if !controller::is_credential(&name) && !launch.env.contains_key(&name) {
-            launch.env.insert(
-                name,
-                json!(value.to_str().context("invalid worker environment")?),
-            );
-        }
-    }
-    let request = json!({"op":"create","unit":row["dispatch"],"attempt":row["attempt"],
-        "cwd":row["cwd"],"argv":launch.argv,"env":launch.env});
+    let request = launch_request(row, launch)?;
     let answer = if row["bundledStartupCommit"] == true {
         // The original dispatch CLI is the only process that may commit ready.
         Some(crate::bundled::create(state, &request, || {
@@ -68,6 +56,96 @@ pub(super) fn create(
         create_in_backend(state, &request)?
     };
     launch_answer(answer)
+}
+
+fn launch_request(row: &Value, mut launch: Launch) -> Result<Value> {
+    for (name, value) in env::vars_os() {
+        let name = name
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("invalid environment name"))?;
+        if !controller::is_credential(&name) && !launch.env.contains_key(&name) {
+            launch.env.insert(
+                name,
+                json!(value.to_str().context("invalid worker environment")?),
+            );
+        }
+    }
+    Ok(
+        json!({"op":"create","unit":row["dispatch"],"attempt":row["attempt"],
+        "cwd":row["cwd"],"argv":launch.argv,"env":launch.env}),
+    )
+}
+
+pub(in crate::workflow) fn observe_for_resume(state: &Path, row: &Value) -> Result<(Value, Value)> {
+    let ticket = registered_ticket(row)?;
+    ensure!(
+        ticket["version"] == 2
+            && ticket["attempt"] == row["attempt"]
+            && (ticket["startupProtocol"] == 1) == (row["bundledStartupCommit"] == true)
+            && env::var_os("WFC_BUNDLED_CGROUP_ROOT").is_none()
+                == (row["bundledStartupCommit"] == true)
+            && ["dispatch", "round", "attempt"]
+                .iter()
+                .all(|&key| row["create"][key] == row[key]),
+        "unverified original bundled launch"
+    );
+    let (bound, intent) = binding(state, row, &bundled_close_path(state, row)?)?;
+    ensure!(
+        &bound == ticket && (intent.is_some() || !close_blocks_callback(state, row)?),
+        "cannot verify the original bundled close intent"
+    );
+    // This operation reads the signed cleanup for the exact current ticket
+    // without contacting a runtime or applying cleanup.
+    let answer = crate::bundled::assignment_operation(state, ticket, "cleanup-receipt").0;
+    ensure!(
+        answer["result"] == "completed"
+            && answer["ticket"] == *ticket
+            && answer["proof"]["proves"] == "execution-empty"
+            && matches!(answer["proof"]["state"].as_str(), Some("closed" | "exited")),
+        "original bundled execution has no verified stop receipt"
+    );
+    let worker = terminal_worker(&answer).context("missing original bundled worker outcome")?;
+    let mut inspection = evidence(&answer);
+    inspection["alive"] = json!(false);
+    Ok((worker, inspection))
+}
+
+// Resume already holds the scope and old execution locks. The published
+// attempt and Inbox lock fence readiness for the replacement.
+pub(in crate::workflow) fn resume(
+    state: &Path,
+    row: &Value,
+    previous: &Value,
+    launch: Launch,
+    owner: Option<&str>,
+) -> Result<Value> {
+    let mut request = launch_request(row, launch)?;
+    let ticket = &previous["ticket"];
+    let scope = record_scope(row).context("invalid dispatch scope")?;
+    let authorize = || -> Result<()> {
+        controller::Owners::read(state)?.require(scope, owner, "resume")?;
+        Ok(())
+    };
+    authorize()?;
+    crate::bundled::apply_resume_cleanup(state, ticket, &previous["proof"])?;
+    authorize()?;
+    request["previous"] = ticket.clone();
+    let id = row["dispatch"]
+        .as_str()
+        .context("missing bundled dispatch ID")?;
+    let answer = crate::bundled::create(state, &request, || {
+        let Some(ledger) = messages::try_lock_for_publish(state)? else {
+            return Ok(None);
+        };
+        authorize()?;
+        ensure!(
+            messages::read_callback_record(&state.join("dispatches"), id)? == *row
+                && !close_blocks_callback(state, row)?,
+            "bundled resume changed before ready"
+        );
+        Ok(Some((ledger, authorize)))
+    })?;
+    launch_answer(Some(answer))
 }
 
 fn create_in_backend(state: &Path, request: &Value) -> Result<Option<Value>> {
