@@ -27,32 +27,36 @@ jobs:
         run: |
           test "$(id -u)" -gt 0
           unit="wfc-ci-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          sudo systemd-run --unit="$unit" --wait --pipe --collect             --property=Type=exec --property="User=$(id -un)" --property=Delegate=yes             /usr/bin/bash -euo pipefail -c '
-              expected_uid=$1
-              test "$(id -u)" = "$expected_uid"
-              test "$expected_uid" -gt 0
-              IFS= read -r membership < "/proc/$$/cgroup"
-              [[ "$membership" == 0::/system.slice/wfc-ci-probe-*.service ]]
-              group=${membership#0::}
-              root="/sys/fs/cgroup$group"
-              printf "Probe UID: %s\nDelegated cgroup: %s\n" "$expected_uid" "$group"
-              test -w "$root"
-              test -w "$root/cgroup.procs"
-              test -e "$root/cgroup.kill"
-              test -c /dev/ptmx
-              printf "Delegated controllers: "
-              cat "$root/cgroup.controllers"
-              child="$root/wfc-probe"
-              mkdir -- "$child"
-              trap '\''rmdir -- "$child"'\'' EXIT
-              test -w "$child/cgroup.procs"
-              test -w "$child/cgroup.kill"
-              /usr/bin/bash -eu -c '\''
-                printf "%s\n" "$$" > "$1/cgroup.procs"
-                IFS= read -r observed < "/proc/$$/cgroup"
-                test "$observed" = "0::$2"
-              '\'' probe-child "$child" "$group/wfc-probe"
-              rmdir -- "$child"
-              trap - EXIT
-              printf "WFC_DELEGATED_USER_PASS\n"
-            ' probe-service "$(id -u)"
+          probe=$(mktemp "$RUNNER_TEMP/wfc-probe.XXXXXXXX.sh")
+          cat > "$probe" <<'PROBE'
+          expected_uid=$1
+          test "$(id -u)" = "$expected_uid"
+          test "$expected_uid" -gt 0
+          IFS= read -r membership < "/proc/$$/cgroup"
+          [[ "$membership" == 0::/system.slice/wfc-ci-probe-*.service ]]
+          group=${membership#0::}
+          root="/sys/fs/cgroup$group"
+          printf 'Probe UID: %s\nDelegated cgroup: %s\n' "$expected_uid" "$group"
+          test -w "$root" || { echo 'Delegated root is not writable'; exit 1; }
+          test -w "$root/cgroup.procs" || { echo 'Delegated cgroup.procs is not writable'; exit 1; }
+          test -e "$root/cgroup.kill" || { echo 'Delegated cgroup.kill is missing'; exit 1; }
+          test -c /dev/ptmx
+          printf 'Delegated controllers: '
+          cat "$root/cgroup.controllers"
+          child="$root/wfc-probe"
+          mkdir -- "$child"
+          trap 'rmdir -- "$child"' EXIT
+          test -w "$child/cgroup.procs" || { echo 'Probe cgroup.procs is not writable'; exit 1; }
+          test -w "$child/cgroup.kill" || { echo 'Probe cgroup.kill is not writable'; exit 1; }
+          /usr/bin/bash -eu -c '
+            printf "%s\n" "$$" > "$1/cgroup.procs"
+            IFS= read -r observed < "/proc/$$/cgroup"
+            test "$observed" = "0::$2"
+          ' probe-child "$child" "$group/wfc-probe"
+          rmdir -- "$child"
+          trap - EXIT
+          printf 'WFC_DELEGATED_USER_PASS\n'
+          PROBE
+          sudo systemd-run --unit="$unit" --wait --pipe --collect \
+            --property=Type=exec --property="User=$(id -un)" --property=Delegate=yes \
+            /usr/bin/bash -euo pipefail "$probe" "$(id -u)"
