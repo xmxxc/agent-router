@@ -154,6 +154,8 @@ wfc wait --scope team-a --timeout 30
 
 已完成的 bundled Codex worker 仍在线时，可用 `wfc continue DISPATCH --task FILE --report FILE` 给原终端下一项任务。原运行票据与历史回报保留，新一轮使用新的 attempt 和回调引用。新报告须用原报告目录中的新路径。原输入框须为空，且画面能完整核对本次指令。相同任务和报告路径重取本轮回执，待核输入不会重发。
 
+bundled Codex 提醒或续派若明确未写出首帧、账本暂时无法结算，且原待核记录仍完整，错误会附带 `noSendProof`。恢复合法写权限后，当前 owner 可用原参数加 `--no-send-proof PROOF`，把原审计结算为 `definitely-not-sent`。这一步只结算记录。缺少证明、执行身份变化、账本已有对应正文或新轮回调时，原输入继续待核。
+
 旧同文或旧拒收从滚动历史重现时，画面可能和一次实际新输入相同。此时命令会保留待核，`wfc status --dispatch ID` 的 `audit` 可以查看原轮次及诊断，重试不会再发键。若续派的 worker 已用该轮的 `--callback-ref` 成功发问或回报，可以用原 `continue` 参数重取同一输入的回执。
 
 在已认领的组中，worker 可用启动时分配的独立回调凭据发问或回报。总控兼容入口使用当前租约的凭据。`ask` 与 `done` 均接受显式的 `--owner-token`。

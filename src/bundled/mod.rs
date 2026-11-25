@@ -370,20 +370,27 @@ impl InputSession {
         Ok(answer)
     }
 
+    /// The second field says whether the operation frame may have left the client.
     pub(crate) fn input(
         &self,
         prior: u64,
         text: &str,
         check_write: impl FnOnce() -> Result<()>,
-    ) -> Result<Value> {
+    ) -> (Result<Value>, bool) {
         let Some(seq) = prior.checked_add(1) else {
-            return Ok(
-                json!({"result":"definitely-not-sent","diagnostic":"bundled input sequence exhausted"}),
+            return (
+                Ok(
+                    json!({"result":"definitely-not-sent","diagnostic":"bundled input sequence exhausted"}),
+                ),
+                false,
             );
         };
         if store::process_state(&self.ready["worker"]) != "alive" {
-            return Ok(
-                json!({"result":"definitely-not-sent","diagnostic":"bundled worker changed before input"}),
+            return (
+                Ok(
+                    json!({"result":"definitely-not-sent","diagnostic":"bundled worker changed before input"}),
+                ),
+                false,
             );
         }
         let mut authorization = Ok(());
@@ -396,26 +403,22 @@ impl InputSession {
                 authorization.is_ok()
             },
         );
-        authorization?;
-        if !sent {
-            return Ok(
-                json!({"result":"definitely-not-sent","diagnostic":"bundled input frame was not sent"}),
-            );
+        if let Err(error) = authorization {
+            return (Err(error), sent);
         }
-        if reply["result"] == "accepted"
+        let answer = if !sent {
+            json!({"result":"definitely-not-sent","diagnostic":"bundled input frame was not sent"})
+        } else if reply["result"] == "accepted"
             && reply["last_input"] == seq
             && reply["data"]["written"] == true
         {
-            return Ok(reply);
-        }
-        if reply["result"] == "refused" {
-            return Ok(
-                json!({"result":"refused","diagnostic":"bundled runtime refused the input sequence"}),
-            );
-        }
-        Ok(
-            json!({"result":"uncertain","diagnostic":"bundled runtime did not confirm the input frame"}),
-        )
+            reply
+        } else if reply["result"] == "refused" {
+            json!({"result":"refused","diagnostic":"bundled runtime refused the input sequence"})
+        } else {
+            json!({"result":"uncertain","diagnostic":"bundled runtime did not confirm the input frame"})
+        };
+        (Ok(answer), sent)
     }
 }
 

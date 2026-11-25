@@ -41,7 +41,7 @@ pub(crate) fn strip_credentials(command: &mut std::process::Command) {
 }
 
 #[derive(Debug)]
-pub struct ControllerError(Value);
+pub struct ControllerError(pub(super) Value);
 
 impl fmt::Display for ControllerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

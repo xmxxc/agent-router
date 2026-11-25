@@ -115,7 +115,15 @@ pub(in crate::workflow) fn submit_reply(
     begin: &mut impl FnMut(bool) -> Result<()>,
     check_write: impl Fn() -> Result<()>,
 ) -> Result<Value> {
-    submit(state, row, text, Submission::Reply, begin, check_write)
+    submit(
+        state,
+        row,
+        text,
+        Submission::Reply,
+        begin,
+        check_write,
+        || {},
+    )
 }
 
 pub(in crate::workflow) fn submit_nudge(
@@ -125,7 +133,7 @@ pub(in crate::workflow) fn submit_nudge(
     earlier_reminders: usize,
     prepare: impl FnMut() -> Result<()>,
     check_write: impl Fn() -> Result<()>,
-) -> Result<Value> {
+) -> (Result<Value>, bool) {
     submit_worker_input(
         state,
         row,
@@ -142,7 +150,7 @@ pub(in crate::workflow) fn submit_continue(
     text: &str,
     prepare: impl FnMut() -> Result<()>,
     check_write: impl Fn() -> Result<()>,
-) -> Result<Value> {
+) -> (Result<Value>, bool) {
     submit_worker_input(state, row, text, Submission::Continue, prepare, check_write)
 }
 
@@ -153,8 +161,9 @@ fn submit_worker_input(
     submission: Submission,
     mut prepare: impl FnMut() -> Result<()>,
     check_write: impl Fn() -> Result<()>,
-) -> Result<Value> {
+) -> (Result<Value>, bool) {
     let mut prepared = false;
+    let mut first_frame_may_have_written = false;
     let answer = submit(
         state,
         row,
@@ -166,13 +175,15 @@ fn submit_worker_input(
             Ok(())
         },
         check_write,
+        || first_frame_may_have_written = true,
     );
-    match answer {
+    let answer = match answer {
         Err(error) if !prepared && !error.is::<ControllerError>() => {
             Ok(json!({"result":"definitely-not-sent","diagnostic":format!("{error:#}")}))
         }
         answer => answer,
-    }
+    };
+    (answer, first_frame_may_have_written)
 }
 
 // The caller owns scope and execution locks. Begin revalidates the original
@@ -184,6 +195,7 @@ fn submit(
     submission: Submission,
     begin: &mut impl FnMut(bool) -> Result<()>,
     check_write: impl Fn() -> Result<()>,
+    mark_possible_write: impl FnOnce(),
 ) -> Result<Value> {
     let operation = match submission {
         Submission::Reply => "reply",
@@ -244,7 +256,11 @@ fn submit(
         }
     };
     let paste = format!("\x1b[200~{text}\x1b[201~");
-    let pasted = match session.input(ready.sequence, &paste, &check_write) {
+    let (pasted, may_have_written) = session.input(ready.sequence, &paste, &check_write);
+    if may_have_written {
+        mark_possible_write();
+    }
+    let pasted = match pasted {
         Ok(pasted) => pasted,
         Err(error) if error.is::<ControllerError>() => return Err(error),
         Err(error) => {
@@ -283,6 +299,7 @@ fn submit(
     );
     let entered = session
         .input(draft.sequence, "\r", &check_write)
+        .0
         .map_err(|error| anyhow::anyhow!("{operation} Enter could not be authorized: {error:#}"))?;
     ensure!(
         entered["result"] == "accepted",

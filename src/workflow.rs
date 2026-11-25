@@ -980,10 +980,9 @@ fn status_with_history(
             .unwrap()
             .remove(controller::CALLBACK_REF_HASH);
         #[cfg(target_os = "linux")]
-        record
-            .as_object_mut()
-            .unwrap()
-            .remove(handoff::PENDING_CALLBACK_HASH);
+        for field in [handoff::PENDING_CALLBACK_HASH, input::NO_SEND_RECOVERY] {
+            record.as_object_mut().unwrap().remove(field);
+        }
         if let Some(scope) = record_scope(record) {
             if let Some(owner) = owners.public(scope)? {
                 record["controllerOwner"] = owner;
