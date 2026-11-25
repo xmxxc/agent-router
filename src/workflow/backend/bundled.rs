@@ -203,12 +203,11 @@ fn close_new(state: &Path, row: &Value, path: &Path, ticket: &Value) -> Result<V
     // A signed terminal receipt can establish the business outcome before
     // cleanup. Keep that outcome even if the receipt later becomes unreadable.
     let prior = terminal_worker(&read_receipt());
-    let mut intent = json!({"ticket":ticket,"round":row["round"],"workerOnClose":prior});
+    let mut intent = json!({"ticket":ticket,"round":row["round"],"workerOnClose":prior,
+        "requestId":uuid::Uuid::new_v4().to_string()});
     let dir = path.parent().context("missing dispatch directory")?;
     let directory = fs::File::open(dir)?;
-    {
-        let _messages = messages::lock_for_publish(state)?;
-        // Commit against the same assignment and ledger generation seen by done.
+    let validate_assignment = || -> Result<()> {
         let current =
             assignment::public_record(dir, row["dispatch"].as_str().context("missing dispatch")?)?
                 .context("missing bundled assignment")?;
@@ -219,37 +218,76 @@ fn close_new(state: &Path, row: &Value, path: &Path, ticket: &Value) -> Result<V
                 && record_scope(&current) == record_scope(row)
                 && current["controllerOwner"].is_null()
                 && (current["create"]["ticket"].is_null()
-                    || &current["create"]["ticket"] == ticket),
+                    || &current["create"]["ticket"] == ticket)
+                && (current["backendHandle"].is_null() || &current["backendHandle"] == ticket),
             "bundled assignment changed before close"
         );
-        write_json(path, &intent, None)?;
-        if let Err(error) = directory.sync_all() {
-            // No RPC can have started: release the unpublished claim while
-            // done and competing closes are still excluded from this commit.
-            fs::remove_file(path).context("withdraw unsent bundled close")?;
-            directory
-                .sync_all()
-                .context("sync withdrawal of unsent bundled close")?;
-            return Err(error).context("sync bundled close intent");
-        }
+        Ok(())
+    };
+    let messages = messages::lock_for_publish(state)?;
+    validate_assignment()?;
+    write_json(path, &intent, None)?;
+    if let Err(error) = directory.sync_all() {
+        // No RPC can have started. Done and other closes are still excluded.
+        fs::remove_file(path).context("withdraw unsent bundled close")?;
+        directory
+            .sync_all()
+            .context("sync withdrawal of unsent bundled close")?;
+        return Err(error).context("sync bundled close intent");
     }
+    messages.release_for_bundled_close()?;
     if prior.is_some() {
         return Ok(read_receipt());
     }
-    let (answer, sent) = crate::bundled::assignment_operation(state, ticket, "close");
+    let (answer, withdraw) = crate::bundled::assignment_operation(state, ticket, "close");
     // The worker may have exited while the intent waited for the ledger.
     // Preserve a newly verified natural exit before returning that proof.
     if let Some(worker) = terminal_worker(&answer).filter(|w| w["state"] == "exited") {
+        // A confirmed terminal receipt is independently readable when
+        // the optional snapshot update is blocked by the write fence.
+        let Ok(_messages) = messages::lock_for_publish(state) else {
+            return Ok(answer);
+        };
+        validate_assignment()?;
+        require_close_intent(&intent, &serde_json::from_reader(fs::File::open(path)?)?)?;
         intent["workerOnClose"] = worker;
         write_json(path, &intent, None)?;
         directory.sync_all()?;
-    } else if !sent && answer["result"] != "completed" && answer["execution_cleanup"] != "confirmed"
-    {
-        let _messages = messages::lock_for_publish(state)?;
+    } else if withdraw {
+        // Scope and attempt locks are still held. Undo only the marker this
+        // invocation wrote, without reopening any ledger publication path.
+        messages.serialize_bundled_close_withdrawal()?;
+        validate_assignment()?;
+        require_close_intent(&intent, &serde_json::from_reader(fs::File::open(path)?)?)?;
         fs::remove_file(path)?;
         directory.sync_all()?;
     }
     Ok(answer)
+}
+
+fn require_close_intent(expected: &Value, current: &Value) -> Result<()> {
+    ensure!(
+        current == expected && expected["requestId"].is_string(),
+        "bundled close intent changed before withdrawal"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsent_withdrawal_requires_the_original_intent() {
+        let intent = json!({"ticket":{"unit":"fixture"},"round":1,"requestId":"first"});
+        assert!(require_close_intent(&intent, &intent).is_ok());
+        let mut later = intent.clone();
+        later["requestId"] = json!("later");
+        assert!(require_close_intent(&intent, &later).is_err());
+        later = intent.clone();
+        later["ticket"]["unit"] = json!("other");
+        assert!(require_close_intent(&intent, &later).is_err());
+    }
 }
 
 /// Only a confirmed exact receipt is eligible for the read-only close path.

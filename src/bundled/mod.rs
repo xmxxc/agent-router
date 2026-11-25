@@ -305,12 +305,18 @@ fn unit_lock_file(state: &Path, name: &str) -> Result<(PathBuf, File)> {
     Ok((unit, guard))
 }
 
-/// A public close retry reads only the original execution's receipt. The send
-/// flag lets the workflow release its intent after a confirmed pre-send failure.
+/// The flag authorizes withdrawing this call's intent for an exact, unsent close.
 pub(crate) fn assignment_operation(state: &Path, ticket: &Value, op: &str) -> (Value, bool) {
-    let mut sent = false;
+    let mut withdraw = false;
     let outcome = (|| -> Result<Value> {
-        let (unit, _guard) = operation_unit(state, field(ticket, "unit")?, op)?;
+        let name = field(ticket, "unit")?;
+        let (unit, _guard) = if op == "close" {
+            let (unit, guard) = unit_lock_file(state, name)?;
+            guard.lock()?;
+            (unit, guard)
+        } else {
+            operation_unit(state, name, op)?
+        };
         let current = store::current(&unit).ok().flatten();
         let ordered = current
             .as_ref()
@@ -324,6 +330,8 @@ pub(crate) fn assignment_operation(state: &Path, ticket: &Value, op: &str) -> (V
         }
         let target = Store::open(&unit, ticket)?;
         let legacy = ticket.get("version").is_none();
+        let exact =
+            ordered && !legacy && current.as_ref().is_some_and(|(_, s)| s.ticket == *ticket);
         if let Ok(proof) = target.proof() {
             if ordered && (!legacy || target.current_proof().is_ok()) {
                 return Ok(terminal_reply(&target, proof, op));
@@ -333,18 +341,38 @@ pub(crate) fn assignment_operation(state: &Path, ticket: &Value, op: &str) -> (V
                 "execution_cleanup":"confirmed","execution_proof":proof}),
             );
         }
+        if op == "close" {
+            // Read the authenticated binding under the unit lock even when
+            // its legacy write fence prevents sending any part of the request.
+            if let Err(error) = ensure_state_writable(state) {
+                let answer = json!({"result":"uncertain","cleanup":"unknown","diagnostic":format!("{error:#}")});
+                withdraw = unsent_close(op, exact, false, &answer);
+                return Ok(answer);
+            }
+        }
         if op == "cleanup-receipt" || current.is_none() {
             return Ok(unknown_cleanup());
         }
-        Ok(live_operation(
+        let mut sent = false;
+        let answer = live_operation(
             &target,
             &json!({"op":op,"ticket":ticket}),
             op,
             !ordered || legacy,
             &mut sent,
-        ))
+        );
+        withdraw = unsent_close(op, exact, sent, &answer);
+        Ok(answer)
     })();
-    (outcome.unwrap_or_else(|_| unknown_cleanup()), sent)
+    (outcome.unwrap_or_else(|_| unknown_cleanup()), withdraw)
+}
+
+fn unsent_close(op: &str, exact: bool, sent: bool, answer: &Value) -> bool {
+    op == "close"
+        && exact
+        && !sent
+        && answer["result"] != "completed"
+        && answer["execution_cleanup"] != "confirmed"
 }
 
 fn terminal_reply(store: &Store, proof: Value, op: &str) -> Value {
@@ -555,6 +583,27 @@ pub fn run(stage: &str, selected: Option<&Path>) -> Result<u8> {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn close_withdrawal_requires_verified_unsent_exact_execution() {
+        let unknown = unknown_cleanup();
+        assert!(unsent_close("close", true, false, &unknown));
+        assert!(!unsent_close("close", true, true, &unknown));
+        assert!(!unsent_close("close", false, false, &unknown));
+        assert!(!unsent_close("cleanup-receipt", true, false, &unknown));
+        assert!(!unsent_close(
+            "close",
+            true,
+            false,
+            &json!({"result":"completed"})
+        ));
+        assert!(!unsent_close(
+            "close",
+            true,
+            false,
+            &json!({"execution_cleanup":"confirmed"})
+        ));
+    }
 
     fn authenticate_client(
         socket: &mut wire::Wire<TcpStream>,

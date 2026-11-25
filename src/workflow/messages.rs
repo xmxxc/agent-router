@@ -845,6 +845,27 @@ impl PublishLock {
     pub(super) fn dir(&self) -> &Path {
         &self.dir
     }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn release_for_bundled_close(&self) -> Result<()> {
+        Ok(self._file.unlock()?)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn serialize_bundled_close_withdrawal(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        // Reuse the lock already opened when this call published the intent.
+        // Withdrawal cannot create a lock or publish controller messages.
+        self._file.lock()?;
+        let held = self._file.metadata()?;
+        let current = fs::metadata(self.dir.join("messages.lock"))?;
+        ensure!(
+            held.dev() == current.dev() && held.ino() == current.ino(),
+            "controller message lock changed before withdrawing close intent"
+        );
+        Ok(())
+    }
 }
 
 pub(super) fn lock_for_publish(dir: &Path) -> Result<PublishLock> {
