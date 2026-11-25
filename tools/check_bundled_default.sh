@@ -81,7 +81,7 @@ HOST
 chmod +x host
 if [ "$mode" = reply ]; then
     jq -n --arg composer "$composer" '{hosts:{codex:{command:["/usr/bin/timeout", "30s",
-        "/usr/bin/python3", $composer, "one", "--submit-first", "--reply-worker", "normal"]}}}' > launch.json
+        "/usr/bin/python3", $composer, "one", "--submit-first", "--reply-worker", "bundled-paste"]}}}' > launch.json
 else
     jq -n --arg host "$work/host" '{hosts:{codex:{command:[$host]}}}' > launch.json
 fi
@@ -121,10 +121,14 @@ if [ "$mode" = reply ]; then
     done
     qid=$(jq -er '.message' question.json)
     jq -c '{op:"read",ticket:.create.ticket}' created > viewport-query
+    read_viewport() {
+        "$binary" --bundled "$WFC_STATE" < viewport-query > viewport
+        jq -e --slurpfile create created '.result=="accepted" and .ticket==$create[0].create.ticket
+            and .data.screen=="Primary" and .data.exit==null and .data.eof==false' viewport >/dev/null
+    }
     ready=
     for i in $(seq 40); do
-        "$binary" --bundled "$WFC_STATE" < viewport-query > viewport
-        jq -e '.result=="accepted" and .data.screen=="Primary"' viewport >/dev/null
+        read_viewport
         if jq -e '.data.text | contains("Ask Codex to do anything")' viewport >/dev/null; then
             ready=yes
             break
@@ -132,24 +136,32 @@ if [ "$mode" = reply ]; then
         sleep .05
     done
     test "$ready" = yes
+    sequence=$(jq -er '.last_input | select(type=="number")' viewport)
+    expected_sequence=$((sequence + 2))
     "$binary" reply "$qid" confirmed > answered
+    read_viewport
+    jq -e --argjson expected "$expected_sequence" '.last_input==$expected' viewport >/dev/null
     jq -e --slurpfile question question.json --arg id "$id" '
         .replied==$question[0].message and .dispatch==$id' answered
-    if "$binary" reply "$qid" repeated > duplicate 2>&1; then exit 1; fi
-    grep -F 'already answered' duplicate
     "$binary" status --dispatch "$id" > after-reply
     jq -e --slurpfile created created --slurpfile question question.json '
         [.dispatches[0].messages[] | select(.type=="reply")] | length==1 and
         (.[0] | .inputResult=="accepted" and .to==$question[0].message
             and .questionMessageId==$question[0].messageId and .dispatch==$created[0].dispatch
-            and .attempt==$created[0].attempt and .round==$created[0].round)' after-reply
+            and .attempt==$created[0].attempt and .round==$created[0].round
+            and (.id | type=="number" and .>0) and (.messageId | startswith("m-")))' after-reply
+    if "$binary" reply "$qid" repeated > duplicate 2>&1; then exit 1; fi
+    grep -F 'already answered' duplicate
+    read_viewport
+    jq -e --argjson expected "$expected_sequence" '.last_input==$expected' viewport >/dev/null
+    "$binary" status --dispatch "$id" > after-repeat
+    jq -e --slurpfile first after-reply '
+        [.dispatches[0].messages[] | select(.type=="reply")] ==
+        [$first[0].dispatches[0].messages[] | select(.type=="reply")]' after-repeat
     printf '[router] Answer to question %s: confirmed\n' "$qid" > expected
     cmp expected accepted
-    "$binary" close "$id" > closed
-    jq -e --slurpfile created created '.result=="completed" and .cleanup=="confirmed"
-        and .ticket==$created[0].create.ticket' closed
+    printf 'BUNDLED_REPLY_PASTE_ENTER_NS=%s\n' "$(cat paste-enter-ns)"
     test ! -e external-called
-    id=
     echo BUNDLED_REPLY_RECEIPT_PASS
     exit 0
 fi

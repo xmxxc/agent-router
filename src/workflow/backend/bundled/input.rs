@@ -6,6 +6,8 @@ use serde_json::{json, Value};
 use std::{path::Path, thread::sleep, time::Duration};
 use wfc_herdr::{classify_reply_capture, matches_single_line_draft, reply_input_paused, ReplyBox};
 
+const CODEX_PASTE_SETTLE: Duration = Duration::from_millis(500);
+
 struct Composer {
     visible: String,
     composer: ReplyBox,
@@ -80,28 +82,29 @@ pub(in crate::workflow) fn submit_reply(
             "diagnostic":"Codex composer changed before text was sent"}))
         }
     };
-    let typed = match session.input(ready.sequence, text, &check_write) {
-        Ok(typed) => typed,
+    let paste = format!("\x1b[200~{text}\x1b[201~");
+    let pasted = match session.input(ready.sequence, &paste, &check_write) {
+        Ok(pasted) => pasted,
         Err(error) if error.is::<ControllerError>() => return Err(error),
         Err(error) => {
             return Ok(json!({"result":"definitely-not-sent","diagnostic":format!("{error:#}")}));
         }
     };
-    if typed["result"] != "accepted" {
-        return Ok(typed);
+    if pasted["result"] != "accepted" {
+        return Ok(pasted);
     }
 
     // The existing ledger is already marked uncertain. Any error from here
-    // leaves the question claimed, and this path never repeats Text or Enter.
-    sleep(Duration::from_millis(300));
+    // leaves the question claimed. Codex needs Enter outside the paste burst.
+    sleep(CODEX_PASTE_SETTLE);
     begin(false)
         .map_err(|error| anyhow::anyhow!("reply draft could not be authorized: {error:#}"))?;
     let draft = observe(&session)?;
     ensure!(
         draft.sequence
-            == typed["last_input"]
+            == pasted["last_input"]
                 .as_u64()
-                .context("missing text acknowledgement")?
+                .context("missing paste acknowledgement")?
             && !reply_input_paused(&before.visible, &draft.visible)
             && matches!(draft.composer, ReplyBox::Draft(Some(shown)) if matches_single_line_draft(&shown, text)),
         "Codex did not show the complete reply draft before Enter"

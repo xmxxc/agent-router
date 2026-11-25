@@ -45,6 +45,10 @@ disabled = reply_mode in ('disabled', 'claude-disabled')
 image = reply_mode in ('codex-image', 'codex-image-unstyled')
 accepted = False
 submit_first = '--submit-first' in sys.argv[2:]
+bundled_paste = reply_mode == 'bundled-paste'
+paste_begin, paste_end = b'\x1b[200~', b'\x1b[201~'
+paste_frame = bytearray()
+pasted_at = None
 
 
 def draw():
@@ -107,6 +111,8 @@ def draw():
              b' ' + body + footer.encode())
 
 
+if bundled_paste:
+    os.write(1, b'\x1b[?2004h')
 draw()
 drop_next_enter = not submit_first or reply_mode == 'exact-reply'
 while True:
@@ -132,6 +138,26 @@ while True:
     key = os.read(0, 1)
     if not key:
         break
+    if bundled_paste:
+        if pasted_at is None:
+            if key in (b'\r', b'\n'):
+                raise SystemExit('Enter arrived before the bracketed paste ended')
+            paste_frame += key
+            if len(paste_frame) <= len(paste_begin) and not paste_begin.startswith(paste_frame):
+                raise SystemExit('reply did not start with a bracketed paste')
+            if paste_frame.endswith(paste_end):
+                draft = bytes(paste_frame[len(paste_begin):-len(paste_end)])
+                pasted_at = time.monotonic_ns()
+                draw()
+            continue
+        if key != b'\r' or accepted:
+            raise SystemExit('unexpected bytes after the bracketed paste')
+        elapsed_ns = time.monotonic_ns() - pasted_at
+        # PTY reads can be scheduled later than the acknowledged write.
+        # Allow 50 ms of receiver-side slack while rejecting the old 300 ms delay.
+        if elapsed_ns < 450_000_000:
+            raise SystemExit('Enter arrived during the paste settling window')
+        Path('paste-enter-ns').write_text(f'{elapsed_ns}\n')
     if key in (b'\r', b'\n'):
         if reply_mode == 'always-drop':
             pass
