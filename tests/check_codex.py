@@ -241,9 +241,10 @@ class LostLaunchReceipt(unittest.TestCase):
         base = Path(fixture.name)
         root = base / 'private'
         root.mkdir()
-        delegate = base / 'delegation'
+        prepared_case = outcome.startswith('prepared')
+        delegate = None if prepared_case else base / 'delegation'
         args = SimpleNamespace(wfc=base / 'wfc', codex=base / 'codex', codex_home=base / 'profile',
-                               model='fixture', elf_sha256='b' * 64)
+                               model='fixture', elf_sha256='b' * 64, timeout=3)
         dispatch, attempt = 'd-a1', 'a-b1'
         ticket = dict(version=2, unit=dispatch, attempt=attempt,
                       generation='00000000-0000-4000-8000-000000000001',
@@ -251,11 +252,42 @@ class LostLaunchReceipt(unittest.TestCase):
         boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
         identity = {key: dict(boot=boot, pid=2**30 + index, start_ticks=10)
                     for index, key in enumerate(('guardian', 'service', 'kernel', 'worker'))}
+        parent = delegate
+        if prepared_case:
+            ticket['startupProtocol'] = 1
+            uid = os.geteuid()
+            unit = f"wfc-bundled-{ticket['generation']}.service"
+            parent = Path(f'/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice') / unit
+            identity['userService'] = dict(uid=uid, unit=unit, invocation='a' * 32)
         identity['containment'] = dict(kind='cgroup-v2', device=1, inode=2,
-                                       path=str(delegate / 'wfc-00000000-0000-4000-8000-000000000003'))
-        proof = dict(proves='execution-empty', state='closed', identity=identity)
+                                       path=str(parent / 'wfc-00000000-0000-4000-8000-000000000003'))
+        proof = dict(proves='execution-empty', state='startup-aborted' if prepared_case else 'closed',
+                     identity=identity)
         calls = []
         row = {}
+        refused_after_ack = outcome == 'refused-after-ack'
+        message_id = 'm-' + 'a' * 32
+        if refused_after_ack:
+            group = Path(identity['containment']['path'])
+            group.mkdir(parents=True)
+            group_stat = group.stat()
+            identity['containment'].update(device=group_stat.st_dev, inode=group_stat.st_ino)
+            args.wfc.touch()
+            pids = {str(identity[key]['pid']) for key in ('guardian', 'service', 'kernel', 'worker')}
+            for pid in pids:
+                proc = base / 'proc' / pid
+                proc.mkdir(parents=True)
+                (proc / 'exe').symlink_to(args.wfc)
+            worker = base / 'proc' / str(identity['worker']['pid'])
+            (worker / 'cwd').symlink_to(root / 'worker cwd')
+            (worker / 'cgroup').write_text(f'0::/{group.relative_to(base)}\n')
+
+            def fixture_path(path):
+                path = Path(path)
+                parts = path.parts
+                if len(parts) >= 3 and parts[:2] == ('/', 'proc') and parts[2] in pids:
+                    return (base / 'proc').joinpath(*parts[2:])
+                return path
 
         def command(argv, **_):
             op, *values = argv[1:]
@@ -267,17 +299,43 @@ class LostLaunchReceipt(unittest.TestCase):
                 row.update(dispatch=dispatch, attempt=attempt, scope=options['--scope'],
                            cwd=str(root / 'worker cwd'), task=options['--task'], report=options['--report'],
                            host='codex', backend='bundled', round=1, createPending=True, backendHandle=ticket,
-                           backendObservation={'result': 'uncertain', 'ticket': ticket})
+                           backendResult='accepted', backendAlive=True,
+                           backendObservation={'result': 'accepted', 'ticket': ticket, 'alive': True,
+                                               'owned': True})
                 if outcome == 'empty-output':
                     return 0, ''
                 if outcome == 'conflicting-launch':
                     return 0, json.dumps(dict(dispatch=dispatch, attempt='a-b2'))
+                if refused_after_ack:
+                    row.update(createPending=False, role='reports', launchConfig=options['--launch-config'],
+                               create={'result': 'accepted', 'ticket': ticket, 'identity': identity})
+                    return 0, json.dumps(row)
                 raise RuntimeError('smoke command timed out')
+            if op == 'wait' and refused_after_ack:
+                report = Path(row['report'])
+                lines = [row['scope'].removeprefix('codex-smoke-'), row['cwd'], 'inherited', 'shared',
+                         'host override', 'runtime argument', str(args.codex_home), str(args.wfc),
+                         dispatch, attempt, args.elf_sha256]
+                report.write_text('\n'.join(lines) + '\n')
+                report.with_suffix('.done.json').write_text(
+                    json.dumps(dict(message=1, messageId=message_id, duplicate=False)))
+                delivered = {key: row[key] for key in ('dispatch', 'attempt', 'round', 'scope', 'role', 'report')}
+                delivered.update(id=1, messageId=message_id, type='done', state='received')
+                return 0, json.dumps({'messages': [delivered]})
+            if op == 'ack' and refused_after_ack:
+                return 0, json.dumps(dict(message=1, messageId=message_id, state='processed',
+                                          statusVersion=3, duplicate=False))
             if op == 'status':
                 if values:
                     self.assertEqual(values, ['--dispatch', dispatch])
-                    closed = dict(row, backendAlive=False, backendObservation={
-                        'ticket': ticket, 'cleanup': 'confirmed', 'proof': proof})
+                    if refused_after_ack:
+                        refused = dict(row, backendResult='refused', backendAlive=None,
+                                       backendObservation={'result': 'refused', 'ticket': ticket},
+                                       messages=[dict(id=1, messageId=message_id, state='processed')])
+                        return 0, json.dumps({'dispatches': [refused]})
+                    closed = dict(row, backendResult='completed', backendAlive=False, backendObservation={
+                        'result': 'completed', 'alive': False, 'ticket': ticket,
+                        'cleanup': 'confirmed', 'proof': proof})
                     return 0, json.dumps({'dispatches': [closed]})
                 if outcome == 'no-assignment':
                     return 0, '{"dispatches":[]}'
@@ -289,21 +347,59 @@ class LostLaunchReceipt(unittest.TestCase):
                     row['backendObservation'] = {'result': 'uncertain'}
                 if outcome == 'conflicting-ticket':
                     row['backendHandle'] = dict(ticket, generation='00000000-0000-4000-8000-000000000004')
+                if outcome == 'refused':
+                    row.update(createPending=False, create={'result': 'accepted', 'ticket': ticket,
+                                                            'identity': identity},
+                               backendResult='refused', backendAlive=None,
+                               backendObservation={'result': 'refused', 'ticket': ticket,
+                                                   'diagnostic': 'stale execution identity'})
+                if outcome == 'uncertain-echo':
+                    row.update(backendResult='uncertain', backendAlive=None,
+                               backendObservation={'result': 'uncertain', 'ticket': ticket,
+                                                   'cleanup': 'unknown'})
+                if outcome == 'accepted-unowned':
+                    del row['backendObservation']['owned']
+                    del row['backendObservation']['alive']
+                    row['backendAlive'] = None
+                if prepared_case:
+                    row.update(backendResult='uncertain', backendAlive=None,
+                               backendObservation={'result': 'uncertain', 'ticket': ticket,
+                                                   'startup': 'prepared', 'cleanup': 'unknown'})
+                    if outcome != 'prepared-without-identity':
+                        row['backendObservation']['startupIdentity'] = identity
+                if outcome.startswith('terminal-'):
+                    row.update(backendResult='completed', backendAlive=False,
+                               backendObservation={'result': 'completed', 'ticket': ticket, 'alive': False,
+                                                   'cleanup': 'confirmed'})
+                    if outcome != 'terminal-without-proof':
+                        row['backendObservation']['proof'] = proof
                 return 0, json.dumps({'dispatches': [row]})
             self.assertEqual((op, values), ('close', [dispatch]))
             close_ticket = dict(ticket, attempt='a-b2') if outcome == 'wrong-close-proof' else ticket
+            close_proof = dict(proof, state='exited') if outcome == 'terminal-changed-on-close' else proof
             return 0, json.dumps(dict(operation='close', result='completed', cleanup='confirmed',
                                       dispatch=dispatch, attempt=attempt, round=1, ticket=close_ticket,
-                                      proof=proof))
+                                      proof=close_proof))
 
         output = io.StringIO()
-        with patch.dict(exercise.__globals__, run_command=command), redirect_stdout(output):
+        overrides = {'run_command': command}
+        if refused_after_ack:
+            overrides.update(Path=fixture_path, CGROUP=base, same_process=lambda _: True,
+                             worker_arguments_match=lambda *_: True)
+        if prepared_case:
+            # Cover the user-service proof without querying any real user manager.
+            def retired_prepared(observed, group, service, service_group):
+                self.assertEqual((observed, group, service, service_group),
+                                 (identity, Path(identity['containment']['path']), unit, parent))
+                return True
+            overrides['retired'] = retired_prepared
+        with patch.dict(exercise.__globals__, overrides), redirect_stdout(output):
             with self.assertRaises((RuntimeError, json.JSONDecodeError)):
                 exercise(args, root, delegate, lambda: False)
         return calls, root, [json.loads(line) for line in output.getvalue().splitlines()]
 
     def test_bound_reservation_closes_once_without_a_launch_receipt(self):
-        for outcome in ('timeout', 'empty-output'):
+        for outcome in ('timeout', 'empty-output', 'prepared', 'terminal-proof'):
             with self.subTest(outcome=outcome):
                 calls, root, records = self.exercise_breakpoint(outcome)
                 self.assertEqual(calls, [('dispatch',), ('status',), ('close', 'd-a1'),
@@ -313,7 +409,8 @@ class LostLaunchReceipt(unittest.TestCase):
 
     def test_unknown_or_mismatched_reservation_is_retained_without_close(self):
         for outcome in ('no-assignment', 'ambiguous', 'wrong-scope', 'unknown-ticket',
-                        'conflicting-ticket', 'conflicting-launch'):
+                        'conflicting-ticket', 'conflicting-launch', 'uncertain-echo',
+                        'accepted-unowned', 'prepared-without-identity', 'terminal-without-proof'):
             with self.subTest(outcome=outcome):
                 calls, root, records = self.exercise_breakpoint(outcome)
                 self.assertEqual(calls, [('dispatch',), ('status',)])
@@ -321,11 +418,27 @@ class LostLaunchReceipt(unittest.TestCase):
                 self.assertEqual(records[-1]['cleanup'], 'unconfirmed')
                 self.assertTrue(records[-1]['reason'])
 
-    def test_mismatched_close_proof_is_retained_without_retry(self):
-        calls, root, records = self.exercise_breakpoint('wrong-close-proof')
-        self.assertEqual(calls, [('dispatch',), ('status',), ('close', 'd-a1')])
+    def test_refused_ticket_echo_is_retained_without_close(self):
+        calls, root, records = self.exercise_breakpoint('refused')
+        self.assertEqual(calls, [('dispatch',), ('status',)])
         self.assertTrue(root.is_dir())
         self.assertEqual(records[-1]['cleanup'], 'unconfirmed')
+        self.assertIn('refused', records[-1]['reason'])
+
+    def test_refusal_observed_after_normal_ack_is_retained_without_close(self):
+        calls, root, records = self.exercise_breakpoint('refused-after-ack')
+        self.assertEqual([call[0] for call in calls], ['dispatch', 'wait', 'ack', 'status'])
+        self.assertTrue(root.is_dir())
+        self.assertEqual(records[-1]['cleanup'], 'unconfirmed')
+        self.assertIn('refused', records[-1]['reason'])
+
+    def test_mismatched_close_proof_is_retained_without_retry(self):
+        for outcome in ('wrong-close-proof', 'terminal-changed-on-close'):
+            with self.subTest(outcome=outcome):
+                calls, root, records = self.exercise_breakpoint(outcome)
+                self.assertEqual(calls, [('dispatch',), ('status',), ('close', 'd-a1')])
+                self.assertTrue(root.is_dir())
+                self.assertEqual(records[-1]['cleanup'], 'unconfirmed')
 
 
 class VersionProbe(unittest.TestCase):
