@@ -112,6 +112,33 @@ fn lock_for_write(state: &Path, file: File) -> Result<File> {
     Ok(file)
 }
 
+pub(crate) fn authorize_create<G, Check: FnOnce() -> Result<()>>(
+    mut lock: impl FnMut() -> Result<File>,
+    delegated: bool,
+    authorize_ready: &impl Fn() -> Result<Option<(G, Check)>>,
+) -> Result<(File, Option<(G, Check)>)> {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let guard = lock()?;
+        // Managed startup authorizes its signed decision after preparation.
+        if !delegated {
+            return Ok((guard, None));
+        }
+        if let Some(authorization) = authorize_ready()? {
+            return Ok((guard, Some(authorization)));
+        }
+        // Input can take the unit lock and then check the Inbox. Release
+        // the unit before retrying a temporarily busy publication lock.
+        drop(guard);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(
+            !remaining.is_zero(),
+            "cannot lock the delegated launch publication"
+        );
+        thread::sleep(remaining.min(TICK));
+    }
+}
+
 pub(crate) fn create<G, Check: FnOnce() -> Result<()>>(
     state: &Path,
     req: &Value,
@@ -150,7 +177,12 @@ pub(crate) fn create<G, Check: FnOnce() -> Result<()>>(
     }
     ensure_state_writable(state)?;
     let unit_path = unit_dir(state, unit)?;
-    let guard = lock_for_write(state, create_lock_file(&unit_path)?)?;
+    let delegated = std::env::var_os("WFC_BUNDLED_CGROUP_ROOT").is_some();
+    let (guard, authorization) = authorize_create(
+        || lock_for_write(state, create_lock_file(&unit_path)?),
+        delegated,
+        &authorize_ready,
+    )?;
     let current_path = unit_path.join("current.json");
     let current = match store::current(&unit_path) {
         Ok(current) => current,
@@ -169,7 +201,7 @@ pub(crate) fn create<G, Check: FnOnce() -> Result<()>>(
     } else {
         ensure!(req["previous"].is_null(), "missing previous create");
     }
-    let root = if std::env::var_os("WFC_BUNDLED_CGROUP_ROOT").is_some() {
+    let root = if delegated {
         match group::root() {
             Ok(root) => Some(root),
             Err(error) => {
@@ -222,6 +254,11 @@ pub(crate) fn create<G, Check: FnOnce() -> Result<()>>(
         drop(guard);
         return user_service::await_ready(state, &store, &spec, context, launcher, authorize_ready);
     }
+    let (publication, check_owner) =
+        authorization.context("missing delegated launch authorization")?;
+    if let Err(answer) = check_delegated_launch(state, &store, check_owner) {
+        return Ok(answer);
+    }
     let mut child = match explicit.context("missing explicit guardian")?.spawn() {
         Ok(c) => c,
         Err(_) => {
@@ -232,6 +269,7 @@ pub(crate) fn create<G, Check: FnOnce() -> Result<()>>(
             return Ok(json!({"result":"definitely-not-sent","ticket":ticket}));
         }
     };
+    drop(publication);
     drop(guard);
     let end = Instant::now() + TIMEOUT + TIMEOUT;
     loop {
@@ -246,6 +284,30 @@ pub(crate) fn create<G, Check: FnOnce() -> Result<()>>(
         }
         thread::sleep(TICK);
     }
+}
+
+fn check_delegated_launch(
+    state: &Path,
+    store: &Store,
+    authorize: impl FnOnce() -> Result<()>,
+) -> std::result::Result<(), Value> {
+    ensure_state_writable(state)
+        .and_then(|()| authorize())
+        .map_err(|error| {
+            // The new index already names this generation. Record that it
+            // never launched, unless the state write fence prevents evidence.
+            let unstarted = json!({"reason":"delegated launch authorization failed",
+                "group_cleanup":"not-created"});
+            let recorded = ensure_state_writable(state)
+                .and_then(|()| store.save_signed("unstarted", unstarted))
+                .is_ok();
+            let result = if recorded {
+                "definitely-not-sent"
+            } else {
+                "uncertain"
+            };
+            json!({"result":result,"ticket":store.ticket,"diagnostic":format!("{error:#}")})
+        })
 }
 
 fn explicit_guardian(
@@ -353,16 +415,27 @@ fn open_write_unit(state: &Path, name: &str) -> Result<(PathBuf, File)> {
     Ok((unit, lock_for_write(state, guard)?))
 }
 
-pub(crate) fn apply_resume_cleanup(state: &Path, ticket: &Value, expected: &Value) -> Result<()> {
-    let (unit, _guard) = open_write_unit(state, field(ticket, "unit")?)?;
-    let (current, store) = store::current(&unit)?.context("missing original bundled execution")?;
+fn resume_source(unit: &Path, ticket: &Value) -> Result<(Value, Store, Value)> {
+    let (current, store) = store::current(unit)?.context("missing original bundled execution")?;
     ensure!(
-        &store.ticket == ticket && ticket["version"] == 2 && store::ordered(&unit, &store)?,
+        &store.ticket == ticket && ticket["version"] == 2 && store::ordered(unit, &store)?,
         "bundled execution changed before resume"
     );
-    let proof = store.current_proof()?;
+    let proof = store.resume_proof()?;
+    Ok((current, store, proof))
+}
+
+pub(crate) fn inspect_resume_cleanup(state: &Path, ticket: &Value) -> Result<Value> {
+    let (unit, _guard) = open_unit(state, field(ticket, "unit")?)?;
+    let (_, _, proof) = resume_source(&unit, ticket)?;
+    Ok(proof)
+}
+
+pub(crate) fn apply_resume_cleanup(state: &Path, ticket: &Value, expected: &Value) -> Result<()> {
+    let (unit, _guard) = open_write_unit(state, field(ticket, "unit")?)?;
+    let (current, store, proof) = resume_source(&unit, ticket)?;
     ensure!(
-        &proof == expected && matches!(proof["state"].as_str(), Some("closed" | "exited")),
+        &proof == expected,
         "original bundled cleanup could not be verified"
     );
     let applied = store.reconcile(&unit.join("current.json"), current, proof)?;
@@ -840,8 +913,21 @@ pub(crate) fn ticket_cleanup_fixture(
     attempt: &str,
     cleaned: bool,
 ) -> Result<(Value, PathBuf)> {
-    let (ticket, cleanup, _) = resume_ticket_fixture(state, unit, attempt, cleaned, false)?;
+    let phase = if cleaned {
+        ResumeFixture::Closed
+    } else {
+        ResumeFixture::Ready
+    };
+    let (ticket, cleanup, _) = resume_ticket_fixture(state, unit, attempt, phase, false)?;
     Ok((ticket, cleanup))
+}
+
+#[cfg(test)]
+pub(crate) enum ResumeFixture {
+    Ready,
+    Closed,
+    ReadyFault,
+    StartupFault,
 }
 
 #[cfg(test)]
@@ -849,7 +935,7 @@ pub(crate) fn resume_ticket_fixture(
     state: &Path,
     unit: &str,
     attempt: &str,
-    cleaned: bool,
+    phase: ResumeFixture,
     managed: bool,
 ) -> Result<(Value, PathBuf, Value)> {
     let unit_path = unit_dir(state, unit)?;
@@ -880,16 +966,28 @@ pub(crate) fn resume_ticket_fixture(
     let ready = json!({"guardian":process,"service":process,"kernel":process,"worker":process,
         "endpoint":42,"kernel_generation":fresh(),
         "containment":{"kind":"cgroup-v2","path":"/fixture","device":1,"inode":2}});
-    if managed {
+    if matches!(phase, ResumeFixture::StartupFault) {
+        let starting = json!({"guardian":ready["guardian"],"containment":ready["containment"]});
+        store.save_signed("starting", starting.clone())?;
+        store.save_signed(
+            "cleanup",
+            json!({"state":"faulted","proves":"execution-empty","identity":starting}),
+        )?;
+    } else if managed {
         store.save_signed("prepared", ready.clone())?;
         store.commit_ready(&ready, || Ok(()))?;
     } else {
         store.save_signed("ready", ready.clone())?;
     }
-    if cleaned {
+    let terminal = match phase {
+        ResumeFixture::Closed => Some("closed"),
+        ResumeFixture::ReadyFault => Some("faulted"),
+        ResumeFixture::StartupFault | ResumeFixture::Ready => None,
+    };
+    if let Some(terminal) = terminal {
         store.save_signed(
             "cleanup",
-            json!({"state":"closed","proves":"execution-empty","identity":ready}),
+            json!({"state":terminal,"proves":"execution-empty","identity":ready}),
         )?;
     }
     Ok((ticket, run.join("cleanup.json"), ready))
@@ -899,6 +997,44 @@ pub(crate) fn resume_ticket_fixture(
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn delegated_launch_denial_preserves_ticket_and_respects_write_fence() -> Result<()> {
+        let state = std::env::temp_dir().join(fresh());
+        store::private_dir(&state)?;
+        let result = (|| -> Result<()> {
+            for blocked in [false, true] {
+                let run = state.join(fresh());
+                store::private_dir(&run)?;
+                let store = Store {
+                    run,
+                    ticket: json!({"version":2,"unit":"resume-fixture","generation":fresh()}),
+                    token: fresh(),
+                };
+                let fence = state.join("router.db-journal");
+                if blocked {
+                    fs::write(&fence, b"ordinary synthetic legacy fence")?;
+                }
+                let answer = check_delegated_launch(&state, &store, || {
+                    assert!(!blocked, "write fence must run before owner authorization");
+                    bail!("synthetic lease expired before launch")
+                })
+                .expect_err("denied delegated launch must not spawn");
+                assert_eq!(answer["ticket"], store.ticket);
+                if blocked {
+                    assert_eq!(answer["result"], "uncertain");
+                    assert!(!store.run.join("unstarted.json").try_exists()?);
+                    assert_eq!(fs::read(&fence)?, b"ordinary synthetic legacy fence");
+                } else {
+                    assert_eq!(answer["result"], "definitely-not-sent");
+                    assert_eq!(store.signed("unstarted")?["group_cleanup"], "not-created");
+                }
+            }
+            Ok(())
+        })();
+        fs::remove_dir_all(&state)?;
+        result
+    }
 
     #[test]
     fn close_withdrawal_requires_verified_unsent_exact_execution() {

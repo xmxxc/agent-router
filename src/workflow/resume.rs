@@ -605,7 +605,28 @@ impl<'a> Resume<'a> {
             }
         }
         {
-            let ledger = lock_for_publication()?;
+            let ledger = match lock_for_publication() {
+                Ok(ledger) => ledger,
+                Err(error)
+                    if bundled
+                        && answer["result"] == "uncertain"
+                        && answer["ticket"].is_object() =>
+                {
+                    ensure!(
+                        read()? == next,
+                        "assignment changed during resume; inspect its lifecycle audit"
+                    );
+                    let mut pending = reconcile(
+                        &next,
+                        json!(event),
+                        &format!("cannot settle the bundled resume: {error}"),
+                    );
+                    pending["backend"] = json!("bundled");
+                    pending["ticket"] = answer["ticket"].clone();
+                    return Ok(pending);
+                }
+                Err(error) => return Err(error),
+            };
             ensure!(
                 read()? == next,
                 "assignment changed during resume; inspect its lifecycle audit"

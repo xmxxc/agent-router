@@ -511,6 +511,18 @@ impl Store {
         Ok(proof)
     }
 
+    pub(super) fn resume_proof(&self) -> Result<Value> {
+        let proof = self.current_proof()?;
+        ensure!(
+            matches!(
+                proof["state"].as_str(),
+                Some("closed" | "exited" | "faulted")
+            ) && self.signed("ready")? == proof["identity"],
+            "original bundled cleanup has no matching committed ready identity"
+        );
+        Ok(proof)
+    }
+
     pub fn replaceable(&self, current: &Value) -> bool {
         if self.ticket["version"] == 2 && self.authorizes_unstarted().unwrap_or(false) {
             return true;

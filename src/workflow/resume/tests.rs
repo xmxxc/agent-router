@@ -1,4 +1,5 @@
 use super::*;
+use crate::bundled::ResumeFixture;
 
 struct Fixture(PathBuf);
 
@@ -12,6 +13,9 @@ impl Drop for Fixture {
 fn bundled_first_task_resume_requires_original_stop_and_starts_once() -> Result<()> {
     for case in [
         "accepted",
+        "ready-fault",
+        "startup-fault",
+        "late-write-fence",
         "uncertain",
         "missing-ready",
         "no-stop-receipt",
@@ -44,13 +48,25 @@ fn bundled_first_task_resume_requires_original_stop_and_starts_once() -> Result<
         let scope = "resume-fixture";
         let owner = "ordinary synthetic owner";
         let managed = std::env::var_os("WFC_BUNDLED_CGROUP_ROOT").is_none();
-        let (ticket, cleanup, _) = crate::bundled::resume_ticket_fixture(
-            &state,
-            dispatch,
-            attempt,
-            case != "no-stop-receipt",
-            managed,
-        )?;
+        let phase = match case {
+            "no-stop-receipt" => ResumeFixture::Ready,
+            "ready-fault" => ResumeFixture::ReadyFault,
+            "startup-fault" => ResumeFixture::StartupFault,
+            _ => ResumeFixture::Closed,
+        };
+        let (ticket, cleanup, _) =
+            crate::bundled::resume_ticket_fixture(&state, dispatch, attempt, phase, managed)?;
+        if case == "startup-fault" {
+            // This is valid cleanup for the failed startup, but it cannot
+            // settle a resume that requires a committed original execution.
+            let cleanup =
+                crate::bundled::assignment_operation(&state, &ticket, "cleanup-receipt").0;
+            assert_eq!(cleanup["result"], "completed");
+            assert_eq!(cleanup["proof"]["state"], "faulted");
+            assert!(
+                crate::bundled::apply_resume_cleanup(&state, &ticket, &cleanup["proof"]).is_err()
+            );
+        }
         let mut recorded_ticket = ticket.clone();
         if case == "wrong-ticket" {
             recorded_ticket["nonce"] = json!(Uuid::new_v4().to_string());
@@ -154,10 +170,16 @@ fn bundled_first_task_resume_requires_original_stop_and_starts_once() -> Result<
         let result =
             Resume::parse(&args)?.run_in(state.clone(), |state, next, prior, launch, token| {
                 starts += 1;
-                assert!(matches!(case, "accepted" | "uncertain" | "missing-ready"));
+                assert!(matches!(
+                    case,
+                    "accepted" | "ready-fault" | "uncertain" | "missing-ready" | "late-write-fence"
+                ));
                 assert_eq!(token, Some(owner));
                 assert_eq!(prior["ticket"], ticket);
                 assert_eq!(prior["proof"]["proves"], "execution-empty");
+                if case == "ready-fault" {
+                    assert_eq!(prior["proof"]["state"], "faulted");
+                }
                 assert_eq!(next["round"], 1);
                 assert_ne!(next["attempt"], attempt);
                 assert_eq!(next["messages"], row["messages"]);
@@ -173,6 +195,15 @@ fn bundled_first_task_resume_requires_original_stop_and_starts_once() -> Result<
                 if case == "uncertain" {
                     anyhow::bail!("ordinary synthetic ambiguous launch");
                 }
+                if case == "late-write-fence" {
+                    fs::write(
+                        state.join("router.db-journal"),
+                        b"synthetic late legacy fence",
+                    )?;
+                    let mut replacement = ticket.clone();
+                    replacement["attempt"] = next["attempt"].clone();
+                    return Ok(json!({"result":"uncertain","ticket":replacement}));
+                }
                 if case == "missing-ready" {
                     let mut replacement = ticket.clone();
                     replacement["attempt"] = next["attempt"].clone();
@@ -182,14 +213,17 @@ fn bundled_first_task_resume_requires_original_stop_and_starts_once() -> Result<
                     state,
                     dispatch,
                     next["attempt"].as_str().context("replacement attempt")?,
-                    false,
+                    ResumeFixture::Ready,
                     managed,
                 )?;
                 Ok(json!({"result":"accepted","ticket":replacement,"identity":ready}))
             });
-        if matches!(case, "accepted" | "uncertain" | "missing-ready") {
+        if matches!(
+            case,
+            "accepted" | "ready-fault" | "uncertain" | "missing-ready" | "late-write-fence"
+        ) {
             let result = result?;
-            let outcome = if case == "accepted" {
+            let outcome = if matches!(case, "accepted" | "ready-fault") {
                 "accepted"
             } else {
                 "uncertain"
@@ -198,12 +232,21 @@ fn bundled_first_task_resume_requires_original_stop_and_starts_once() -> Result<
             assert_eq!(result["result"], outcome);
             assert_eq!(result["audit"], 1);
             let settled = super::super::read_record(&path)?;
-            assert_eq!(settled["audit"][0]["result"], outcome);
+            if case == "late-write-fence" {
+                assert_eq!(settled["audit"][0]["result"], "pending");
+                assert_eq!(result["ticket"]["attempt"], settled["attempt"]);
+                assert!(settled["create"].is_null());
+                let marker = state.join("router.db-journal");
+                assert_eq!(fs::read(&marker)?, b"synthetic late legacy fence");
+                fs::remove_file(marker)?;
+            } else {
+                assert_eq!(settled["audit"][0]["result"], outcome);
+            }
             assert_eq!(settled["audit"][0]["priorBackendHandle"], ticket);
             assert_eq!(settled["audit"][0]["priorCreate"], row["create"]);
             assert_eq!(settled["rounds"][0]["attempt"], attempt);
             assert_eq!(settled["messages"], row["messages"]);
-            if case == "accepted" {
+            if outcome == "accepted" {
                 assert_eq!(backend::bundled_input_ticket(&settled)?, &result["ticket"]);
             }
             let saved = fs::read(&path)?;
