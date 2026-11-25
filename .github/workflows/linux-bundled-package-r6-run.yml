@@ -1,0 +1,11 @@
+name: Linux bundled same-package checkpoint
+on:
+  push:
+    branches: [rust-router/linux-package-same-artifact-checkpoint]
+
+permissions:
+  contents: read
+
+jobs:
+  checkpoint:
+    uses: ./.github/workflows/linux-bundled-package-checkpoint.yml
