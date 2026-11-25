@@ -204,6 +204,17 @@ pub(super) enum StartupDecision {
     Aborted,
 }
 
+#[derive(Debug)]
+pub(super) struct AbortNotInstalled;
+
+impl std::fmt::Display for AbortNotInstalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("startup abort failed before installation")
+    }
+}
+
+impl std::error::Error for AbortNotInstalled {}
+
 pub(super) enum Preparation {
     NotInstalled(anyhow::Error),
     Installed,
@@ -370,6 +381,14 @@ impl Store {
     }
 
     pub fn abort_startup(&self, prepared: &Value) -> Result<StartupDecision> {
+        self.abort_startup_with(prepared, || Ok(()))
+    }
+
+    fn abort_startup_with(
+        &self,
+        prepared: &Value,
+        check: impl FnOnce() -> Result<()>,
+    ) -> Result<StartupDecision> {
         if let Some(decision) = self.startup_decision(prepared)? {
             return Ok(decision);
         }
@@ -378,7 +397,7 @@ impl Store {
                 && !has_entry(&self.run.join("cleanup.json"))?,
             "startup already ended"
         );
-        self.install_startup_decision(StartupDecision::Aborted, prepared, || Ok(()))
+        self.install_startup_decision(StartupDecision::Aborted, prepared, check)
     }
 
     fn install_startup_decision(
@@ -398,10 +417,12 @@ impl Store {
         };
         let envelope = self.signed_envelope(kind, prepared)?;
         let path = self.run.join("startup-decision.json");
+        let mut link_attempted = false;
         let result = publish_with(&path, &envelope, |tmp, path| {
             // A single name commits exactly one choice. Both file contents
             // are synced before the link, which never replaces a decision.
             check()?;
+            link_attempted = true;
             fs::hard_link(tmp, path)?;
             Ok(fs::remove_file(tmp)?)
         });
@@ -411,7 +432,15 @@ impl Store {
             File::open(&self.run)?.sync_all()?;
             return Ok(decision);
         }
-        result?;
+        result.map_err(|error| {
+            if choice == StartupDecision::Aborted && !link_attempted {
+                // The signed lookup above proved the decision name absent
+                // and this writer never attempted to install it.
+                error.context(AbortNotInstalled)
+            } else {
+                error
+            }
+        })?;
         bail!("missing startup decision")
     }
 
@@ -911,8 +940,8 @@ mod tests {
                 Ok(store)
             };
             let expired = json!({"deadline":0});
-            let poll = |store: &Store, may_abort: &mut bool| {
-                super::super::user_service::poll_startup(store, &expired, &proposal, may_abort)
+            let poll = |store: &Store, next_abort: &mut Option<Instant>| {
+                super::super::user_service::poll_startup(store, &expired, &proposal, next_abort)
             };
             let before = fixture()?;
             assert!(matches!(
@@ -928,19 +957,22 @@ mod tests {
                 Preparation::Installed
             ));
             assert_eq!(after.signed("prepared")?, proposal);
-            assert_eq!(poll(&after, &mut true)?, Some(StartupDecision::Aborted));
+            assert_eq!(
+                poll(&after, &mut Some(Instant::now()))?,
+                Some(StartupDecision::Aborted)
+            );
             assert!(after.commit_ready(&proposal, || Ok(())).is_err());
             let decision_path = after.run.join("startup-decision.json");
             let saved_abort = read(&decision_path)?;
             publish(&decision_path, &json!({"fixture":"unreadable decision"}))?;
-            let mut may_abort = true;
-            assert!(poll(&after, &mut may_abort).is_err());
-            assert!(!may_abort);
+            let mut next_abort = Some(Instant::now());
+            assert!(poll(&after, &mut next_abort).is_err());
+            assert_eq!(next_abort, None);
             fs::remove_file(&decision_path)?;
-            assert_eq!(poll(&after, &mut may_abort)?, None);
+            assert_eq!(poll(&after, &mut next_abort)?, None);
             publish(&decision_path, &saved_abort)?;
             assert_eq!(
-                poll(&after, &mut may_abort)?,
+                poll(&after, &mut next_abort)?,
                 Some(StartupDecision::Aborted)
             );
             let aborted =
@@ -960,7 +992,7 @@ mod tests {
                 committed.prepare_startup(&proposal),
                 Preparation::Existing
             ));
-            assert_eq!(poll(&committed, &mut false)?, Some(StartupDecision::Ready));
+            assert_eq!(poll(&committed, &mut None)?, Some(StartupDecision::Ready));
             let mut other = proposal.clone();
             other["endpoint"] = json!(43);
             assert!(matches!(
@@ -979,7 +1011,7 @@ mod tests {
                 committed.prepare_startup(&proposal),
                 Preparation::Existing
             ));
-            assert_eq!(poll(&committed, &mut false)?, None);
+            assert_eq!(poll(&committed, &mut None)?, None);
             assert!(committed.abort_startup(&proposal).is_err());
             assert!(committed.signed("ready").is_err());
             assert!(committed.proof().is_err());
@@ -992,6 +1024,278 @@ mod tests {
             ));
             assert!(committed.signed("ready").is_err());
             assert!(committed.proof().is_err());
+            Ok(())
+        };
+        fs::create_dir(&root)?;
+        let result = exercise();
+        fs::remove_dir_all(root)?;
+        result
+    }
+
+    #[test]
+    fn managed_abort_retries_only_a_confirmed_preinstall_failure() -> Result<()> {
+        use super::super::runtime::{publish_cleanup, watch_startup, CleanupBinding, StartupWatch};
+        use super::super::user_service::{poll_startup_with, ABORT_RETRY_DELAY};
+        use std::cell::Cell;
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+
+        let root = std::env::temp_dir().join(fresh());
+        let exercise = || -> Result<()> {
+            let process = json!({"pid":7,"boot":fresh(),"start_ticks":5});
+            let proposed = json!({"guardian":process,"service":process,"kernel":process,
+                "worker":process,"endpoint":42,"kernel_generation":fresh(),
+                "containment":{"kind":"cgroup-v2","path":"/fixture","device":1,"inode":2}});
+            let expired = json!({"deadline":0});
+            let fixture = || -> Result<Store> {
+                let mut store = generation(&root.join(fresh()), false)?;
+                store.ticket["startupProtocol"] = json!(1);
+                store.save_signed("prepared", proposed.clone())?;
+                Ok(store)
+            };
+            let poll = |store: &Store, next: &mut Option<Instant>, now, fail| {
+                poll_startup_with(store, &expired, &proposed, next, now, || {
+                    store.abort_startup_with(&proposed, || {
+                        if fail {
+                            return Err(io::Error::from_raw_os_error(libc::EIO).into());
+                        }
+                        Ok(())
+                    })
+                })
+            };
+            let now = Instant::now();
+            let transient = fixture()?;
+            let mut retry = Some(now);
+            assert_eq!(
+                poll_startup_with(
+                    &transient,
+                    &json!({"deadline":u64::MAX}),
+                    &proposed,
+                    &mut retry,
+                    now,
+                    || panic!("an unverified publisher exit cannot authorize an abort"),
+                )?,
+                None
+            );
+            assert_eq!(poll(&transient, &mut retry, now, true)?, None);
+            assert_eq!(transient.startup_decision(&proposed)?, None);
+            assert_eq!(poll(&transient, &mut retry, now, false)?, None);
+            assert_eq!(retry, Some(now + ABORT_RETRY_DELAY));
+            assert_eq!(
+                poll(&transient, &mut retry, now + ABORT_RETRY_DELAY, false)?,
+                Some(StartupDecision::Aborted)
+            );
+
+            let exited_during_delay = fixture()?;
+            let tick = Cell::new(now);
+            let seen = Cell::new(0);
+            let exit = ExitStatus::from_raw(0);
+            let cleaned = Cell::new(0);
+            let outcome = watch_startup(
+                Some(now),
+                now,
+                |next| {
+                    let attempt = seen.get();
+                    seen.set(attempt + 1);
+                    assert!(attempt < 3, "a recovered retry must settle the decision");
+                    if attempt > 0 {
+                        assert_eq!(cleaned.get(), 1, "cleanup must precede the retry");
+                    }
+                    poll(&exited_during_delay, next, tick.get(), tick.get() == now)
+                },
+                || Ok(Some(ExitStatus::from_raw(0))),
+                || {
+                    cleaned.set(cleaned.get() + 1);
+                    Ok(())
+                },
+                || tick.get(),
+                || tick.set(tick.get() + ABORT_RETRY_DELAY),
+            );
+            let StartupWatch::Exited {
+                decision,
+                status,
+                cleanup,
+            } = outcome
+            else {
+                panic!("expected the previously observed runtime exit");
+            };
+            assert_eq!(seen.get(), 3);
+            assert_eq!(cleaned.get(), 1);
+            assert_eq!(status, exit);
+            assert_eq!(decision, Some(StartupDecision::Aborted));
+            assert_eq!(exited_during_delay.startup_decision(&proposed)?, decision);
+            let cleanup = publish_cleanup(
+                &exited_during_delay,
+                &proposed,
+                "closed",
+                CleanupBinding::Prepared(decision),
+                cleanup,
+            );
+            cleanup?;
+            assert_eq!(
+                exited_during_delay.proof()?,
+                json!({"proves":"execution-empty","state":"startup-aborted","identity":proposed})
+            );
+
+            let persistent = fixture()?;
+            let mut retry = Some(now);
+            for step in 0..3 {
+                let tick = now + ABORT_RETRY_DELAY * step;
+                assert_eq!(poll(&persistent, &mut retry, tick, true)?, None);
+                assert_eq!(retry, Some(tick + ABORT_RETRY_DELAY));
+                assert_eq!(persistent.startup_decision(&proposed)?, None);
+                assert!(persistent.proof().is_err());
+            }
+
+            tick.set(now);
+            cleaned.set(0);
+            let watch = watch_startup(
+                Some(now),
+                now,
+                |next| {
+                    if tick.get() > now {
+                        assert_eq!(cleaned.get(), 1);
+                    }
+                    poll(&persistent, next, tick.get(), true)
+                },
+                || Ok(Some(exit)),
+                || {
+                    cleaned.set(cleaned.get() + 1);
+                    Ok(())
+                },
+                || tick.get(),
+                || tick.set(tick.get() + ABORT_RETRY_DELAY),
+            );
+            let StartupWatch::Exited {
+                status,
+                cleanup,
+                decision,
+            } = watch
+            else {
+                panic!("persistent failures must finish the post-exit wait");
+            };
+            assert_eq!(status, exit);
+            assert_eq!(cleaned.get(), 1);
+            assert!(tick.get() >= now + TIMEOUT);
+            assert!(tick.get() < now + TIMEOUT + ABORT_RETRY_DELAY);
+            assert_eq!(decision, None);
+            assert!(publish_cleanup(
+                &persistent,
+                &proposed,
+                "closed",
+                CleanupBinding::Prepared(decision),
+                cleanup
+            )
+            .is_err());
+            assert!(persistent.signed("cleanup").is_err());
+
+            let early_exit = fixture()?;
+            tick.set(now);
+            cleaned.set(0);
+            let startup_deadline = now + TIMEOUT + TIMEOUT;
+            let outcome = watch_startup(
+                Some(now),
+                startup_deadline,
+                |next| {
+                    if tick.get() < startup_deadline {
+                        poll_startup_with(
+                            &early_exit,
+                            &json!({"deadline":u64::MAX}),
+                            &proposed,
+                            next,
+                            tick.get(),
+                            || panic!("publisher can still be live"),
+                        )
+                    } else {
+                        assert_eq!(cleaned.get(), 1);
+                        poll(&early_exit, next, tick.get(), false)
+                    }
+                },
+                || Ok(Some(exit)),
+                || {
+                    cleaned.set(cleaned.get() + 1);
+                    Ok(())
+                },
+                || tick.get(),
+                || tick.set(tick.get() + TIMEOUT),
+            );
+            let StartupWatch::Exited {
+                cleanup, decision, ..
+            } = outcome
+            else {
+                panic!("early exit must keep waiting after cleanup");
+            };
+            assert_eq!(tick.get(), startup_deadline);
+            assert_eq!(cleaned.get(), 1);
+            assert_eq!(decision, Some(StartupDecision::Aborted));
+            publish_cleanup(
+                &early_exit,
+                &proposed,
+                "closed",
+                CleanupBinding::Prepared(decision),
+                cleanup,
+            )?;
+            assert_eq!(early_exit.proof()?["state"], "startup-aborted");
+
+            let ready = fixture()?;
+            ready.commit_ready(&proposed, || Ok(()))?;
+            assert!(matches!(
+                watch_startup(
+                    Some(now),
+                    now,
+                    |next| poll(&ready, next, now, true),
+                    || panic!("ready startup must return to the normal runtime wait"),
+                    || panic!("ready startup must not reclaim its group"),
+                    || now,
+                    || panic!("existing ready decision needs no retry"),
+                ),
+                StartupWatch::Decided(StartupDecision::Ready)
+            ));
+            assert!(publish_cleanup(
+                &ready,
+                &proposed,
+                "closed",
+                CleanupBinding::Prepared(Some(StartupDecision::Ready)),
+                Err(io::Error::from_raw_os_error(libc::EIO).into())
+            )
+            .is_err());
+            assert!(ready.signed("cleanup").is_err());
+            for (store, decision) in [
+                (&ready, StartupDecision::Ready),
+                (&transient, StartupDecision::Aborted),
+            ] {
+                let path = store.run.join("startup-decision.json");
+                let contents = fs::read(&path)?;
+                let result =
+                    poll_startup_with(store, &expired, &proposed, &mut Some(now), now, || {
+                        panic!("an existing decision must be read without writing")
+                    })?;
+                assert_eq!(result, Some(decision));
+                assert_eq!(fs::read(&path)?, contents);
+            }
+
+            let path = persistent.run.join("startup-decision.json");
+            let other = json!({"fixture":"different proposal"});
+            publish(&path, &persistent.signed_envelope("startup-abort", &other)?)?;
+            let tick = retry.unwrap();
+            assert!(poll(&persistent, &mut retry, tick, false).is_err());
+            assert_eq!(retry, None);
+            fs::remove_file(path)?;
+            assert_eq!(poll(&persistent, &mut retry, tick, false)?, None);
+
+            let uncertain = fixture()?;
+            let mut retry = Some(now);
+            assert!(
+                poll_startup_with(&uncertain, &expired, &proposed, &mut retry, now, || {
+                    Err(io::Error::from_raw_os_error(libc::EIO).into())
+                })
+                .is_err()
+            );
+            assert_eq!(retry, None);
+            assert_eq!(
+                poll(&uncertain, &mut retry, now + ABORT_RETRY_DELAY, false)?,
+                None
+            );
             Ok(())
         };
         fs::create_dir(&root)?;

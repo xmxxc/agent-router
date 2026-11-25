@@ -6,11 +6,12 @@ use std::os::unix::{
     fs::{FileTypeExt, MetadataExt},
     net::UnixStream,
 };
-use store::StartupDecision;
+use store::{AbortNotInstalled, StartupDecision};
 
 pub(super) const STAGE: &str = "--bundled-user-guardian";
 const MANAGER_REQUIRED: &str =
     "bundled dispatch requires the current user's systemd user manager or an explicitly delegated WFC_BUNDLED_CGROUP_ROOT";
+pub(super) const ABORT_RETRY_DELAY: Duration = Duration::from_millis(200);
 
 fn uid() -> u32 {
     unsafe { libc::geteuid() }
@@ -134,14 +135,21 @@ pub(super) fn start(store: &Store) -> Result<Launcher> {
 
 pub(super) fn startup_live(context: &Value) -> Result<()> {
     ensure!(
-        unix_ms()?
-            < context["deadline"]
-                .as_u64()
-                .context("missing startup deadline")?
-            && store::process_state(&context["creator"]) == "alive",
+        !startup_deadline_reached(context)? && store::process_state(&context["creator"]) == "alive",
         "bundled startup was interrupted before ready"
     );
     Ok(())
+}
+
+fn startup_deadline_reached(context: &Value) -> Result<bool> {
+    Ok(startup_time_remaining(context)?.is_zero())
+}
+
+pub(super) fn startup_time_remaining(context: &Value) -> Result<Duration> {
+    let deadline = context["deadline"]
+        .as_u64()
+        .context("missing startup deadline")?;
+    Ok(Duration::from_millis(deadline.saturating_sub(unix_ms()?)).min(TIMEOUT + TIMEOUT))
 }
 
 fn own_membership(text: &str, uid: u32, unit: &str) -> Result<PathBuf> {
@@ -315,7 +323,20 @@ pub(super) fn poll_startup(
     store: &Store,
     context: &Value,
     proposed: &Value,
-    may_abort: &mut bool,
+    next_abort: &mut Option<Instant>,
+) -> Result<Option<StartupDecision>> {
+    poll_startup_with(store, context, proposed, next_abort, Instant::now(), || {
+        store.abort_startup(proposed)
+    })
+}
+
+pub(super) fn poll_startup_with(
+    store: &Store,
+    context: &Value,
+    proposed: &Value,
+    next_abort: &mut Option<Instant>,
+    now: Instant,
+    abort: impl FnOnce() -> Result<StartupDecision>,
 ) -> Result<Option<StartupDecision>> {
     let result = (|| {
         if let Some(decision) = store.startup_decision(proposed)? {
@@ -326,23 +347,29 @@ pub(super) fn poll_startup(
             }
             return Ok(Some(decision));
         }
-        if *may_abort
-            && startup_live(context)
-                .and_then(|()| proposal_live(proposed))
-                .is_err()
+        if next_abort.is_some_and(|after| now >= after)
+            && (startup_deadline_reached(context)?
+                || store::process_state(&context["creator"]) == "exited")
         {
-            // Installation may have won even if its directory sync failed.
-            return store
-                .abort_startup(proposed)
-                .or_else(|error| store.startup_decision(proposed)?.ok_or(error))
-                .map(Some);
+            return match abort() {
+                Ok(decision) => Ok(Some(decision)),
+                // Installation may have won even if its directory sync failed.
+                Err(error) => match store.startup_decision(proposed)? {
+                    Some(decision) => Ok(Some(decision)),
+                    None if error.is::<AbortNotInstalled>() => {
+                        *next_abort = Some(now + ABORT_RETRY_DELAY);
+                        Ok(None)
+                    }
+                    None => Err(error),
+                },
+            };
         }
         Ok(None)
     })();
     if result.is_err() {
         // An unreadable decision may have already won. Re-read it without
         // choosing a replacement if its name subsequently goes missing.
-        *may_abort = false;
+        *next_abort = None;
     }
     result
 }
