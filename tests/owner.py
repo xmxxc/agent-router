@@ -51,6 +51,14 @@ class Owner(relay.Relay):
 
     @unittest.skipIf(os.geteuid() == 0, "script lookup requires a regular user")
     def test_startup_preflight_rechecks_scope_owner(self):
+        self.startup_preflight_fence("herdr", {})
+
+    @unittest.skipIf(os.geteuid() == 0, "script lookup requires a regular user")
+    @unittest.skipUnless(os.environ.get("WFC_TEST_DELEGATION"), "requires an authorized cgroup v2 delegation")
+    def test_bundled_startup_preflight_rechecks_scope_owner(self):
+        self.startup_preflight_fence("bundled", {"WFC_BUNDLED_CGROUP_ROOT": os.environ["WFC_TEST_DELEGATION"]})
+
+    def startup_preflight_fence(self, backend, launch_env):
         hidden = self.root / "private-script-dir"
         hidden.mkdir()
         denied = hidden / "worker.py"
@@ -65,18 +73,18 @@ class Owner(relay.Relay):
         def config_for(path):
             return {"hosts": {"codex": {"runtime": [sys.executable], "command": [str(path)]}}}
 
-        for backend, path in (("tmux", missing), ("tmux", denied), ("herdr", missing), ("herdr", denied)):
+        for path in (missing, denied):
             with self.subTest(backend=backend, missing=path == missing):
                 scope = f"startup-{backend}-{path.name}"
                 fifo = self.root / scope
                 os.mkfifo(fifo)
                 args = [*dispatch, "--scope", scope, "--backend", backend, "--launch-config", str(fifo)]
-                if backend == "tmux":
+                if backend == "bundled":
                     token = self.data("owner", "acquire", "--scope", scope)["token"]
                 else:
                     token = "fixture-future-owner"
                     args += ["--herdr-endpoint", str(self.root / "unused-herdr.sock")]
-                pending = self.start(*args, WFC_CONTROLLER_TOKEN=token)
+                pending = self.start(*args, WFC_CONTROLLER_TOKEN=token, **launch_env)
 
                 def writer():
                     try:
@@ -89,14 +97,14 @@ class Owner(relay.Relay):
                 # Opening the writer proves dispatch passed its initial owner
                 # check and is blocked awaiting the rest of the launch config.
                 with os.fdopen(self.until(writer), "w") as stream:
-                    if backend == "tmux":
+                    if backend == "bundled":
                         replacement = self.data("takeover", "--scope", scope)["token"]
                     else:
                         replacement = self.data("acquire", "--scope", scope, "--token", token)["token"]
                     json.dump(config_for(path), stream)
                 out, error = pending.communicate(timeout=7)
                 self.assertEqual((pending.returncode, out), (1, ""), error)
-                if backend == "tmux":
+                if backend == "bundled":
                     detail = json.loads(error)
                     self.assertEqual((detail["error"], detail["scope"], detail["generation"]),
                                      ("stale_controller_owner", scope, 2))

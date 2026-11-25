@@ -1,7 +1,5 @@
 name: Linux reply, reclaim and controller receipts
 on:
-  push:
-    branches: [rust-router/11-reply-r11-tmux-composer]
   workflow_dispatch:
 
 permissions:
@@ -55,7 +53,7 @@ jobs:
           git log -1 --format='Rust HEAD %H tree %T' | tee "$EVIDENCE/sources.log"
           test "$(git rev-parse HEAD)" = "$WFC_BUILD_ID"
           test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
-          sha256sum vendor/INPUTS.sha256 tests/herdr_public.py tools/check_tmux.py crates/herdr/tests/live.py crates/herdr/tests/composer.py tests/relay.py tests/opencode_relay.py | tee "$EVIDENCE/inputs.log"
+          sha256sum vendor/INPUTS.sha256 tests/herdr_public.py crates/herdr/tests/live.py crates/herdr/tests/composer.py tests/relay.py tests/opencode_relay.py | tee "$EVIDENCE/inputs.log"
           sha256sum -c vendor/INPUTS.sha256 2>&1 | tee -a "$EVIDENCE/inputs.log"
           rustup toolchain install 1.96.1 --profile minimal 2>&1 | tee "$EVIDENCE/toolchain.log"
           { rustc -vV; cargo --version; zig version; python --version; pkg-config --modversion openssl zlib; } | tee -a "$EVIDENCE/toolchain.log"
@@ -113,24 +111,6 @@ jobs:
             PublicLifecycle.test_question_replays_after_herdr_close_intent \
             PublicLifecycle.test_reclaim_uses_verified_herdr_close_and_keeps_sibling \
             2>&1 | tee "$EVIDENCE/herdr-public.log"
-      - name: Verify tmux reply text and controller takeover
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: product
-        run: |
-          if ! command -v tmux >/dev/null; then
-            sudo apt-get update 2>&1 | tee "$EVIDENCE/tmux-install.log"
-            sudo apt-get install -y --no-install-recommends tmux 2>&1 | tee -a "$EVIDENCE/tmux-install.log"
-          fi
-          tmux -V | tee "$EVIDENCE/tmux.log"
-          python -Bu tools/check_tmux.py target/release/wfc -v \
-            Backend.test_public_reply_once_and_original_done \
-            Backend.test_public_reply_preserves_tmux_draft_with_changed_whitespace \
-            Backend.test_public_reply_requires_confirmed_tmux_chat_composer \
-            Backend.test_managed_tmux_reply_rechecks_owner_while_waiting \
-            Backend.test_public_reply_and_reclaim_preserve_controller_receipts \
-            Backend.test_public_reclaim_preview_mixed_results_and_history \
-            Backend.test_public_reclaim_stops_on_scope_authority_loss \
-            2>&1 | tee -a "$EVIDENCE/tmux.log"
       - name: Verify controller delivery receipts for both routes
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: product

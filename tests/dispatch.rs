@@ -586,10 +586,13 @@ fn invalid_public_options_and_launch_config_leave_no_active_dispatch() {
     }
     #[cfg(target_os = "linux")]
     {
+        let endpoint = f.0.join("missing.sock");
         let out = f
             .wfc()
             .args(args)
-            .args(["--backend", "tmux", "--launch-config", "bad.json"])
+            .args(["--backend", "herdr", "--herdr-endpoint"])
+            .arg(endpoint)
+            .args(["--launch-config", "bad.json"])
             .output()
             .unwrap();
         let error = String::from_utf8_lossy(&out.stderr);
@@ -600,10 +603,10 @@ fn invalid_public_options_and_launch_config_leave_no_active_dispatch() {
         run(f.wfc().args(["status", "--active"]))["dispatches"],
         json!([])
     );
-    assert!(fs::read_dir(f.0.join("state/dispatches"))
-        .unwrap()
-        .next()
-        .is_none());
+    match fs::read_dir(f.0.join("state/dispatches")) {
+        Ok(mut entries) => assert!(entries.next().is_none()),
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+    }
 }
 #[test]
 fn live_worker_reports_once_and_wait_returns_the_same_receipt() {
@@ -1436,7 +1439,7 @@ fn r1_bare_retry_preserves_receipt_across_upgrade() {
 
 #[test]
 #[cfg(target_os = "linux")]
-fn old_host_archive_preserves_known_exit_but_rechecks_session_cleanup() {
+fn old_host_archive_preserves_known_exit_with_unknown_session_state() {
     let f = Fixture::new();
     let dir = f.0.join("state/dispatches");
     fs::create_dir_all(&dir).unwrap();
@@ -1455,6 +1458,8 @@ fn old_host_archive_preserves_known_exit_but_rechecks_session_cleanup() {
         let status = run(f.wfc().args(["status", "--dispatch", id]));
         let current = &status["dispatches"][0];
         assert_eq!(current["backendResult"], "uncertain");
+        assert_eq!(current["historyOnly"], true);
+        assert_eq!(current["backendAlive"], Value::Null);
         if worker["state"] == "exited" {
             assert_eq!(current["worker"], worker);
         } else {

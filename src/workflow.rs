@@ -38,7 +38,7 @@ pub(crate) mod startup;
 mod view;
 
 pub const DISPATCH_USAGE: &str =
-    "wfc dispatch --host {codex,opencode,claude} --task FILE --cwd DIR --report FILE [--backend {tmux,herdr,bundled}] [--herdr-endpoint PATH] [--launch-config FILE] [--scope S] [--role R] [--model M] [--effort E] [--label L] [--git] [--network] [--owner-token TOKEN]\n    wfc dispatch --role ROLE --task FILE --cwd DIR [--report FILE] [--scope S] [--owner-token TOKEN] -- PROGRAM [ARG ...]";
+    "wfc dispatch --host {codex,opencode,claude} --task FILE --cwd DIR --report FILE [--backend {bundled,herdr}] [--herdr-endpoint PATH] [--launch-config FILE] [--scope S] [--role R] [--model M] [--effort E] [--label L] [--git] [--network] [--owner-token TOKEN]\n    wfc dispatch --role ROLE --task FILE --cwd DIR [--report FILE] [--scope S] [--owner-token TOKEN] -- PROGRAM [ARG ...]";
 pub const STATUS_USAGE: &str = "wfc status [--dispatch ID | --active]";
 
 pub struct Dispatch<'a> {
@@ -121,10 +121,7 @@ impl<'a> Dispatch<'a> {
                 "invalid --host"
             );
             let backend = string("--backend")?.unwrap_or("bundled");
-            ensure!(
-                matches!(backend, "tmux" | "herdr" | "bundled"),
-                "invalid --backend"
-            );
+            ensure!(matches!(backend, "bundled" | "herdr"), "invalid --backend");
             let endpoint = string("--herdr-endpoint")?;
             ensure!(
                 endpoint.is_none() || backend == "herdr",
@@ -179,11 +176,6 @@ impl<'a> Dispatch<'a> {
         ensure!(task.is_file(), "--task must name a file");
 
         let state = writable_state_dir()?;
-        // Keep the cutover independent of the new default adapter.
-        ensure!(
-            self.host.as_ref().is_none_or(|host| host.backend != "tmux"),
-            "tmux backend is retired"
-        );
         let records = state.join("dispatches");
         let dispatch = format!("d-{}", Uuid::new_v4().simple());
         let attempt = format!("a-{}", Uuid::new_v4().simple());
@@ -273,11 +265,6 @@ impl<'a> Dispatch<'a> {
                 );
                 record["endpoint"] =
                     json!(endpoint.to_str().context("Herdr endpoint must be UTF-8")?);
-            } else if host.backend == "tmux" {
-                record["tmux"] = json!(format!("wfc-{dispatch}"));
-                record["tmuxSocket"] = json!(backend::tmux_socket()?);
-                record["executionId"] = record["attempt"].clone();
-                record["tmuxLaunchProtocol"] = json!(backend::LAUNCH_PROTOCOL);
             } else {
                 crate::bundled::require_delegation()?;
             }
@@ -286,17 +273,6 @@ impl<'a> Dispatch<'a> {
                 Err(err) => {
                     #[cfg(target_os = "linux")]
                     if let Some(failure) = err.downcast_ref::<host::ScriptUnavailable>() {
-                        if host.name == "opencode" && host.backend == "tmux" {
-                            use std::os::unix::fs::DirBuilderExt;
-
-                            // The script check precedes private OpenCode store
-                            // setup. Keep both directories private for a retry.
-                            fs::DirBuilder::new()
-                                .recursive(true)
-                                .mode(0o700)
-                                .create(&records)
-                                .context("create OpenCode state directory")?;
-                        }
                         // Owner changes lock scope then ledger. Herdr must
                         // stay unowned through the same publication boundary.
                         let _scope = (host.backend == "herdr")
@@ -370,20 +346,18 @@ impl<'a> Dispatch<'a> {
         };
         let mut preserve_binding = false;
         #[cfg(target_os = "linux")]
-        let mut adoption_ledger = None;
+        let mut _adoption_ledger = None;
         let result = (|| -> Result<()> {
             if let Some(launch) = launch {
                 #[cfg(target_os = "linux")]
-                if record["backend"] == "bundled" {
-                    messages::sync_directory(&records)?;
-                }
+                messages::sync_directory(&records)?;
                 let answer = backend::create(&state, &record, launch);
                 #[cfg(target_os = "linux")]
                 if opencode_opening {
                     // The hook can publish during create. Serialize promotion
                     // or cleanup with the same publisher before reading it back.
                     preserve_binding = true;
-                    adoption_ledger = Some(messages::lock_for_private_publish(&state)?);
+                    _adoption_ledger = Some(messages::lock_for_private_publish(&state)?);
                     host::preserve_opencode_adoption(&pending, &mut record)?;
                     preserve_binding = !record["hostSession"].is_null();
                 }
@@ -391,8 +365,7 @@ impl<'a> Dispatch<'a> {
                 let accepted = answer["result"] == "accepted";
                 if accepted
                     || answer["result"] == "uncertain"
-                    || (record["backend"] == "bundled"
-                        && answer["unstarted"]["group_cleanup"] == "unknown")
+                    || answer["unstarted"]["group_cleanup"] == "unknown"
                     || matches!(
                         answer["category"].as_str(),
                         Some("executable_missing" | "permission_denied" | "spawn_failed")
@@ -403,7 +376,7 @@ impl<'a> Dispatch<'a> {
                     answer["dispatch"] = record["dispatch"].clone();
                     answer["attempt"] = record["attempt"].clone();
                     answer["round"] = record["round"].clone();
-                    if record["backend"] == "bundled" && answer["ticket"].is_object() {
+                    if answer["ticket"].is_object() {
                         record["backendHandle"] = answer["ticket"].clone();
                     }
                     record["create"] = answer.clone();
@@ -413,20 +386,7 @@ impl<'a> Dispatch<'a> {
                     })?;
                     fs::remove_file(&pending)?;
                     #[cfg(target_os = "linux")]
-                    if record["backend"] == "bundled" || adoption_ledger.is_some() {
-                        messages::sync_directory(&records)?;
-                    }
-                    #[cfg(target_os = "linux")]
-                    if record["backend"] == "tmux"
-                        && backend::publish_unconfirmed_tmux_exit(
-                            &state,
-                            &record,
-                            adoption_ledger.take(),
-                        )
-                        .is_err()
-                    {
-                        eprintln!("wfc: could not publish confirmed startup failure");
-                    }
+                    messages::sync_directory(&records)?;
                 }
                 ensure!(
                     accepted,

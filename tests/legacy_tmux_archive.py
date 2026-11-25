@@ -63,16 +63,18 @@ def native_fixture(root, state):
     return cases
 
 
-def run(binary, root, state, *args, code=0, extra=None):
+def run(binary, root, state, *args, code=0, extra=None, plain=False):
     env = {"PATH": str(root / "no-commands"), "HOME": str(root),
            "WFC_STATE": str(state), "WFC_TMUX_SOCKET": str(root / "missing.sock")}
     env.update(extra or {})
     result = subprocess.run([binary, *map(str, args)], cwd=root, env=env,
                             text=True, capture_output=True, timeout=8)
     assert result.returncode == code, (args, result)
-    if code == 1:
+    if code in (1, 2):
         assert not result.stdout, result
         return result.stderr
+    if plain:
+        return result.stdout
     return json.loads(result.stdout)
 
 
@@ -85,6 +87,12 @@ def verify_native(binary, root):
     rows = listed["dispatches"]
     assert [row["dispatch"] for row in rows] == [row["dispatch"] for row, _, _ in cases]
     assert run(binary, root, state, "status", "--active")["reclaimable"] == []
+    for command in ("dispatch", "handoff"):
+        help_text = run(binary, root, state, command, "--help", plain=True)
+        assert "tmux" not in help_text
+    assert "invalid --backend" in run(binary, root, state, "dispatch", "--host", "codex",
+                                       "--backend", "tmux", "--task", cases[0][0]["task"],
+                                       "--cwd", root, "--report", root / "new.md", code=2)
     for row, done, question in cases:
         dispatch = row["dispatch"]
         selected, = run(binary, root, state, "status", "--dispatch", dispatch)["dispatches"]
@@ -110,6 +118,8 @@ def verify_native(binary, root):
             ("close", dispatch), ("reclaim", "--yes", "--dispatch", dispatch),
             ("continue", dispatch, "--task", row["task"], "--report", root / "next.md"),
             ("resume", dispatch), ("handoff", dispatch, "--host", "claude"),
+            ("handoff", dispatch, "--host", "claude", "--backend", "herdr",
+             "--herdr-endpoint", root / "missing.sock"),
             ("nudge", dispatch, "--text", "fixture"),
             ("reply", question["id"], "fixture"), ("ack", done["messageId"]),
             ("wait", "--dispatch", dispatch, "--timeout", "0"),
@@ -212,6 +222,8 @@ def verify_mixed(binary, root):
         assert view["undelivered"] == [] and view["dispatches"][0]["messages"]
 
     before = snapshot(state)
+    assert "--backend must be herdr" in run(binary, root, state, "handoff", dispatch,
+                                             "--host", "claude", "--backend", "tmux", code=2)
     assert HISTORY_ONLY in run(binary, root, state, "ack", 22, code=1)
     assert HISTORY_ONLY in run(binary, root, state, "resolve", 23, "--actor", "fixture",
                                 "--reason", "fixture", "--evidence", "fixture",

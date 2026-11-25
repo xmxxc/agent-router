@@ -106,7 +106,7 @@ impl<'a> Request<'a> {
                 row["backend"] == "tmux"
                     && (row["host"] == "codex"
                         || replay.is_some_and(|index| row["audit"][index]["result"] == "accepted")),
-                "{operation} requires a supported live Codex/tmux assignment"
+                "{operation} is unavailable for this backend"
             );
             Ok(())
         };

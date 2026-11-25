@@ -139,14 +139,15 @@ fn call(state: &Path, row: &Value, mut request: Value) -> Result<Value> {
 
 pub fn create(state: &Path, row: &Value, launch: Launch) -> Result<Value> {
     #[cfg(target_os = "linux")]
-    if row["backend"] == "bundled" {
-        return bundled::create(state, row, launch);
+    {
+        ensure!(row["backend"] == "bundled", "bundled assignment required");
+        bundled::create(state, row, launch)
     }
-    call(
-        state,
-        row,
-        json!({"op":"create","executionId":row["executionId"],"freshDispatch":true,"cwd":row["cwd"],"label":row["label"],"argv":launch.argv,"env":launch.env}),
-    )
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (state, row, launch);
+        bail!("bundled dispatch requires Linux")
+    }
 }
 
 #[cfg(target_os = "linux")]

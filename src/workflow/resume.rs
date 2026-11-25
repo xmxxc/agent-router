@@ -72,9 +72,8 @@ impl<'a> Resume<'a> {
         let opencode = row["host"] == "opencode";
         let herdr = row["backend"] == "herdr";
         ensure!(
-            (row["backend"] == "tmux" && (row["host"] == "codex" || claude || opencode))
-                || (herdr && row["host"] == "codex" && row["round"] == 1),
-            "resume requires a Linux Codex, Claude or OpenCode dispatch using the tmux backend, or an original Codex task using Herdr"
+            herdr && row["host"] == "codex" && row["round"] == 1,
+            "resume requires an original Codex task using Herdr"
         );
         ensure!(
             assignment::identified(&row) && row["controllerOwner"].is_null(),

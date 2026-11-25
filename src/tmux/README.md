@@ -1,4 +1,6 @@
-# Linux tmux 后端接口
+# Linux tmux 后端历史接口
+
+此页记录退役前的协议和测试用法。当前公开派发使用 bundled 或显式 Herdr。旧 tmux 派工通过 `wfc status --dispatch ID` 查历史。
 
 调度层可调用 `tmux::execute(state, request)`，也可启动一次 `wfc --tmux-backend`，将一个 UTF-8 JSON 对象写入标准输入后关闭输入，读取标准输出的一个 JSON 对象。后者用于跨进程集成和独立复验。每个请求带 `dispatch` 和 `op`。Linux 的新请求与旧记录中缺省、null、空字符串的 `backend` 都选 tmux，也接受显式的 `"tmux"`。其他后端由上层路由到对应实现。
 

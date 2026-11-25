@@ -14,7 +14,7 @@ use std::{
 use uuid::Uuid;
 use wfc_herdr::Process;
 
-pub const USAGE: &str = "wfc handoff DISPATCH --host HOST [--backend tmux|herdr] [--herdr-endpoint PATH] [--task PATH --report PATH] [--model MODEL] [--owner-token TOKEN]";
+pub const USAGE: &str = "wfc handoff DISPATCH --host HOST --backend herdr --herdr-endpoint PATH [--task PATH --report PATH] [--model MODEL] [--owner-token TOKEN]\n    Replay a recorded Herdr handoff.";
 pub(super) const PENDING_CALLBACK_HASH: &str = "handoffCallbackHash";
 
 pub struct Handoff<'a> {
@@ -47,18 +47,15 @@ impl<'a> Handoff<'a> {
             task.is_some() == report.is_some(),
             "give both --task and --report, or neither"
         );
-        let backend = backend.unwrap_or("tmux");
         ensure!(
-            matches!(backend, "tmux" | "herdr"),
-            "--backend must be tmux or herdr"
+            backend.is_none_or(|name| name == "herdr"),
+            "--backend must be herdr"
         );
         ensure!(
-            if backend == "herdr" {
-                endpoint.is_some_and(|socket| Path::new(socket).is_absolute())
-            } else {
-                endpoint.is_none()
-            },
-            "an absolute --herdr-endpoint is required for a Herdr target only"
+            (backend.is_none() && endpoint.is_none())
+                || (backend == Some("herdr")
+                    && endpoint.is_some_and(|socket| Path::new(socket).is_absolute())),
+            "use --backend herdr with an absolute --herdr-endpoint"
         );
         Ok(Self {
             dispatch: dispatch
@@ -67,7 +64,7 @@ impl<'a> Handoff<'a> {
             host: host
                 .filter(|name| matches!(*name, "codex" | "opencode" | "claude"))
                 .context("--host must be codex, opencode or claude")?,
-            backend,
+            backend: "herdr",
             endpoint,
             next: task
                 .zip(report)
@@ -88,8 +85,10 @@ impl<'a> Handoff<'a> {
         };
         let initial = read()?;
         assignment::require_not_tmux_history(&initial)?;
-        // Retire the destination before the source can be closed.
-        ensure!(self.backend != "tmux", "tmux backend is retired");
+        ensure!(
+            self.endpoint.is_some(),
+            "handoff requires an explicit Herdr target"
+        );
         let scope = super::record_scope(&initial).context("invalid dispatch scope")?;
         let token = controller::token(self.owner_token);
         let authorize = || -> Result<Value> {
@@ -123,7 +122,7 @@ impl<'a> Handoff<'a> {
         let herdr_source = row["backend"] == "herdr";
         ensure!(
             !herdr_source || self.backend == "tmux",
-            "Herdr source handoff requires a tmux target"
+            "handoff has no supported target for an active Herdr assignment"
         );
         ensure!(
             !herdr_source || (generation.is_null() && row["round"] == 1 && self.next.is_none()),
@@ -139,7 +138,7 @@ impl<'a> Handoff<'a> {
                         && row["tmuxSocket"]
                             .as_str()
                             .is_some_and(|socket| Path::new(socket).is_absolute()))),
-            "handoff requires an original native execution with a confirmed launch"
+            "starting a new handoff is unavailable in this build"
         );
         ensure!(
             row["host"] != self.host || row["backend"] != self.backend,

@@ -158,33 +158,6 @@ fn run() -> anyhow::Result<ExitCode> {
             )?));
         }
         #[cfg(target_os = "linux")]
-        Some("--tmux-backend") if args.len() <= 1 => {
-            let request = serde_json::from_reader(std::io::stdin().lock())?;
-            let state = match args.first() {
-                Some(path) => Path::new(path).to_owned(),
-                None => workflow::state_dir()?,
-            };
-            anyhow::ensure!(state.is_absolute(), "tmux backend requires an absolute state path");
-            println!("{}", tmux::execute(&state, request)?);
-        }
-        #[cfg(target_os = "linux")]
-        Some("--tmux-attach") if args.len() == 4 => {
-            tmux::attach(
-                Path::new(&args[0]),
-                args[1].to_str().unwrap_or_default(),
-                Path::new(&args[2]),
-                args[3].to_str().unwrap_or_default(),
-            )?;
-        }
-        #[cfg(target_os = "linux")]
-        Some("--tmux-record-session") if args.len() == 8 => {
-            tmux::record_created_session(&args)?;
-        }
-        #[cfg(target_os = "linux")]
-        Some("--tmux-host") if args.len() == 1 => {
-            return tmux::launch::run_host(Path::new(&args[0]));
-        }
-        #[cfg(target_os = "linux")]
         Some("--opencode-adopt") if args.is_empty() => {
             return Ok(if workflow::host::opencode_first_message() {
                 ExitCode::SUCCESS
