@@ -36,6 +36,22 @@ fn check_cgroup(fd: &File) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn verify_service_root(path: &Path) -> Result<()> {
+    let dir = directory(path)?;
+    check_cgroup(&dir)?;
+    ensure!(
+        dir.metadata()?.uid() == unsafe { libc::geteuid() },
+        "user service cgroup is not delegated to the current user"
+    );
+    let mut procs = String::new();
+    child_file(&dir, OsStr::new("cgroup.procs"), libc::O_RDONLY)?.read_to_string(&mut procs)?;
+    ensure!(
+        procs.trim() == std::process::id().to_string(),
+        "bundled guardian must be its user service's sole initial process"
+    );
+    Ok(())
+}
+
 // Nothing inside an owned group may redirect an operation across a mount,
 // including a bind mount of a sibling on the very same cgroup filesystem.
 fn child_file(parent: &File, name: &OsStr, flags: i32) -> Result<File> {

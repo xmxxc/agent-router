@@ -158,6 +158,13 @@ fn run() -> anyhow::Result<ExitCode> {
             )?));
         }
         #[cfg(target_os = "linux")]
+        Some("--bundled-user-guardian") if args.is_empty() => {
+            return Ok(ExitCode::from(bundled::run(
+                "--bundled-user-guardian",
+                None,
+            )?));
+        }
+        #[cfg(target_os = "linux")]
         Some("--tmux-backend") if args.len() <= 1 => {
             let request = serde_json::from_reader(std::io::stdin().lock())?;
             let state = match args.first() {

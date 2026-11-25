@@ -45,7 +45,7 @@ wfc dispatch --host codex --task task.md --cwd . --report reports/04-review/r1.m
 wfc status --active
 ```
 
-Linux 宿主派发默认使用同一可执行文件中的 bundled 后端。运行前把 `WFC_BUNDLED_CGROUP_ROOT` 指向已经授权给当前用户的可写 cgroup v2 委派子树。内核须提供 `cgroup.kill`，用户须能在该委派下创建子组并把自建运行时迁入。缺少这些条件时派发会给出错误。普通目录无法充当委派子树。可按编号查询、回报和关闭。客户端重开后，查询和关闭仍按原派发号、attempt 和运行票据查证已存在的执行。
+Linux 宿主派发默认使用同一可执行文件中的 bundled 后端。普通登录用户可直接派发，wfc 通过该用户的 systemd 管理器为每次派发启动一个临时 guardian 服务。派发命令返回后 worker 继续运行，关闭后 guardian 结束并释放此次服务。也可以设置 `WFC_BUNDLED_CGROUP_ROOT`，使用已授权给当前用户的可写 cgroup v2 委派子树。两种方式都要求内核支持 `cgroup.kill` 和创建、迁入子组。用户管理器或委派不可用时会显示诊断。客户端重开后，可按原派发号、attempt 和票据查询、回报和关闭。
 
 宿主可选 codex、opencode 或 claude，`--launch-config` 或 `WFC_LAUNCH_CONFIG` 指向带有 env、hosts 的 JSON 配置。每个宿主可指定 command、runtime 参数数组及 env。Herdr 由 `--backend herdr` 显式选择。下面的旧 tmux 示例和隔离测试使用显式 `--backend tmux`。
 

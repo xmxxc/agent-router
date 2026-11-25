@@ -92,9 +92,7 @@ pub fn stage_cmd(stage: &str, dir: &Path, spec: &Value, token: &str) -> Result<C
     let path = dir.join(fresh());
     let mut input = new_file(&path)?;
     fs::remove_file(path)?;
-    let grant = json!([stage, spec]);
-    let signature = sign(token, &serde_json::to_vec(&grant)?);
-    serde_json::to_writer(&mut input, &json!({"spec":spec,"signature":signature}))?;
+    write_grant(&mut input, stage, spec, token)?;
     input.seek(SeekFrom::Start(0))?;
     let mut cmd = Command::new("/proc/self/exe");
     for name in std::env::vars_os().map(|(name, _)| name) {
@@ -116,6 +114,13 @@ pub fn stage_cmd(stage: &str, dir: &Path, spec: &Value, token: &str) -> Result<C
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     Ok(cmd)
+}
+
+pub fn write_grant(mut input: impl Write, stage: &str, spec: &Value, token: &str) -> Result<()> {
+    let grant = json!([stage, spec]);
+    let signature = sign(token, &serde_json::to_vec(&grant)?);
+    serde_json::to_writer(&mut input, &json!({"spec":spec,"signature":signature}))?;
+    Ok(())
 }
 
 fn process(pid: u32) -> Result<(Value, bool)> {

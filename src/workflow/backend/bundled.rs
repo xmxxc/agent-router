@@ -24,7 +24,8 @@ pub(super) fn create(state: &Path, row: &Value, mut launch: Launch) -> Result<Va
         }
     }
     let request = json!({"op":"create","unit":row["dispatch"],"attempt":row["attempt"],
-        "cwd":row["cwd"],"argv":launch.argv,"env":launch.env});
+        "cwd":row["cwd"],"argv":launch.argv,"env":launch.env,
+        "publisher":crate::bundled::publisher_identity()?});
     let mut command = Command::new(env::current_exe()?);
     controller::strip_credentials(&mut command);
     let mut child = command

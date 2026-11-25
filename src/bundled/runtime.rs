@@ -4,9 +4,18 @@ use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use wire::{Wire, FRAME, LIMIT, PREAUTH};
 
-pub fn guard(state: &Path, spec: &Value, store: Store) -> Result<()> {
+pub fn guard(
+    state: &Path,
+    spec: &Value,
+    store: Store,
+    managed: Option<(PathBuf, Value)>,
+) -> Result<()> {
     let guardian = store::identity(std::process::id())?;
-    let group = match group::root()
+    let (root, user_service) = match managed {
+        Some((root, unit)) => (Ok(root), Some(unit)),
+        None => (group::root(), None),
+    };
+    let group = match root
         .map_err(group::AllocationFailure::from)
         .and_then(|root| group::Group::create(&root))
     {
@@ -21,6 +30,9 @@ pub fn guard(state: &Path, spec: &Value, store: Store) -> Result<()> {
     };
     // From group creation onwards every return passes through empty+remove.
     let mut actual = json!({"guardian":guardian, "containment":group.identity});
+    if let Some(binding) = &user_service {
+        actual["userService"] = binding.clone();
+    }
     let outcome = (|| -> Result<&str> {
         store.save_signed("starting", actual.clone())?;
         let (reader, writer) = UnixStream::pair()?;
@@ -35,6 +47,11 @@ pub fn guard(state: &Path, spec: &Value, store: Store) -> Result<()> {
         let started = (|| -> Result<()> {
             store.save_signed("starting", actual.clone())?;
             let details = boot.read(LIMIT, Instant::now() + TIMEOUT)?;
+            if user_service.is_some() {
+                // After ready, the original ticket owns the execution even
+                // if the dispatch publisher later loses the reply.
+                super::user_service::startup_live(&spec["userService"])?;
+            }
             for key in ["kernel", "kernel_generation", "worker", "endpoint"] {
                 actual[key] = details
                     .get(key)
@@ -153,6 +170,9 @@ fn receive(socket: &mut Wire<TcpStream>, token: &str) -> Result<Value> {
 }
 
 pub fn serve(spec: &Value, store: Store) -> Result<u8> {
+    if spec["userService"].is_object() {
+        user_service::startup_live(&spec["userService"])?;
+    }
     let mut kernel = Kernel::start(spec)?;
     let spawn = &spec["request"];
     // Only argv/cwd belong on the kernel wire.

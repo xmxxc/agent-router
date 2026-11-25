@@ -2,6 +2,7 @@
 mod group;
 mod runtime;
 mod store;
+mod user_service;
 mod wire;
 
 use crate::workflow::ensure_state_writable;
@@ -28,10 +29,18 @@ fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
 }
 
 pub(crate) fn require_delegation() -> Result<()> {
-    group::root().context(
-        "bundled dispatch requires WFC_BUNDLED_CGROUP_ROOT to point to a writable, delegated cgroup v2 subtree with cgroup.kill",
-    )?;
+    if std::env::var_os("WFC_BUNDLED_CGROUP_ROOT").is_some() {
+        group::root().context(
+            "bundled dispatch requires WFC_BUNDLED_CGROUP_ROOT to point to a writable, delegated cgroup v2 subtree with cgroup.kill",
+        )?;
+    } else {
+        user_service::bus()?;
+    }
     Ok(())
+}
+
+pub(crate) fn publisher_identity() -> Result<Value> {
+    store::identity(std::process::id())
 }
 
 fn native_state(selected: Option<&Path>, inherited: Option<&std::ffi::OsStr>) -> Result<PathBuf> {
@@ -60,7 +69,8 @@ fn unit_dir(state: &Path, name: &str) -> Result<PathBuf> {
 
 fn attached_store(state: &Path, spec: &Value) -> Result<(Store, File)> {
     let ticket = &spec["ticket"];
-    let (unit, guard) = open_write_unit(state, field(ticket, "unit")?)?;
+    let (unit, guard) = unit_lock_file(state, field(ticket, "unit")?)?;
+    guard.lock()?;
     let (_, store) = store::current(&unit)?.context("missing current execution")?;
     ensure!(
         store.ticket == *ticket && store::ordered(&unit, &store)?,
@@ -141,11 +151,22 @@ fn create(state: &Path, req: &Value) -> Result<Value> {
     } else {
         ensure!(req["previous"].is_null(), "missing previous create");
     }
-    let root = match group::root() {
-        Ok(root) => root,
-        Err(error) => {
-            return Ok(json!({"result":"definitely-not-sent","diagnostic":error.to_string()}))
+    let root = if std::env::var_os("WFC_BUNDLED_CGROUP_ROOT").is_some() {
+        match group::root() {
+            Ok(root) => Some(root),
+            Err(error) => {
+                return Ok(json!({"result":"definitely-not-sent","diagnostic":error.to_string()}))
+            }
         }
+    } else {
+        None
+    };
+    let creator = publisher_identity()?;
+    let expires = unix_ms()? + (TIMEOUT + TIMEOUT).as_millis() as u64;
+    let user_start = if root.is_none() {
+        Some(user_service::context(state, req, &creator, expires)?)
+    } else {
+        None
     };
     let generation = fresh();
     let token = format!("{}{}", fresh(), fresh());
@@ -153,20 +174,10 @@ fn create(state: &Path, req: &Value) -> Result<Value> {
     let run = unit_path.join(&generation);
     store::private_dir(&run)?;
     publish(&run.join("key.json"), &json!(token))?;
-    let spec = json!({"ticket":ticket,"request":req});
-    let mut cmd = store::stage_cmd("--bundled-guardian", &run, &spec, &token)?;
-    cmd.arg(state).env("WFC_BUNDLED_CGROUP_ROOT", root);
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
-    let creator = store::identity(std::process::id())?;
-    let expires = unix_ms()? + (TIMEOUT + TIMEOUT).as_millis() as u64;
+    let spec = json!({"ticket":ticket,"request":req,"userService":user_start});
+    let explicit = root
+        .map(|root| explicit_guardian(state, &run, &spec, &token, root))
+        .transpose()?;
     let store = Store::open(&unit_path, &ticket)?;
     let index =
         json!({"ticket":ticket,"applied":false,"creator":creator,"pending_until_ms":expires});
@@ -185,7 +196,12 @@ fn create(state: &Path, req: &Value) -> Result<Value> {
             json!({"result":"definitely-not-sent","ticket":ticket,"diagnostic":error.to_string()}),
         );
     }
-    let mut child = match cmd.spawn() {
+    if let Some(context) = &user_start {
+        let launcher = user_service::start(&store);
+        drop(guard);
+        return user_service::await_ready(state, &store, &spec, context, launcher);
+    }
+    let mut child = match explicit.context("missing explicit guardian")?.spawn() {
         Ok(c) => c,
         Err(_) => {
             store.save_signed(
@@ -209,6 +225,27 @@ fn create(state: &Path, req: &Value) -> Result<Value> {
         }
         thread::sleep(TICK);
     }
+}
+
+fn explicit_guardian(
+    state: &Path,
+    run: &Path,
+    spec: &Value,
+    token: &str,
+    root: PathBuf,
+) -> Result<Command> {
+    let mut cmd = store::stage_cmd("--bundled-guardian", run, spec, token)?;
+    cmd.arg(state).env("WFC_BUNDLED_CGROUP_ROOT", root);
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(io::Error::last_os_error().into())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    Ok(cmd)
 }
 
 fn service_changed() -> Value {
@@ -538,17 +575,23 @@ fn operate(state: &Path, req: &Value) -> Result<Value> {
 }
 
 pub fn run(stage: &str, selected: Option<&Path>) -> Result<u8> {
-    let inherited = std::env::var_os("WFC_STATE");
-    let state = native_state(selected, inherited.as_deref())?;
+    let managed = stage == user_service::STAGE;
     let mut bytes = Vec::new();
     // Internal specs also carry the generated ticket around the caller's frame.
     let limit = wire::LIMIT + if stage == "--bundled" { 0 } else { 4096 };
     io::stdin().take(limit as u64 + 1).read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= limit, "oversized request");
     let request: Value = serde_json::from_slice(&bytes)?;
+    let spec = &request["spec"];
+    let inherited = std::env::var_os("WFC_STATE");
+    let selected = if managed {
+        Some(Path::new(field(&spec["userService"], "state")?))
+    } else {
+        selected
+    };
+    let state = native_state(selected, inherited.as_deref())?;
     match stage {
-        "--bundled-guardian" | "--bundled-runtime" => {
-            let spec = &request["spec"];
+        "--bundled-guardian" | "--bundled-runtime" | user_service::STAGE => {
             let (store, guard) = attached_store(&state, spec)?;
             let grant = json!([stage, spec]);
             store::verify(
@@ -556,6 +599,15 @@ pub fn run(stage: &str, selected: Option<&Path>) -> Result<u8> {
                 &serde_json::to_vec(&grant)?,
                 field(&request, "signature")?,
             )?;
+            if managed {
+                user_service::restore_legacy_context(&spec["userService"])?;
+                ensure!(
+                    fs::symlink_metadata(store.run.join("unstarted.json"))
+                        .is_err_and(|e| e.kind() == io::ErrorKind::NotFound),
+                    "bundled user service grant was withdrawn"
+                );
+            }
+            ensure_state_writable(&state)?;
             // Consume the signed grant once, including if the stage dies while starting.
             OpenOptions::new()
                 .write(true)
@@ -564,8 +616,10 @@ pub fn run(stage: &str, selected: Option<&Path>) -> Result<u8> {
                 .open(store.run.join(stage))?;
             // The next stage also acquires this lock before consuming its grant.
             drop(guard);
-            if stage == "--bundled-guardian" {
-                runtime::guard(&state, spec, store)?;
+            if managed {
+                user_service::guard(&state, spec, store)?;
+            } else if stage == "--bundled-guardian" {
+                runtime::guard(&state, spec, store, None)?;
             } else {
                 return runtime::serve(spec, store);
             }
