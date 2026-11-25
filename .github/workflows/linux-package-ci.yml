@@ -19,6 +19,10 @@ on:
         description: Exercise the downloaded binary in an ordinary Jammy hosted VM with systemd delegation
         type: boolean
         default: false
+      clean_guest_runtime:
+        description: Exercise the same downloaded binary in the offline clean Jammy guest with systemd delegation
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -45,6 +49,8 @@ jobs:
       LC_ALL: C.UTF-8
     outputs:
       manifest_sha256: ${{ steps.manifest.outputs.manifest_sha256 }}
+      package_sha256: ${{ steps.manifest.outputs.package_sha256 }}
+      elf_sha256: ${{ steps.manifest.outputs.elf_sha256 }}
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
       artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
     steps:
@@ -178,7 +184,13 @@ jobs:
           sha256sum -- "$archive" binary.sha256 *.log > SHA256SUMS
           sha256sum --check --strict SHA256SUMS
           manifest=$(sha256sum SHA256SUMS | cut -d ' ' -f 1)
-          printf 'manifest_sha256=%s\n' "$manifest" >> "$GITHUB_OUTPUT"
+          package=$(sha256sum "$archive" | cut -d ' ' -f 1)
+          read -r elf _ < binary.sha256
+          {
+            printf 'manifest_sha256=%s\n' "$manifest"
+            printf 'package_sha256=%s\n' "$package"
+            printf 'elf_sha256=%s\n' "$elf"
+          } | tee -a "$GITHUB_OUTPUT"
       - name: Upload the Linux checkpoint
         id: upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -191,10 +203,16 @@ jobs:
   runtime:
     name: ${{ inputs.hosted_delegated_runtime && 'Downloaded bundled lifecycle on a delegated hosted VM' || 'Downloaded bundled lifecycle in a clean runtime' }}
     needs: package
+    if: inputs.hosted_delegated_runtime || !inputs.clean_guest_runtime
     runs-on: ${{ inputs.hosted_delegated_runtime && 'ubuntu-22.04' || inputs.runtime_runner }}
     timeout-minutes: 15
     env:
       RUNTIME_BASE: docker.io/library/ubuntu:22.04@sha256:b682e31336cc8e0a73ed91ab32b7a95e32591c5ff09994490a20accf9b3600f9
+      MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
+      PACKAGE_SHA256: ${{ needs.package.outputs.package_sha256 }}
+      ELF_SHA256: ${{ needs.package.outputs.elf_sha256 }}
+      ARTIFACT_ID: ${{ needs.package.outputs.artifact_id }}
+      ARTIFACT_DIGEST: ${{ needs.package.outputs.artifact_digest }}
     steps:
       - name: Check out the Bash acceptance scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -204,25 +222,16 @@ jobs:
           path: ci
           persist-credentials: false
       - name: Download the checkpoint from the build job
+        if: env.ARTIFACT_ID != ''
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ needs.package.outputs.artifact_id }}
           path: checkpoint
           merge-multiple: true
-      - name: Verify the downloaded manifest and files
-        working-directory: checkpoint
-        env:
-          MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
-          ARTIFACT_ID: ${{ needs.package.outputs.artifact_id }}
-          ARTIFACT_DIGEST: ${{ needs.package.outputs.artifact_digest }}
-        run: |
-          printf 'downloaded_artifact=%s digest=%s\n' "$ARTIFACT_ID" "$ARTIFACT_DIGEST"
-          printf '%s  %s\n' "$MANIFEST_SHA256" SHA256SUMS | sha256sum --check --strict
-          sha256sum --check --strict SHA256SUMS
+      - name: Verify the downloaded checkpoint against the build outputs
+        run: bash ci/tools/check_linux_download.sh "$GITHUB_WORKSPACE/checkpoint"
       - name: Exercise the downloaded binary in a delegated hosted VM
         if: inputs.hosted_delegated_runtime
-        env:
-          MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
         run: |
           test "$(id -u)" -gt 0
           unit="wfc-package-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -245,8 +254,6 @@ jobs:
           DOCKERFILE
       - name: Check the same downloaded binary in the clean hosted container
         if: ${{ !inputs.hosted_delegated_runtime && runner.environment == 'github-hosted' }}
-        env:
-          MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
         run: |
           docker image inspect --format='runtime_image_id={{.Id}}' wfc-package-runtime
           docker run --rm --init --platform linux/amd64 --user 1000:1000 \
@@ -258,8 +265,44 @@ jobs:
             wfc-package-runtime /bin/bash /check_linux_runtime.sh /checkpoint "$PRODUCT_SHA" "$TARGET" "$MANIFEST_SHA256"
       - name: Exercise default dispatch in the pre-provisioned clean runtime
         if: ${{ !inputs.hosted_delegated_runtime && runner.environment == 'self-hosted' }}
-        env:
-          MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
         run: |
           bash ci/tools/check_linux_runtime.sh "$GITHUB_WORKSPACE/checkpoint" \
             "$PRODUCT_SHA" "$TARGET" "$MANIFEST_SHA256"
+
+  clean_guest:
+    name: Downloaded bundled lifecycle in the offline clean Jammy guest
+    needs: package
+    if: inputs.clean_guest_runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
+      PACKAGE_SHA256: ${{ needs.package.outputs.package_sha256 }}
+      ELF_SHA256: ${{ needs.package.outputs.elf_sha256 }}
+      ARTIFACT_ID: ${{ needs.package.outputs.artifact_id }}
+      ARTIFACT_DIGEST: ${{ needs.package.outputs.artifact_digest }}
+      GUEST_EVIDENCE: ${{ github.workspace }}/guest-evidence
+    steps:
+      - name: Check out the guest and Bash acceptance scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: xmxxc/agent-router
+          ref: ${{ job.workflow_sha }}
+          fetch-depth: 2
+          path: ci
+          persist-credentials: false
+      - name: Download the checkpoint from the same build job
+        if: env.ARTIFACT_ID != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact_id }}
+          path: checkpoint
+          merge-multiple: true
+      - name: Verify the downloaded checkpoint against the build outputs
+        run: bash ci/tools/check_linux_download.sh "$GITHUB_WORKSPACE/checkpoint"
+      - name: Prepare the pinned offline guest and its checkpoint mount
+        run: |
+          bash ci/tools/ci/linux-guest-preflight/prepare.sh "$RUNNER_TEMP/wfc-clean-guest" "$GUEST_EVIDENCE" checkpoint
+      - name: Check the platform and the downloaded product in the guest
+        run: |
+          bash ci/tools/ci/linux-guest-preflight/boot.sh "$RUNNER_TEMP/wfc-clean-guest" "$GUEST_EVIDENCE" "$GITHUB_WORKSPACE/checkpoint"

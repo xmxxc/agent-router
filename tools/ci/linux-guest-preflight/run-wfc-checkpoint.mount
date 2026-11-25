@@ -1,0 +1,8 @@
+[Unit]
+Description=Mount the sealed WFC checkpoint input disk
+
+[Mount]
+What=/dev/vdb
+Where=/run/wfc/checkpoint
+Type=ext4
+Options=ro,noload,nodev,nosuid,noexec

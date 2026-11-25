@@ -80,3 +80,6 @@ printf '%s\n' "$version"
 [[ "$version" == *"(Rust, $target, release, build $product)" ]]
 
 /bin/bash "$tools/check_linux_bundled_package.sh" "$work/wfc"
+rm -r -- "$work"
+trap - EXIT
+printf 'WFC_DEFAULT_BUNDLED_PRODUCT_PASS\n'

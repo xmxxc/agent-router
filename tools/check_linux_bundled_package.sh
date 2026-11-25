@@ -77,6 +77,8 @@ jq -e '.backend == "bundled" and .create.result == "accepted"
     and .create.ticket.unit == .dispatch and .create.ticket.attempt == .attempt' "$work/dispatch.json" >/dev/null
 attempt=$(jq -er '.attempt | strings | select(startswith("a-"))' "$work/dispatch.json")
 jq '{dispatch,round,attempt,backend,identity:.create.identity}' "$work/dispatch.json"
+create_ticket=$(jq -cS '.create.ticket' "$work/dispatch.json" | sha256sum | cut -d ' ' -f 1)
+printf 'dispatch_ticket_sha256=%s\n' "$create_ticket"
 
 boot=$(cat /proc/sys/kernel/random/boot_id)
 group=$(jq -er '.create.identity.containment.path | strings' "$work/dispatch.json")
@@ -119,8 +121,11 @@ jq '{dispatch,round,attempt,operation,result,cleanup,proof:{state:.proof.state,p
 jq -e --arg dispatch "$dispatch" --arg attempt "$attempt" --slurpfile creation "$work/dispatch.json" '
     .dispatch == $dispatch and .attempt == $attempt and .round == 1 and .operation == "close"
     and .result == "completed" and .cleanup == "confirmed"
+    and .ticket == $creation[0].create.ticket
     and .proof.state == "closed" and .proof.proves == "execution-empty"
     and .proof.identity == $creation[0].create.identity' "$work/close.json" >/dev/null
+close_ticket=$(jq -cS '.ticket' "$work/close.json" | sha256sum | cut -d ' ' -f 1)
+printf 'close_ticket_sha256=%s\n' "$close_ticket"
 wfc status --dispatch "$dispatch" | jq -e --arg id "$message" '
     .dispatches | length == 1 and (.[0] | .backend == "bundled" and .backendAlive == false
         and .backendObservation.cleanup == "confirmed"
@@ -136,7 +141,7 @@ for _ in {1..50}; do
         fi
     done
     if [[ "$remaining" == false && ! -e "$group" ]]; then
-        printf 'Default bundled smoke passed: original receipt processed, original processes and group removed.\n'
+        printf 'Default bundled smoke passed: original receipt processed, same ticket closed, original processes and group removed.\n'
         exit 0
     fi
     sleep 0.1

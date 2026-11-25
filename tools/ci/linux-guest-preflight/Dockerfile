@@ -12,6 +12,7 @@ RUN apt-get update \
     && rm /tmp/linux-image.deb /tmp/linux-modules.deb
 COPY guest-preflight.sh /usr/local/libexec/wfc-guest-preflight.sh
 COPY wfc-guest-preflight.service /etc/systemd/system/wfc-guest-preflight.service
+COPY guest-config/ /
 RUN useradd --uid 1000 --no-create-home --shell /usr/sbin/nologin wfc-guest \
     && mkdir -p /etc/systemd/system/multi-user.target.wants \
     && ln -s /etc/systemd/system/wfc-guest-preflight.service /etc/systemd/system/multi-user.target.wants/ \
