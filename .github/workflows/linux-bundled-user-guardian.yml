@@ -1,0 +1,162 @@
+name: Linux bundled startup publication sync on Jammy
+on:
+  push:
+    branches: [rust-router/linux-33-guardian-publication-sync-jammy-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  default-dispatch:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      WFC_BUILD_ID: a6f29e48e8d45790c73257764f278e84a7fce5fc
+      PRODUCT_TREE: 73200da5545d1bb0f3447bbed7f59384288bfa97
+      PRODUCT_PARENT: fe985ac93d53ab59c0eafce3c5fd8c8c4a66a561
+      NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+      EVIDENCE: ${{ github.workspace }}/bundled-publication-sync-evidence
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - name: Record the hosted run
+        run: |
+          mkdir -p "$EVIDENCE"
+          printf 'workflow %s\nrun %s attempt %s\nproduct %s\n' \
+            "$GITHUB_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$WFC_BUILD_ID" \
+            | tee "$EVIDENCE/run.log"
+          uname -a | tee -a "$EVIDENCE/run.log"
+          { getconf GNU_LIBC_VERSION; systemctl --version; id -u; } | tee "$EVIDENCE/platform.log"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.WFC_BUILD_ID }}
+          path: product
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.NATIVE_INPUT_SHA }}
+          path: native-input
+          sparse-checkout: vendor/zlib-1.3.1.tar.gz
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        with:
+          version: '0.16.0'
+      - name: Verify product provenance and prepare the pinned build
+        working-directory: product
+        run: |
+          test "$(git rev-parse HEAD)" = "$WFC_BUILD_ID"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          test "$(git show -s --format=%P HEAD)" = "$PRODUCT_PARENT"
+          test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
+          git log -1 --format='product %H tree %T parent %P' | tee "$EVIDENCE/product.log"
+          sha256sum --check --strict vendor/INPUTS.sha256 | tee "$EVIDENCE/inputs.log"
+          rustup toolchain install 1.96.1 --profile minimal
+          { rustc -vV; cargo --version; zig version; } | tee "$EVIDENCE/toolchain.log"
+          python tools/prepare.py --zlib-archive ../native-input/vendor/zlib-1.3.1.tar.gz \
+            2>&1 | tee "$EVIDENCE/prepare.log"
+          cargo build --release --locked --bin wfc 2>&1 | tee "$EVIDENCE/build.log"
+          install -m 0500 target/release/wfc "$EVIDENCE/wfc"
+          version=$("$EVIDENCE/wfc" --version)
+          [[ "$version" == *"(Rust, x86_64-unknown-linux-gnu, release, build $WFC_BUILD_ID)" ]]
+          printf '%s\n' "$version" | tee "$EVIDENCE/version.log"
+          (cd "$EVIDENCE" && sha256sum wfc | tee binary.sha256)
+          readelf --version-info "$EVIDENCE/wfc" > "$EVIDENCE/elf-versions.log"
+          python - "$EVIDENCE/elf-versions.log" <<'PYTHON'
+          import re
+          import sys
+          from pathlib import Path
+
+          versions = re.findall(r"\bGLIBC_(\d+)\.(\d+)\b", Path(sys.argv[1]).read_text())
+          assert versions and max((int(a), int(b)) for a, b in versions) <= (2, 35)
+          PYTHON
+      - name: Exercise default dispatch with ordinary directories
+        working-directory: product
+        run: |
+          env -i PATH=/usr/bin:/bin TMPDIR="$RUNNER_TEMP" \
+            /bin/sh tools/check_bundled_default.sh "$EVIDENCE/wfc" ordinary \
+            2>&1 | tee "$EVIDENCE/ordinary.log"
+          grep -Fx BUNDLED_DEFAULT_ORDINARY_PASS "$EVIDENCE/ordinary.log"
+      - name: Verify the legacy write fence using ordinary state
+        working-directory: product
+        run: |
+          env -i PATH=/usr/bin:/bin TMPDIR="$RUNNER_TEMP" \
+            /usr/bin/python3 -Bu tests/bundled_write_fence.py "$EVIDENCE/wfc" \
+            2>&1 | tee "$EVIDENCE/legacy-fence.log"
+          test "$(grep -c '^BUNDLED_WRITE_FENCE_PASS ' "$EVIDENCE/legacy-fence.log")" -eq 2
+      - name: Verify controlled startup and original notice acknowledgement
+        working-directory: product
+        run: |
+          env -i PATH=/usr/bin:/bin TMPDIR="$RUNNER_TEMP" \
+            /usr/bin/python3 -Bu tests/owner.py "$EVIDENCE/wfc" \
+            test_controlled_startup_failure_keeps_owner_notice_and_ack \
+            2>&1 | tee "$EVIDENCE/owner.log"
+          grep -F 'Ran 1 test' "$EVIDENCE/owner.log"
+          grep -Fx 'OK' "$EVIDENCE/owner.log"
+      - name: Verify the bundled worker brief without launching a host
+        working-directory: product
+        run: |
+          selector=workflow::host::tests::bundled_opening_directs_blockers_to_the_report
+          cargo test --release --locked --bin wfc "$selector" -- --exact \
+            2>&1 | tee "$EVIDENCE/brief.log"
+          grep -F "test $selector ... ok" "$EVIDENCE/brief.log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored' "$EVIDENCE/brief.log"
+      - name: Exercise close and guardian decisions without starting a service
+        working-directory: product
+        run: |
+          for selector in \
+            bundled::tests::close_withdrawal_requires_verified_unsent_exact_execution \
+            workflow::backend::bundled::tests::unsent_withdrawal_requires_the_original_intent \
+            bundled::user_service::tests::user_service_membership_names_the_exact_user_and_ticket \
+            bundled::user_service::tests::user_service_startup_rejects_expired_proposals \
+            bundled::user_service::tests::user_manager_snapshot_binds_the_grant_recipient \
+            bundled::store::tests::managed_startup_keeps_the_first_signed_decision \
+            bundled::store::tests::managed_preparation_publication_preserves_the_startup_decision
+          do
+            cargo test --release --locked --bin wfc "$selector" -- --exact \
+              2>&1 | tee -a "$EVIDENCE/guard-decisions.log"
+            grep -F "test $selector ... ok" "$EVIDENCE/guard-decisions.log"
+          done
+      - name: Exercise the public user service and its original receipts
+        working-directory: product
+        run: |
+          if ! env -i PATH=/usr/bin:/bin TMPDIR="$RUNNER_TEMP" \
+            /bin/sh tools/check_bundled_default.sh "$EVIDENCE/wfc" user-service \
+            2>&1 | tee "$EVIDENCE/user-service.log"; then
+            echo 'User service verification failed or the ordinary runner lacks a usable user manager.' \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          grep -Fx BUNDLED_USER_SERVICE_PASS "$EVIDENCE/user-service.log"
+      - name: Exercise both startup decisions with the fixed user-service ELF
+        working-directory: product
+        run: |
+          env -i PATH=/usr/bin:/bin TMPDIR="$RUNNER_TEMP" \
+            /usr/bin/python3 -Bu tools/check_bundled_startup.py "$EVIDENCE/wfc" \
+            2>&1 | tee "$EVIDENCE/startup-decisions.log"
+          grep -E '^BUNDLED_STARTUP_COMMITTED_AFTER_OUTPUT_LOSS d-[0-9a-f]+$' "$EVIDENCE/startup-decisions.log"
+          grep -E '^BUNDLED_STARTUP_INTERRUPTION_PASS d-[0-9a-f]+ a-[0-9a-f]+ wfc-bundled-[0-9a-f-]+\.service$' \
+            "$EVIDENCE/startup-decisions.log"
+      - name: Checksum the artifact
+        if: ${{ always() }}
+        run: |
+          cd "$EVIDENCE"
+          if [ -f binary.sha256 ]; then
+            sha256sum --check --strict binary.sha256
+          fi
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+            | LC_ALL=C sort -z | xargs -0 -r sha256sum > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() }}
+        with:
+          name: bundled-publication-sync-${{ env.WFC_BUILD_ID }}-ci-${{ github.workflow_sha }}-attempt-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 14
