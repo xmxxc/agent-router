@@ -3,8 +3,9 @@
 mod bundled;
 #[cfg(target_os = "linux")]
 pub(super) use bundled::{
-    observe_for_resume as observe_bundled_for_resume, registered_ticket as bundled_input_ticket,
-    resume as resume_bundled, submit_continue as submit_bundled_continue,
+    create_handoff as create_bundled_handoff, observe_for_resume as observe_bundled_for_resume,
+    registered_ticket as bundled_input_ticket, resume as resume_bundled,
+    submit_continue as submit_bundled_continue,
     submit_nudge as submit_bundled_nudge, submit_reply as submit_bundled_reply,
     APPENDED_USER_ENTRY as BUNDLED_APPENDED_USER_ENTRY,
 };

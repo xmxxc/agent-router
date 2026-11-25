@@ -150,6 +150,18 @@ fn authorize_resume_publication<Check: Fn() -> Result<()>>(
     Ok(Some((ledger, authorize)))
 }
 
+pub(in crate::workflow) fn create_handoff<G, Check: FnOnce() -> Result<()>>(
+    state: &Path,
+    row: &Value,
+    launch: Launch,
+    previous: &Value,
+    authorize_ready: impl Fn() -> Result<Option<(G, Check)>>,
+) -> Result<Value> {
+    let mut request = launch_request(row, launch)?;
+    request["previous"] = previous.clone();
+    launch_answer(Some(crate::bundled::create(state, &request, authorize_ready)?))
+}
+
 fn create_in_backend(state: &Path, request: &Value) -> Result<Option<Value>> {
     let mut command = Command::new("/proc/self/exe");
     controller::strip_credentials(&mut command);

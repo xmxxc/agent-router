@@ -142,6 +142,8 @@ bundled Codex 提醒或续派若明确未写出首帧、账本暂时无法结算
 
 旧同文或旧拒收从滚动历史重现时，画面可能和一次实际新输入相同。此时命令会保留待核，`wfc status --dispatch ID` 的 `audit` 可以查看原轮次及诊断，重试不会再发键。若续派的 worker 已用该轮的 `--callback-ref` 成功发问或回报，可以用原 `continue` 参数重取同一输入的回执。
 
+首轮仍在执行的 bundled Codex 普通任务，可用 `wfc handoff DISPATCH --host opencode --backend bundled` 交给新的 bundled OpenCode worker。交接沿用原 scope、任务和报告路径，并为目标生成新的 attempt。只有签名回执确认原票据的完整执行组已经关闭，才创建目标。同一请求重取原审计和确认票据，待核请求可用 `wfc status --dispatch ID` 查看。已完结任务的下一轮交接仍待接入。
+
 旧输入及交接回执仍可用 `wfc status --dispatch ID` 查看。
 
 在已认领的组中，worker 可用启动时分配的独立回调凭据发问或回报。总控兼容入口使用当前租约的凭据。`ask` 与 `done` 均接受显式的 `--owner-token`。

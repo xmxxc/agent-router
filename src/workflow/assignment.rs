@@ -305,9 +305,19 @@ pub(super) fn unresolved_resume(row: &Value) -> Option<&Value> {
 }
 
 pub(super) fn handoff_preflight(event: &Value) -> bool {
-    // A diagnostic from the read-only probe precedes the durable handoff intent.
-    event["operation"] == "handoff"
-        && event["phase"] == "preflight"
+    if event["operation"] != "handoff" {
+        return false;
+    }
+    // Bundled publishes a numbered audit before its scope order. No backend
+    // effect is allowed until both are durable and the audit enters closing.
+    if event["phase"] == "ordering"
+        && event["result"] == "pending"
+        && event["fromBackend"] == "bundled"
+        && event["target"]["backend"] == "bundled"
+    {
+        return event["close"].is_null() && event["launch"].is_null();
+    }
+    event["phase"] == "preflight"
         && event["toAttempt"].is_null()
         && event["close"].is_null()
         && event["launch"].is_null()

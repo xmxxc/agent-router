@@ -435,7 +435,12 @@ impl<'a> Request<'a> {
             audit.push(event);
             recovery::stage(&current, &mut next, &staged_proof, index)?;
             if operation == "continue" {
-                inbox.finish_continue_publication(self.dispatch, &current, token.as_deref())?;
+                inbox.finish_hosted_publication(
+                    self.dispatch,
+                    &current,
+                    token.as_deref(),
+                    "continue",
+                )?;
             }
             save(&state, &path, &next)?;
             (next, index, text, generation, earlier_reminders)
