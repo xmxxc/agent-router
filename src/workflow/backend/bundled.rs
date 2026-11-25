@@ -138,9 +138,13 @@ pub(in crate::workflow) fn registered_ticket(row: &Value) -> Result<&Value> {
     Ok(ticket)
 }
 
-// Done and ask test this marker while holding the Inbox publication lock.
+// Check the marker itself, including entries whose contents cannot be read.
 pub(super) fn close_blocks_callback(state: &Path, row: &Value) -> Result<bool> {
-    Ok(bundled_close_path(state, row)?.try_exists()?)
+    match fs::symlink_metadata(bundled_close_path(state, row)?) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn binding(state: &Path, row: &Value, intent: &Path) -> Result<(Value, Option<Value>)> {
