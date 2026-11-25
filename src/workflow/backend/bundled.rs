@@ -19,22 +19,10 @@ use std::{
 pub(super) fn create(
     state: &Path,
     row: &Value,
-    mut launch: Launch,
+    launch: Launch,
     owner: Option<&str>,
 ) -> Result<Value> {
-    for (name, value) in env::vars_os() {
-        let name = name
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("invalid environment name"))?;
-        if !controller::is_credential(&name) && !launch.env.contains_key(&name) {
-            launch.env.insert(
-                name,
-                json!(value.to_str().context("invalid worker environment")?),
-            );
-        }
-    }
-    let request = json!({"op":"create","unit":row["dispatch"],"attempt":row["attempt"],
-        "cwd":row["cwd"],"argv":launch.argv,"env":launch.env});
+    let request = launch_request(row, launch)?;
     let answer = if row["bundledStartupCommit"] == true {
         // The original dispatch CLI is the only process that may commit ready.
         Some(crate::bundled::create(state, &request, || {
@@ -68,6 +56,98 @@ pub(super) fn create(
         create_in_backend(state, &request)?
     };
     launch_answer(answer)
+}
+
+fn launch_request(row: &Value, mut launch: Launch) -> Result<Value> {
+    for (name, value) in env::vars_os() {
+        let name = name
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("invalid environment name"))?;
+        if !controller::is_credential(&name) && !launch.env.contains_key(&name) {
+            launch.env.insert(
+                name,
+                json!(value.to_str().context("invalid worker environment")?),
+            );
+        }
+    }
+    Ok(
+        json!({"op":"create","unit":row["dispatch"],"attempt":row["attempt"],
+        "cwd":row["cwd"],"argv":launch.argv,"env":launch.env}),
+    )
+}
+
+pub(in crate::workflow) fn observe_for_resume(state: &Path, row: &Value) -> Result<(Value, Value)> {
+    let ticket = registered_ticket(row)?;
+    ensure!(
+        ticket["version"] == 2
+            && ticket["attempt"] == row["attempt"]
+            && (ticket["startupProtocol"] == 1) == (row["bundledStartupCommit"] == true)
+            && env::var_os("WFC_BUNDLED_CGROUP_ROOT").is_none()
+                == (row["bundledStartupCommit"] == true)
+            && ["dispatch", "round", "attempt"]
+                .iter()
+                .all(|&key| row["create"][key] == row[key]),
+        "unverified original bundled launch"
+    );
+    let (bound, intent) = binding(state, row, &bundled_close_path(state, row)?)?;
+    ensure!(
+        &bound == ticket && (intent.is_some() || !close_blocks_callback(state, row)?),
+        "cannot verify the original bundled close intent"
+    );
+    let proof = crate::bundled::inspect_resume_cleanup(state, ticket)?;
+    let answer = json!({"result":"completed","ticket":ticket,"proof":proof});
+    let worker = terminal_worker(&answer).context("missing original bundled worker outcome")?;
+    let mut inspection = evidence(&answer);
+    inspection["alive"] = json!(false);
+    Ok((worker, inspection))
+}
+
+// Resume already holds the scope and old execution locks. The published
+// attempt and Inbox lock fence readiness for the replacement.
+pub(in crate::workflow) fn resume(
+    state: &Path,
+    row: &Value,
+    previous: &Value,
+    launch: Launch,
+    owner: Option<&str>,
+) -> Result<Value> {
+    let mut request = launch_request(row, launch)?;
+    let ticket = &previous["ticket"];
+    let scope = record_scope(row).context("invalid dispatch scope")?;
+    let authorize = || -> Result<()> {
+        controller::Owners::read(state)?.require(scope, owner, "resume")?;
+        Ok(())
+    };
+    authorize()?;
+    crate::bundled::apply_resume_cleanup(state, ticket, &previous["proof"])?;
+    authorize()?;
+    request["previous"] = ticket.clone();
+    let answer = crate::bundled::create(state, &request, || {
+        authorize_resume_publication(state, row, authorize)
+    })?;
+    launch_answer(Some(answer))
+}
+
+fn authorize_resume_publication<Check: Fn() -> Result<()>>(
+    state: &Path,
+    row: &Value,
+    authorize: Check,
+) -> Result<Option<(messages::PublishLock, Check)>> {
+    // Explicit startup already holds the unit lock. Do not wait for the
+    // Inbox while another operation can be waiting for that unit.
+    let Some(ledger) = messages::try_lock_for_publish(state)? else {
+        return Ok(None);
+    };
+    authorize()?;
+    let id = row["dispatch"]
+        .as_str()
+        .context("missing bundled dispatch ID")?;
+    ensure!(
+        messages::read_callback_record(&state.join("dispatches"), id)? == *row
+            && !close_blocks_callback(state, row)?,
+        "bundled resume changed before launch authorization"
+    );
+    Ok(Some((ledger, authorize)))
 }
 
 fn create_in_backend(state: &Path, request: &Value) -> Result<Option<Value>> {
@@ -355,6 +435,87 @@ fn require_close_intent(expected: &Value, current: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegated_resume_rechecks_expired_owner_after_unit_lock() -> Result<()> {
+        let state = std::env::temp_dir().join(format!("wfc-resume-lease-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&state)?;
+        let result = (|| -> Result<()> {
+            let dir = state.join("dispatches");
+            fs::create_dir(&dir)?;
+            let dispatch = "d-1234abcd";
+            let attempt = "a-0123456789ab";
+            let scope = "resume-fixture";
+            let owner = "synthetic delegated owner";
+            let row = json!({"dispatch":dispatch,"attempt":attempt,"round":1,"scope":scope,
+                "role":"worker","backend":"bundled","host":"codex",
+                "audit":[{"id":1,"operation":"resume","result":"pending"}]});
+            write_json(&dir.join(format!("{dispatch}.json")), &row, None)?;
+            let lease = |until| {
+                write_json(
+                    &state.join("controller-owners.json"),
+                    &json!({(scope):{"owner":"fixture","generation":1,"until":until,
+                        "fingerprint":messages::body_hash(owner),"retired":[]}}),
+                    None,
+                )
+            };
+            lease(chrono::Utc::now().timestamp() as f64 + 600.0)?;
+            let authorize = || -> Result<()> {
+                controller::Owners::read(&state)?.require(scope, Some(owner), "resume")?;
+                Ok(())
+            };
+            let _scope = controller::lock_scope(&state, scope)?;
+            let _execution = assignment::close_lock(&state, &row)?;
+            authorize()?;
+            let path = state.join("synthetic-unit.lock");
+            fs::File::create(&path)?;
+            let open_unit = || fs::OpenOptions::new().read(true).write(true).open(&path);
+            let mut tries = 0;
+            let mut busy = Some(messages::lock_for_publish(&state)?);
+            let (guard, publication) = crate::bundled::authorize_create(
+                || {
+                    tries += 1;
+                    if tries == 2 {
+                        drop(busy.take());
+                    }
+                    let file = open_unit()?;
+                    // A fresh lock succeeds only if the first guard was released.
+                    assert!(file.try_lock().is_ok());
+                    Ok(file)
+                },
+                true,
+                &|| authorize_resume_publication(&state, &row, authorize),
+            )?;
+            assert_eq!(tries, 2);
+            assert!(publication.is_some());
+            drop(publication);
+            drop(guard);
+            let result = crate::bundled::authorize_create(
+                || {
+                    let file = open_unit()?;
+                    file.lock()?;
+                    // Model the lease observed after a wait without a timer
+                    // or concurrent writer.
+                    lease(1.0)?;
+                    Ok(file)
+                },
+                true,
+                &|| {
+                    let probe = open_unit()?;
+                    assert!(matches!(
+                        probe.try_lock(),
+                        Err(std::fs::TryLockError::WouldBlock)
+                    ));
+                    authorize_resume_publication(&state, &row, authorize)
+                },
+            );
+            let denied = result.err().context("expired owner must prevent launch")?;
+            assert!(denied.to_string().contains("stale_controller_owner"));
+            Ok(())
+        })();
+        fs::remove_dir_all(&state)?;
+        result
+    }
 
     #[test]
     fn unsent_withdrawal_requires_the_original_intent() {

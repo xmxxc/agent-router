@@ -1,13 +1,16 @@
 //! Replace an offline execution with a new attempt in its original host conversation.
+#[cfg(test)]
+mod tests;
+
 use super::{assignment, backend, controller, host, messages, view};
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
     ffi::OsString,
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, ErrorKind, Read},
     os::unix::fs::OpenOptionsExt,
-    path::Path,
+    path::{Path, PathBuf},
 };
 use uuid::Uuid;
 
@@ -44,11 +47,23 @@ impl<'a> Resume<'a> {
 
     pub fn run(self) -> Result<Value> {
         controller::require_controller("resume")?;
-        let state = super::writable_state_dir()?;
+        self.run_in(super::writable_state_dir()?, backend::resume_bundled)
+    }
+
+    fn run_in(
+        self,
+        state: PathBuf,
+        start_bundled: impl FnOnce(&Path, &Value, &Value, host::Launch, Option<&str>) -> Result<Value>,
+    ) -> Result<Value> {
+        super::ensure_state_writable(&state)?;
         let dir = state.join("dispatches");
-        let read = || {
-            assignment::public_record(&dir, self.dispatch)?
-                .with_context(|| format!("unknown native dispatch {}", self.dispatch))
+        let read = || -> Result<Value> {
+            let row = assignment::public_record(&dir, self.dispatch)?
+                .with_context(|| format!("unknown native dispatch {}", self.dispatch))?;
+            if row["backend"] == "bundled" {
+                return messages::read_callback_record(&dir, self.dispatch);
+            }
+            Ok(row)
         };
         let initial = read()?;
         assignment::require_not_tmux_history(&initial)?;
@@ -71,14 +86,60 @@ impl<'a> Resume<'a> {
         let claude = row["host"] == "claude";
         let opencode = row["host"] == "opencode";
         let herdr = row["backend"] == "herdr";
+        let bundled = row["backend"] == "bundled";
         ensure!(
-            herdr && row["host"] == "codex" && row["round"] == 1,
-            "resume requires an original Codex task using Herdr"
+            (herdr || bundled) && row["host"] == "codex" && row["round"] == 1,
+            "resume requires an original Codex task using Herdr or bundled"
         );
         ensure!(
             assignment::identified(&row) && row["controllerOwner"].is_null(),
             "invalid or unverified assignment for resume"
         );
+        if bundled {
+            ensure!(
+                self.next.is_none(),
+                "bundled resume requires the original task and report"
+            );
+            ensure!(
+                row["publicationDiagnostic"].is_null(),
+                "cannot verify the original bundled publication"
+            );
+            if let Some(event) = assignment::resume_audit(&row) {
+                if event["result"] == "accepted" && backend::bundled_input_ticket(&row).is_ok() {
+                    return Ok(
+                        json!({"operation":"resume","backend":"bundled","result":"accepted",
+                        "dispatch":row["dispatch"],"attempt":row["attempt"],"round":row["round"],
+                        "audit":event["id"],"session":event["session"],"resumed":row["dispatch"],
+                        "launchResult":"accepted","duplicate":true}),
+                    );
+                }
+                return Ok(reconcile(
+                    &row,
+                    event["id"].clone(),
+                    "previous bundled resume is unresolved",
+                ));
+            }
+            if !row["codexHome"].is_string()
+                || !row["codexBriefHash"].as_str().is_some_and(|hash| {
+                    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            {
+                return Ok(reconcile(
+                    &row,
+                    Value::Null,
+                    "missing original bundled Codex conversation binding",
+                ));
+            }
+            if !host::worker_brief(&row, host::FIRST_BRIEF)
+                .is_ok_and(|brief| row["codexBriefHash"] == messages::body_hash(&brief))
+            {
+                return Ok(reconcile(
+                    &row,
+                    Value::Null,
+                    "original bundled task and report do not match the Codex brief",
+                ));
+            }
+        }
         if let Some(event) = assignment::unresolved_lifecycle(&row) {
             return Ok(reconcile(
                 &row,
@@ -117,6 +178,8 @@ impl<'a> Resume<'a> {
                 herdr_resume = Some(unit);
                 (worker, inspected)
             })
+        } else if bundled {
+            backend::observe_bundled_for_resume(&state, &row)
         } else {
             backend::observe_for_resume(&state, &row)
         };
@@ -138,7 +201,8 @@ impl<'a> Resume<'a> {
                 inspection["result"].as_str(),
                 Some("accepted" | "completed")
             )
-            || !matches!(worker["state"].as_str(), Some("exited" | "not_started"))
+            || !(matches!(worker["state"].as_str(), Some("exited" | "not_started"))
+                || bundled && worker["state"] == "cancelled")
         {
             return Ok(reconcile(
                 &row,
@@ -156,6 +220,10 @@ impl<'a> Resume<'a> {
         };
         let old = snapshot(&history()?)?;
         let completed = old["state"] == "done";
+        ensure!(
+            !bundled || !completed,
+            "the original bundled task is already complete"
+        );
         ensure!(
             completed == self.next.is_some(),
             "{}",
@@ -180,6 +248,20 @@ impl<'a> Resume<'a> {
             report_dir.canonicalize()?.as_path() == report_dir && report_dir.is_dir(),
             "the original report directory changed"
         );
+        if bundled {
+            let task = Path::new(row["task"].as_str().context("missing original task")?);
+            ensure!(
+                task.canonicalize()?.as_path() == task
+                    && task.is_file()
+                    && super::resolve_report_path(bound)?.as_path() == bound
+                    && match fs::symlink_metadata(bound) {
+                        Ok(metadata) => metadata.is_file(),
+                        Err(error) if error.kind() == ErrorKind::NotFound => true,
+                        Err(error) => return Err(error).context("verify original report"),
+                    },
+                "the original task or report path changed"
+            );
+        }
         if let Some((task, report)) = self.next {
             let report = super::resolve_report_path(report)?;
             ensure!(
@@ -204,7 +286,7 @@ impl<'a> Resume<'a> {
         let attempt = format!("a-{}", Uuid::new_v4().simple());
         next["attempt"] = json!(attempt);
         next["executionId"] = json!(attempt);
-        if herdr {
+        if herdr || bundled {
             for field in ["backendHandle", "pendingReplyMessageId"] {
                 next.as_object_mut().unwrap().remove(field);
             }
@@ -223,7 +305,13 @@ impl<'a> Resume<'a> {
         }
         let options = host::Options {
             name: row["host"].as_str().context("missing host")?,
-            backend: if herdr { "herdr" } else { "tmux" },
+            backend: if bundled {
+                "bundled"
+            } else if herdr {
+                "herdr"
+            } else {
+                "tmux"
+            },
             config: row["launchConfig"].as_str(),
             model: row["model"].as_str(),
             effort: row["effort"].as_str(),
@@ -277,7 +365,24 @@ impl<'a> Resume<'a> {
                 }
             }
         } else {
-            let mut launch = options.prepare_worker(&state, &mut next, Some(opening))?;
+            let mut launch = match options.prepare_worker(&state, &mut next, Some(opening)) {
+                Ok(launch) => launch,
+                Err(e) if bundled => {
+                    return Ok(reconcile(
+                        &row,
+                        Value::Null,
+                        &format!("cannot prepare the original Codex conversation: {e}"),
+                    ))
+                }
+                Err(e) => return Err(e),
+            };
+            if bundled && row["launchConfig"] != next["launchConfig"] {
+                return Ok(reconcile(
+                    &row,
+                    Value::Null,
+                    "configured Codex launch path differs from the original dispatch",
+                ));
+            }
             if !row["codexHome"].is_null()
                 && row["codexHome"] != next["codexHome"]
                 && !row["codexHome"]
@@ -323,6 +428,21 @@ impl<'a> Resume<'a> {
                 authorize()? == generation && read()? == row,
                 "assignment or owner changed while preparing resume"
             );
+            if bundled {
+                let pending = dir.join(format!("{}.pending", self.dispatch));
+                ensure!(
+                    fs::symlink_metadata(pending)
+                        .is_err_and(|error| error.kind() == ErrorKind::NotFound),
+                    "cannot verify a settled bundled publication before resume"
+                );
+                if ledger.unresolved_resume_reply(&row)? {
+                    return Ok(reconcile(
+                        &row,
+                        Value::Null,
+                        "original bundled reply is unresolved",
+                    ));
+                }
+            }
             let history = history()?;
             let current = snapshot(&history)?;
             ensure!(
@@ -364,7 +484,7 @@ impl<'a> Resume<'a> {
                 "at":now.to_rfc3339(),"ownerGeneration":generation,"result":"pending",
                 "priorInspection":inspection,"priorWorker":worker,"priorCreate":row["create"]}),
             );
-            if herdr {
+            if herdr || bundled {
                 audit[event - 1]["priorBackendHandle"] = row["backendHandle"].clone();
             }
             if let Some(proof) = claude_proof {
@@ -413,17 +533,45 @@ impl<'a> Resume<'a> {
                     ))
                 }
             }
+        } else if bundled {
+            start_bundled(&state, &next, &inspection, launch, token.as_deref()).unwrap_or_else(|e| {
+                json!({"result":"uncertain","diagnostic":format!("cannot confirm bundled resume: {e}")})
+            })
         } else {
             backend::resume(&state, &next, launch).unwrap_or_else(|e| {
                 json!({"result":"definitely-not-sent","diagnostic":format!("could not call tmux backend: {e}")})
             })
         };
-        if herdr && answer["result"] != "accepted" {
+        if bundled {
+            let ticket = &answer["ticket"];
+            let matching_ticket = ticket["version"] == 2
+                && ticket["unit"] == next["dispatch"]
+                && ticket["attempt"] == next["attempt"]
+                && (ticket["startupProtocol"] == 1) == (next["bundledStartupCommit"] == true);
+            let ready_confirmed = answer["result"] != "accepted"
+                || (matching_ticket
+                    && crate::bundled::confirm_resume_start(&state, ticket, &answer["identity"])
+                        .unwrap_or(false));
+            if !matching_ticket || !ready_confirmed {
+                answer
+                    .as_object_mut()
+                    .context("invalid bundled resume response")?
+                    .remove("ticket");
+            }
+            if !ready_confirmed {
+                answer["result"] = json!("uncertain");
+                answer["diagnostic"] =
+                    json!("bundled resume did not confirm the replacement's signed ready identity");
+            }
+        } else if herdr && answer["result"] != "accepted" {
             answer["result"] = json!("uncertain");
             answer["error"] = json!("lifecycle_reconcile_required");
         }
         let launch_result = match answer["result"].as_str() {
-            _ if answer["launchResult"] == "accepted" || answer["category"] == "process_exited" => {
+            _ if !bundled
+                && (answer["launchResult"] == "accepted"
+                    || answer["category"] == "process_exited") =>
+            {
                 "accepted"
             }
             Some("accepted") => "accepted",
@@ -431,6 +579,10 @@ impl<'a> Resume<'a> {
             _ => "uncertain",
         };
         answer["launchResult"] = json!(launch_result);
+        if bundled && answer["result"] != "accepted" {
+            answer["result"] = json!("uncertain");
+            answer["error"] = json!("lifecycle_reconcile_required");
+        }
         if claude && answer["result"] == "accepted" {
             host::claude::wait_for_resume_adoption(&state, &next);
         }
@@ -453,7 +605,28 @@ impl<'a> Resume<'a> {
             }
         }
         {
-            let ledger = lock_for_publication()?;
+            let ledger = match lock_for_publication() {
+                Ok(ledger) => ledger,
+                Err(error)
+                    if bundled
+                        && answer["result"] == "uncertain"
+                        && answer["ticket"].is_object() =>
+                {
+                    ensure!(
+                        read()? == next,
+                        "assignment changed during resume; inspect its lifecycle audit"
+                    );
+                    let mut pending = reconcile(
+                        &next,
+                        json!(event),
+                        &format!("cannot settle the bundled resume: {error}"),
+                    );
+                    pending["backend"] = json!("bundled");
+                    pending["ticket"] = answer["ticket"].clone();
+                    return Ok(pending);
+                }
+                Err(error) => return Err(error),
+            };
             ensure!(
                 read()? == next,
                 "assignment changed during resume; inspect its lifecycle audit"
@@ -497,6 +670,9 @@ impl<'a> Resume<'a> {
             for field in ["dispatch", "round", "attempt"] {
                 answer[field] = next[field].clone();
             }
+            if bundled && answer["ticket"].is_object() {
+                next["backendHandle"] = answer["ticket"].clone();
+            }
             next["create"] = answer.clone();
             let audit = &mut next["audit"][event - 1];
             for field in [
@@ -518,6 +694,9 @@ impl<'a> Resume<'a> {
             if answer["result"] == "accepted" {
                 next["rounds"].as_array_mut().unwrap().last_mut().unwrap()["state"] =
                     json!("running");
+                if bundled {
+                    next["worker"] = json!({"state":"running"});
+                }
             }
             super::write_json(&path, &next, None)?;
             messages::sync_directory(&dir)?;
@@ -525,7 +704,9 @@ impl<'a> Resume<'a> {
         answer["operation"] = json!("resume");
         answer["audit"] = json!(event);
         answer["session"] = json!(session);
-        if herdr {
+        if bundled {
+            answer["backend"] = json!("bundled");
+        } else if herdr {
             answer["backend"] = json!("herdr");
         } else {
             answer["tmux"] = next["tmux"].clone();
