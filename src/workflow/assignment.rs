@@ -60,6 +60,21 @@ pub(super) fn identified(row: &Value) -> bool {
 pub(super) const TMUX_HISTORY_ONLY: &str = "tmux assignment history is read-only";
 pub(super) const UNVERIFIED_ASSIGNMENT: &str = "cannot verify assignment publication identity";
 
+pub(super) fn same_publication_identity(before: &Value, after: &Value) -> bool {
+    [
+        "dispatch",
+        "role",
+        "round",
+        "attempt",
+        "scope",
+        "controllerOwner",
+        "backend",
+        "executionId",
+    ]
+    .iter()
+    .all(|&field| before[field] == after[field])
+}
+
 pub(super) fn tmux_history(row: &Value) -> bool {
     row["backend"] == "tmux"
         || ((row["backend"].is_null() || row["backend"] == "")
@@ -426,6 +441,33 @@ pub(super) fn input_unresolved(row: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_identity_allows_new_evidence_but_fences_identity_changes() {
+        let pending = json!({"dispatch":"d-00000031","role":"worker","round":1,
+            "attempt":"a-000000000031","scope":"ours","backend":"herdr",
+            "executionId":"a-000000000031","worker":{"state":"running"},"createPending":true});
+        let mut published = pending.clone();
+        published.as_object_mut().unwrap().remove("createPending");
+        published["create"] = json!({"result":"accepted"});
+        published["backendHandle"] = json!({"ticket":"fixture"});
+        published["worker"]["state"] = json!("exited");
+        assert!(same_publication_identity(&pending, &published));
+        for (field, value) in [
+            ("dispatch", json!("d-00000032")),
+            ("role", json!("reviewer")),
+            ("round", json!(2)),
+            ("attempt", json!("a-000000000032")),
+            ("scope", json!("neighbor")),
+            ("controllerOwner", json!({"generation":2})),
+            ("backend", json!("bundled")),
+            ("executionId", json!("a-000000000032")),
+        ] {
+            let mut changed = published.clone();
+            changed[field] = value;
+            assert!(!same_publication_identity(&pending, &changed), "{field}");
+        }
+    }
 
     #[test]
     fn retired_tmux_classification_keeps_explicit_backends() {

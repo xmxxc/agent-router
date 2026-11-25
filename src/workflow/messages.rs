@@ -271,11 +271,11 @@ impl Assignment {
     ) -> Result<(Inbox, Self, Value)> {
         // Check before creating the ledger lock, then reselect under the lock.
         // A matching reservation may be promoted between the two reads.
-        let (before, _) = Self::current(state, dispatch, attempt, reference)?;
+        let (_, before) = Self::current(state, dispatch, attempt, reference)?;
         let inbox = Inbox::open(state)?;
         let (assignment, row) = Self::current(state, dispatch, attempt, reference)?;
         ensure!(
-            before.worker == assignment.worker,
+            super::assignment::same_publication_identity(&before, &row),
             "{}",
             super::assignment::UNVERIFIED_ASSIGNMENT
         );
@@ -1989,10 +1989,8 @@ impl<'a> Done<'a> {
             .transpose()?;
         let (current, row, mut inbox, duplicate, key) = check()?;
         ensure!(
-            initial.worker.round == current.worker.round
-                && initial.worker.attempt == current.worker.attempt
+            super::assignment::same_publication_identity(&initial_row, &row)
                 && initial.cwd == current.cwd
-                && initial.worker.scope() == current.worker.scope()
                 && (self.reference.is_none()
                     || ["host", "backend", "tmuxSocket", "executionId", "create"]
                         .iter()
@@ -2122,7 +2120,7 @@ impl<'a> Ask<'a> {
             };
             Ok((inbox, assignment, row, replay))
         };
-        let (inbox, initial, row, replay) = check()?;
+        let (inbox, _, row, replay) = check()?;
         if let (Some(receipt), None) = (&replay, self.reference) {
             return Ok(receipt.clone());
         }
@@ -2160,8 +2158,8 @@ impl<'a> Ask<'a> {
             return Ok(receipt.clone());
         }
         ensure!(
-            initial.worker == assignment.worker
-                && ["host", "backend", "tmuxSocket", "endpoint", "executionId"]
+            super::assignment::same_publication_identity(&row, &current)
+                && ["host", "tmuxSocket", "endpoint"]
                     .iter()
                     .all(|key| row[*key] == current[*key])
                 && (self.reference.is_none() || row["create"] == current["create"]),

@@ -109,16 +109,7 @@ impl Generations {
             .as_ref()
             .is_some_and(|generation| !assignment::valid_reservation(&generation.row));
         if let (Some(a), Some(b)) = (&pending, &published) {
-            damaged |= [
-                "attempt",
-                "round",
-                "scope",
-                "controllerOwner",
-                "backend",
-                "executionId",
-            ]
-            .iter()
-            .any(|&key| a.row[key] != b.row[key]);
+            damaged |= !assignment::same_publication_identity(&a.row, &b.row);
         }
         Self {
             pending,
@@ -385,7 +376,7 @@ mod tests {
             let pending = state.join(format!("{dispatch}.pending"));
             let published = state.join(format!("{dispatch}.json"));
             let row = json!({"dispatch":dispatch,"round":1,"attempt":"a-000000000031",
-                "scope":"fixture","host":"codex","backend":"herdr"});
+                "scope":"fixture","role":"worker","host":"codex","backend":"herdr"});
             fs::write(&pending, serde_json::to_vec(&row)?)?;
             let generations = Generations::read(&state, dispatch);
             assert!(generations.message_boundary().refusal(None, None).is_none());
@@ -401,6 +392,8 @@ mod tests {
 
             for (field, value) in [
                 ("backend", json!("bundled")),
+                ("executionId", json!("a-000000000032")),
+                ("role", json!("reviewer")),
                 ("scope", json!("conflicting-publication")),
                 ("round", json!(2)),
             ] {
