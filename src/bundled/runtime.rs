@@ -2,6 +2,8 @@ use super::*;
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
+use std::process::ExitStatus;
+use store::{Preparation, StartupDecision};
 use wire::{Wire, FRAME, LIMIT, PREAUTH};
 
 pub fn guard(
@@ -33,7 +35,8 @@ pub fn guard(
     if let Some(binding) = &user_service {
         actual["userService"] = binding.clone();
     }
-    let mut awaiting_commit = false;
+    let mut has_proposal = false;
+    let mut known_decision = None;
     let outcome = (|| -> Result<&str> {
         store.save_signed("starting", actual.clone())?;
         let (reader, writer) = UnixStream::pair()?;
@@ -45,7 +48,7 @@ pub fn guard(
         };
         actual["service"] = store::identity(child.id())?;
         let mut boot = Wire::new(reader);
-        let started = (|| -> Result<()> {
+        let started = (|| -> Result<Option<ExitStatus>> {
             store.save_signed("starting", actual.clone())?;
             let details = boot.read(LIMIT, Instant::now() + TIMEOUT)?;
             let mut proposal = actual.clone();
@@ -56,23 +59,55 @@ pub fn guard(
                     .clone();
             }
             if user_service.is_some() {
-                store.save_signed("prepared", proposal.clone())?;
-                awaiting_commit = true;
+                let publication = store.prepare_startup(&proposal);
+                let mut may_abort = match publication {
+                    Preparation::NotInstalled(error) => return Err(error),
+                    Preparation::Installed => true,
+                    Preparation::Existing | Preparation::Uncertain => false,
+                };
                 actual = proposal;
-                super::user_service::await_commit(&store, &spec["userService"], &actual)?;
-                awaiting_commit = false;
-                Ok(())
+                has_proposal = true;
+                loop {
+                    let mut poll = || {
+                        super::user_service::poll_startup(
+                            &store,
+                            &spec["userService"],
+                            &actual,
+                            &mut may_abort,
+                        )
+                        .ok()
+                        .flatten()
+                    };
+                    if let Some(decision) = poll() {
+                        known_decision = Some(decision);
+                        if decision == StartupDecision::Aborted {
+                            bail!("bundled startup was cancelled before ready");
+                        }
+                        break;
+                    }
+                    // While the decision is unreadable, keep observing both
+                    // it and the runtime. Only a verified abort may stop it.
+                    if let Ok(Some(status)) = child.try_wait() {
+                        known_decision = poll();
+                        return Ok(Some(status));
+                    }
+                    thread::sleep(TICK);
+                }
             } else {
                 actual = proposal;
-                store.save_signed("ready", actual.clone())
+                store.save_signed("ready", actual.clone())?;
             }
+            Ok(None)
         })();
-        if let Err(e) = started {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e);
-        }
-        let status = child.wait()?;
+        let status = match started {
+            Ok(Some(status)) => status,
+            Ok(None) => child.wait()?,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
         Ok(match status.code() {
             Some(0) => "closed",
             Some(10) => "exited",
@@ -90,10 +125,15 @@ pub fn guard(
         return Ok(());
     }
     cleanup?;
-    let state = if awaiting_commit {
-        match store.startup_decision(&actual)? {
-            Some(store::StartupDecision::Aborted) => "startup-aborted",
-            Some(store::StartupDecision::Ready) => "faulted",
+    let state = if has_proposal {
+        let decision = store.startup_decision(&actual)?;
+        ensure!(
+            known_decision.is_none_or(|known| decision == Some(known)),
+            "bundled startup decision could not be reverified for cleanup"
+        );
+        match decision {
+            Some(StartupDecision::Aborted) => "startup-aborted",
+            Some(StartupDecision::Ready) => outcome.unwrap_or("faulted"),
             None => bail!("bundled startup cleanup has no confirmed decision"),
         }
     } else {

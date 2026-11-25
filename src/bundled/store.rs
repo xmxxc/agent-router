@@ -67,13 +67,30 @@ fn publish_with(
     value: &Value,
     install: impl FnOnce(&Path, &Path) -> Result<()>,
 ) -> Result<()> {
+    publish_with_sync(path, value, install, sync_directory)
+}
+
+fn sync_directory(dir: &Path) -> Result<()> {
+    Ok(File::open(dir)?.sync_all()?)
+}
+
+fn link_preparation(tmp: &Path, path: &Path) -> Result<()> {
+    Ok(fs::hard_link(tmp, path)?)
+}
+
+fn publish_with_sync(
+    path: &Path,
+    value: &Value,
+    install: impl FnOnce(&Path, &Path) -> Result<()>,
+    sync_dir: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     let tmp = path.with_extension(fresh());
     let mut file = new_file(&tmp)?;
     let result = (|| -> Result<()> {
         serde_json::to_writer(&mut file, value)?;
         file.sync_all()?;
         install(&tmp, path)?;
-        File::open(path.parent().context("missing parent")?)?.sync_all()?;
+        sync_dir(path.parent().context("missing parent")?)?;
         Ok(())
     })();
     if result.is_err() {
@@ -187,6 +204,13 @@ pub(super) enum StartupDecision {
     Aborted,
 }
 
+pub(super) enum Preparation {
+    NotInstalled(anyhow::Error),
+    Installed,
+    Existing,
+    Uncertain,
+}
+
 impl Store {
     pub fn open(unit: &Path, ticket: &Value) -> Result<Self> {
         let generation = field(ticket, "generation")?;
@@ -225,10 +249,74 @@ impl Store {
     }
 
     fn publish_signed(&self, slot: &str, kind: &str, data: Value) -> Result<()> {
+        let path = self.run.join(format!("{slot}.json"));
+        publish(&path, &self.signed_envelope(kind, &data)?)
+    }
+
+    fn signed_envelope(&self, kind: &str, data: &Value) -> Result<Value> {
         let body = json!({"version":1,"kind":kind,"ticket":self.ticket,"data":data});
         let mac = sign(&self.token, &serde_json::to_vec(&body)?);
-        let path = self.run.join(format!("{slot}.json"));
-        publish(&path, &json!({"body":body,"signature":mac}))
+        Ok(json!({"body":body,"signature":mac}))
+    }
+
+    pub(super) fn prepare_startup(&self, proposed: &Value) -> Preparation {
+        self.prepare_startup_with(proposed, link_preparation, sync_directory)
+    }
+
+    fn prepare_startup_with(
+        &self,
+        proposed: &Value,
+        install: impl FnOnce(&Path, &Path) -> Result<()>,
+        sync_dir: impl FnOnce(&Path) -> Result<()>,
+    ) -> Preparation {
+        let path = self.run.join("prepared.json");
+        let visible = || -> Result<bool> {
+            if !has_entry(&path)? {
+                return Ok(false);
+            }
+            ensure!(
+                self.signed("prepared")? == *proposed,
+                "startup proposal changed"
+            );
+            Ok(true)
+        };
+        let undecided = || -> io::Result<bool> {
+            for slot in ["startup-decision", "cleanup", "unstarted"] {
+                if has_entry(&self.run.join(format!("{slot}.json")))? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        match visible() {
+            Ok(true) => return Preparation::Existing,
+            Ok(false) if matches!(undecided(), Ok(true)) => (),
+            _ => return Preparation::Uncertain,
+        }
+        let envelope = self.signed_envelope("prepared", proposed);
+        let mut installed = false;
+        let result = envelope.and_then(|envelope| {
+            publish_with_sync(
+                &path,
+                &envelope,
+                |tmp, path| {
+                    install(tmp, path)?;
+                    installed = true;
+                    Ok(fs::remove_file(tmp)?)
+                },
+                sync_dir,
+            )
+        });
+        match (visible(), result) {
+            // The same authenticated proposal remains authoritative even when
+            // the directory sync failed after its name became visible.
+            (Ok(true), _) if installed => Preparation::Installed,
+            (Ok(true), _) => Preparation::Existing,
+            (Ok(false), Err(error)) if !installed && matches!(undecided(), Ok(true)) => {
+                Preparation::NotInstalled(error)
+            }
+            _ => Preparation::Uncertain,
+        }
     }
 
     // Caller holds the unit lock. The original publisher alone calls this
@@ -282,6 +370,14 @@ impl Store {
     }
 
     pub fn abort_startup(&self, prepared: &Value) -> Result<StartupDecision> {
+        if let Some(decision) = self.startup_decision(prepared)? {
+            return Ok(decision);
+        }
+        ensure!(
+            !has_entry(&self.run.join("unstarted.json"))?
+                && !has_entry(&self.run.join("cleanup.json"))?,
+            "startup already ended"
+        );
         self.install_startup_decision(StartupDecision::Aborted, prepared, || Ok(()))
     }
 
@@ -300,10 +396,9 @@ impl Store {
         } else {
             "startup-abort"
         };
-        let body = json!({"version":1,"kind":kind,"ticket":self.ticket,"data":prepared});
-        let mac = sign(&self.token, &serde_json::to_vec(&body)?);
+        let envelope = self.signed_envelope(kind, prepared)?;
         let path = self.run.join("startup-decision.json");
-        let result = publish_with(&path, &json!({"body":body,"signature":mac}), |tmp, path| {
+        let result = publish_with(&path, &envelope, |tmp, path| {
             // A single name commits exactly one choice. Both file contents
             // are synced before the link, which never replaces a decision.
             check()?;
@@ -502,6 +597,13 @@ impl Store {
             body
         } else {
             ensure!(state == "faulted", "pre-ready cleanup must be faulted");
+            if self.ticket["startupProtocol"] == 1 {
+                ensure!(
+                    !has_entry(&self.run.join("prepared.json"))?
+                        && !has_entry(&self.run.join("startup-decision.json"))?,
+                    "bundled startup cleanup has no confirmed decision"
+                );
+            }
             self.signed_body("starting")?
         };
         let phase = field(&binding, "kind")?;
@@ -788,6 +890,111 @@ mod tests {
         };
         fs::create_dir(&root)?;
         let result = task();
+        fs::remove_dir_all(root)?;
+        result
+    }
+
+    #[test]
+    fn managed_preparation_publication_preserves_the_startup_decision() -> Result<()> {
+        let root = std::env::temp_dir().join(fresh());
+        let exercise = || -> Result<()> {
+            let proposal = json!({"guardian":{"pid":7,"boot":fresh(),"start_ticks":5},
+                "service":{"pid":8,"boot":fresh(),"start_ticks":6},
+                "kernel":{"pid":9,"boot":fresh(),"start_ticks":7},
+                "worker":{"pid":10,"boot":fresh(),"start_ticks":8},
+                "endpoint":42,"kernel_generation":fresh(),
+                "containment":{"kind":"cgroup-v2","path":"/fixture","device":1,"inode":2}});
+            let fixture = || -> Result<Store> {
+                let mut store = generation(&root.join(fresh()), false)?;
+                store.ticket["startupProtocol"] = json!(1);
+                Ok(store)
+            };
+            let expired = json!({"deadline":0});
+            let poll = |store: &Store, may_abort: &mut bool| {
+                super::super::user_service::poll_startup(store, &expired, &proposal, may_abort)
+            };
+            let before = fixture()?;
+            assert!(matches!(
+                before.prepare_startup_with(&proposal, |_, _| bail!("install failed"), |_| Ok(())),
+                Preparation::NotInstalled(_)
+            ));
+            assert!(before.signed("prepared").is_err());
+            assert!(before.commit_ready(&proposal, || Ok(())).is_err());
+
+            let after = fixture()?;
+            assert!(matches!(
+                after.prepare_startup_with(&proposal, link_preparation, |_| bail!("sync failed")),
+                Preparation::Installed
+            ));
+            assert_eq!(after.signed("prepared")?, proposal);
+            assert_eq!(poll(&after, &mut true)?, Some(StartupDecision::Aborted));
+            assert!(after.commit_ready(&proposal, || Ok(())).is_err());
+            let decision_path = after.run.join("startup-decision.json");
+            let saved_abort = read(&decision_path)?;
+            publish(&decision_path, &json!({"fixture":"unreadable decision"}))?;
+            let mut may_abort = true;
+            assert!(poll(&after, &mut may_abort).is_err());
+            assert!(!may_abort);
+            fs::remove_file(&decision_path)?;
+            assert_eq!(poll(&after, &mut may_abort)?, None);
+            publish(&decision_path, &saved_abort)?;
+            assert_eq!(
+                poll(&after, &mut may_abort)?,
+                Some(StartupDecision::Aborted)
+            );
+            let aborted =
+                json!({"proves":"execution-empty","state":"startup-aborted","identity":proposal});
+            after.save_signed("cleanup", aborted.clone())?;
+            assert_eq!(after.proof()?, aborted);
+
+            let committed = fixture()?;
+            assert!(matches!(
+                committed.prepare_startup_with(&proposal, link_preparation, |_| {
+                    committed.commit_ready(&proposal, || Ok(()))?;
+                    bail!("sync failed after commit")
+                }),
+                Preparation::Installed
+            ));
+            assert!(matches!(
+                committed.prepare_startup(&proposal),
+                Preparation::Existing
+            ));
+            assert_eq!(poll(&committed, &mut false)?, Some(StartupDecision::Ready));
+            let mut other = proposal.clone();
+            other["endpoint"] = json!(43);
+            assert!(matches!(
+                committed.prepare_startup(&other),
+                Preparation::Uncertain
+            ));
+            assert_eq!(committed.signed("prepared")?, proposal);
+            let closed = json!({"proves":"execution-empty","state":"closed","identity":proposal});
+            committed.save_signed("cleanup", closed.clone())?;
+            assert_eq!(committed.proof()?, closed);
+            // Losing either half of the binding must not invent a decision or proof.
+            let decision_path = committed.run.join("startup-decision.json");
+            let saved_ready = read(&decision_path)?;
+            fs::remove_file(&decision_path)?;
+            assert!(matches!(
+                committed.prepare_startup(&proposal),
+                Preparation::Existing
+            ));
+            assert_eq!(poll(&committed, &mut false)?, None);
+            assert!(committed.abort_startup(&proposal).is_err());
+            assert!(committed.signed("ready").is_err());
+            assert!(committed.proof().is_err());
+            publish(&decision_path, &saved_ready)?;
+            assert_eq!(committed.proof()?, closed);
+            fs::remove_file(committed.run.join("prepared.json"))?;
+            assert!(matches!(
+                committed.prepare_startup(&proposal),
+                Preparation::Uncertain
+            ));
+            assert!(committed.signed("ready").is_err());
+            assert!(committed.proof().is_err());
+            Ok(())
+        };
+        fs::create_dir(&root)?;
+        let result = exercise();
         fs::remove_dir_all(root)?;
         result
     }

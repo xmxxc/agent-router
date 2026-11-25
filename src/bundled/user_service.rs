@@ -281,7 +281,7 @@ pub(super) fn guard(state: &Path, spec: &Value, store: Store) -> Result<()> {
     }
 }
 
-fn cancel_start(state: &Path, store: &Store, spec: &Value, reason: &str) -> Result<()> {
+fn cancel_unconsumed(state: &Path, store: &Store, spec: &Value, reason: &str) -> Result<()> {
     let Some((current, _lock)) = try_attached_store(state, spec)? else {
         return Ok(());
     };
@@ -297,8 +297,6 @@ fn cancel_start(state: &Path, store: &Store, spec: &Value, reason: &str) -> Resu
             "unstarted",
             json!({"reason":reason,"group_cleanup":"not-created"}),
         )?;
-    } else if let Ok(prepared) = current.signed("prepared") {
-        current.abort_startup(&prepared)?;
     }
     Ok(())
 }
@@ -313,25 +311,40 @@ fn proposal_live(prepared: &Value) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn await_commit(store: &Store, context: &Value, proposed: &Value) -> Result<()> {
-    loop {
-        match store.startup_decision(proposed)? {
-            Some(StartupDecision::Ready) => {
-                // Also seal a visible link if the original CLI died before syncing.
-                File::open(&store.run)?.sync_all()?;
-                return Ok(());
+pub(super) fn poll_startup(
+    store: &Store,
+    context: &Value,
+    proposed: &Value,
+    may_abort: &mut bool,
+) -> Result<Option<StartupDecision>> {
+    let result = (|| {
+        if let Some(decision) = store.startup_decision(proposed)? {
+            if decision == StartupDecision::Ready {
+                // Try to seal a link left by the publisher. A sync error
+                // cannot invalidate that decision or authorize stopping it.
+                let _ = File::open(&store.run).and_then(|dir| dir.sync_all());
             }
-            Some(StartupDecision::Aborted) => bail!("bundled startup was cancelled before ready"),
-            None => (),
+            return Ok(Some(decision));
         }
-        if let Err(error) = startup_live(context).and_then(|()| proposal_live(proposed)) {
-            match store.abort_startup(proposed)? {
-                StartupDecision::Ready => return Ok(()),
-                StartupDecision::Aborted => return Err(error),
-            }
+        if *may_abort
+            && startup_live(context)
+                .and_then(|()| proposal_live(proposed))
+                .is_err()
+        {
+            // Installation may have won even if its directory sync failed.
+            return store
+                .abort_startup(proposed)
+                .or_else(|error| store.startup_decision(proposed)?.ok_or(error))
+                .map(Some);
         }
-        thread::sleep(TICK);
+        Ok(None)
+    })();
+    if result.is_err() {
+        // An unreadable decision may have already won. Re-read it without
+        // choosing a replacement if its name subsequently goes missing.
+        *may_abort = false;
     }
+    result
 }
 
 pub(super) fn await_ready<G, Check: FnOnce() -> Result<()>>(
@@ -377,7 +390,7 @@ pub(super) fn await_ready<G, Check: FnOnce() -> Result<()>>(
         Err(error) => Some(error),
     };
     if let Some(error) = &failure {
-        let _ = cancel_start(state, store, spec, &format!("{error:#}"));
+        let _ = cancel_unconsumed(state, store, spec, &format!("{error:#}"));
     }
     if let Ok(identity) = store.signed("ready").and_then(|identity| {
         File::open(&store.run)?.sync_all()?;
