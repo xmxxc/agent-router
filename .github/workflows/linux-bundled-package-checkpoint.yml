@@ -1,4 +1,4 @@
-name: Linux bundled pre-release reference at #33 R6
+name: Linux bundled download candidate at #24
 on:
   workflow_call:
 
@@ -9,8 +9,8 @@ jobs:
   checkpoint:
     uses: ./.github/workflows/linux-package-ci.yml
     with:
-      product_sha: 78790a4bee35b69f31f4c3ea6eb4a5594a22152e
-      product_tree: 7c4f48a4fc34f9b23431d447e65fda1d0e41fe3f
-      product_parents: 2a2c8128e5e73193d9b224bd73f56b70c7248db2
+      product_sha: 0b17234b994e1da4e82de2194d212e970bf31785
+      product_tree: fcbaa3f316184114508ec1a32647360d1ce88970
+      product_parents: 706fce1970ea315d9072c7f3076120be23444ce1 312c4e0cef8543b7a5879775c157c2f2b271479b
       hosted_delegated_runtime: true
       clean_guest_runtime: true

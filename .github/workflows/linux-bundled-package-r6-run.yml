@@ -1,7 +1,7 @@
-name: Linux bundled same-package checkpoint
+name: Linux bundled release candidate download
 on:
   push:
-    branches: [rust-router/linux-package-same-artifact-checkpoint]
+    branches: [rust-router/24-linux-download-candidate-jammy-ci]
 
 permissions:
   contents: read
