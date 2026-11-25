@@ -1,8 +1,20 @@
 name: Linux package CI
 on:
-  push:
-    branches: [rust-router/linux-package-ci]
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      product_sha:
+        type: string
+        required: true
+      product_tree:
+        type: string
+        required: true
+      product_parents:
+        type: string
+        required: true
+      runtime_runner:
+        description: GitHub-hosted label or an existing clean runner with approved delegation
+        type: string
+        default: ubuntu-22.04
 
 permissions:
   contents: read
@@ -12,9 +24,9 @@ defaults:
     shell: bash
 
 env:
-  PRODUCT_SHA: f8d5e713d3e5e41cf4eff94b7583c875034092c0
-  PRODUCT_TREE: a9dafd1bddac0c2877410be566a279edbc35d3a6
-  PRODUCT_PARENTS: 'fdfcaec8adebaadd5046ce66603a23849d6e277e d27f3948b34c75726636df9dc873206229fe4231'
+  PRODUCT_SHA: ${{ inputs.product_sha }}
+  PRODUCT_TREE: ${{ inputs.product_tree }}
+  PRODUCT_PARENTS: ${{ inputs.product_parents }}
   TARGET: x86_64-unknown-linux-gnu
 
 jobs:
@@ -32,9 +44,15 @@ jobs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
       artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
     steps:
+      - name: Require full frozen product identities
+        run: |
+          parents_pattern='^[0-9a-f]{40}( [0-9a-f]{40})*$'
+          [[ "$PRODUCT_SHA" =~ ^[0-9a-f]{40}$ && "$PRODUCT_TREE" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PRODUCT_PARENTS" =~ $parents_pattern ]]
       - name: Check out the frozen product
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          repository: xmxxc/agent-router
           ref: ${{ env.PRODUCT_SHA }}
           fetch-depth: 2
           path: product
@@ -42,6 +60,7 @@ jobs:
       - name: Check out the verified native zlib input
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          repository: xmxxc/agent-router
           ref: ${{ env.NATIVE_INPUT_SHA }}
           path: native-input
           sparse-checkout: /vendor/zlib-1.3.1.tar.gz
@@ -50,6 +69,7 @@ jobs:
       - name: Check out the reviewed Jammy packaging and notice checks
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          repository: xmxxc/agent-router
           ref: ${{ env.NOTICE_TOOLS_SHA }}
           path: notice-tools
           sparse-checkout: /tools/ci/opencode-relay/
@@ -61,11 +81,12 @@ jobs:
       - name: Record runner and install the pinned toolchain
         env:
           RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          HARNESS_SHA: ${{ job.workflow_sha }}
         run: |
           mkdir -p "$EVIDENCE"
           {
             printf 'workflow=%s\nhead=%s\nrun=%s\nattempt=%s\n' \
-              "$GITHUB_WORKFLOW_SHA" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+              "$HARNESS_SHA" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
             printf 'runner=%s\nimage=%s/%s\n' "$RUNNER_ENVIRONMENT" "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
             cat /etc/os-release
             uname -srm
@@ -164,9 +185,9 @@ jobs:
           retention-days: 14
 
   runtime:
-    name: Accept the downloaded checkpoint without Python
+    name: Accept the downloaded default bundled checkpoint
     needs: package
-    runs-on: ubuntu-22.04
+    runs-on: ${{ inputs.runtime_runner }}
     timeout-minutes: 15
     env:
       RUNTIME_BASE: docker.io/library/ubuntu:22.04@sha256:b682e31336cc8e0a73ed91ab32b7a95e32591c5ff09994490a20accf9b3600f9
@@ -174,7 +195,8 @@ jobs:
       - name: Check out the Bash acceptance scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ github.sha }}
+          repository: xmxxc/agent-router
+          ref: ${{ job.workflow_sha }}
           path: ci
           persist-credentials: false
       - name: Download the checkpoint from the build job
@@ -194,6 +216,7 @@ jobs:
           printf '%s  %s\n' "$MANIFEST_SHA256" SHA256SUMS | sha256sum --check --strict
           sha256sum --check --strict SHA256SUMS
       - name: Prepare the pinned Jammy runtime with only required libraries and jq
+        if: runner.environment == 'github-hosted'
         run: |
           printf 'runtime_base=%s\n' "$RUNTIME_BASE"
           docker build --platform linux/amd64 --build-arg BASE_IMAGE="$RUNTIME_BASE" \
@@ -204,7 +227,8 @@ jobs:
               && apt-get install -y --no-install-recommends libgcc-s1 libssl3 zlib1g jq \
               && apt-get clean
           DOCKERFILE
-      - name: Exercise the same downloaded binary in the isolated runtime
+      - name: Check the same downloaded binary in the clean hosted container
+        if: runner.environment == 'github-hosted'
         env:
           MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
         run: |
@@ -214,5 +238,12 @@ jobs:
             --tmpfs /tmp:rw,nosuid,nodev,exec,size=64m,mode=1777 \
             --mount "type=bind,source=$GITHUB_WORKSPACE/checkpoint,target=/checkpoint,readonly" \
             --mount "type=bind,source=$GITHUB_WORKSPACE/ci/tools/check_linux_runtime.sh,target=/check_linux_runtime.sh,readonly" \
-            --mount "type=bind,source=$GITHUB_WORKSPACE/ci/tools/check_linux_package.sh,target=/check_linux_package.sh,readonly" \
-            wfc-package-runtime /bin/bash /check_linux_runtime.sh "$PRODUCT_SHA" "$TARGET" "$MANIFEST_SHA256"
+            --mount "type=bind,source=$GITHUB_WORKSPACE/ci/tools/check_linux_bundled_package.sh,target=/check_linux_bundled_package.sh,readonly" \
+            wfc-package-runtime /bin/bash /check_linux_runtime.sh /checkpoint "$PRODUCT_SHA" "$TARGET" "$MANIFEST_SHA256"
+      - name: Exercise default dispatch in the pre-provisioned clean runtime
+        if: runner.environment == 'self-hosted'
+        env:
+          MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
+        run: |
+          bash ci/tools/check_linux_runtime.sh "$GITHUB_WORKSPACE/checkpoint" \
+            "$PRODUCT_SHA" "$TARGET" "$MANIFEST_SHA256"
