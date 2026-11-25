@@ -60,39 +60,31 @@ pub fn guard(
             }
             if user_service.is_some() {
                 let publication = store.prepare_startup(&proposal);
-                let mut may_abort = match publication {
+                let next_abort = match publication {
                     Preparation::NotInstalled(error) => return Err(error),
-                    Preparation::Installed => true,
-                    Preparation::Existing | Preparation::Uncertain => false,
+                    Preparation::Installed => Some(Instant::now()),
+                    Preparation::Existing | Preparation::Uncertain => None,
                 };
                 actual = proposal;
                 has_proposal = true;
-                loop {
-                    let mut poll = || {
+                let (decision, exited) = watch_startup(
+                    next_abort,
+                    |next_abort| {
                         super::user_service::poll_startup(
                             &store,
                             &spec["userService"],
                             &actual,
-                            &mut may_abort,
+                            next_abort,
                         )
-                        .ok()
-                        .flatten()
-                    };
-                    if let Some(decision) = poll() {
-                        known_decision = Some(decision);
-                        if decision == StartupDecision::Aborted {
-                            bail!("bundled startup was cancelled before ready");
-                        }
-                        break;
-                    }
-                    // While the decision is unreadable, keep observing both
-                    // it and the runtime. Only a verified abort may stop it.
-                    if let Ok(Some(status)) = child.try_wait() {
-                        known_decision = poll();
-                        return Ok(Some(status));
-                    }
-                    thread::sleep(TICK);
+                    },
+                    || child.try_wait(),
+                    || thread::sleep(TICK),
+                );
+                known_decision = decision;
+                if decision == Some(StartupDecision::Aborted) && exited.is_none() {
+                    bail!("bundled startup was cancelled before ready");
                 }
+                return Ok(exited);
             } else {
                 actual = proposal;
                 store.save_signed("ready", actual.clone())?;
@@ -143,6 +135,29 @@ pub fn guard(
         "cleanup",
         json!({"proves":"execution-empty","state":state, "identity":actual}),
     )
+}
+
+pub(super) fn watch_startup(
+    mut next_abort: Option<Instant>,
+    mut poll: impl FnMut(&mut Option<Instant>) -> Result<Option<StartupDecision>>,
+    mut try_wait: impl FnMut() -> io::Result<Option<ExitStatus>>,
+    mut pause: impl FnMut(),
+) -> (Option<StartupDecision>, Option<ExitStatus>) {
+    let mut exited = None;
+    loop {
+        if let Ok(Some(decision)) = poll(&mut next_abort) {
+            return (Some(decision), exited);
+        }
+        if exited.is_none() {
+            exited = try_wait().ok().flatten();
+        }
+        // A natural exit does not discard a verified, pending abort retry.
+        // Once read-only, a known exit is enough to stop waiting.
+        if exited.is_some() && next_abort.is_none() {
+            return (None, exited);
+        }
+        pause();
+    }
 }
 
 struct Kernel {
