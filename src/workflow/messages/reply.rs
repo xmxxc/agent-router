@@ -78,6 +78,12 @@ impl<'a> Reply<'a> {
             .collect::<Vec<_>>()
             .join(" ");
         let question = self.question;
+        if let Some(original) = Inbox::snapshot(&state)?
+            .into_iter()
+            .find(|m| m.id == question && m.question_payload.is_some())
+        {
+            super::super::reject_tmux_history(&state, &original.worker.dispatch)?;
+        }
         let (worker, uid, row) = {
             let mut inbox = Inbox::open(&state)?;
             let original = inbox

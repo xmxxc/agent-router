@@ -57,6 +57,35 @@ pub(super) fn identified(row: &Value) -> bool {
         && row["round"].as_u64().is_some_and(|n| n > 0)
 }
 
+pub(super) const TMUX_HISTORY_ONLY: &str = "tmux assignment history is read-only";
+
+pub(super) fn tmux_history(row: &Value) -> bool {
+    row["backend"] == "tmux"
+        || ((row["backend"].is_null() || row["backend"] == "")
+            && row["legacyArchived"] != true
+            && (row["host"].is_string()
+                || row["tmuxSocket"].is_string()
+                || row["tmux"].as_str().is_some_and(|name| {
+                    row["dispatch"]
+                        .as_str()
+                        .is_some_and(|id| name.strip_prefix("wfc-") == Some(id))
+                })))
+}
+
+pub(super) fn require_not_tmux_history(row: &Value) -> Result<()> {
+    ensure!(!tmux_history(row), "{TMUX_HISTORY_ONLY}");
+    Ok(())
+}
+
+pub(super) fn has_tmux_history(dir: &Path, id: &str) -> Result<bool> {
+    if !valid_id(id) {
+        // Older orphan receipts and private backend fixtures can have IDs
+        // outside the public assignment namespace.
+        return Ok(false);
+    }
+    Ok(public_record(dir, id)?.as_ref().is_some_and(tmux_history))
+}
+
 pub(super) fn resume_audit(row: &Value) -> Option<&Value> {
     row["audit"].as_array()?.iter().rev().find(|event| {
         event["operation"] == "resume"
@@ -213,4 +242,27 @@ pub(super) fn input_unresolved(row: &Value) -> bool {
             && event["round"] == row["round"]
             && event["attempt"] == row["attempt"]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retired_tmux_classification_keeps_explicit_backends() {
+        let ordinary = json!({"dispatch":"d-00000031","host":"codex","tmux":"wfc-d-00000031"});
+        assert!(tmux_history(&ordinary));
+        assert!(tmux_history(
+            &json!({"dispatch":"d-00000031","tmux":"wfc-d-00000031"})
+        ));
+        assert!(tmux_history(&json!({"backend":"tmux"})));
+        assert!(!tmux_history(
+            &json!({"dispatch":"d-00000031","worker":{"state":"running"}})
+        ));
+        for backend in ["herdr", "bundled"] {
+            let mut hosted = ordinary.clone();
+            hosted["backend"] = json!(backend);
+            assert!(require_not_tmux_history(&hosted).is_ok());
+        }
+    }
 }

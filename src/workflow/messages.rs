@@ -13,13 +13,14 @@ use receipt::{Delivery, Resolution, State};
 pub use reply::{Reply, REPLY_USAGE};
 
 use super::{
-    controller, ensure_state_writable, git_snapshot::Snapshot, resolve_report_path, valid_id,
-    writable_state_dir,
+    controller, ensure_state_writable, git_snapshot::Snapshot, reject_tmux_history,
+    resolve_report_path, valid_id, writable_state_dir,
 };
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use std::collections::{hash_map::Entry, HashMap};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -209,6 +210,7 @@ impl Assignment {
         if path.extension().is_some_and(|ext| ext == "pending") {
             row["createPending"] = json!(true);
         }
+        super::assignment::require_not_tmux_history(&row)?;
         let assignment = Self::deserialize(&row).context("read worker assignment identity")?;
         ensure!(row["legacyArchived"] != true, "offline legacy assignment has no writable worker");
         ensure!(
@@ -1077,19 +1079,32 @@ impl Inbox {
         scope: Option<&str>,
         state: State,
     ) -> Result<Vec<Value>> {
-        let batch: Vec<_> = self
-            .messages
-            .iter_mut()
-            .filter(|m| {
-                m.claimable()
-                    && dispatch.is_none_or(|id| id == m.worker.dispatch)
-                    && scope.is_none_or(|scope| scope == m.worker.scope())
-            })
-            .map(|m| {
+        let dir = self.dir.join("dispatches");
+        let mut archived = HashMap::new();
+        let mut batch = Vec::new();
+        for m in self.messages.iter_mut().filter(|m| {
+            m.claimable()
+                && dispatch.is_none_or(|id| id == m.worker.dispatch)
+                && scope.is_none_or(|scope| scope == m.worker.scope())
+        }) {
+            let is_archived = match archived.entry(m.worker.dispatch.clone()) {
+                Entry::Occupied(entry) => *entry.get(),
+                Entry::Vacant(entry) => {
+                    let history_only =
+                        match super::assignment::has_tmux_history(&dir, &m.worker.dispatch) {
+                            Ok(value) => value,
+                            Err(error) if dispatch.is_some() => return Err(error),
+                            // Keep this entry untouched and allow other dispatches to deliver.
+                            Err(_) => true,
+                        };
+                    *entry.insert(history_only)
+                }
+            };
+            if !is_archived {
                 m.claim(state)?;
-                Ok(m.view())
-            })
-            .collect::<Result<_>>()?;
+                batch.push(m.view());
+            }
+        }
         if !batch.is_empty() {
             self.save().context("claim controller messages")?;
         }
@@ -1858,6 +1873,7 @@ impl<'a> Done<'a> {
         let dispatch = env::var("WFC_DISPATCH")
             .context("run done inside a dispatched worker (WFC_DISPATCH)")?;
         ensure!(valid_id(&dispatch), "invalid dispatch ID");
+        reject_tmux_history(&state, &dispatch)?;
         let token = controller::token(self.owner_token);
         let check = || {
             let inbox = Inbox::open(&state)?;
@@ -1982,6 +1998,7 @@ impl<'a> Ask<'a> {
         let dispatch = env::var("WFC_DISPATCH")
             .context("run ask inside a dispatched worker (WFC_DISPATCH)")?;
         ensure!(valid_id(&dispatch), "invalid dispatch ID");
+        reject_tmux_history(&state, &dispatch)?;
         let payload = Question {
             text: self.question.to_owned(),
             options: self
@@ -2141,6 +2158,9 @@ impl<'a> Wait<'a> {
 
     pub fn run(self) -> Result<Vec<Value>> {
         let state = writable_state_dir()?;
+        if let Some(dispatch) = self.dispatch {
+            reject_tmux_history(&state, dispatch)?;
+        }
         let token = controller::token(self.owner_token);
         let start = Instant::now();
         #[cfg(target_os = "linux")]

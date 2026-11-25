@@ -87,6 +87,9 @@ impl<'a> Handoff<'a> {
                 .with_context(|| format!("unknown native dispatch {}", self.dispatch))
         };
         let initial = read()?;
+        assignment::require_not_tmux_history(&initial)?;
+        // Retire the destination before the source can be closed.
+        ensure!(self.backend != "tmux", "tmux backend is retired");
         let scope = super::record_scope(&initial).context("invalid dispatch scope")?;
         let token = controller::token(self.owner_token);
         let authorize = || -> Result<Value> {

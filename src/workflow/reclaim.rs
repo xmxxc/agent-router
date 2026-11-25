@@ -78,6 +78,9 @@ impl<'a> Reclaim<'a> {
                 ensure!(valid_id(id), "unknown dispatch {id} in {}", state.display());
                 let row = assignment::public_record(&dir, id)?
                     .with_context(|| format!("unknown dispatch {id} in {}", state.display()))?;
+                if self.yes {
+                    assignment::require_not_tmux_history(&row)?;
+                }
                 targets.push((row, None));
             }
         } else {
@@ -216,6 +219,11 @@ fn inspect(state: &Path, dir: &Path, row: &Value) -> Result<(Value, bool)> {
     project_history(state, &mut current)?;
 
     let mut item = session(&current);
+    if assignment::tmux_history(&current) {
+        item["result"] = json!("unknown");
+        item["note"] = json!(assignment::TMUX_HISTORY_ONLY);
+        return Ok((item, false));
+    }
     if !same_execution(row, &current) {
         item["result"] = json!("changed");
         item["note"] = json!("dispatch execution changed; skipped");

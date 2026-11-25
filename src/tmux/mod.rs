@@ -904,6 +904,8 @@ pub(crate) fn attach(state: &Path, dispatch: &str, socket: &Path, token: &str) -
             && token.bytes().all(|b| b.is_ascii_hexdigit()),
         "invalid attach identity"
     );
+    crate::workflow::reject_tmux_history(state, dispatch)?;
+    crate::workflow::ensure_state_writable(state)?;
     let state = state.canonicalize()?;
     let backend = Tmux {
         state: &state,
@@ -983,6 +985,7 @@ pub(crate) fn execute_checked(
         "request selects another execution backend"
     );
     ensure!(valid_dispatch(&request.dispatch), "invalid dispatch ID");
+    crate::workflow::reject_tmux_history(state, &request.dispatch)?;
     ensure!(
         request
             .legacy_execution_id
@@ -1021,6 +1024,9 @@ pub(crate) fn execute_checked(
                 && request.legacy_recovery.is_none()),
         "readOnly requires ordinary inspect without legacy recovery"
     );
+    if request.read_only {
+        crate::workflow::ensure_no_legacy_db(state)?;
+    }
     if let Some(refusal) = write_refusal(state, request.read_only) {
         return Ok(refusal);
     }

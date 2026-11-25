@@ -143,7 +143,7 @@ pub(super) enum SubmissionPhase {
 #[serde(rename_all = "camelCase")]
 pub(super) struct Submission {
     pub(super) launch_id: String,
-    dispatch: String,
+    pub(super) dispatch: String,
     execution_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     round: Option<u64>,
@@ -972,11 +972,13 @@ pub(crate) fn run_host(id: &Path) -> Result<ExitCode> {
         "invalid launch ID"
     );
     let state = PathBuf::from(env::var_os("WFC_STATE").context("missing tmux state")?);
+    let dispatch = env::var("WFC_DISPATCH").context("missing dispatch")?;
+    crate::workflow::reject_tmux_history(&state, &dispatch)?;
+    crate::workflow::ensure_state_writable(&state)?;
     let dir = state.join("launches");
     let spec_path = dir.join(format!("{id}.spec"));
     let receipt = dir.join(format!("{id}.json"));
     let initial = read_receipt(&receipt).context("missing initial launch receipt")?;
-    let dispatch = env::var("WFC_DISPATCH").context("missing dispatch")?;
     let spec = pending_spec(&spec_path, &initial, &state, &dispatch)
         .context("unverified launch specification")?;
     let submission = dir.join(format!("{id}.submission"));

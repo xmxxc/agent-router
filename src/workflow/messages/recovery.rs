@@ -242,7 +242,8 @@ impl Scan {
         }
         let generations = Generations::read(dir, id);
         let row = generations.published()?;
-        if !assignment::identified(row)
+        if assignment::tmux_history(row)
+            || !assignment::identified(row)
             || row["createPending"] == true
             || !row["publicationDiagnostic"].is_null()
             || !row["controllerOwner"].is_null()

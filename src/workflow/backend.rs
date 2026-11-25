@@ -6,7 +6,6 @@ use std::{
     borrow::Cow,
     env,
     fs::File,
-    io::ErrorKind,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -453,11 +452,7 @@ fn private_receipt(state: &Path, launch: Option<&str>) -> Result<Value> {
     let Some(stem) = launch else {
         return Ok(Value::Null);
     };
-    match File::open(state.join("launches").join(format!("{stem}.json"))) {
-        Ok(f) => Ok(serde_json::from_reader(f)?),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(Value::Null),
-        Err(e) => Err(e).context("open host launch receipt"),
-    }
+    Ok(read_evidence(&state.join("launches").join(format!("{stem}.json")))?.unwrap_or(Value::Null))
 }
 
 #[cfg(target_os = "linux")]
@@ -599,22 +594,27 @@ fn closed_path(state: &Path, row: &Value) -> Result<PathBuf> {
     )))
 }
 
-pub(super) fn archive(state: &Path, row: &Value) -> Result<Option<Value>> {
-    let row = execution_row(row)?;
-    match File::open(closed_path(state, &row)?) {
-        Ok(f) => {
-            let saved: Value = serde_json::from_reader(f)?;
-            ensure!(
-                saved["dispatch"] == row["dispatch"]
-                    && saved["attempt"] == row["attempt"]
-                    && saved["round"] == row["round"],
-                "closed record identity mismatch"
-            );
-            Ok(Some(saved))
-        }
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+fn read_evidence(path: &Path) -> Result<Option<Value>> {
+    #[cfg(target_os = "linux")]
+    return super::handoff::read_order(path);
+    #[cfg(not(target_os = "linux"))]
+    match File::open(path) {
+        Ok(f) => Ok(Some(serde_json::from_reader(f)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+pub(super) fn archive(state: &Path, row: &Value) -> Result<Option<Value>> {
+    let row = execution_row(row)?;
+    let Some(saved) = read_evidence(&closed_path(state, &row)?)? else {
+        return Ok(None);
+    };
+    ensure!(
+        same_execution(&row, &saved),
+        "closed record identity mismatch"
+    );
+    Ok(Some(saved))
 }
 
 fn archived_exit(saved: &Value) -> bool {
@@ -964,6 +964,27 @@ pub(super) fn observe_with_mode(
     row: &mut Value,
     read_only: bool,
 ) -> Result<(Value, Value)> {
+    if super::assignment::tmux_history(row) {
+        let mut inspection = json!({"result":"uncertain","alive":null,
+            "diagnostic":super::assignment::TMUX_HISTORY_ONLY});
+        let mut worker = if script_preflight_failed(row) {
+            row["worker"].clone()
+        } else {
+            json!({"state":"unknown"})
+        };
+        if let Ok(physical) = execution_row(row) {
+            if let Ok(Some(saved)) = archive(state, &physical) {
+                copy_close_fields(&saved, &mut inspection);
+                if archived_exit(&saved) || confirmed(&physical, &saved) {
+                    worker = saved["worker"].clone();
+                }
+            }
+            if let Some(exit) = recorded_tmux_exit(state, &physical) {
+                worker = exit;
+            }
+        }
+        return Ok((worker, inspection));
+    }
     if script_preflight_failed(row) {
         return Ok((
             row["worker"].clone(),
@@ -976,6 +997,22 @@ pub(super) fn observe_with_mode(
     }
     let physical = execution_row(row)?;
     observe_tmux(state, physical.as_ref(), read_only)
+}
+
+fn recorded_tmux_exit(state: &Path, row: &Value) -> Option<Value> {
+    let launch = receipt_id(row).ok()??;
+    let receipt = private_receipt(state, Some(launch)).ok()?;
+    if receipt.get("launchId").is_some_and(|id| id != launch)
+        || ["dispatch", "executionId", "attempt"]
+            .iter()
+            .any(|&key| receipt.get(key).is_some_and(|value| value != &row[key]))
+        || receipt.get("round").is_some_and(|value| {
+            value != &row["round"] && value.as_str() != Some(row["round"].to_string().as_str())
+        })
+    {
+        return None;
+    }
+    exited(&receipt)
 }
 
 fn observe_tmux(state: &Path, row: &Value, read_only: bool) -> Result<(Value, Value)> {

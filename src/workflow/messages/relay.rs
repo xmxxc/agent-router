@@ -411,6 +411,7 @@ struct AssignmentProof {
     stamps: Option<GenerationStamps>,
     identity: Option<(String, u64)>,
     damaged: bool,
+    archived: bool,
 }
 
 struct ScopeAssignments {
@@ -441,7 +442,8 @@ impl ScopeAssignments {
 
     fn permits(&self, dir: &Path, worker: &Identity) -> bool {
         if let Some(proof) = self.proofs.get(&worker.dispatch) {
-            if proof.damaged
+            if proof.archived
+                || proof.damaged
                 || !proof
                     .stamps
                     .is_some_and(|stamps| stamps.current(dir, &worker.dispatch))
@@ -497,8 +499,13 @@ fn scope_assignments(
             Some(proof) => proof,
             None => {
                 let generations = Generations::read(&dir, &id);
+                let archived = generations
+                    .assigned()
+                    .is_some_and(crate::workflow::assignment::tmux_history);
                 for row in generations.rows() {
-                    if !row["controllerOwner"].is_null() {
+                    if !crate::workflow::assignment::tmux_history(row)
+                        && !row["controllerOwner"].is_null()
+                    {
                         let owned = if row["scope"].is_null() {
                             Some(id.as_str())
                         } else {
@@ -532,6 +539,7 @@ fn scope_assignments(
                     stamps: stamps.filter(|_| unchanged),
                     identity,
                     damaged: !unchanged || generations.damaged,
+                    archived,
                 }
             }
         };

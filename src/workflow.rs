@@ -179,6 +179,11 @@ impl<'a> Dispatch<'a> {
         ensure!(task.is_file(), "--task must name a file");
 
         let state = writable_state_dir()?;
+        // Keep the cutover independent of the new default adapter.
+        ensure!(
+            self.host.as_ref().is_none_or(|host| host.backend != "tmux"),
+            "tmux backend is retired"
+        );
         let records = state.join("dispatches");
         let dispatch = format!("d-{}", Uuid::new_v4().simple());
         let attempt = format!("a-{}", Uuid::new_v4().simple());
@@ -603,6 +608,15 @@ pub(crate) fn writable_state_dir() -> Result<PathBuf> {
     state
 }
 
+pub(crate) fn reject_tmux_history(state: &Path, dispatch: &str) -> Result<()> {
+    ensure!(
+        !assignment::has_tmux_history(&state.join("dispatches"), dispatch)?,
+        "{}",
+        assignment::TMUX_HISTORY_ONLY
+    );
+    Ok(())
+}
+
 pub(crate) fn ensure_state_writable(state: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -632,7 +646,7 @@ fn check_legacy_state_path(native: Option<&Path>) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_no_legacy_db(state: &Path) -> Result<()> {
+pub(crate) fn ensure_no_legacy_db(state: &Path) -> Result<()> {
     // An entry or recovery sidecar is sufficient. Opening SQLite to establish
     // its type or contents can require recovery or create sidecars.
     for name in [
@@ -696,8 +710,9 @@ fn decode_record(file: File, path: &Path) -> Result<Value> {
         "dispatch record identity mismatch in {}",
         path.display()
     );
-    // Hosted assignments predate the explicit backend column.
-    if record["host"].is_string() && (record["backend"].is_null() || record["backend"] == "") {
+    // The original hosted records predate the explicit backend column.
+    if assignment::tmux_history(&record) && (record["backend"].is_null() || record["backend"] == "")
+    {
         record["backend"] = json!("tmux");
     }
     Ok(record)
@@ -850,12 +865,17 @@ fn observe_dispatch(
 ) -> Result<Value> {
     #[cfg(not(target_os = "linux"))]
     let _ = dir;
+    let tmux_history = assignment::tmux_history(record);
+    if tmux_history {
+        record["historyOnly"] = json!(true);
+        record["tmuxAlive"] = Value::Null;
+    }
     if record["createPending"] == true && record["publicationDiagnostic"].is_string() {
         record["worker"] = json!({"state":"unknown"});
         record["backendResult"] = json!("uncertain");
         record["backendAlive"] = Value::Null;
         return Ok(json!({"result":"uncertain","diagnostic":record["publicationDiagnostic"]}));
-    } else if record["host"].is_string() {
+    } else if tmux_history || record["host"].is_string() {
         let (worker, inspection) = if read_only {
             backend::observe_with_mode(state, record, true)?
         } else {
@@ -864,7 +884,7 @@ fn observe_dispatch(
         backend::copy_close_fields(&inspection, record);
         record["worker"] = worker;
         record["backendResult"] = inspection["result"].clone();
-        if record["backend"] == "herdr" && inspection["diagnostic"].is_string() {
+        if (tmux_history || record["backend"] == "herdr") && inspection["diagnostic"].is_string() {
             record["backendDiagnostic"] = inspection["diagnostic"].clone();
         }
         record["backendAlive"] = if inspection["alive"] == true && inspection["owned"] != true {
