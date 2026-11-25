@@ -1,0 +1,275 @@
+name: Jammy bundled cross-host handoff
+on:
+  push:
+    branches: [rust-router/31-bundled-cross-host-handoff-r47-jammy-ci]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  bundled-combination:
+    name: '#31 bundled combination'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      PRODUCT_SHA: a62b1bce8f4a90d57cd7631164392725eb38a27c
+      PRODUCT_TREE: ae8444c9db005d579c25df033c6556d826ebf9dc
+      PRODUCT_PARENTS: e6d2a8b1a6594474f13024b3bb9864105900bfee
+      INPUTS_SHA256: 9ffbdeabc2c89b250bec2d9afe9c3a59a329c1582f8804687b3f30fed2994109
+      INPUTS_COUNT: '141'
+      PUBLICATION_COMBINATION_SHA: 877740474f09ea2f3824cba38b49fd99866b1940
+      PUBLICATION_COMBINATION_TREE: ac07e1598c1234050cd13bc210b570838960e61e
+      PUBLICATION_COMBINATION_PARENTS: 0aa6206b851c1292f9af1697b2b01dc47be5efc7 8236be6c469507cf953a953d59109d7c10e042b5
+      INPUT_COMBINATION_SHA: 0fc068d3ccd1797b59892016710e0a85fa66d68d
+      INPUT_COMBINATION_TREE: 9789ef9e9d3e549bd9559bf218f86b3194e7032c
+      INPUT_COMBINATION_PARENTS: eee0d7e446a638fbb229910c7f34407a78a70e63 9c1d34c280c1808aba1d16912d260527cbfedd05
+      STARTUP_COMBINATION_SHA: eee0d7e446a638fbb229910c7f34407a78a70e63
+      STARTUP_COMBINATION_TREE: 49ac7a5873633f9b026ccbee4d204cdd881b60a2
+      STARTUP_COMBINATION_PARENTS: be5a01d638c4ddf2c7e15f0b75b2634675a786f5 a6f29e48e8d45790c73257764f278e84a7fce5fc
+      NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+      NATIVE_INPUT_TREE: 7480986f4468ffafc76b95012562945ee586b52a
+      TARGET: x86_64-unknown-linux-gnu
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TERM_COLOR: never
+      EVIDENCE: ${{ github.workspace }}/linux-bundled-cross-host-handoff-evidence
+    steps:
+      - name: Record workflow and run identity
+        run: |
+          mkdir -p "$EVIDENCE"
+          printf '%s\n' "workflow=$GITHUB_WORKFLOW_SHA" "head=$GITHUB_SHA" \
+            "ref=$GITHUB_REF" "run=$GITHUB_RUN_ID" "attempt=$GITHUB_RUN_ATTEMPT" "job=$GITHUB_JOB" \
+            "expectedProduct=$PRODUCT_SHA" "expectedTree=$PRODUCT_TREE" \
+            "expectedParents=$PRODUCT_PARENTS" | tee "$EVIDENCE/run.log"
+      - name: Check out the fixed workflow
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: ci
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Check out the fixed product
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out the approved zlib archive
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.NATIVE_INPUT_SHA }}
+          path: native-input
+          sparse-checkout: vendor/zlib-1.3.1.tar.gz
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Check the fixed sources and product input manifest
+        working-directory: product
+        run: |
+          {
+            test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
+            test "$GITHUB_REF" = refs/heads/rust-router/31-bundled-cross-host-handoff-r47-jammy-ci
+            test "$(git -C ../ci rev-parse HEAD)" = "$GITHUB_WORKFLOW_SHA"
+            test "$(git -C ../ci show -s --format=%P HEAD)" = "$PRODUCT_SHA"
+            ci_paths=$(git -C ../ci diff --name-only HEAD^ HEAD)
+            test "$ci_paths" = "$(printf '%s\n' .github/workflows/linux-bundled-combination.yml tools/ci/bundled-combination.sh)"
+            git -C ../ci show -s --format='ci=%H tree=%T parents=%P'
+            test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+            test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+            test "$(git show -s --format=%P HEAD)" = "$PRODUCT_PARENTS"
+            git show -s --format='product=%H tree=%T parents=%P'
+            git merge-base --is-ancestor "$PUBLICATION_COMBINATION_SHA" HEAD
+            test "$(git rev-parse "$PUBLICATION_COMBINATION_SHA^{tree}")" = "$PUBLICATION_COMBINATION_TREE"
+            test "$(git show -s --format=%P "$PUBLICATION_COMBINATION_SHA")" = "$PUBLICATION_COMBINATION_PARENTS"
+            git show -s --format='publicationCombination=%H tree=%T parents=%P' "$PUBLICATION_COMBINATION_SHA"
+            git merge-base --is-ancestor "$INPUT_COMBINATION_SHA" HEAD
+            test "$(git rev-parse "$INPUT_COMBINATION_SHA^{tree}")" = "$INPUT_COMBINATION_TREE"
+            test "$(git show -s --format=%P "$INPUT_COMBINATION_SHA")" = "$INPUT_COMBINATION_PARENTS"
+            git show -s --format='inputCombination=%H tree=%T parents=%P' "$INPUT_COMBINATION_SHA"
+            git merge-base --is-ancestor "$STARTUP_COMBINATION_SHA" HEAD
+            test "$(git rev-parse "$STARTUP_COMBINATION_SHA^{tree}")" = "$STARTUP_COMBINATION_TREE"
+            test "$(git show -s --format=%P "$STARTUP_COMBINATION_SHA")" = "$STARTUP_COMBINATION_PARENTS"
+            git show -s --format='startupCombination=%H tree=%T parents=%P' "$STARTUP_COMBINATION_SHA"
+            test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
+            test "$(git -C ../native-input rev-parse 'HEAD^{tree}')" = "$NATIVE_INPUT_TREE"
+            git -C ../native-input show -s --format='nativeInput=%H tree=%T'
+            for checkout in . ../ci ../native-input; do
+              test -z "$(git -C "$checkout" status --porcelain)"
+            done
+            printf '%s  %s\n' "$INPUTS_SHA256" vendor/INPUTS.sha256 | sha256sum --check --strict
+            test "$(wc -l < vendor/INPUTS.sha256)" = "$INPUTS_COUNT"
+            sha256sum --check --strict vendor/INPUTS.sha256
+            printf '%s  %s\n' 17e88863f3600672ab49182f217281b6fc4d3c762bde361935e436a95214d05c \
+              ../native-input/vendor/zlib-1.3.1.tar.gz | sha256sum --check --strict
+            sha256sum tests/legacy_tmux_archive.py tests/legacy_public.py tests/bundled_write_fence.py \
+              tools/check_bundled_default.sh tools/check_bundled_startup.py crates/herdr/tests/composer.py \
+              tests/herdr_public.py crates/herdr/tests/live.py \
+              tests/check_codex.py tools/check_codex.py tests/startup_failure.py \
+              ../ci/.github/workflows/linux-bundled-combination.yml ../ci/tools/ci/bundled-combination.sh
+          } 2>&1 | tee "$EVIDENCE/sources.log"
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - name: Install the approved Zig archive
+        run: |
+          {
+            package=zig-x86_64-linux-0.16.0
+            archive="$RUNNER_TEMP/$package.tar.xz"
+            digest=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+            verified=0
+            for base in https://ziglang.org/download/0.16.0 https://zig.bcr.ist; do
+              url="$base/$package.tar.xz"
+              printf 'Downloading %s\n' "$url"
+              if curl --fail --silent --show-error --location --retry 2 --retry-max-time 180 \
+                --connect-timeout 15 --max-time 120 --output "$archive" "$url" &&
+                printf '%s  %s\n' "$digest" "$archive" | sha256sum --check --strict; then
+                verified=1
+                break
+              fi
+            done
+            test "$verified" = 1
+            tar -xJf "$archive" -C "$RUNNER_TEMP"
+            zig_dir="$RUNNER_TEMP/$package"
+            version=$("$zig_dir/zig" version)
+            printf 'Zig %s\n' "$version"
+            test "$version" = 0.16.0
+            printf '%s\n' "$zig_dir" >> "$GITHUB_PATH"
+          } 2>&1 | tee "$EVIDENCE/zig-install.log"
+      - name: Prepare the fixed build toolchain
+        run: |
+          {
+            rustup toolchain install 1.96.1 --profile minimal
+            test "$(id -u)" -ne 0
+            grep -Fx 'VERSION_ID="22.04"' /etc/os-release
+            getconf GNU_LIBC_VERSION
+            test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.35"
+            id -u
+            test "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs
+            systemctl --version
+            command -v jq
+            uname -srm
+            rustc +1.96.1 -vV
+            cargo +1.96.1 --version
+            zig version
+            python3 --version
+            cc --version
+          } 2>&1 | tee "$EVIDENCE/toolchain.log"
+      - name: Materialize verified Ghostty and zlib sources
+        working-directory: product
+        run: |
+          python3 tools/prepare.py --zlib-archive ../native-input/vendor/zlib-1.3.1.tar.gz \
+            2>&1 | tee "$EVIDENCE/native-prepare.log"
+      - name: Prime the pinned Wuffs package
+        working-directory: product/vendor/libghostty-vt
+        run: |
+          {
+            url=https://deps.files.ghostty.org/wuffs-7411f488fe2e2c205c3d3b3d28638b7356522930.tar.gz
+            archive="$RUNNER_TEMP/wuffs.tar.gz"
+            printf 'Wuffs source %s\n' "$url"
+            curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+              --retry-max-time 120 --connect-timeout 15 --max-time 60 "$url" -o "$archive"
+            printf '%s  %s\n' 17877d346f7988651d6c62e45b2e3b05c86809a6442c5e34612374b2a9719a1c "$archive" |
+              sha256sum --check --strict
+            package=$(zig fetch "$archive")
+            printf 'Wuffs Zig package %s\n' "$package"
+            test "$package" = 'N-V-__8AAP5JWgCGP_AD0teWpa4krRvE9VPZzvviGdbmN4jI'
+          } 2>&1 | tee "$EVIDENCE/wuffs.log"
+      - name: Build and identify the fixed release ELF
+        id: build
+        working-directory: product
+        env:
+          WFC_BUILD_ID: ${{ env.PRODUCT_SHA }}
+        run: |
+          {
+            cargo +1.96.1 build --release --locked --target "$TARGET" --bin wfc
+            install -m 0500 "target/$TARGET/release/wfc" "$EVIDENCE/wfc"
+            (cd "$EVIDENCE" && sha256sum wfc | tee elf.sha256)
+            version=$("$EVIDENCE/wfc" --version)
+            printf '%s\n' "$version"
+            [[ "$version" == *"(Rust, $TARGET, release, build $PRODUCT_SHA)" ]]
+            readelf -hW "$EVIDENCE/wfc"
+            readelf -VW "$EVIDENCE/wfc" > "$EVIDENCE/elf-versions.log"
+            python3 - "$EVIDENCE/elf-versions.log" <<'PY' | tee "$EVIDENCE/elf-symbol-requirements.log"
+          import re
+          import sys
+          from pathlib import Path
+
+          names = set(re.findall(r"\bName: ((?:GLIBC|GCC)_\S+)", Path(sys.argv[1]).read_text()))
+          for family in ("GLIBC", "GCC"):
+              requirements = sorted(name for name in names if name.startswith(family + "_"))
+              versions = [
+                  tuple(map(int, name.split("_", 1)[1].split(".")))
+                  for name in requirements if re.fullmatch(family + r"_[0-9]+(?:\.[0-9]+)+", name)
+              ]
+              highest = max(versions, default=())
+              print(f"{family}_symbols={' '.join(requirements) or 'none'}")
+              print(f"{family}_max={'.'.join(map(str, highest)) or 'none'}")
+              if family == "GLIBC":
+                  assert highest and highest <= (2, 35) and len(versions) == len(requirements)
+          PY
+          } 2>&1 | tee "$EVIDENCE/build.log"
+      - name: Verify bundled cross-host handoff and adjacent lifecycle cases
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        run: |
+          result=0
+          for group in user-handoff user-continue archive write-fence; do
+            bash ../ci/tools/ci/bundled-combination.sh "$group" |& tee "$EVIDENCE/$group.log" || result=1
+          done
+          exit "$result"
+      - name: Verify the exact bundled handoff selectors
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: product
+        env:
+          WFC_BUILD_ID: ${{ env.PRODUCT_SHA }}
+          RUST_SELECTORS: |
+            workflow::handoff::bundled::tests::bundled_handoff_requires_the_original_whole_execution_receipt
+            workflow::handoff::bundled::tests::bundled_handoff_ordering_keeps_the_number_and_old_writer
+            workflow::handoff::bundled::tests::bundled_handoff_retries_only_recover_the_same_signed_target
+        run: |
+          {
+            (cd "$EVIDENCE" && sha256sum --check --strict elf.sha256)
+            fixture=$(mktemp -d "$RUNNER_TEMP/wfc-runtime-smoke-rust.XXXXXXXX")
+            trap 'rm -rf -- "$fixture"' EXIT
+            unset WFC_CONTROLLER_TOKEN WFC_OWNER_TOKEN WFC_WORKER_CALLBACK
+            export TMPDIR="$fixture" WFC_STATE="$fixture"
+            printf '%s' "$RUST_SELECTORS" > "$EVIDENCE/selectors.log"
+            mapfile -t selectors < "$EVIDENCE/selectors.log"
+            test "${#selectors[@]}" -eq 3
+            result=0
+            for selector in "${selectors[@]}"; do
+              printf 'selector=%s\n' "$selector"
+              status=0
+              cargo +1.96.1 test --release --locked --target "$TARGET" --bin wfc -- "$selector" --exact || status=$?
+              printf 'selector_exit=%s\n' "$status"
+              if (( status != 0 )); then result=1; fi
+            done
+            rm -rf -- "$fixture"
+            test ! -e "$fixture"
+            trap - EXIT
+            printf 'rust_fixture_removed=yes\n'
+            (cd "$EVIDENCE" && sha256sum --check --strict elf.sha256)
+            exit "$result"
+          } |& tee "$EVIDENCE/rust.log"
+          while IFS= read -r selector; do
+            grep -Fx "test $selector ... ok" "$EVIDENCE/rust.log"
+          done < "$EVIDENCE/selectors.log"
+          test "$(grep -Fc 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$EVIDENCE/rust.log")" =             "$(wc -l < "$EVIDENCE/selectors.log")"
+      - name: Checksum the available evidence
+        if: ${{ always() }}
+        run: |
+          cd "$EVIDENCE"
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0             | LC_ALL=C sort -z | xargs -0 -r sha256sum > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+          if [ -f elf.sha256 ]; then sha256sum --check --strict elf.sha256; fi
+      - name: Upload Jammy combination evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-bundled-combination-${{ env.PRODUCT_SHA }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 14
