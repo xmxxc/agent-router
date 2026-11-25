@@ -231,6 +231,15 @@ impl<'a> Request<'a> {
             );
             verify_ticket(&state, ticket)?;
             let _inbox = messages::Inbox::open(&state)?;
+            if operation == "continue" {
+                // The physical ticket survives continuation, but its close intent
+                // binds the current logical round. Keep that binding intact.
+                ensure!(
+                    !backend::close_blocks_callback(&state, &current)
+                        .context("could not verify bundled close state; keep the input pending")?,
+                    "bundled close has an existing intent; keep the input pending"
+                );
+            }
             let history =
                 view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
             ensure!(

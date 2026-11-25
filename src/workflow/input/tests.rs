@@ -174,3 +174,111 @@ fn bundled_zero_write_recovery_never_sends_input() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn bundled_zero_write_recovery_preserves_existing_close_binding() -> Result<()> {
+    for cleaned in [false, true] {
+        let fixture =
+            Fixture(std::env::temp_dir().join(format!("wfc-close-binding-{}", Uuid::new_v4())));
+        fs::create_dir(&fixture.0)?;
+        let state = &fixture.0;
+        let dir = state.join("dispatches");
+        fs::create_dir(&dir)?;
+        let dispatch = "d-1234abcd";
+        let physical = "a-0123456789ab";
+        let logical = "a-0123456789cd";
+        let scope = "input-fixture";
+        let (ticket, cleanup) =
+            crate::bundled::ticket_cleanup_fixture(state, dispatch, physical, cleaned)?;
+        let path = dir.join(format!("{dispatch}.json"));
+        let report = state.join("first-report.md");
+        let task = state.join("next-task.md");
+        let next_report = state.join("next-report.md");
+        fs::write(&task, "ordinary next task\n")?;
+
+        let original = json!({"dispatch":dispatch,"round":1,"attempt":physical,"role":"worker",
+            "scope":scope,"host":"codex","backend":"bundled","report":report,"backendHandle":ticket,
+            "create":{"result":"accepted","round":1,"attempt":physical,"dispatch":dispatch,"ticket":ticket},
+            "audit":[],"rounds":[{"round":1,"attempt":physical,"state":"completed","report":report}]});
+        let mut pending = original.clone();
+        pending["round"] = json!(2);
+        pending["attempt"] = json!(logical);
+        pending["executionId"] = json!(physical);
+        pending["task"] = json!(task);
+        pending["report"] = json!(next_report);
+        pending["audit"] = json!([{"id":"i-close-fixture","operation":"continue","result":"pending",
+            "round":2,"attempt":logical,"fromRound":1,"fromAttempt":physical,
+            "task":task,"report":next_report}]);
+        let proof = Uuid::new_v4().simple().to_string().repeat(2);
+        recovery::stage(&original, &mut pending, &proof, 0)?;
+        save(state, &path, &pending)?;
+        let old_message = json!({"id":17,"messageId":"m-original-done","type":"done",
+            "dispatch":dispatch,"round":1,"attempt":physical,"role":"worker","scope":scope,
+            "report":report,"state":"processed","statusVersion":3});
+        messages::stage_legacy_messages(state, &[old_message])?;
+
+        // The closing record names the physical ticket and the current
+        // business round, as it does when a close follows a staged continue.
+        let intent = dir.join(format!("{dispatch}.{physical}.closing"));
+        write_json(
+            &intent,
+            &json!({"ticket":ticket,"round":2,"workerOnClose":null}),
+            None,
+        )?;
+        let ledger = state.join("messages.json");
+        let preserved = [&path, &intent, &ledger];
+        let before = [fs::read(&path)?, fs::read(&intent)?, fs::read(&ledger)?];
+        let cleanup_before = if cleaned {
+            Some(fs::read(&cleanup)?)
+        } else {
+            None
+        };
+        let status_before = backend::observe(state, &mut pending.clone())?;
+        let receipt_before = backend::read_only_close(state, &pending)?;
+        assert_eq!(status_before.1["ticket"], ticket);
+        assert_eq!(receipt_before.is_some(), cleaned);
+        if let Some(receipt) = &receipt_before {
+            assert_eq!(receipt["cleanup"], "confirmed");
+            assert_eq!(receipt["ticket"], ticket);
+            assert_eq!(receipt["round"], 2);
+            assert_eq!(receipt["attempt"], logical);
+        }
+
+        let args = [
+            OsString::from(dispatch),
+            OsString::from("--task"),
+            task.into_os_string(),
+            OsString::from("--report"),
+            next_report.into_os_string(),
+            OsString::from("--no-send-proof"),
+            OsString::from(proof),
+        ];
+        let refusal = Request::parse("continue", &args)?
+            .run_in(
+                state.clone(),
+                |_, _| panic!("recovery must never inspect a live transport"),
+                |_, _, _| panic!("recovery must never enter the transport"),
+                verify_bundled_ticket,
+            )
+            .expect_err("the original close intent must keep the continuation pending");
+        assert!(refusal.to_string().contains("close has an existing intent"));
+        for (file, bytes) in preserved.into_iter().zip(before) {
+            assert!(fs::read(file)? == bytes, "fixture file changed: {file:?}");
+        }
+        if let Some(bytes) = cleanup_before {
+            assert!(
+                fs::read(&cleanup)? == bytes,
+                "signed cleanup receipt changed"
+            );
+        } else {
+            assert!(
+                !cleanup.try_exists()?,
+                "recovery published a cleanup receipt"
+            );
+        }
+        let mut after = super::super::read_record(&path)?;
+        assert_eq!(backend::observe(state, &mut after)?, status_before);
+        assert_eq!(backend::read_only_close(state, &after)?, receipt_before);
+    }
+    Ok(())
+}

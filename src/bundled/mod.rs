@@ -669,6 +669,40 @@ pub fn run(stage: &str, selected: Option<&Path>) -> Result<u8> {
 }
 
 #[cfg(test)]
+pub(crate) fn ticket_cleanup_fixture(
+    state: &Path,
+    unit: &str,
+    attempt: &str,
+    cleaned: bool,
+) -> Result<(Value, PathBuf)> {
+    let unit_path = unit_dir(state, unit)?;
+    create_lock_file(&unit_path)?;
+    let token = fresh();
+    let generation = fresh();
+    let ticket = json!({"version":2,"unit":unit,"attempt":attempt,"generation":generation,
+        "nonce":fresh(),"capabilityHash":store::digest(token.as_bytes())});
+    let run = unit_path.join(generation);
+    store::private_dir(&run)?;
+    publish(&run.join("key.json"), &json!(token))?;
+    let store = Store::open(&unit_path, &ticket)?;
+    let process = store::identity(std::process::id())?;
+    let index = json!({"ticket":ticket,"applied":false,"creator":process,"pending_until_ms":1});
+    store::publish_current(&run.join("index.json"), index.clone(), &store)?;
+    store::publish_current(&unit_path.join("current.json"), index, &store)?;
+    let ready = json!({"guardian":process,"service":process,"kernel":process,"worker":process,
+        "endpoint":42,"kernel_generation":fresh(),
+        "containment":{"kind":"cgroup-v2","path":"/fixture","device":1,"inode":2}});
+    store.save_signed("ready", ready.clone())?;
+    if cleaned {
+        store.save_signed(
+            "cleanup",
+            json!({"state":"closed","proves":"execution-empty","identity":ready}),
+        )?;
+    }
+    Ok((ticket, run.join("cleanup.json")))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::net::TcpListener;
