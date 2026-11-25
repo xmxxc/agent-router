@@ -5,8 +5,8 @@ pub(in crate::workflow) use input::{
     submit_continue, submit_nudge, submit_reply, APPENDED_USER_ENTRY,
 };
 
-use super::{closed_path, execution_row, write_json, Launch};
-use crate::workflow::{assignment, controller, messages, record_scope};
+use super::{closed_path, execution_row, Launch};
+use crate::workflow::{assignment, controller, messages, record_scope, write_json};
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{

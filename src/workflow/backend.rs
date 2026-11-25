@@ -13,9 +13,10 @@ use super::{host::Launch, valid_identity};
 use super::write_json;
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
+#[cfg(not(target_os = "linux"))]
+use std::fs::File;
 use std::{
     borrow::Cow,
-    fs::File,
     path::{Path, PathBuf},
 };
 
