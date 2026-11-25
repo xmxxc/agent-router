@@ -962,21 +962,22 @@ pub(super) fn recover_expired_scope_handoff(
     Ok(())
 }
 
-// Called with the scope lock. An abandoned handoff is not a new launch
-// opportunity, and an old backend could still be working on its request.
-pub(super) fn require_scope_settled(state: &Path, scope: &str) -> Result<()> {
+// Called with the scope lock. Report whether there is a completed bundled
+// handoff whose dispatch directory must be synced before changing owner.
+pub(super) fn require_scope_settled(state: &Path, scope: &str) -> Result<bool> {
     require_interrupt_settled(state, scope)?;
     let Some((row, index)) = scope_handoff(state, scope)? else {
-        return Ok(());
+        return Ok(false);
     };
     let event = &row["audit"][index];
     if bundled::order_had_no_backend_effect(event) {
-        return Ok(());
+        return Ok(false);
     }
+    let bundled = event["target"]["backend"] == "bundled";
     ensure!(
         event["result"] == "accepted"
             && event["phase"] == "complete"
-            && if event["target"]["backend"] == "bundled" {
+            && if bundled {
                 bundled::has_bound_stop(&row, event)
                     && bundled::launch_matches(&event["launch"], &row["dispatch"], &event["toAttempt"])
                     && event["launch"]["round"] == event["round"]
@@ -988,5 +989,5 @@ pub(super) fn require_scope_settled(state: &Path, scope: &str) -> Result<()> {
         "handoff audit {} is unresolved; reconcile the original execution before changing owner",
         event["id"]
     );
-    Ok(())
+    Ok(bundled)
 }

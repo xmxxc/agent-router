@@ -335,10 +335,18 @@ impl<'a> Owner<'a> {
 
     pub fn run(self) -> Result<Value> {
         let state = writable_state_dir()?;
-        self.run_in(&state)
+        self.run_in(
+            &state,
+            #[cfg(target_os = "linux")]
+            messages::sync_directory,
+        )
     }
 
-    pub(super) fn run_in(self, state: &Path) -> Result<Value> {
+    pub(super) fn run_in(
+        self,
+        state: &Path,
+        #[cfg(target_os = "linux")] sync_handoff: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<Value> {
         let _scope_lock = lock_scope(state, &self.scope)?;
         let ledger_lock = messages::lock_for_publish(state)?;
         #[cfg(target_os = "linux")]
@@ -404,23 +412,34 @@ impl<'a> Owner<'a> {
                 1
             };
             #[cfg(target_os = "linux")]
-            if let Err(unsettled) = super::handoff::require_scope_settled(state, &self.scope) {
-                let Some(expired_generation) = expired_generation else {
-                    return Err(unsettled);
+            {
+                let bundled = match super::handoff::require_scope_settled(state, &self.scope) {
+                    Ok(settled) => settled,
+                    Err(unsettled) => {
+                        let Some(expired_generation) = expired_generation else {
+                            return Err(unsettled);
+                        };
+                        // Recovery takes the execution lock before the Inbox. Keep
+                        // the scope locked and reread other scopes after reacquiring.
+                        drop(ledger_lock);
+                        super::handoff::recover_expired_scope_handoff(
+                            state,
+                            &self.scope,
+                            expired_generation,
+                        )?;
+                        ledger_lock = messages::lock_for_publish(state)?;
+                        owners = Owners::read(state)?;
+                        super::handoff::require_scope_settled(state, &self.scope)?
+                    }
                 };
-                // Recovery takes the execution lock before the Inbox. Keep
-                // the scope locked and reread other scopes after reacquiring.
-                drop(ledger_lock);
-                super::handoff::recover_expired_scope_handoff(
-                    state,
-                    &self.scope,
-                    expired_generation,
-                )?;
-                ledger_lock = messages::lock_for_publish(state)?;
-                owners = Owners::read(state)?;
-                super::handoff::require_scope_settled(state, &self.scope)?;
-                until = now() + self.lease;
-                lease_until = lease_time(until)?;
+                // A previous process may have renamed the settled assignment
+                // and stopped before syncing its directory.
+                if bundled {
+                    sync_handoff(&state.join("dispatches"))
+                        .context("sync settled bundled handoff before changing owner")?;
+                    until = now() + self.lease;
+                    lease_until = lease_time(until)?;
+                }
             }
             owners.0.insert(
                 self.scope.clone(),

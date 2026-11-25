@@ -781,9 +781,13 @@ mod tests {
                 "replacement",
             ]
             .map(OsString::from);
-            let transition = || controller::Owner::parse(action, &args)?.run_in(state);
+            let transition =
+                || controller::Owner::parse(action, &args)?.run_in(state, messages::sync_directory);
             let renew_args = ["--scope", scope, "--token", old_token].map(OsString::from);
-            let renew = || controller::Owner::parse("renew", &renew_args)?.run_in(state);
+            let renew = || {
+                controller::Owner::parse("renew", &renew_args)?
+                    .run_in(state, messages::sync_directory)
+            };
             let read_owners =
                 || -> Result<Value> { Ok(serde_json::from_slice(&std::fs::read(&owner_path)?)?) };
             let mut owners = json!({
@@ -900,6 +904,60 @@ mod tests {
                 ticket
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_handoff_owner_retry_requires_durable_settlement() -> Result<()> {
+        let (fixture, mut row) = pending_handoff(json!(7))?;
+        let state = &fixture.0;
+        let dispatch = row["dispatch"].as_str().unwrap().to_owned();
+        let target = row["attempt"].as_str().unwrap();
+        let scope = row["scope"].as_str().unwrap().to_owned();
+        let dir = state.join("dispatches");
+        let row_path = dir.join(format!("{dispatch}.json"));
+        let owner_path = state.join("controller-owners.json");
+        let old_token = "fixture-old-controller";
+        let new_token = "fixture-new-controller";
+        let owners = json!({(&scope): {"owner":"original","generation":7,"until":0.0,
+            "fingerprint":messages::body_hash(old_token),"retired":[]}});
+        write_json(&owner_path, &owners, None)?;
+        let old_owners = std::fs::read(&owner_path)?;
+        let (ticket, _) = crate::bundled::ticket_cleanup_fixture(state, &dispatch, target, false)?;
+        let close = &row["audit"][0]["close"];
+        let receipt = crate::bundled::handoff_launch_receipt(
+            state,
+            &dispatch,
+            &row["attempt"],
+            &close["ticket"],
+            &close["proof"],
+        )?;
+        // Model a process interrupted after rename and before directory sync.
+        settle_launch(&mut row, 0, receipt);
+        write_json(&row_path, &row, None)?;
+        let args = ["--scope", &scope, "--token", new_token].map(OsString::from);
+        let transition = || controller::Owner::parse("takeover", &args);
+        let blocked = transition()?.run_in(state, |path| {
+            assert_eq!(path, dir);
+            Err(std::io::Error::other("injected dispatch directory sync failure").into())
+        });
+        assert!(format!("{:#}", blocked.unwrap_err())
+            .contains("injected dispatch directory sync failure"));
+        assert_eq!(std::fs::read(&owner_path)?, old_owners);
+        assert_eq!(messages::read_callback_record(&dir, &dispatch)?, row);
+        assert!(run(retry_request(&dispatch, Some(old_token)), state).is_err());
+
+        let acquired = transition()?.run_in(state, |path| {
+            assert_eq!(path, dir);
+            assert_eq!(std::fs::read(&owner_path)?, old_owners);
+            messages::sync_directory(path)
+        })?;
+        assert_eq!(acquired["generation"], 8);
+        let replay = run(retry_request(&dispatch, Some(new_token)), state)?;
+        assert_eq!(replay["duplicate"], true);
+        assert_eq!(replay["audit"], 1);
+        assert_eq!(replay["ticket"], ticket);
+        assert_eq!(messages::read_callback_record(&dir, &dispatch)?, row);
         Ok(())
     }
 }

@@ -103,14 +103,19 @@ def worker_arguments_match(proc, executables, flags, brief_refs):
             and all(os.fsencode(ref) in fields[-1] for ref in brief_refs))
 
 
-def check_assignment(row, scope, work, task, report):
+def check_assignment(row, scope, work, task, report, *, expected_owner=None):
     check(isinstance(row, dict) and row.get('scope') == scope and row.get('cwd') == str(work)
           and row.get('task') == str(task) and row.get('report') == str(report)
           and row.get('host') == 'codex' and row.get('backend') == 'bundled' and row.get('round') == 1
-          and row.get('publicationDiagnostic') is None and row.get('controllerOwner') is None
+          and row.get('publicationDiagnostic') is None
           and isinstance(row.get('dispatch'), str) and re.fullmatch(r'd-[0-9a-f]+', row['dispatch'])
           and isinstance(row.get('attempt'), str) and re.fullmatch(r'a-[0-9a-f]+', row['attempt']),
           'dispatch does not match the private fixture')
+    owner = row.get('controllerOwner')
+    check(owner is None or (expected_owner is not None and isinstance(owner, dict)
+                            and type(owner.get('generation')) is int
+                            and (owner.get('owner'), owner.get('generation')) == expected_owner),
+          'dispatch owner does not match the private fixture')
 
 
 def check_ticket(row, ticket):

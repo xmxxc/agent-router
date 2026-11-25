@@ -102,6 +102,7 @@ class Fixture:
         self.cleaning = False
         self.stage = "prepare"
         self.dispatch = None
+        self.owner = None
         self.known = {}
         self.retired = set()
         self.dispatch_requested = False
@@ -140,7 +141,7 @@ class Fixture:
         return row
 
     def remember(self, row, phase=None):
-        check_assignment(row, self.scope, self.work, self.task, self.report)
+        check_assignment(row, self.scope, self.work, self.task, self.report, expected_owner=self.owner)
         create = row["create"]
         ticket = create["ticket"]
         check_ticket(row, ticket)
@@ -262,6 +263,7 @@ class Fixture:
     def run(self):
         self.stage = "dispatch"
         owner = self.cli("acquire", "--scope", self.scope, "--lease", "180")
+        self.owner = (owner["owner"], owner["generation"])
         self.env["WFC_CONTROLLER_TOKEN"] = owner["token"]
         self.dispatch_requested = True
         old = self.cli("dispatch", "--host", "codex", "--scope", self.scope, "--cwd", self.work,
