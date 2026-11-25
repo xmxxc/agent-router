@@ -977,8 +977,14 @@ fn check_snapshot_size(size: usize) -> Result<()> {
 }
 
 fn continued_input_binding(row: &Value, event: &Value) -> Option<Value> {
+    let bundled = row["backend"] == "bundled";
     (row["host"] == "codex"
-        && row["backend"] == "tmux"
+        && (row["backend"] == "tmux"
+            || bundled
+                && matches!(
+                    super::backend::execution_row(row).ok()?,
+                    std::borrow::Cow::Owned(_)
+                ))
         && super::assignment::unresolved_handoff(row).is_none()
         && event["operation"] == "continue"
         && event["round"] == row["round"]
@@ -988,11 +994,15 @@ fn continued_input_binding(row: &Value, event: &Value) -> Option<Value> {
             Some("pending" | "uncertain" | "accepted")
         ))
     .then_some(())?;
-    Some(json!({
+    let mut proof = json!({
         "executionId": row["executionId"].as_str()?,
         "audit": event["id"].as_str()?,
         "referenceHash": row[controller::CALLBACK_REF_HASH].as_str()?,
-    }))
+    });
+    if bundled {
+        proof["ticket"] = row["create"]["ticket"].clone();
+    }
+    Some(proof)
 }
 
 fn authenticated_continued_input(row: &Value, reference: Option<&str>) -> Option<Value> {
@@ -1360,11 +1370,7 @@ impl Inbox {
             return Ok(false);
         }
         let physical = super::backend::execution_row(row)?;
-        let launch_round = if row["backend"] == "tmux" {
-            physical["round"].as_u64()
-        } else {
-            None
-        };
+        let launch_round = physical["round"].as_u64();
         Ok(self.messages.iter().any(|message| {
             message.worker.dispatch == row["dispatch"]
                 && except != Some(message.message_id.as_str())
@@ -1424,7 +1430,8 @@ impl Inbox {
                     .is_some_and(|saved| {
                         saved == &proof
                             // Earlier binaries stored only the reference digest.
-                            || (event["result"] == "uncertain" && saved == &proof["referenceHash"])
+                            || (row["backend"] != "bundled"
+                                && event["result"] == "uncertain" && saved == &proof["referenceHash"])
                     })
         }))
     }
@@ -1475,7 +1482,6 @@ impl Inbox {
             .and_then(Value::as_str);
         use crate::tmux::APPENDED_USER_ENTRY;
         let bundled_entry = row["backend"] == "bundled"
-            && matches!(input, WorkerInput::Nudge { .. })
             && proof == Some(super::backend::BUNDLED_APPENDED_USER_ENTRY);
         let tmux_entry = proof == Some(APPENDED_USER_ENTRY);
         match (event["result"].as_str(), proof) {
@@ -1515,8 +1521,10 @@ impl Inbox {
     pub(super) fn publish_worker_input(&mut self, row: &Value, event: &Value) -> Result<u64> {
         ensure!(
             if row["backend"] == "bundled" {
-                event["operation"] == "nudge"
-                    && event["inputEvidence"] == super::backend::BUNDLED_APPENDED_USER_ENTRY
+                event["inputEvidence"] == super::backend::BUNDLED_APPENDED_USER_ENTRY
+                    || (event["operation"] == "continue"
+                        && event["inputEvidence"] == CONTINUED_INPUT_CALLBACK
+                        && self.verified_continued_input_callback(row, event)?)
             } else {
                 event["inputEvidence"] == crate::tmux::APPENDED_USER_ENTRY
                     || (event["operation"] == "continue"

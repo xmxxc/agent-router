@@ -103,8 +103,8 @@ impl<'a> Request<'a> {
         let require_host = |row: &Value, replay: Option<usize>| -> Result<()> {
             if row["backend"] == "bundled" {
                 ensure!(
-                    operation == "nudge" && row["host"] == "codex",
-                    "bundled input requires a Codex nudge"
+                    row["host"] == "codex",
+                    "bundled input requires a Codex assignment"
                 );
                 return Ok(());
             }
@@ -140,10 +140,17 @@ impl<'a> Request<'a> {
         );
         controller::Owners::read(&state)?.require(scope, token.as_deref(), operation)?;
         ensure!(
-            ["host", "backend", "executionId", "tmuxSocket", "create"]
+            ["host", "backend", "tmuxSocket", "create"]
                 .iter()
                 .all(|key| current[*key] == original[*key])
-                && (!bundled || current["backendHandle"] == original["backendHandle"]),
+                && if bundled {
+                    // The first continuation records executionId while a retry
+                    // may still hold a snapshot of the original logical round.
+                    backend::bundled_input_ticket(&current)?
+                        == backend::bundled_input_ticket(&original)?
+                } else {
+                    current["executionId"] == original["executionId"]
+                },
             "execution changed while waiting for input"
         );
         let same_round =
@@ -213,19 +220,16 @@ impl<'a> Request<'a> {
             current["controllerOwner"].is_null()
                 && assignment::identified(&current)
                 && current["create"]["result"] == "accepted"
-                && if bundled {
-                    let ticket = &current["create"]["ticket"];
-                    ticket.is_object()
-                        && ticket["unit"] == current["dispatch"]
-                        && ticket["attempt"] == current["attempt"]
-                        && current["backendHandle"] == *ticket
-                } else {
+                && (bundled || (
                     current["executionId"].is_string()
                         && current["tmuxSocket"].as_str().is_some_and(|socket| Path::new(socket).is_absolute())
                         && current["create"]["receipt"].is_string()
-                },
+                )),
             "input requires a confirmed native launch; verify the original execution before retrying"
         );
+        let bundled_ticket = bundled
+            .then(|| backend::bundled_input_ticket(&current))
+            .transpose()?;
         ensure!(
             backend::archive(&state, &current)?.is_none(),
             "execution resources are closing or closed; use resume for an exited worker"
@@ -243,8 +247,8 @@ impl<'a> Request<'a> {
         ensure!(
             observed["owned"] == true
                 && worker["state"] == "running"
-                && if bundled {
-                    observed["ticket"] == current["create"]["ticket"]
+                && if let Some(ticket) = bundled_ticket {
+                    observed["ticket"] == *ticket
                 } else {
                     observed["workerBound"] == true
                         && observed["executionId"] == current["executionId"]
@@ -253,6 +257,7 @@ impl<'a> Request<'a> {
             "execution is not a verified writable worker"
         );
         let legacy_callback = operation == "continue"
+            && !bundled
             && current[controller::CALLBACK_HASH].is_null()
             && current[controller::CALLBACK_REF_HASH].is_null();
         if legacy_callback {
@@ -268,13 +273,12 @@ impl<'a> Request<'a> {
             );
             let history =
                 view::merged_history(&current, messages::history(&state, self.dispatch)?)?;
-            let earlier_reminders = if bundled {
+            let earlier_reminders = if bundled && operation == "nudge" {
                 history
                     .iter()
                     .filter(|message| {
                         message["type"] == "nudge"
-                            && message["attempt"] == current["attempt"]
-                            && message["round"] == current["round"]
+                            && message["inputEvidence"] == backend::BUNDLED_APPENDED_USER_ENTRY
                             && message["text"].as_str() == nudge.as_deref()
                     })
                     .count()
@@ -316,6 +320,9 @@ impl<'a> Request<'a> {
                     }));
                     next["round"] = json!(round);
                     next["attempt"] = json!(attempt);
+                    if let Some(ticket) = bundled_ticket {
+                        next["executionId"] = ticket["attempt"].clone();
+                    }
                     next["task"] = json!(task);
                     next["report"] = json!(report);
                     if let Some(reference) = &reference {
@@ -402,17 +409,22 @@ impl<'a> Request<'a> {
         };
         let mut first_write_error = None;
         let answer = if bundled {
-            let result = backend::submit_bundled_nudge(
-                &state,
-                &current,
-                &text,
-                earlier_reminders,
-                || {
-                    prepare()?;
-                    check_write()
-                },
-                &check_write,
-            );
+            let prepare = || {
+                prepare()?;
+                check_write()
+            };
+            let result = if operation == "continue" {
+                backend::submit_bundled_continue(&state, &current, &text, prepare, &check_write)
+            } else {
+                backend::submit_bundled_nudge(
+                    &state,
+                    &current,
+                    &text,
+                    earlier_reminders,
+                    prepare,
+                    &check_write,
+                )
+            };
             match result {
                 Err(error) if error.is::<controller::ControllerError>() => {
                     let diagnostic = format!("{error:#}");

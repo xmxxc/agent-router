@@ -152,6 +152,8 @@ wfc wait --scope team-a --timeout 30
 
 在 Linux 可用 `wfc nudge DISPATCH --text TEXT [--message-id KEY]` 提醒当前仍在处理任务的 Codex worker，支持 bundled 和 tmux。bundled 在原终端的空输入框发送单行提醒，看到原对话保留且出现新用户消息后才发放回执。省略 `--message-id` 时，每次合法调用都是一条新提醒，可以主动再次发送同文。需要在返回丢失或结算报错后精确取回回执时，从首次发送起为该意图使用同一个键。同一派发内，同键同正文会取回原数字 `message`，同键不同正文会报冲突。发送结果仍待核对时，只有匹配且已证实送达的收据可以用于补结算。另一条输入待核对时，已有的确认键仍可只读取回原号，新输入会继续受阻。
 
+已完成的 bundled Codex worker 仍在线时，可用 `wfc continue DISPATCH --task FILE --report FILE` 给原终端下一项任务。原运行票据与历史回报保留，新一轮使用新的 attempt 和回调引用。新报告须用原报告目录中的新路径。原输入框须为空，且画面能完整核对本次指令。相同任务和报告路径重取本轮回执，待核输入不会重发。
+
 旧同文或旧拒收从滚动历史重现时，画面可能和一次实际新输入相同。此时命令会保留待核，`wfc status --dispatch ID` 的 `audit` 可以查看原轮次及诊断，重试不会再发键。若续派的 worker 已用该轮的 `--callback-ref` 成功发问或回报，可以用原 `continue` 参数重取同一输入的回执。
 
 在已认领的组中，worker 可用启动时分配的独立回调凭据发问或回报。总控兼容入口使用当前租约的凭据。`ask` 与 `done` 均接受显式的 `--owner-token`。

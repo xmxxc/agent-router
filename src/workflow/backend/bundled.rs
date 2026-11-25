@@ -1,9 +1,11 @@
 //! Bind backend operations to the assignment. A durable close intent turns
 //! concurrent requests and retries after a lost reply into receipt reads.
 mod input;
-pub(in crate::workflow) use input::{submit_nudge, submit_reply, APPENDED_USER_ENTRY};
+pub(in crate::workflow) use input::{
+    submit_continue, submit_nudge, submit_reply, APPENDED_USER_ENTRY,
+};
 
-use super::{closed_path, write_json, Launch};
+use super::{closed_path, execution_row, write_json, Launch};
 use crate::workflow::{assignment, controller, messages, record_scope};
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
@@ -72,7 +74,24 @@ pub(super) fn create(state: &Path, row: &Value, mut launch: Launch) -> Result<Va
 }
 
 fn bundled_close_path(state: &Path, row: &Value) -> Result<PathBuf> {
-    Ok(closed_path(state, row)?.with_extension("closing"))
+    Ok(closed_path(state, execution_row(row)?.as_ref())?.with_extension("closing"))
+}
+
+pub(in crate::workflow) fn registered_ticket(row: &Value) -> Result<&Value> {
+    let physical = execution_row(row)?;
+    let create = &row["create"];
+    let ticket = &create["ticket"];
+    ensure!(
+        row["backend"] == "bundled"
+            && row["createPending"] != true
+            && create["result"] == "accepted"
+            && ticket.is_object()
+            && ticket["unit"] == row["dispatch"]
+            && ticket["attempt"] == physical["attempt"]
+            && row["backendHandle"] == *ticket,
+        "bundled input requires the registered current writable execution"
+    );
+    Ok(ticket)
 }
 
 // Done and ask test this marker while holding the Inbox publication lock.
@@ -81,6 +100,7 @@ pub(super) fn close_blocks_callback(state: &Path, row: &Value) -> Result<bool> {
 }
 
 fn binding(state: &Path, row: &Value, intent: &Path) -> Result<(Value, Option<Value>)> {
+    let physical = execution_row(row)?;
     let mut ticket = row["create"]["ticket"].clone();
     let closing = match fs::File::open(intent) {
         Ok(file) => {
@@ -106,7 +126,7 @@ fn binding(state: &Path, row: &Value, intent: &Path) -> Result<(Value, Option<Va
         let lookup = crate::bundled::lookup_assignment(
             state,
             row["dispatch"].as_str().context("missing dispatch")?,
-            &row["attempt"],
+            &physical["attempt"],
         )?;
         ensure!(
             lookup["result"] == "accepted",
@@ -117,7 +137,7 @@ fn binding(state: &Path, row: &Value, intent: &Path) -> Result<(Value, Option<Va
     ensure!(
         ticket.is_object()
             && ticket["unit"] == row["dispatch"]
-            && ticket["attempt"] == row["attempt"]
+            && ticket["attempt"] == physical["attempt"]
             && (row["backendHandle"].is_null() || row["backendHandle"] == ticket),
         "bundled ticket does not match assignment"
     );

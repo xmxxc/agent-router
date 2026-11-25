@@ -3,6 +3,7 @@
 mod bundled;
 #[cfg(target_os = "linux")]
 pub(super) use bundled::{
+    registered_ticket as bundled_input_ticket, submit_continue as submit_bundled_continue,
     submit_nudge as submit_bundled_nudge, submit_reply as submit_bundled_reply,
     APPENDED_USER_ENTRY as BUNDLED_APPENDED_USER_ENTRY,
 };
@@ -22,11 +23,14 @@ use std::{
 // Public assignments published with the session-aware tmux protocol.
 pub(super) const LAUNCH_PROTOCOL: u64 = 8;
 
-// Continue changes the public round without changing the tmux writer or its
+// Continue changes the public round without changing the writer or its
 // launch receipt. All native lifecycle operations still name that execution.
 pub(super) fn execution_row(row: &Value) -> Result<Cow<'_, Value>> {
     let execution = &row["executionId"];
-    if row["backend"] != "tmux" || execution.is_null() || execution == &row["attempt"] {
+    if !matches!(row["backend"].as_str(), Some("tmux" | "bundled"))
+        || execution.is_null()
+        || execution == &row["attempt"]
+    {
         return Ok(Cow::Borrowed(row));
     }
     let create = &row["create"];
@@ -37,6 +41,11 @@ pub(super) fn execution_row(row: &Value) -> Result<Cow<'_, Value>> {
             && create["attempt"] == *execution
             && create["result"] == "accepted"
             && create["dispatch"] == row["dispatch"]
+            && (row["backend"] != "bundled"
+                || (create["ticket"].is_object()
+                    && create["ticket"]["unit"] == row["dispatch"]
+                    && create["ticket"]["attempt"] == *execution
+                    && row["backendHandle"] == create["ticket"]))
             && create["round"]
                 .as_u64()
                 .zip(row["round"].as_u64())

@@ -8,7 +8,7 @@ delegation=${WFC_TEST_DELEGATION-}
 export PATH=/usr/bin:/bin
 case "$mode" in
     ordinary) ;;
-    delegated|reply|nudge)
+    delegated|reply|nudge|continue)
         if [ -z "$delegation" ]; then
             echo "BUNDLED_DELEGATION_UNVERIFIED no authorized runner delegation"
             exit 0
@@ -28,7 +28,7 @@ case "$mode" in
         ;;
     *) exit 2 ;;
 esac
-if [ "$mode" = reply ] || [ "$mode" = nudge ]; then
+if [ "$mode" = reply ] || [ "$mode" = nudge ] || [ "$mode" = continue ]; then
     composer=$(realpath -e "$(dirname "$0")/../crates/herdr/tests/composer.py")
 fi
 
@@ -79,9 +79,10 @@ for i in $(seq 300); do
 done
 HOST
 chmod +x host
-if [ "$mode" = reply ] || [ "$mode" = nudge ]; then
+if [ "$mode" = reply ] || [ "$mode" = nudge ] || [ "$mode" = continue ]; then
     fixture=bundled-paste
     if [ "$mode" = nudge ]; then fixture=bundled-nudge; fi
+    if [ "$mode" = continue ]; then fixture=bundled-continue; fi
     jq -n --arg composer "$composer" --arg fixture "$fixture" '{hosts:{codex:{command:["/usr/bin/timeout", "30s",
         "/usr/bin/python3", $composer, "one", "--submit-first", "--reply-worker", $fixture]}}}' > launch.json
 else
@@ -106,7 +107,7 @@ if [ "$mode" = ordinary ]; then
 fi
 
 export WFC_BUNDLED_CGROUP_ROOT="$delegation"
-if [ "$mode" = nudge ]; then
+if [ "$mode" = nudge ] || [ "$mode" = continue ]; then
     owner=$("$binary" owner acquire --scope fixture --owner fixture-controller)
     WFC_CONTROLLER_TOKEN=$(printf '%s\n' "$owner" | jq -er '.token')
     owner_generation=$(printf '%s\n' "$owner" | jq -er '.generation | select(type=="number")')
@@ -130,17 +131,24 @@ if [ "$mode" = reply ]; then
     done
     qid=$(jq -er '.message' question.json)
 fi
-if [ "$mode" = reply ] || [ "$mode" = nudge ]; then
+if [ "$mode" = reply ] || [ "$mode" = nudge ] || [ "$mode" = continue ]; then
     jq -c '{op:"read",ticket:.create.ticket}' created > viewport-query
     read_viewport() {
-        "$binary" --bundled "$WFC_STATE" < viewport-query > viewport
+        if [ "$mode" = continue ]; then
+            # The viewport can contain the new callback reference. Store only the needed fields.
+            "$binary" --bundled "$WFC_STATE" < viewport-query | jq -c '
+                .data.promptVisible=((.data.text // "") | contains("Ask Codex to do anything"))
+                | del(.data.text, .data.styled)' > viewport
+        else
+            "$binary" --bundled "$WFC_STATE" < viewport-query > viewport
+        fi
         jq -e --slurpfile create created '.result=="accepted" and .ticket==$create[0].create.ticket
             and .data.screen=="Primary" and .data.exit==null and .data.eof==false' viewport >/dev/null
     }
     ready=
     for i in $(seq 40); do
         read_viewport
-        if jq -e '.data.text | contains("Ask Codex to do anything")' viewport >/dev/null; then
+        if jq -e '.data.promptVisible or ((.data.text // "") | contains("Ask Codex to do anything"))' viewport >/dev/null; then
             ready=yes
             break
         fi
@@ -153,6 +161,63 @@ if [ "$mode" = reply ] || [ "$mode" = nudge ]; then
         read_viewport
         jq -e --argjson expected "$expected_sequence" '.last_input==$expected' viewport >/dev/null
     }
+fi
+if [ "$mode" = continue ]; then
+    wait_receipt() {
+        for i in $(seq 200); do
+            [ ! -f "$1" ] || return 0
+            sleep .05
+        done
+        return 1
+    }
+    touch finish-first
+    wait_receipt first.json
+    first_id=$(jq -er '.messageId' first.json)
+    "$binary" wait --dispatch "$id" --scope fixture --timeout 4 > first-claim
+    jq -e --slurpfile first first.json '.messages | length==1 and .[0].id==$first[0].message' first-claim
+    "$binary" ack "$first_id" > first-ack
+    jq -e --slurpfile first first.json '.state=="processed" and .message==$first[0].message and .messageId==$first[0].messageId' first-ack
+    "$binary" status --dispatch "$id" > first-status
+    jq -e --slurpfile first first.json '.dispatches[0] | .state=="done" and .backendAlive==true and .attempt==$first[0].attempt' first-status
+    printf 'ordinary bundled follow-up\n' > 'next task'
+    advance_round() { "$binary" continue "$id" --task 'next task' --report 'next report'; }
+    advance_round > continued
+    require_one_submission
+    advance_round > repeated-continue
+    jq -e --slurpfile original continued '. == ($original[0] + {duplicate:true})' repeated-continue
+    require_one_submission
+    "$binary" status --dispatch "$id" > advanced
+    jq -e --slurpfile create created --slurpfile old first-status --slurpfile next continued --arg root "$work" --argjson owner "$owner_generation" '
+        .dispatches[0] | .state=="working" and .backendAlive==true and .round==2
+        and .attempt==$next[0].attempt and .attempt!=$create[0].attempt and .executionId==$create[0].attempt
+        and .create==$create[0].create and .backendHandle==$create[0].create.ticket
+        and .task==($root+"/next task") and .report==($root+"/next report")
+        and .rounds[0]==$old[0].dispatches[0].rounds[0]
+        and .rounds[0].task==$create[0].task and .rounds[0].report==$create[0].report
+        and ([.audit[] | select(.operation=="continue")] | length==1 and (.[0] |
+            .result=="accepted" and .id==$next[0].audit and .message==$next[0].message and .ownerGeneration==$owner))' advanced
+    touch finish-next
+    wait_receipt second.json
+    jq -e --slurpfile first first.json --slurpfile next continued '
+        .pid==$first[0].pid and .attempt==$next[0].attempt and .message!=$first[0].message' second.json
+    "$binary" status --dispatch "$id" > completed
+    jq -e --slurpfile first first.json --slurpfile ack first-ack --slurpfile second second.json --slurpfile next continued --slurpfile create created '
+        .dispatches[0] | .state=="done" and .backendAlive==true and .attempt==$second[0].attempt
+        and .backendHandle==$create[0].create.ticket
+        and (.rounds | length==2 and .[0].attempt==$first[0].attempt and .[0].result.messageId==$first[0].messageId
+            and .[1].attempt==$second[0].attempt and .[1].result.messageId==$second[0].messageId)
+        and ([.messages[] | select(.messageId==$first[0].messageId)] | length==1 and (.[0] |
+            .id==$first[0].message and .state=="processed" and .statusVersion==$ack[0].statusVersion))
+        and ([.messages[] | select(.type=="continue")] | length==1 and (.[0] |
+            .id==$next[0].message and .attempt==$second[0].attempt and .inputEvidence=="bundled-appended-user-entry"))' completed
+    advance_round > continued-after-done
+    jq -e --slurpfile original continued '. == ($original[0] + {duplicate:true})' continued-after-done
+    require_one_submission
+    test "$(cat report)" = 'first report from the original pane'
+    test "$(cat 'next report')" = 'second report from the original pane'
+    test ! -e external-called
+    echo BUNDLED_CONTINUE_RECEIPT_PASS
+    exit 0
 fi
 if [ "$mode" = nudge ]; then
     notice='ordinary reminder'
