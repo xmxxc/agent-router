@@ -11,7 +11,12 @@ use std::{
     process::{Command, Stdio},
 };
 
-pub(super) fn create(state: &Path, row: &Value, mut launch: Launch) -> Result<Value> {
+pub(super) fn create(
+    state: &Path,
+    row: &Value,
+    mut launch: Launch,
+    owner: Option<&str>,
+) -> Result<Value> {
     for (name, value) in env::vars_os() {
         let name = name
             .into_string()
@@ -24,9 +29,44 @@ pub(super) fn create(state: &Path, row: &Value, mut launch: Launch) -> Result<Va
         }
     }
     let request = json!({"op":"create","unit":row["dispatch"],"attempt":row["attempt"],
-        "cwd":row["cwd"],"argv":launch.argv,"env":launch.env,
-        "publisher":crate::bundled::publisher_identity()?});
-    let mut command = Command::new(env::current_exe()?);
+        "cwd":row["cwd"],"argv":launch.argv,"env":launch.env});
+    let answer = if row["bundledStartupCommit"] == true {
+        // The original dispatch CLI is the only process that may commit ready.
+        Some(crate::bundled::create(state, &request, || {
+            let scope = record_scope(row).context("invalid dispatch scope")?;
+            let Some(scope_lock) = controller::try_scope_lock(state, scope)? else {
+                return Ok(None);
+            };
+            let Some(ledger) = messages::try_lock_for_publish(state)? else {
+                return Ok(None);
+            };
+            controller::Owners::read(state)?.require(scope, owner, "dispatch")?;
+            let id = row["dispatch"].as_str().context("missing dispatch")?;
+            let mut reserved = assignment::public_record(&state.join("dispatches"), id)?
+                .context("missing bundled dispatch reservation")?;
+            ensure!(
+                reserved
+                    .as_object_mut()
+                    .context("invalid dispatch reservation")?
+                    .remove("createPending")
+                    == Some(Value::Bool(true))
+                    && reserved == *row
+                    && !close_blocks_callback(state, row)?,
+                "bundled dispatch reservation changed before ready"
+            );
+            Ok(Some(((scope_lock, ledger), move || {
+                controller::Owners::read(state)?.require(scope, owner, "dispatch")?;
+                Ok(())
+            })))
+        })?)
+    } else {
+        create_in_backend(state, &request)?
+    };
+    launch_answer(answer)
+}
+
+fn create_in_backend(state: &Path, request: &Value) -> Result<Option<Value>> {
+    let mut command = Command::new("/proc/self/exe");
     controller::strip_credentials(&mut command);
     let mut child = command
         .arg("--bundled")
@@ -38,13 +78,16 @@ pub(super) fn create(state: &Path, row: &Value, mut launch: Launch) -> Result<Va
         .context("start bundled backend")?;
     let sent = serde_json::to_writer(
         child.stdin.take().context("missing bundled request pipe")?,
-        &request,
+        request,
     );
-    let answer = child
+    Ok(child
         .wait_with_output()
         .ok()
         .filter(|out| sent.is_ok() && out.status.success())
-        .and_then(|out| serde_json::from_slice::<Value>(&out.stdout).ok());
+        .and_then(|out| serde_json::from_slice::<Value>(&out.stdout).ok()))
+}
+
+fn launch_answer(answer: Option<Value>) -> Result<Value> {
     if let Some(mut answer) = answer.filter(|reply| {
         matches!(
             reply["result"].as_str(),
@@ -141,6 +184,8 @@ fn evidence(answer: &Value) -> Value {
         "execution_proof",
         "reconcile",
         "category",
+        "startup",
+        "startupIdentity",
     ] {
         if let Some(value) = answer.get(key) {
             view[key] = value.clone();
@@ -155,7 +200,9 @@ fn evidence(answer: &Value) -> Value {
 fn terminal_worker(answer: &Value) -> Option<Value> {
     let proof = answer.get("execution_proof").unwrap_or(&answer["proof"]);
     match proof["state"].as_str() {
-        Some("closed") => Some(json!({"state":"cancelled","exit_code":null,"signal":null})),
+        Some("closed" | "startup-aborted") => {
+            Some(json!({"state":"cancelled","exit_code":null,"signal":null}))
+        }
         Some("exited" | "faulted") => {
             Some(json!({"state":"exited","exit_code":null,"signal":null}))
         }
@@ -187,7 +234,11 @@ pub(super) fn observe(state: &Path, row: &Value) -> Result<(Value, Value)> {
         && answer["data"]["read_error"].is_null();
     let worker = prior_worker
         .or_else(|| terminal_worker(&answer))
-        .unwrap_or_else(|| json!({"state":if live {"running"} else {"unknown"}}));
+        .unwrap_or_else(|| {
+            json!({"state": if live {"running"} else if answer["startup"] == "unstarted" {
+                "not_started"
+            } else {"unknown"}})
+        });
     if answer["scope"] != "execution" {
         if live {
             view["alive"] = json!(true);

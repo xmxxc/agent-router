@@ -6,6 +6,7 @@ use std::os::unix::{
     fs::{FileTypeExt, MetadataExt},
     net::UnixStream,
 };
+use store::StartupDecision;
 
 pub(super) const STAGE: &str = "--bundled-user-guardian";
 const MANAGER_REQUIRED: &str =
@@ -39,18 +40,7 @@ fn manager_command(program: &str) -> Result<Command> {
     Ok(command)
 }
 
-pub(super) fn context(state: &Path, req: &Value, creator: &Value, deadline: u64) -> Result<Value> {
-    let publisher = match req.get("publisher") {
-        Some(identity) => {
-            ensure!(
-                identity["pid"].as_u64() == Some(unsafe { libc::getppid() } as u64)
-                    && store::process_state(identity) == "alive",
-                "bundled dispatch publisher has stopped"
-            );
-            identity
-        }
-        None => creator,
-    };
+pub(super) fn context(state: &Path, creator: &Value, deadline: u64) -> Result<Value> {
     let env = |key| -> Result<Option<String>> {
         std::env::var_os(key)
             .map(|value| {
@@ -66,7 +56,7 @@ pub(super) fn context(state: &Path, req: &Value, creator: &Value, deadline: u64)
         "state":state.to_str().context("non-UTF-8 native state path")?,
         "cwd":cwd.to_str().context("non-UTF-8 launch directory")?,
         "home":env("HOME")?, "legacyState":env("WFC_STATE")?,
-        "creator":creator, "publisher":publisher, "deadline":deadline,
+        "creator":creator, "deadline":deadline,
         "exeDevice":exe.dev(), "exeInode":exe.ino()
     }))
 }
@@ -148,9 +138,7 @@ pub(super) fn startup_live(context: &Value) -> Result<()> {
             < context["deadline"]
                 .as_u64()
                 .context("missing startup deadline")?
-            && ["creator", "publisher"]
-                .iter()
-                .all(|name| store::process_state(&context[*name]) == "alive"),
+            && store::process_state(&context["creator"]) == "alive",
         "bundled startup was interrupted before ready"
     );
     Ok(())
@@ -293,8 +281,10 @@ pub(super) fn guard(state: &Path, spec: &Value, store: Store) -> Result<()> {
     }
 }
 
-fn absent_grant(state: &Path, store: &Store, spec: &Value, reason: &str) -> Result<()> {
-    let (current, _lock) = attached_store(state, spec)?;
+fn cancel_start(state: &Path, store: &Store, spec: &Value, reason: &str) -> Result<()> {
+    let Some((current, _lock)) = try_attached_store(state, spec)? else {
+        return Ok(());
+    };
     ensure_state_writable(state)?;
     if fs::symlink_metadata(current.run.join(STAGE))
         .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
@@ -307,16 +297,50 @@ fn absent_grant(state: &Path, store: &Store, spec: &Value, reason: &str) -> Resu
             "unstarted",
             json!({"reason":reason,"group_cleanup":"not-created"}),
         )?;
+    } else if let Ok(prepared) = current.signed("prepared") {
+        current.abort_startup(&prepared)?;
     }
     Ok(())
 }
 
-pub(super) fn await_ready(
+fn proposal_live(prepared: &Value) -> Result<()> {
+    ensure!(
+        ["guardian", "service", "kernel", "worker"]
+            .iter()
+            .all(|key| store::process_state(&prepared[*key]) == "alive"),
+        "bundled execution stopped before committing ready"
+    );
+    Ok(())
+}
+
+pub(super) fn await_commit(store: &Store, context: &Value, proposed: &Value) -> Result<()> {
+    loop {
+        match store.startup_decision(proposed)? {
+            Some(StartupDecision::Ready) => {
+                // Also seal a visible link if the original CLI died before syncing.
+                File::open(&store.run)?.sync_all()?;
+                return Ok(());
+            }
+            Some(StartupDecision::Aborted) => bail!("bundled startup was cancelled before ready"),
+            None => (),
+        }
+        if let Err(error) = startup_live(context).and_then(|()| proposal_live(proposed)) {
+            match store.abort_startup(proposed)? {
+                StartupDecision::Ready => return Ok(()),
+                StartupDecision::Aborted => return Err(error),
+            }
+        }
+        thread::sleep(TICK);
+    }
+}
+
+pub(super) fn await_ready<G, Check: FnOnce() -> Result<()>>(
     state: &Path,
     store: &Store,
     spec: &Value,
     context: &Value,
     launcher: Result<Launcher>,
+    authorize_ready: impl Fn() -> Result<Option<(G, Check)>>,
 ) -> Result<Value> {
     let ticket = &store.ticket;
     let before_ready = |launcher: &mut Launcher| -> Result<()> {
@@ -332,6 +356,18 @@ pub(super) fn await_ready(
                 return Ok(());
             }
             startup_live(context)?;
+            if let Ok(proposed) = store.signed("prepared") {
+                if let Some((_authorization, check_owner)) = authorize_ready()? {
+                    if let Some((target, _unit_lock)) = try_attached_store(state, spec)? {
+                        return target.commit_ready(&proposed, || {
+                            ensure_state_writable(state)?;
+                            startup_live(context)?;
+                            proposal_live(&proposed)?;
+                            check_owner()
+                        });
+                    }
+                }
+            }
             ensure!(launcher.child.try_wait()?.is_none(), "{MANAGER_REQUIRED}");
             thread::sleep(TICK);
         }
@@ -341,17 +377,35 @@ pub(super) fn await_ready(
         Err(error) => Some(error),
     };
     if let Some(error) = &failure {
-        let _ = absent_grant(state, store, spec, &format!("{error:#}"));
+        let _ = cancel_start(state, store, spec, &format!("{error:#}"));
     }
-    if let Ok(identity) = store.signed("ready") {
+    if let Ok(identity) = store.signed("ready").and_then(|identity| {
+        File::open(&store.run)?.sync_all()?;
+        Ok(identity)
+    }) {
         return Ok(json!({"result":"accepted","ticket":ticket,"identity":identity}));
     }
     if let Ok(info) = store.signed("unstarted") {
         return Ok(json!({"result":"definitely-not-sent","ticket":ticket,"unstarted":info}));
     }
-    Ok(json!({"result":"uncertain","ticket":ticket,
+    if let Ok(proof) = store.proof() {
+        if proof["state"] == "startup-aborted" {
+            return Ok(
+                json!({"result":"uncertain","ticket":ticket,"startup":"aborted",
+                "cleanup":"confirmed","proof":proof,"diagnostic":"bundled startup was cancelled before ready"}),
+            );
+        }
+    }
+    let mut answer = json!({"result":"uncertain","ticket":ticket,
         "diagnostic":failure.map_or_else(|| "bundled user service exited before ready; inspect the original dispatch".to_owned(),
-            |error| format!("bundled user service did not confirm startup: {error:#}"))}))
+            |error| format!("bundled user service did not confirm startup: {error:#}"))});
+    if let Ok(prepared) = store.signed("prepared") {
+        if store.startup_decision(&prepared).ok().flatten() == Some(StartupDecision::Aborted) {
+            answer["startup"] = json!("aborted");
+            answer["cleanup"] = json!("unknown");
+        }
+    }
+    Ok(answer)
 }
 
 #[cfg(test)]
@@ -373,18 +427,11 @@ mod tests {
     #[test]
     fn user_service_startup_rejects_expired_proposals() -> Result<()> {
         let creator = publisher_identity()?;
-        startup_live(
-            &json!({"creator":creator,"publisher":creator,"deadline":unix_ms()? + 60_000}),
-        )?;
-        assert!(
-            startup_live(&json!({"creator":creator,"publisher":creator,"deadline":0})).is_err()
-        );
+        startup_live(&json!({"creator":creator,"deadline":unix_ms()? + 60_000}))?;
+        assert!(startup_live(&json!({"creator":creator,"deadline":0})).is_err());
         let mut departed = creator.clone();
         departed["start_ticks"] = json!(creator["start_ticks"].as_u64().unwrap() ^ 1);
-        assert!(startup_live(
-            &json!({"creator":creator,"publisher":departed,"deadline":unix_ms()? + 60_000})
-        )
-        .is_err());
+        assert!(startup_live(&json!({"creator":departed,"deadline":unix_ms()? + 60_000})).is_err());
         Ok(())
     }
 

@@ -39,7 +39,7 @@ pub(crate) fn require_delegation() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn publisher_identity() -> Result<Value> {
+fn publisher_identity() -> Result<Value> {
     store::identity(std::process::id())
 }
 
@@ -71,12 +71,26 @@ fn attached_store(state: &Path, spec: &Value) -> Result<(Store, File)> {
     let ticket = &spec["ticket"];
     let (unit, guard) = unit_lock_file(state, field(ticket, "unit")?)?;
     guard.lock()?;
-    let (_, store) = store::current(&unit)?.context("missing current execution")?;
+    Ok((current_store(&unit, ticket)?, guard))
+}
+
+fn try_attached_store(state: &Path, spec: &Value) -> Result<Option<(Store, File)>> {
+    let ticket = &spec["ticket"];
+    let (unit, guard) = unit_lock_file(state, field(ticket, "unit")?)?;
+    match guard.try_lock() {
+        Ok(()) => Ok(Some((current_store(&unit, ticket)?, guard))),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+fn current_store(unit: &Path, ticket: &Value) -> Result<Store> {
+    let (_, store) = store::current(unit)?.context("missing current execution")?;
     ensure!(
-        store.ticket == *ticket && store::ordered(&unit, &store)?,
+        store.ticket == *ticket && store::ordered(unit, &store)?,
         "stale create"
     );
-    Ok((store, guard))
+    Ok(store)
 }
 
 fn create_lock_file(unit: &Path) -> Result<File> {
@@ -98,7 +112,11 @@ fn lock_for_write(state: &Path, file: File) -> Result<File> {
     Ok(file)
 }
 
-fn create(state: &Path, req: &Value) -> Result<Value> {
+pub(crate) fn create<G, Check: FnOnce() -> Result<()>>(
+    state: &Path,
+    req: &Value,
+    authorize_ready: impl Fn() -> Result<Option<(G, Check)>>,
+) -> Result<Value> {
     let unit = field(req, "unit")?;
     let attempt = field(req, "attempt")?;
     ensure!(store::valid_name(attempt), "invalid attempt");
@@ -164,13 +182,16 @@ fn create(state: &Path, req: &Value) -> Result<Value> {
     let creator = publisher_identity()?;
     let expires = unix_ms()? + (TIMEOUT + TIMEOUT).as_millis() as u64;
     let user_start = if root.is_none() {
-        Some(user_service::context(state, req, &creator, expires)?)
+        Some(user_service::context(state, &creator, expires)?)
     } else {
         None
     };
     let generation = fresh();
     let token = format!("{}{}", fresh(), fresh());
-    let ticket = json!({"version":2,"unit":unit,"attempt":attempt,"generation":generation,"nonce":fresh(),"capabilityHash":store::digest(token.as_bytes())});
+    let mut ticket = json!({"version":2,"unit":unit,"attempt":attempt,"generation":generation,"nonce":fresh(),"capabilityHash":store::digest(token.as_bytes())});
+    if user_start.is_some() {
+        ticket["startupProtocol"] = json!(1);
+    }
     let run = unit_path.join(&generation);
     store::private_dir(&run)?;
     publish(&run.join("key.json"), &json!(token))?;
@@ -199,7 +220,7 @@ fn create(state: &Path, req: &Value) -> Result<Value> {
     if let Some(context) = &user_start {
         let launcher = user_service::start(&store);
         drop(guard);
-        return user_service::await_ready(state, &store, &spec, context, launcher);
+        return user_service::await_ready(state, &store, &spec, context, launcher, authorize_ready);
     }
     let mut child = match explicit.context("missing explicit guardian")?.spawn() {
         Ok(c) => c,
@@ -390,6 +411,21 @@ pub(crate) fn assignment_operation(state: &Path, ticket: &Value, op: &str) -> (V
         if op == "cleanup-receipt" || current.is_none() {
             return Ok(unknown_cleanup());
         }
+        if op == "inspect" && exact && target.signed("ready").is_err() {
+            if let Ok(prepared) = target.signed("prepared") {
+                let phase = match target.startup_decision(&prepared)? {
+                    None => "prepared",
+                    Some(store::StartupDecision::Aborted) => "aborted",
+                    Some(store::StartupDecision::Ready) => return Ok(unknown_cleanup()),
+                };
+                return Ok(json!({"result":"uncertain","startup":phase,
+                    "startupIdentity":prepared,"cleanup":"unknown"}));
+            }
+            if let Ok(info) = target.signed("unstarted") {
+                return Ok(json!({"result":"definitely-not-sent","startup":"unstarted",
+                    "diagnostic":info["reason"]}));
+            }
+        }
         let mut sent = false;
         let answer = live_operation(
             &target,
@@ -523,7 +559,7 @@ fn lookup(unit: &Path, attempt: &Value) -> Result<Value> {
 fn operate(state: &Path, req: &Value) -> Result<Value> {
     let op = field(req, "op")?;
     if op == "create" {
-        return create(state, req);
+        return create(state, req, || Ok(Some(((), || Ok(())))));
     }
     if op == "lookup" {
         let (unit, _guard) = open_unit(state, field(req, "unit")?)?;
@@ -572,6 +608,19 @@ fn operate(state: &Path, req: &Value) -> Result<Value> {
         ticket.get("version").is_none(),
         &mut false,
     ))
+}
+
+pub(crate) fn assignment_ready(state: &Path, unit: &str, row: &Value) -> Result<bool> {
+    let (path, _unit) = open_unit(state, unit)?;
+    let Some((_, store)) = store::current(&path)? else {
+        return Ok(false);
+    };
+    Ok(store.ticket["attempt"] == row["attempt"]
+        && [&row["create"]["ticket"], &row["backendHandle"]]
+            .into_iter()
+            .all(|ticket| ticket.is_null() || ticket == &store.ticket)
+        && store::ordered(&path, &store)?
+        && store.signed("ready").is_ok())
 }
 
 pub fn run(stage: &str, selected: Option<&Path>) -> Result<u8> {

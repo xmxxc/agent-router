@@ -59,12 +59,20 @@ fn new_file(path: &Path) -> io::Result<File> {
 }
 
 pub fn publish(path: &Path, value: &Value) -> Result<()> {
+    publish_with(path, value, |tmp, path| Ok(fs::rename(tmp, path)?))
+}
+
+fn publish_with(
+    path: &Path,
+    value: &Value,
+    install: impl FnOnce(&Path, &Path) -> Result<()>,
+) -> Result<()> {
     let tmp = path.with_extension(fresh());
     let mut file = new_file(&tmp)?;
     let result = (|| -> Result<()> {
         serde_json::to_writer(&mut file, value)?;
         file.sync_all()?;
-        fs::rename(&tmp, path)?;
+        install(&tmp, path)?;
         File::open(path.parent().context("missing parent")?)?.sync_all()?;
         Ok(())
     })();
@@ -173,6 +181,12 @@ pub struct Store {
     pub token: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StartupDecision {
+    Ready,
+    Aborted,
+}
+
 impl Store {
     pub fn open(unit: &Path, ticket: &Value) -> Result<Self> {
         let generation = field(ticket, "generation")?;
@@ -195,18 +209,128 @@ impl Store {
     }
 
     pub fn save_signed(&self, kind: &str, data: Value) -> Result<()> {
+        ensure!(
+            kind != "ready" || self.ticket["startupProtocol"] != 1,
+            "managed ready requires a startup decision"
+        );
         // Promote the starting binding by rename. A ready file only appears
         // once complete, and no weaker binding survives that transition.
         let slot = if kind == "ready" { "starting" } else { kind };
-        let body = json!({"version":1,"kind":kind,"ticket":self.ticket,"data":data});
-        let mac = sign(&self.token, &serde_json::to_vec(&body)?);
-        let path = self.run.join(format!("{slot}.json"));
-        publish(&path, &json!({"body":body,"signature":mac}))?;
+        self.publish_signed(slot, kind, data)?;
         if kind == "ready" {
-            fs::rename(path, self.run.join("ready.json"))?;
+            fs::rename(self.run.join("starting.json"), self.run.join("ready.json"))?;
             File::open(&self.run)?.sync_all()?;
         }
         Ok(())
+    }
+
+    fn publish_signed(&self, slot: &str, kind: &str, data: Value) -> Result<()> {
+        let body = json!({"version":1,"kind":kind,"ticket":self.ticket,"data":data});
+        let mac = sign(&self.token, &serde_json::to_vec(&body)?);
+        let path = self.run.join(format!("{slot}.json"));
+        publish(&path, &json!({"body":body,"signature":mac}))
+    }
+
+    // Caller holds the unit lock. The original publisher alone calls this
+    // method after its owner and assignment checks.
+    pub fn commit_ready(&self, prepared: &Value, check: impl FnOnce() -> Result<()>) -> Result<()> {
+        ensure!(
+            !has_entry(&self.run.join("unstarted.json"))?
+                && !has_entry(&self.run.join("cleanup.json"))?,
+            "startup already ended"
+        );
+        ensure!(
+            self.install_startup_decision(StartupDecision::Ready, prepared, check)?
+                == StartupDecision::Ready,
+            "startup was already cancelled"
+        );
+        Ok(())
+    }
+
+    pub fn startup_decision(&self, prepared: &Value) -> Result<Option<StartupDecision>> {
+        let Some(body) = self.startup_decision_body()? else {
+            return Ok(None);
+        };
+        ensure!(
+            body["data"] == *prepared,
+            "startup decision changed the proposal"
+        );
+        match field(&body, "kind")? {
+            "ready" => Ok(Some(StartupDecision::Ready)),
+            "startup-abort" => Ok(Some(StartupDecision::Aborted)),
+            _ => bail!("invalid startup decision"),
+        }
+    }
+
+    fn startup_decision_body(&self) -> Result<Option<Value>> {
+        let slot = "startup-decision";
+        if self.ticket["startupProtocol"] != 1
+            || !has_entry(&self.run.join(format!("{slot}.json")))?
+        {
+            return Ok(None);
+        }
+        let body = self.signed_body(slot)?;
+        ensure!(
+            matches!(body["kind"].as_str(), Some("ready" | "startup-abort")),
+            "invalid startup decision"
+        );
+        ensure!(
+            body["data"] == self.signed("prepared")?,
+            "startup proposal changed"
+        );
+        Ok(Some(body))
+    }
+
+    pub fn abort_startup(&self, prepared: &Value) -> Result<StartupDecision> {
+        self.install_startup_decision(StartupDecision::Aborted, prepared, || Ok(()))
+    }
+
+    fn install_startup_decision(
+        &self,
+        choice: StartupDecision,
+        prepared: &Value,
+        check: impl FnOnce() -> Result<()>,
+    ) -> Result<StartupDecision> {
+        ensure!(
+            self.ticket["startupProtocol"] == 1 && self.signed("prepared")? == *prepared,
+            "startup proposal changed"
+        );
+        let kind = if choice == StartupDecision::Ready {
+            "ready"
+        } else {
+            "startup-abort"
+        };
+        let body = json!({"version":1,"kind":kind,"ticket":self.ticket,"data":prepared});
+        let mac = sign(&self.token, &serde_json::to_vec(&body)?);
+        let path = self.run.join("startup-decision.json");
+        let result = publish_with(&path, &json!({"body":body,"signature":mac}), |tmp, path| {
+            // A single name commits exactly one choice. Both file contents
+            // are synced before the link, which never replaces a decision.
+            check()?;
+            fs::hard_link(tmp, path)?;
+            Ok(fs::remove_file(tmp)?)
+        });
+        // A failed link can mean the other side committed first. A successful
+        // link followed by a failed sync also leaves a verifiable decision.
+        if let Some(decision) = self.startup_decision(prepared)? {
+            File::open(&self.run)?.sync_all()?;
+            return Ok(decision);
+        }
+        result?;
+        bail!("missing startup decision")
+    }
+
+    fn ready_body(&self) -> Result<Option<Value>> {
+        if self.ticket["startupProtocol"] == 1 {
+            let decision = self.startup_decision_body()?;
+            return Ok(decision.filter(|body| body["kind"] == "ready"));
+        }
+        if !has_entry(&self.run.join("ready.json"))? {
+            return Ok(None);
+        }
+        let body = self.signed_body("ready")?;
+        ensure!(body["kind"] == "ready", "invalid ready binding");
+        Ok(Some(body))
     }
 
     fn signed_body(&self, slot: &str) -> Result<Value> {
@@ -228,17 +352,19 @@ impl Store {
     }
 
     pub fn signed(&self, kind: &str) -> Result<Value> {
-        let body = self.signed_body(kind)?;
+        let body = if kind == "ready" {
+            self.ready_body()?
+                .context("execution has no committed ready")?
+        } else {
+            self.signed_body(kind)?
+        };
         ensure!(body["kind"] == kind, "receipt kind mismatch");
         Ok(body["data"].clone())
     }
 
     fn authorizes_unstarted(&self) -> Result<bool> {
         let info = self.signed("unstarted")?;
-        ensure!(
-            !self.run.join("ready.json").try_exists()?,
-            "execution reached ready"
-        );
+        ensure!(self.ready_body()?.is_none(), "execution reached ready");
         if self.run.join("starting.json").try_exists()? {
             let known = self.signed("starting")?;
             ensure!(
@@ -356,12 +482,24 @@ impl Store {
         let state = field(&receipt, "state")?;
         ensure!(
             receipt["proves"] == "execution-empty"
-                && matches!(state, "closed" | "exited" | "faulted"),
+                && matches!(state, "closed" | "exited" | "faulted" | "startup-aborted"),
             "invalid cleanup state"
         );
-        let ready = has_entry(&self.run.join("ready.json"))?;
-        let binding = if ready {
-            self.signed_body("ready")?
+        let ready_body = self.ready_body()?;
+        let ready = ready_body.is_some();
+        let binding = if let Some(body) = ready_body {
+            ensure!(
+                state != "startup-aborted",
+                "committed execution cannot be aborted"
+            );
+            body
+        } else if state == "startup-aborted" {
+            let body = self.signed_body("prepared")?;
+            ensure!(
+                self.startup_decision(&body["data"])? == Some(StartupDecision::Aborted),
+                "startup was not confirmed cancelled"
+            );
+            body
         } else {
             ensure!(state == "faulted", "pre-ready cleanup must be faulted");
             self.signed_body("starting")?
@@ -387,10 +525,11 @@ impl Store {
                 state == "faulted" && identity.get("service").is_none_or(process_record),
                 "invalid pre-ready cleanup"
             ),
-            "ready" => ensure!(
-                ["service", "kernel", "worker"]
-                    .iter()
-                    .all(|k| process_record(&identity[*k]))
+            "ready" | "prepared" => ensure!(
+                (phase == "ready" || state == "startup-aborted")
+                    && ["service", "kernel", "worker"]
+                        .iter()
+                        .all(|k| process_record(&identity[*k]))
                     && uuid::Uuid::parse_str(field(&identity, "kernel_generation")?).is_ok()
                     && identity["endpoint"]
                         .as_u64()
@@ -604,6 +743,53 @@ mod tests {
         assert!(store.proof().is_err());
         fs::remove_dir_all(unit)?;
         Ok(())
+    }
+
+    #[test]
+    fn managed_startup_keeps_the_first_signed_decision() -> Result<()> {
+        let root = std::env::temp_dir().join(fresh());
+        let task = || -> Result<()> {
+            for first in [StartupDecision::Ready, StartupDecision::Aborted] {
+                let unit = root.join(fresh());
+                let mut store = generation(&unit, false)?;
+                store.ticket["startupProtocol"] = json!(1);
+                let process = identity(std::process::id())?;
+                let proposed = json!({"guardian":process,"service":process,"kernel":process,
+                    "worker":process,"endpoint":42,"kernel_generation":fresh(),
+                    "containment":{"kind":"cgroup-v2","path":"/fixture","device":1,"inode":2}});
+                store.save_signed("prepared", proposed.clone())?;
+                assert!(store.signed("ready").is_err());
+                let mut wrong = proposed.clone();
+                wrong["endpoint"] = json!(43);
+                assert!(store.commit_ready(&wrong, || Ok(())).is_err());
+                assert!(store
+                    .commit_ready(&proposed, || bail!("fixture authorization expired"))
+                    .is_err());
+                assert_eq!(store.startup_decision(&proposed)?, None);
+                if first == StartupDecision::Ready {
+                    store.commit_ready(&proposed, || Ok(()))?;
+                    assert_eq!(store.abort_startup(&proposed)?, first);
+                    assert_eq!(store.signed("ready")?, proposed);
+                } else {
+                    assert_eq!(store.abort_startup(&proposed)?, first);
+                    assert!(store.commit_ready(&proposed, || Ok(())).is_err());
+                    assert!(store.signed("ready").is_err());
+                }
+                let state = if first == StartupDecision::Ready {
+                    "closed"
+                } else {
+                    "startup-aborted"
+                };
+                let cleanup = json!({"proves":"execution-empty","state":state,"identity":proposed});
+                store.save_signed("cleanup", cleanup.clone())?;
+                assert_eq!(store.proof()?, cleanup);
+            }
+            Ok(())
+        };
+        fs::create_dir(&root)?;
+        let result = task();
+        fs::remove_dir_all(root)?;
+        result
     }
 
     #[test]

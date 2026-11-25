@@ -138,10 +138,10 @@ fn call(state: &Path, row: &Value, mut request: Value) -> Result<Value> {
     }
 }
 
-pub fn create(state: &Path, row: &Value, launch: Launch) -> Result<Value> {
+pub fn create(state: &Path, row: &Value, launch: Launch, _owner: Option<&str>) -> Result<Value> {
     #[cfg(target_os = "linux")]
     if row["backend"] == "bundled" {
-        return bundled::create(state, row, launch);
+        return bundled::create(state, row, launch, _owner);
     }
     call(
         state,
@@ -896,6 +896,18 @@ pub(super) fn close_blocks_callback(state: &Path, row: &Value) -> Result<bool> {
         return bundled::close_blocks_callback(state, row);
     }
     Ok(row["backend"] == "herdr" && herdr_close_blocks_callback(state, row)?)
+}
+
+pub(super) fn require_callback_start(_state: &Path, _row: &Value) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if _row["backend"] == "bundled" && _row["bundledStartupCommit"] == true {
+        let id = _row["dispatch"].as_str().context("missing bundled dispatch ID")?;
+        ensure!(
+            crate::bundled::assignment_ready(_state, id, _row).unwrap_or(false),
+            "bundled startup has not committed ready for this attempt"
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn herdr_close_blocks_callback(state: &Path, row: &Value) -> Result<bool> {

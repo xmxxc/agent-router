@@ -33,6 +33,7 @@ pub fn guard(
     if let Some(binding) = &user_service {
         actual["userService"] = binding.clone();
     }
+    let mut awaiting_commit = false;
     let outcome = (|| -> Result<&str> {
         store.save_signed("starting", actual.clone())?;
         let (reader, writer) = UnixStream::pair()?;
@@ -47,18 +48,24 @@ pub fn guard(
         let started = (|| -> Result<()> {
             store.save_signed("starting", actual.clone())?;
             let details = boot.read(LIMIT, Instant::now() + TIMEOUT)?;
-            if user_service.is_some() {
-                // After ready, the original ticket owns the execution even
-                // if the dispatch publisher later loses the reply.
-                super::user_service::startup_live(&spec["userService"])?;
-            }
+            let mut proposal = actual.clone();
             for key in ["kernel", "kernel_generation", "worker", "endpoint"] {
-                actual[key] = details
+                proposal[key] = details
                     .get(key)
                     .context("incomplete runtime ready")?
                     .clone();
             }
-            store.save_signed("ready", actual.clone())
+            if user_service.is_some() {
+                store.save_signed("prepared", proposal.clone())?;
+                awaiting_commit = true;
+                actual = proposal;
+                super::user_service::await_commit(&store, &spec["userService"], &actual)?;
+                awaiting_commit = false;
+                Ok(())
+            } else {
+                actual = proposal;
+                store.save_signed("ready", actual.clone())
+            }
         })();
         if let Err(e) = started {
             let _ = child.kill();
@@ -83,9 +90,18 @@ pub fn guard(
         return Ok(());
     }
     cleanup?;
+    let state = if awaiting_commit {
+        match store.startup_decision(&actual)? {
+            Some(store::StartupDecision::Aborted) => "startup-aborted",
+            Some(store::StartupDecision::Ready) => "faulted",
+            None => bail!("bundled startup cleanup has no confirmed decision"),
+        }
+    } else {
+        outcome.unwrap_or("faulted")
+    };
     store.save_signed(
         "cleanup",
-        json!({"proves":"execution-empty","state":outcome.unwrap_or("faulted"), "identity":actual}),
+        json!({"proves":"execution-empty","state":state, "identity":actual}),
     )
 }
 
