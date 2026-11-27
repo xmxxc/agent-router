@@ -371,6 +371,37 @@ class RuntimeFaults(unittest.TestCase):
         self.assertNotEqual(new["messageId"], quota["messageId"])
         self.assertEqual(self.wait(code=3), [])
 
+    def test_stall_dedup_survives_retries_until_verified_recovery(self):
+        stall = {"WFC_ACTIVITY_AFTER": ".06", "WFC_MAX_TURN_SECONDS": "0"}
+        turn = self.turn("task_started")
+        time.sleep(.08)
+        first, = self.wait(env=stall)
+        self.assertEqual(first["kind"], "stall_timeout")
+        ack = self.cli("ack", first["messageId"])
+
+        results = []
+        for _ in range(2):
+            self.turn("turn_aborted", turn)
+            turn = self.turn("task_started")
+            time.sleep(.08)
+            results.append(self.raw_wait(stall))
+        self.assertEqual(results, [(3, []), (3, [])])
+        row, = self.cli("status", "--dispatch", self.dispatch, env=stall)["dispatches"]
+        original, = row["messages"]
+        self.assertEqual((original["id"], original["messageId"], original["state"],
+                          original["statusVersion"]),
+                         (first["id"], first["messageId"], "processed", ack["statusVersion"]))
+
+        self.progress(turn)
+        recovered, = self.wait(env={**stall, "WFC_ACTIVITY_AFTER": "10"})
+        self.assertEqual(recovered["kind"], "runtime_recovered")
+        self.assertEqual(recovered["runtimeEvidence"]["turn"], turn)
+        time.sleep(.08)
+        second, = self.wait(env=stall)
+        self.assertEqual(second["kind"], "stall_timeout")
+        self.assertNotEqual(second["messageId"], first["messageId"])
+        self.assertEqual(self.wait(code=3, env=stall), [])
+
     def test_partial_and_unrelated_records_do_not_restart_stall(self):
         stall = {"WFC_ACTIVITY_AFTER": ".06", "WFC_MAX_TURN_SECONDS": "0"}
         turn = self.turn("task_started")

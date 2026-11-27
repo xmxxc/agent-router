@@ -89,9 +89,9 @@ fn evidence(message: &Message) -> &Value {
 }
 
 fn same_fault(message: &Message, notice: &Notice) -> bool {
-    let prior = evidence(message);
     match notice.kind {
         "host_error" => {
+            let prior = evidence(message);
             let Some(fault) = message.additional_fields.get("fault") else {
                 return false;
             };
@@ -105,14 +105,9 @@ fn same_fault(message: &Message, notice: &Notice) -> bool {
                     host_identity(category, code, status) == notice.fingerprint
                 })
         }
-        "stall_timeout" => {
-            prior["session"] == notice.evidence["session"]
-                && prior["turn"] == notice.evidence["turn"]
-                && (progress_offset(prior) == progress_offset(&notice.evidence)
-                    || legacy_stall_at(prior)
-                        .zip(notice.evidence["lastProgressAtMs"].as_u64())
-                        .is_some_and(|(before, after)| after <= before))
-        }
+        // The caller already matched the kind and the open episode. A new
+        // Codex turn can be a retry without any verified recovery.
+        "stall_timeout" => true,
         _ => false,
     }
 }
