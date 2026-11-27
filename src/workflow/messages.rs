@@ -2309,8 +2309,6 @@ impl<'a> Wait<'a> {
         #[cfg(target_os = "linux")]
         let (mut scan, mut pending, mut first) = (recovery::Scan::default(), None, true);
         #[cfg(target_os = "linux")]
-        let mut watch = runtime_fault::Watch::default();
-        #[cfg(target_os = "linux")]
         let (max_turn, stall) = (
             super::runtime_fault::max_turn(),
             super::runtime_fault::stall_after(),
@@ -2330,9 +2328,7 @@ impl<'a> Wait<'a> {
                     self.timeout.saturating_sub(start.elapsed())
                 };
                 first = false;
-                let startup = scan.poll(&state, self.dispatch, self.scope, allowance);
-                let runtime = watch.poll(&state, self.dispatch, self.scope, allowance);
-                pending = Some((startup, runtime));
+                pending = Some(scan.poll(&state, self.dispatch, self.scope, allowance));
             }
             let batch = match Inbox::try_open(&state)? {
                 Some(mut inbox) => {
@@ -2340,9 +2336,9 @@ impl<'a> Wait<'a> {
                     #[cfg(target_os = "linux")]
                     let mut advance = None;
                     #[cfg(target_os = "linux")]
-                    if let Some((batch, observations)) = pending.take() {
+                    if let Some(batch) = pending.take() {
                         inbox.recover_startups(&mut scan, batch.candidates)?;
-                        inbox.publish_runtime(observations, max_turn, stall)?;
+                        inbox.publish_runtime(batch.runtime, max_turn, stall)?;
                         advance = batch.advance;
                         more = batch.more;
                     }

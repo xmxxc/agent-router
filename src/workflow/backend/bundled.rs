@@ -209,7 +209,7 @@ fn launch_answer(answer: Option<Value>) -> Result<Value> {
     )
 }
 
-pub(in crate::workflow) fn bundled_close_path(state: &Path, row: &Value) -> Result<PathBuf> {
+fn bundled_close_path(state: &Path, row: &Value) -> Result<PathBuf> {
     Ok(closed_path(state, execution_row(row)?.as_ref())?.with_extension("closing"))
 }
 

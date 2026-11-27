@@ -464,6 +464,7 @@ pub(crate) enum RuntimeState {
 
 #[derive(PartialEq, Eq)]
 pub(crate) struct RuntimeBinding {
+    token: String,
     pub worker: Value,
     service: Value,
     kernel: Value,
@@ -471,6 +472,14 @@ pub(crate) struct RuntimeBinding {
 }
 
 impl RuntimeBinding {
+    pub fn sign_cursor(&self, bytes: &[u8]) -> String {
+        store::sign(&self.token, bytes)
+    }
+
+    pub fn verifies_cursor(&self, bytes: &[u8], signature: &str) -> bool {
+        store::verify(&self.token, bytes, signature).is_ok()
+    }
+
     fn live_state(&self) -> Option<RuntimeState> {
         if store::process_state(&self.worker) != "alive" {
             return None;
@@ -502,6 +511,7 @@ pub(crate) fn runtime_binding(state: &Path, ticket: &Value) -> Result<Option<Run
     }
     let ready = target.signed("ready")?;
     let mut binding = RuntimeBinding {
+        token: target.token.clone(),
         worker: ready["worker"].clone(),
         service: ready["service"].clone(),
         kernel: ready["kernel"].clone(),

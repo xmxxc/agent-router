@@ -122,8 +122,16 @@ class RuntimeFaults(unittest.TestCase):
         return turn
 
     def finish(self, info, turn=None):
-        return self.turn("task_complete", turn,
+        return self.turn("task_complete", turn or self.turn("task_started"),
                          {"codex_error_info": info, "message": "private-token https://private.invalid/secret"})
+
+    def complete(self, turn=None):
+        return self.turn("task_complete", turn or self.turn("task_started"))
+
+    def progress(self, turn):
+        self.append("event_msg", {"type": "item_completed", "turn_id": turn,
+                                  "item": {"type": "AgentMessage", "id": "controlled",
+                                           "content": [{"type": "Text", "text": "progress"}]}})
 
     def cli(self, *args, code=0, env=None):
         argv = [BINARY, *args]
@@ -162,8 +170,8 @@ class RuntimeFaults(unittest.TestCase):
         self.assertEqual(quota["fault"]["evidence"]["turn"], first)
         self.cli("ack", str(quota["id"]))
 
-        # Only a subsequent structure from the same rollout records recovery.
-        self.turn("task_started")
+        # Successful completion with a matching later start records recovery.
+        self.complete()
         remaining = 1.02 - (time.time() - self.row["created"])
         if remaining > 0:
             time.sleep(remaining)
@@ -194,7 +202,7 @@ class RuntimeFaults(unittest.TestCase):
                          [m["messageId"] for m in (quota, recovered, overdue, disconnected)])
         self.assertEqual([m["state"] for m in active["messages"]],
                          ["processed", "processed", "processed", "received"])
-        self.turn("task_complete")
+        self.complete()
         new, = self.wait(env=deadline)
         self.assertEqual(new["type"], "recovered")
         self.assertEqual(self.wait(code=3, env=deadline), [])
@@ -240,13 +248,13 @@ class RuntimeFaults(unittest.TestCase):
                                       "content": [{"text": "usage_limit_exceeded"}]})
         time.sleep(.07)
         self.assertEqual(self.wait(code=3, env=stall), [])
-        self.turn("task_started")
+        turn = self.turn("task_started")
         time.sleep(.07)
         notice, = self.wait(env=stall)
         self.assertEqual((notice["type"], notice["kind"], notice["fault"]["category"]),
                          ("stalled", "stall_timeout", "timeout"))
         self.assertEqual(self.wait(code=3, env=stall), [])
-        self.turn("task_complete")
+        self.complete(turn)
         recovered, = self.wait(env=stall)
         self.assertEqual(recovered["type"], "recovered")
         self.assertEqual(self.wait(code=3, env=stall), [])
@@ -305,7 +313,10 @@ class RuntimeFaults(unittest.TestCase):
         self.assertEqual(self.wait(code=3), [])
         time.sleep(.06)
         self.finish("usage_limit_exceeded", turn)
+        self.assertEqual(self.wait(code=3), [])
+        current = self.finish("usage_limit_exceeded")
         second, = self.wait()
+        self.assertEqual(second["fault"]["evidence"]["turn"], current)
         self.assertEqual((second["round"], second["attempt"], second["executionId"]),
                          (2, attempt, self.attempt))
         self.assertNotEqual(second["messageId"], first["messageId"])
@@ -335,6 +346,91 @@ class RuntimeFaults(unittest.TestCase):
         self.assertEqual(self.wait(code=3), [])
         ack = self.cli("ack", str(receipt["id"]))
         self.assertEqual(ack["messageId"], receipt["messageId"])
+
+    def test_distinct_turns_and_alternating_faults_share_one_episode(self):
+        first = self.finish("usage_limit_exceeded")
+        quota, = self.wait()
+        self.cli("ack", quota["messageId"])
+        retry = self.turn("task_started")
+        self.assertNotEqual(retry, first)
+        self.assertEqual(self.wait(code=3), [])
+        self.finish("usage_limit_exceeded", retry)
+        self.assertEqual(self.wait(code=3), [])
+
+        self.finish({"response_stream_disconnected": {"http_status_code": None}})
+        broken, = self.wait()
+        self.assertEqual(broken["fault"]["category"], "protocol_disconnected")
+        self.finish("usage_limit_exceeded")
+        self.assertEqual(self.wait(code=3), [])
+
+        self.progress(self.turn("task_started"))
+        next_turn = self.finish("usage_limit_exceeded")
+        recovered, new = self.wait()
+        self.assertEqual(recovered["kind"], "runtime_recovered")
+        self.assertEqual(new["fault"]["evidence"]["turn"], next_turn)
+        self.assertNotEqual(new["messageId"], quota["messageId"])
+        self.assertEqual(self.wait(code=3), [])
+
+    def test_partial_and_unrelated_records_do_not_restart_stall(self):
+        stall = {"WFC_ACTIVITY_AFTER": ".06", "WFC_MAX_TURN_SECONDS": "0"}
+        turn = self.turn("task_started")
+        time.sleep(.08)
+        first, = self.wait(env=stall)
+        self.cli("ack", first["messageId"])
+        fragment = '{"type":"event_msg","payload":'
+        self.writer.write(fragment)
+        self.writer.flush()
+        self.assertEqual(self.wait(code=3, env=stall), [])
+        self.writer.write('{"type":"token_count"}}\n')
+        self.writer.flush()
+        self.append("event_msg", {"type": "item_completed", "turn_id": str(uuid.uuid4()),
+                                  "item": {"type": "AgentMessage", "id": "elsewhere", "content": []}})
+        time.sleep(.08)
+        self.assertEqual(self.wait(code=3, env=stall), [])
+        self.progress(turn)
+        recovered, = self.wait(env={**stall, "WFC_ACTIVITY_AFTER": "10"})
+        self.assertEqual(recovered["kind"], "runtime_recovered")
+        time.sleep(.08)
+        second, = self.wait(env=stall)
+        self.assertEqual(second["kind"], "stall_timeout")
+        self.assertGreater(second["runtimeEvidence"]["progressOffset"],
+                           first["runtimeEvidence"]["progressOffset"])
+
+    def test_large_rollout_catches_up_across_fresh_wait_processes(self):
+        stall = {"WFC_ACTIVITY_AFTER": ".07", "WFC_MAX_TURN_SECONDS": "0"}
+        turn = self.turn("task_started")
+        self.progress(turn)
+        for _ in range(700):
+            self.append("response_item", {"type": "function_call_output", "call_id": "controlled",
+                                          "output": "x" * 5000})
+        time.sleep(.09)
+        self.assertGreater(self.log.stat().st_size, 3 * 1024 * 1024)
+        self.assertEqual(self.wait(code=3, env=stall), [])
+        self.assertEqual(self.wait(code=3, env=stall), [])
+        self.assertEqual(self.wait(code=3, env=stall), [])
+        stalled, = self.wait(env=stall)
+        self.assertEqual(stalled["runtimeEvidence"]["turn"], turn)
+        self.assertEqual(stalled["kind"], "stall_timeout")
+        self.assertEqual(self.wait(code=3, env=stall), [])
+
+    def test_scope_only_wait_zero_advances_across_fresh_processes(self):
+        for i in range(128):
+            dispatch = f"d-{i + 1000:08x}"
+            self.private_json(self.record.with_name(f"{dispatch}.json"),
+                              {"dispatch": dispatch, "scope": self.scope, "host": "opencode"})
+        self.finish("usage_limit_exceeded")
+        for _ in range(130):
+            result = subprocess.run(
+                [BINARY, "wait", "--scope", self.scope, "--timeout", "0"], cwd=self.root,
+                env=self.env, capture_output=True, text=True, timeout=4)
+            if result.returncode == 0:
+                fault, = json.loads(result.stdout)["messages"]
+                self.assertEqual(fault["dispatch"], self.dispatch)
+                self.assertEqual(fault["fault"]["category"], "quota")
+                break
+            self.assertEqual(result.returncode, 3, result)
+        else:
+            self.fail("scope scan never visited the signed worker")
 
     def test_signed_runtime_process_loss_is_distinct_from_worker_exit(self):
         service = subprocess.Popen(["/bin/sleep", "30"])

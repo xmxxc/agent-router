@@ -1,5 +1,8 @@
 //! An unnamed wait can resume a bounded traversal after the CLI exits.
-use super::{super::body_hash, Candidate, Scan, RECORDS_PER_SLICE, SLICE};
+use super::{
+    super::{body_hash, runtime_fault},
+    Candidate, Scan, RECORDS_PER_SLICE, SLICE,
+};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -126,6 +129,7 @@ impl Drop for Directory {
 
 pub(in crate::workflow::messages) struct Batch {
     pub(in crate::workflow::messages) candidates: Vec<Candidate>,
+    pub(in crate::workflow::messages) runtime: Vec<runtime_fault::Sample>,
     pub(in crate::workflow::messages) advance: Option<Advance>,
     pub(in crate::workflow::messages) more: bool,
 }
@@ -140,19 +144,23 @@ impl Scan {
     ) -> Batch {
         let mut batch = Batch {
             candidates: Vec::new(),
+            runtime: Vec::new(),
             advance: None,
             more: false,
         };
         if allowance.is_zero() {
             return batch;
         }
-        if dispatch.is_some() {
+        let dir = state.join("dispatches");
+        if let Some(id) = dispatch {
             batch.candidates = self.batch(state, dispatch, scope, allowance);
+            batch
+                .runtime
+                .extend(runtime_fault::sample(state, &dir, id, scope));
             return batch;
         }
 
         let start = Instant::now();
-        let dir = state.join("dispatches");
         let path = state.join(scope.map_or_else(
             || "startup-scan.json".to_owned(),
             |scope| format!("startup-scan-{}.json", body_hash(scope)),
@@ -183,6 +191,9 @@ impl Scan {
                 batch
                     .candidates
                     .extend(self.candidate(state, &dir, id, scope));
+                batch
+                    .runtime
+                    .extend(runtime_fault::sample(state, &dir, id, scope));
             }
         }
         batch.more = offset != 0;

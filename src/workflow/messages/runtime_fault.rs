@@ -1,7 +1,7 @@
 //! Publish live observations through the ordinary Inbox transaction.
 use super::{recovery, Assignment, Inbox, Message};
 use crate::workflow::{
-    runtime_fault::{last_accepted_input, Notice, Observation},
+    runtime_fault::{host_identity, last_accepted_input, Notice, Observation},
     view,
 };
 use anyhow::Result;
@@ -33,29 +33,11 @@ impl Watch {
         allowance: Duration,
     ) -> Vec<Sample> {
         let dir = state.join("dispatches");
-        let read = |id: &str| {
-            let generations = recovery::Generations::read(&dir, id);
-            let row = generations.published()?;
-            if row["dispatch"] != id
-                || !row["scope"].as_str().is_some_and(|bound| {
-                    !bound.is_empty() && scope.is_none_or(|scope| bound == scope)
-                })
-            {
-                return None;
-            }
-            let observed = Observation::read(state, row)?;
-            Some(Sample {
-                stamps: generations.stamps(),
-                assignment: serde_json::from_value(row.clone()).ok()?,
-                row: row.clone(),
-                observed,
-            })
-        };
         if allowance.is_zero() {
             return Vec::new();
         }
         if let Some(id) = dispatch {
-            return read(id).into_iter().collect();
+            return sample(state, &dir, id, scope).into_iter().collect();
         }
         let start = Instant::now();
         if self.entries.is_none() {
@@ -73,11 +55,81 @@ impl Watch {
             let Ok(entry) = entry else { continue };
             let name = entry.file_name();
             if let Some(id) = recovery::dispatch_filename(name.as_encoded_bytes()) {
-                observed.extend(read(id));
+                observed.extend(sample(state, &dir, id, scope));
             }
         }
         observed
     }
+}
+
+pub(super) fn sample(state: &Path, dir: &Path, id: &str, scope: Option<&str>) -> Option<Sample> {
+    let generations = recovery::Generations::read(&dir, id);
+    let row = generations.published()?;
+    if row["dispatch"] != id
+        || !row["scope"]
+            .as_str()
+            .is_some_and(|bound| !bound.is_empty() && scope.is_none_or(|scope| bound == scope))
+    {
+        return None;
+    }
+    let observed = Observation::read(state, row)?;
+    Some(Sample {
+        stamps: generations.stamps(),
+        assignment: serde_json::from_value(row.clone()).ok()?,
+        row: row.clone(),
+        observed,
+    })
+}
+
+fn evidence(message: &Message) -> &Value {
+    message
+        .additional_fields
+        .get("runtimeEvidence")
+        .unwrap_or(&Value::Null)
+}
+
+fn same_fault(message: &Message, notice: &Notice) -> bool {
+    let prior = evidence(message);
+    match notice.kind {
+        "host_error" => {
+            let Some(fault) = message.additional_fields.get("fault") else {
+                return false;
+            };
+            fault["category"]
+                .as_str()
+                .zip(prior["code"].as_str())
+                .is_some_and(|(category, code)| {
+                    let status = prior["httpStatus"]
+                        .as_u64()
+                        .and_then(|n| u16::try_from(n).ok());
+                    host_identity(category, code, status) == notice.fingerprint
+                })
+        }
+        "stall_timeout" => {
+            prior["session"] == notice.evidence["session"]
+                && prior["turn"] == notice.evidence["turn"]
+                && (progress_offset(prior) == progress_offset(&notice.evidence)
+                    || legacy_stall_at(prior)
+                        .zip(notice.evidence["lastProgressAtMs"].as_u64())
+                        .is_some_and(|(before, after)| after <= before))
+        }
+        _ => false,
+    }
+}
+
+fn progress_offset(evidence: &Value) -> Option<u64> {
+    evidence["progressOffset"]
+        .as_u64()
+        .or_else(|| evidence["offset"].as_u64())
+}
+
+fn legacy_stall_at(evidence: &Value) -> Option<u64> {
+    // R1 used the file mtime. Progress already present when R1 sampled
+    // the file cannot recover its stall or start a new stall episode.
+    evidence["progressOffset"]
+        .is_null()
+        .then(|| evidence["lastProgressAtMs"].as_u64())
+        .flatten()
 }
 
 impl Inbox {
@@ -116,6 +168,9 @@ impl Inbox {
                 continue;
             }
 
+            // The cursor is an optimization for bounded reads. A cache-only
+            // failure must leave ordinary Inbox publications available.
+            let _ = observed.save_cursor(&self.dir);
             let history: Vec<_> = current
                 .iter()
                 .filter_map(|message| {
@@ -144,47 +199,87 @@ impl Inbox {
                 .and_then(|_| observed.deadline(max, input_ms));
             let activity = observed.activity();
 
-            // Only a later event on the same rollout can recover an observed
-            // host error or stall. The round deadline remains independent.
-            let recovery = activity.and_then(|activity| {
-                let last = current.iter().rev().find(|m| {
-                    m.additional_fields
+            let episode: Vec<_> = current
+                .iter()
+                .copied()
+                .filter(|message| {
+                    message
+                        .additional_fields
                         .get("executionGeneration")
                         .and_then(Value::as_str)
                         == Some(&observed.generation)
-                        && matches!(
-                            m.additional_fields.get("kind").and_then(Value::as_str),
-                            Some("host_error" | "stall_timeout" | "runtime_recovered")
-                        )
-                })?;
-                let fields = &last.additional_fields;
-                let prior = fields.get("runtimeEvidence")?;
-                let progressed = if fields["kind"] == "stall_timeout" {
-                    activity["lastProgressAtMs"].as_u64()? > prior["lastProgressAtMs"].as_u64()?
-                } else {
-                    activity["offset"].as_u64()? > prior["offset"].as_u64()?
-                        && activity["atMs"].as_u64()? >= prior["atMs"].as_u64()?
-                        && activity["turn"] != prior["turn"]
-                };
-                (fields["kind"] != "runtime_recovered"
-                    && activity["session"] == prior["session"]
-                    && progressed)
-                    .then(|| Notice::recovered(activity))
+                })
+                .collect();
+            let last_recovery = episode.iter().rposition(|message| {
+                message
+                    .additional_fields
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    == Some("runtime_recovered")
             });
-            // Seal the observed physical and business identities into the
-            // receipt key, keeping the entire history of keys across polls.
+            let open = &episode[last_recovery.map_or(0, |index| index + 1)..];
+            let recovery = activity.and_then(|activity| {
+                let last = open.iter().rev().find(|message| {
+                    matches!(
+                        message
+                            .additional_fields
+                            .get("kind")
+                            .and_then(Value::as_str),
+                        Some("host_error" | "stall_timeout")
+                    )
+                })?;
+                let prior = evidence(last);
+                let at = activity["atMs"].as_u64()?;
+                (activity["session"] == prior["session"]
+                    && activity["offset"].as_u64()? > progress_offset(prior)?
+                    && at >= prior["atMs"].as_u64()?
+                    && legacy_stall_at(prior).is_none_or(|seen| at > seen))
+                .then(|| Notice::recovered(activity))
+            });
+            // Use the previous verified recovery point to distinguish episodes.
+            // R1 receipts are checked by evidence as well as by request key.
+            let episode_id = recovery
+                .as_ref()
+                .map(|notice| notice.fingerprint.clone())
+                .or_else(|| {
+                    last_recovery.map(|index| {
+                        let point = evidence(episode[index]);
+                        Notice::recovered(point.clone()).fingerprint
+                    })
+                })
+                .unwrap_or_default();
+            let notice = notice.filter(|notice| {
+                recovery.is_some()
+                    || !open.iter().any(|message| {
+                        message
+                            .additional_fields
+                            .get("kind")
+                            .and_then(Value::as_str)
+                            == Some(notice.kind)
+                            && same_fault(message, notice)
+                    })
+            });
             for notice in recovery.into_iter().chain(notice).chain(deadline) {
+                let episode = if matches!(notice.kind, "host_error" | "stall_timeout") {
+                    episode_id.as_str()
+                } else {
+                    ""
+                };
                 let key = format!(
-                    "runtime:{}:{}:{}:{}:{}:{}:{}",
+                    "runtime:{}:{}:{}:{}:{}:{}:{}:{}",
                     worker.dispatch,
                     worker.round,
                     worker.attempt,
                     observed.execution,
                     observed.generation,
                     notice.kind,
-                    notice.fingerprint
+                    notice.fingerprint,
+                    episode,
                 );
-                if self.prior(&worker.dispatch, &key).is_some() {
+                let old_key = key.strip_suffix(':').unwrap_or(&key);
+                if self.prior(&worker.dispatch, &key).is_some()
+                    || self.prior(&worker.dispatch, old_key).is_some()
+                {
                     continue;
                 }
                 let mut message = Message::new(self.next_id()?, worker.clone(), Some(key));

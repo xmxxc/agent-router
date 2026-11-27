@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::{
     ffi::OsString,
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, ErrorKind, Read},
+    io::ErrorKind,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
@@ -761,7 +761,7 @@ fn conversation(old: &Value, next: &Value) -> Result<Uuid> {
             let kind = entry.file_type()?;
             if kind.is_dir() {
                 dirs.push(entry.path());
-            } else if let Some(id) = rollout_id(&entry.path()) {
+            } else if let Some(id) = super::codex_rollout::id(&entry.path()) {
                 files.push((id, entry.path(), kind.is_file()));
             }
         }
@@ -790,65 +790,11 @@ fn conversation(old: &Value, next: &Value) -> Result<Uuid> {
     Ok(id)
 }
 
-pub(super) fn rollout_id(path: &Path) -> Option<Uuid> {
-    let filename = path
-        .file_name()?
-        .to_str()?
-        .strip_prefix("rollout-")?
-        .strip_suffix(".jsonl")?;
-    let id = filename.get(filename.len().checked_sub(36)?..)?;
-    let prefix = &filename[..filename.len() - 36];
-    (prefix.is_empty() || prefix.ends_with('-')).then_some(())?;
-    let uuid = Uuid::parse_str(id).ok()?;
-    (uuid.to_string() == id).then_some(uuid)
-}
-
 fn matches_rollout(path: &Path, id: Uuid, cwd: &str, brief_hash: &str) -> Result<bool> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     ensure!(file.metadata()?.is_file(), "invalid rollout file");
-    let mut lines = BufReader::new(file).take(4 * 1024 * 1024).lines();
-    let Some(Ok(meta)) = lines
-        .next()
-        .transpose()?
-        .map(|line| serde_json::from_str::<Value>(&line))
-    else {
-        return Ok(false);
-    };
-    let payload = &meta["payload"];
-    if meta["type"] != "session_meta"
-        || payload["id"] != id.to_string()
-        || payload["cwd"] != cwd
-        || !matches!(payload["source"].as_str(), Some("cli" | "vscode"))
-        || !payload["forked_from_id"].is_null()
-        || !payload["parent_thread_id"].is_null()
-    {
-        return Ok(false);
-    }
-    let matches_brief = |text: &str| messages::body_hash(text) == brief_hash;
-    for line in lines {
-        let Ok(record) = serde_json::from_str::<Value>(&line?) else {
-            return Ok(false);
-        };
-        let item = &record["payload"];
-        if record["type"] == "event_msg" && item["type"] == "user_message" {
-            return Ok(item["message"].as_str().is_some_and(matches_brief));
-        }
-        if record["type"] == "response_item" && item["type"] == "message" && item["role"] == "user"
-        {
-            if let Some(text) = item["content"][0]["text"].as_str() {
-                if text.starts_with("<environment_context>")
-                    || text.starts_with("# AGENTS.md instructions")
-                    || text.starts_with("<user_instructions>")
-                {
-                    continue;
-                }
-                // Older rollouts can have only the response item.
-                return Ok(matches_brief(text));
-            }
-        }
-    }
-    Ok(false)
+    Ok(super::codex_rollout::opening_matches(&file, 4 * 1024 * 1024, id, cwd, Some(brief_hash), true)?)
 }

@@ -1,10 +1,13 @@
 //! Read the rollout held open by the worker in the signed bundled execution.
-use super::{assignment, backend, messages::body_hash, resume::rollout_id};
+mod rollout;
+
+use super::{assignment, backend, codex_rollout, messages::body_hash, valid_id};
 use chrono::DateTime;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     fs::{self, File, Metadata, OpenOptions},
-    io::{Read, Seek, SeekFrom},
+    io::Read,
     os::{
         fd::AsRawFd,
         unix::fs::{MetadataExt, OpenOptionsExt},
@@ -39,8 +42,8 @@ pub(super) struct Observation {
     pub generation: String,
     ticket: Value,
     binding: crate::bundled::RuntimeBinding,
-    started_ms: u64,
-    sampled_ms: u64,
+    started_us: u64,
+    sampled_us: u64,
     rollout: Option<Rollout>,
 }
 
@@ -48,7 +51,8 @@ struct Rollout {
     file: File,
     stamp: FileStamp,
     fd: PathBuf,
-    turn: Turn,
+    session: Uuid,
+    slice: rollout::Slice,
 }
 
 impl Rollout {
@@ -77,23 +81,15 @@ impl From<&Metadata> for FileStamp {
     }
 }
 
-struct Turn {
-    session: Uuid,
-    id: Uuid,
-    at: u64,
-    offset: u64,
-    progress_ms: u64,
-    event: TurnEvent,
-}
-
+#[derive(Serialize, Deserialize)]
 enum TurnEvent {
     Active,
     Complete,
     Aborted,
     Unclassified,
     Error {
-        code: &'static str,
-        category: &'static str,
+        code: String,
+        category: String,
         status: Option<u16>,
     },
 }
@@ -113,7 +109,7 @@ impl Notice {
         kind: &'static str,
         message_type: &'static str,
         message: &'static str,
-        category: &'static str,
+        category: &str,
         evidence: Value,
     ) -> Self {
         Self {
@@ -143,23 +139,23 @@ impl Notice {
     }
 }
 
-fn turn_evidence(turn: &Turn) -> Value {
-    json!({"source":"codex_rollout","session":turn.session.to_string(),"turn":turn.id.to_string(),
-        "atMs":turn.at,"offset":turn.offset})
+fn turn_evidence(session: Uuid, id: &str, point: rollout::Point) -> Value {
+    json!({"source":"codex_rollout","session":session.to_string(),"turn":id,
+        "atMs":point.at / 1000,"offset":point.offset})
 }
 
 impl Observation {
     pub fn read(state: &Path, row: &Value) -> Option<Self> {
-        let (ticket, close) = target(state, row)?;
+        let ticket = target(state, row)?;
         let binding = crate::bundled::runtime_binding(state, ticket).ok()??;
-        let started_ms = round_started(row)?;
-        let sampled_ms = epoch_ms(SystemTime::now())?;
+        let started_us = round_started(row)?;
+        let sampled_us = epoch_us(SystemTime::now())?;
         let rollout = if binding.state == crate::bundled::RuntimeState::Online {
-            owned_rollout(row, &binding.worker, started_ms, sampled_ms)
+            owned_rollout(state, row, ticket, &binding, started_us)
         } else {
             None
         };
-        if !absent(&close) || !binding.current() {
+        if backend::close_blocks_callback(state, row).unwrap_or(true) || !binding.current() {
             return None;
         }
         Some(Self {
@@ -167,33 +163,36 @@ impl Observation {
             generation: ticket["generation"].as_str()?.to_owned(),
             ticket: ticket.clone(),
             binding,
-            started_ms,
-            sampled_ms,
+            started_us,
+            sampled_us,
             rollout,
         })
     }
 
     pub fn current(&self, state: &Path, row: &Value) -> bool {
-        let Some((ticket, close)) = target(state, row) else {
+        let Some(ticket) = target(state, row) else {
             return false;
         };
         *ticket == self.ticket
-            && absent(&close)
             && crate::bundled::runtime_binding(state, ticket)
                 .is_ok_and(|binding| binding.as_ref() == Some(&self.binding))
             && self.rollout.as_ref().is_none_or(Rollout::current)
     }
 
     pub fn activity(&self) -> Option<Value> {
-        let turn = &self.rollout.as_ref()?.turn;
-        matches!(turn.event, TurnEvent::Active | TurnEvent::Complete).then(|| {
-            let mut evidence = turn_evidence(turn);
-            evidence["lastProgressAtMs"] = json!(turn.progress_ms);
-            evidence
-        })
+        let rollout = self.rollout.as_ref()?;
+        let activity = rollout.slice.activity()?;
+        Some(turn_evidence(rollout.session, &activity.id, activity.point))
     }
 
-    pub fn notice(&self, max: Duration, stall: Duration, input_ms: Option<u64>) -> Option<Notice> {
+    pub fn save_cursor(&self, state: &Path) -> anyhow::Result<()> {
+        if let Some(rollout) = &self.rollout {
+            rollout.slice.save(state, &self.binding, &rollout.file)?;
+        }
+        Ok(())
+    }
+
+    pub fn notice(&self, max: Duration, stall: Duration, input_us: Option<u64>) -> Option<Notice> {
         use crate::bundled::RuntimeState;
         match self.binding.state {
             RuntimeState::Exited => {
@@ -218,26 +217,26 @@ impl Observation {
             }
             RuntimeState::Online => {}
         }
-        let started_ms = self.started_ms.max(input_ms.unwrap_or_default());
-        let turn = self
-            .rollout
-            .as_ref()
-            .map(|rollout| &rollout.turn)
-            .filter(|turn| turn.at >= started_ms);
-        if let Some(turn) = turn {
+        let started_us = self.started_us.max(input_us.unwrap_or_default());
+        let bound = self.rollout.as_ref().and_then(|rollout| {
+            let turn = rollout.slice.turn()?;
+            (turn.started > self.started_us && turn.latest.at >= started_us)
+                .then_some((rollout.session, turn))
+        });
+        if let Some((session, turn)) = bound {
             if let TurnEvent::Error {
                 code,
                 category,
                 status,
-            } = turn.event
+            } = &turn.event
             {
-                let mut evidence = turn_evidence(turn);
+                let mut evidence = turn_evidence(session, &turn.id, turn.latest);
                 evidence["code"] = json!(code);
                 if let Some(status) = status {
                     evidence["httpStatus"] = json!(status);
                 }
                 return Some(Notice::new(
-                    format!("{}:{}:{code}:{status:?}", turn.session, turn.id),
+                    host_identity(category, code, *status),
                     "host_error",
                     "blocked",
                     "Codex recorded a terminal turn error",
@@ -246,19 +245,22 @@ impl Observation {
                 ));
             }
         }
-        if let Some(deadline) = self.deadline(max, input_ms) {
+        if let Some(deadline) = self.deadline(max, input_us) {
             return Some(deadline);
         }
-        if let Some(turn) = turn {
-            let idle = self.sampled_ms.saturating_sub(turn.progress_ms);
+        if let Some((session, turn)) = bound {
+            let idle = self
+                .sampled_us
+                .saturating_sub(turn.progress.at.max(started_us));
             if matches!(turn.event, TurnEvent::Active)
                 && !stall.is_zero()
-                && Duration::from_millis(idle) >= stall
+                && Duration::from_micros(idle) >= stall
             {
-                let mut evidence = turn_evidence(turn);
-                evidence["lastProgressAtMs"] = json!(turn.progress_ms);
+                let mut evidence = turn_evidence(session, &turn.id, turn.latest);
+                evidence["lastProgressAtMs"] = json!(turn.progress.at / 1000);
+                evidence["progressOffset"] = json!(turn.progress.offset);
                 return Some(Notice::new(
-                    format!("{}:{}:{}", turn.session, turn.id, turn.progress_ms),
+                    format!("{}:{}:{}", session, turn.id, turn.progress.offset),
                     "stall_timeout",
                     "stalled",
                     "An open Codex turn has no recent recorded progress",
@@ -269,12 +271,12 @@ impl Observation {
         }
         None
     }
-    pub fn deadline(&self, max: Duration, input_ms: Option<u64>) -> Option<Notice> {
+    pub fn deadline(&self, max: Duration, input_us: Option<u64>) -> Option<Notice> {
         if max.is_zero() || self.binding.state != crate::bundled::RuntimeState::Online {
             return None;
         }
-        let started_ms = self.started_ms.max(input_ms.unwrap_or_default());
-        let elapsed = Duration::from_millis(self.sampled_ms.checked_sub(started_ms)?);
+        let started_us = self.started_us.max(input_us.unwrap_or_default());
+        let elapsed = Duration::from_micros(self.sampled_us.checked_sub(started_us)?);
         if elapsed < max {
             return None;
         }
@@ -284,17 +286,21 @@ impl Observation {
             "unknown",
             "Worker exceeded the configured round deadline",
             "timeout",
-            json!({"source":"round_deadline","startedAtMs":started_ms,
+            json!({"source":"round_deadline","startedAtMs":started_us / 1000,
                 "timeoutMs":u64::try_from(max.as_millis()).ok()?}),
         ))
     }
 }
 
-fn absent(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+pub(super) fn host_identity(category: &str, code: &str, status: Option<u16>) -> String {
+    if category == "host_error" {
+        format!("{code}:{status:?}")
+    } else {
+        category.to_owned()
+    }
 }
 
-fn target<'a>(state: &Path, row: &'a Value) -> Option<(&'a Value, PathBuf)> {
+fn target<'a>(state: &Path, row: &'a Value) -> Option<&'a Value> {
     if row["host"] != "codex"
         || row["legacyArchived"] == true
         || !assignment::identified(row)
@@ -314,8 +320,7 @@ fn target<'a>(state: &Path, row: &'a Value) -> Option<(&'a Value, PathBuf)> {
     {
         return None;
     }
-    let close = backend::bundled_runtime_close(state, row).ok()?;
-    absent(&close).then_some((ticket, close))
+    (!backend::close_blocks_callback(state, row).ok()?).then_some(ticket)
 }
 
 fn round_started(row: &Value) -> Option<u64> {
@@ -332,11 +337,14 @@ fn round_started(row: &Value) -> Option<u64> {
     }) {
         return None;
     }
+    if round.is_none() && row["round"] != 1 {
+        return None;
+    }
     let created = round
         .map_or(&row["created"], |round| &round["created"])
         .as_f64()?;
     let created = Duration::try_from_secs_f64(created).ok()?;
-    created.as_millis().try_into().ok()
+    created.as_micros().try_into().ok()
 }
 
 pub(super) fn last_accepted_input(row: &Value, history: &[Value]) -> Option<u64> {
@@ -348,28 +356,35 @@ pub(super) fn last_accepted_input(row: &Value, history: &[Value]) -> Option<u64>
                 && (message["type"] == "nudge"
                     || (message["type"] == "reply" && message["inputResult"] == "accepted"))
         })
-        .filter_map(|message| parse_timestamp_ms(message["at"].as_str()?))
+        .filter_map(|message| parse_timestamp_us(message["at"].as_str()?))
         .max()
 }
 
-fn parse_timestamp_ms(value: &str) -> Option<u64> {
+fn parse_timestamp_us(value: &str) -> Option<u64> {
     DateTime::parse_from_rfc3339(value)
         .ok()?
-        .timestamp_millis()
+        .timestamp_micros()
         .try_into()
         .ok()
 }
 
-fn epoch_ms(time: SystemTime) -> Option<u64> {
+fn epoch_us(time: SystemTime) -> Option<u64> {
     time.duration_since(UNIX_EPOCH)
         .ok()?
-        .as_millis()
+        .as_micros()
         .try_into()
         .ok()
 }
 
-fn owned_rollout(row: &Value, worker: &Value, started_ms: u64, sampled_ms: u64) -> Option<Rollout> {
-    let pid = worker["pid"].as_u64()?;
+fn owned_rollout(
+    state: &Path,
+    row: &Value,
+    ticket: &Value,
+    binding: &crate::bundled::RuntimeBinding,
+    started_us: u64,
+) -> Option<Rollout> {
+    let pid = binding.worker["pid"].as_u64()?;
+    let dispatch = row["dispatch"].as_str().filter(|id| valid_id(id))?;
     let proc = PathBuf::from(format!("/proc/{pid}"));
     let home = Path::new(row["codexHome"].as_str()?);
     if !home.is_absolute() {
@@ -399,7 +414,7 @@ fn owned_rollout(row: &Value, worker: &Value, started_ms: u64, sampled_ms: u64) 
         if !path.starts_with(&sessions) {
             continue;
         }
-        let Some(session) = rollout_id(&path) else {
+        let Some(session) = codex_rollout::id(&path) else {
             continue;
         };
         if known.is_some_and(|id| id != session) || !writable_fd(&proc, &entry.file_name()) {
@@ -436,7 +451,12 @@ fn owned_rollout(row: &Value, worker: &Value, started_ms: u64, sampled_ms: u64) 
             return None;
         }
         let file = File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd())).ok()?;
-        if !opening_matches(&file, row, session, cwd, known.is_some()) {
+        let brief = if known.is_some() {
+            None
+        } else {
+            Some(row["codexBriefHash"].as_str()?)
+        };
+        if !codex_rollout::opening_matches(&file, WINDOW, session, cwd, brief, false).ok()? {
             continue;
         }
         // Multiple matching writers give no unique binding, even if one has
@@ -447,20 +467,33 @@ fn owned_rollout(row: &Value, worker: &Value, started_ms: u64, sampled_ms: u64) 
         found = Some((file, stamp, session, fd));
     }
     let (mut file, stamp, session, fd) = found?;
-    let progress_ms = epoch_ms(file.metadata().ok()?.modified().ok()?)?;
-    let turn = latest_turn(
+    let identity = body_hash(
+        &json!([
+            dispatch,
+            row["round"],
+            row["attempt"],
+            started_us,
+            ticket["generation"],
+            session.to_string(),
+            stamp.0,
+            stamp.1
+        ])
+        .to_string(),
+    );
+    let slice = rollout::Slice::read(
+        state.join(format!("runtime-rollout-{dispatch}.json")),
+        identity,
+        binding,
         &mut file,
         stamp.2,
-        session,
-        started_ms,
-        sampled_ms,
-        progress_ms,
+        started_us,
     )?;
     let rollout = Rollout {
         file,
         stamp,
         fd,
-        turn,
+        session,
+        slice,
     };
     rollout.current().then_some(rollout)
 }
@@ -478,135 +511,6 @@ fn writable_fd(proc: &Path, name: &std::ffi::OsStr) -> bool {
             .is_some_and(|flags| {
                 flags & libc::O_ACCMODE as u32 != 0 && flags & libc::O_APPEND as u32 != 0
             })
-}
-
-fn opening_matches(file: &File, row: &Value, session: Uuid, cwd: &str, known: bool) -> bool {
-    let mut first = Vec::new();
-    if file.take(WINDOW).read_to_end(&mut first).is_err() {
-        return false;
-    }
-    let mut lines = first.split_inclusive(|b| *b == b'\n');
-    let Some(meta) = lines.next().and_then(record) else {
-        return false;
-    };
-    let p = &meta["payload"];
-    if meta["type"] != "session_meta"
-        || p["id"] != session.to_string()
-        || p["cwd"] != cwd
-        || p["source"] != "cli"
-        || !p["forked_from_id"].is_null()
-        || !p["parent_thread_id"].is_null()
-    {
-        return false;
-    }
-    if known {
-        return true;
-    }
-    let Some(expected) = row["codexBriefHash"].as_str() else {
-        return false;
-    };
-    for line in lines {
-        let Some(entry) = record(line) else {
-            return false;
-        };
-        let p = &entry["payload"];
-        if entry["type"] == "event_msg" && p["type"] == "user_message" {
-            return p["message"]
-                .as_str()
-                .is_some_and(|text| body_hash(text) == expected);
-        }
-        if entry["type"] == "response_item" && p["type"] == "message" && p["role"] == "user" {
-            if let Some(text) = p["content"][0]["text"].as_str() {
-                if ![
-                    "<environment_context>",
-                    "# AGENTS.md instructions",
-                    "<user_instructions>",
-                ]
-                .iter()
-                .any(|prefix| text.starts_with(prefix))
-                {
-                    return body_hash(text) == expected;
-                }
-            }
-        }
-    }
-    false
-}
-
-fn record(line: &[u8]) -> Option<Value> {
-    line.ends_with(b"\n")
-        .then(|| serde_json::from_slice(line).ok())
-        .flatten()
-}
-
-fn latest_turn(
-    file: &mut File,
-    len: u64,
-    session: Uuid,
-    start: u64,
-    now: u64,
-    progress_ms: u64,
-) -> Option<Turn> {
-    let begin = len.saturating_sub(WINDOW);
-    file.seek(SeekFrom::Start(begin)).ok()?;
-    let mut tail = Vec::new();
-    file.take(len - begin).read_to_end(&mut tail).ok()?;
-    let mut latest = None;
-    let mut offset = begin;
-    for (index, line) in tail.split_inclusive(|b| *b == b'\n').enumerate() {
-        offset += line.len() as u64;
-        if index == 0 && begin != 0 {
-            continue;
-        }
-        // A partially appended line is never an event, and cannot hide the
-        // last complete record. A malformed complete record breaks trust.
-        if !line.ends_with(b"\n") {
-            break;
-        }
-        let entry = record(line)?;
-        let p = &entry["payload"];
-        if entry["type"] != "event_msg" {
-            continue;
-        }
-        let event = match p["type"].as_str() {
-            Some("task_started") => TurnEvent::Active,
-            Some("turn_aborted") => TurnEvent::Aborted,
-            Some("task_complete") if p["error"].is_null() => TurnEvent::Complete,
-            Some("task_complete") => classify(&p["error"]["codex_error_info"]),
-            Some("thread_rolled_back") => {
-                latest = None;
-                continue;
-            }
-            _ => continue,
-        };
-        let id = p["turn_id"]
-            .as_str()
-            .and_then(|id| Uuid::parse_str(id).ok());
-        let Some(id) = id else {
-            latest = None;
-            continue;
-        };
-        if p["root_turn_id"]
-            .as_str()
-            .is_some_and(|root| root != id.to_string())
-        {
-            continue;
-        }
-        let at = parse_timestamp_ms(entry["timestamp"].as_str()?)?;
-        if at >= start && at <= now {
-            latest = Some(Turn {
-                session,
-                id,
-                at,
-                offset,
-                progress_ms,
-                event,
-            });
-        } else {
-            latest = None;
-        }
-    }
-    latest
 }
 
 fn classify(info: &Value) -> TurnEvent {
@@ -665,8 +569,8 @@ fn classify(info: &Value) -> TurnEvent {
         _ => return TurnEvent::Unclassified,
     };
     TurnEvent::Error {
-        code,
-        category,
+        code: code.to_owned(),
+        category: category.to_owned(),
         status,
     }
 }
