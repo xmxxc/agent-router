@@ -1,0 +1,321 @@
+name: Linux release package
+# Recipe copied from linux-package-ci.yml at f5be975772b2b8e35760cbfd2865bed7dcd786c3.
+on:
+  workflow_call:
+    inputs:
+      product_sha:
+        type: string
+        required: true
+      product_tree:
+        type: string
+        required: true
+      product_parents:
+        type: string
+        required: true
+      runtime_runner:
+        description: GitHub-hosted label or an existing clean runner with approved delegation
+        type: string
+        default: ubuntu-22.04
+      hosted_delegated_runtime:
+        description: Exercise the downloaded binary in an ordinary Jammy hosted VM with systemd delegation
+        type: boolean
+        default: false
+      clean_guest_runtime:
+        description: Exercise the same downloaded binary in the offline clean Jammy guest with systemd delegation
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PRODUCT_SHA: ${{ inputs.product_sha }}
+  PRODUCT_TREE: ${{ inputs.product_tree }}
+  PRODUCT_PARENTS: ${{ inputs.product_parents }}
+  TARGET: x86_64-unknown-linux-gnu
+  ACCEPTANCE_SHA: f5be975772b2b8e35760cbfd2865bed7dcd786c3
+
+jobs:
+  package:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      EVIDENCE: ${{ github.workspace }}/checkpoint
+      NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+      NOTICE_TOOLS_SHA: 6dfb65a9e93a06d4d4d9f9af45510ed069affe3a
+      LC_ALL: C.UTF-8
+    outputs:
+      manifest_sha256: ${{ steps.manifest.outputs.manifest_sha256 }}
+      package_sha256: ${{ steps.manifest.outputs.package_sha256 }}
+      elf_sha256: ${{ steps.manifest.outputs.elf_sha256 }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - name: Require full frozen product identities
+        run: |
+          parents_pattern='^[0-9a-f]{40}( [0-9a-f]{40})*$'
+          [[ "$PRODUCT_SHA" =~ ^[0-9a-f]{40}$ && "$PRODUCT_TREE" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PRODUCT_PARENTS" =~ $parents_pattern ]]
+      - name: Check out the frozen product
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: xmxxc/agent-router
+          ref: ${{ env.PRODUCT_SHA }}
+          fetch-depth: 2
+          path: product
+          persist-credentials: false
+      - name: Check out the trigger workflow for source identity
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 2
+          path: recipe
+          sparse-checkout: /.github/workflows/linux-release-package.yml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Check out the verified native zlib input
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: xmxxc/agent-router
+          ref: ${{ env.NATIVE_INPUT_SHA }}
+          path: native-input
+          sparse-checkout: /vendor/zlib-1.3.1.tar.gz
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Check out the reviewed Jammy packaging and notice checks
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: xmxxc/agent-router
+          ref: ${{ env.NOTICE_TOOLS_SHA }}
+          path: notice-tools
+          sparse-checkout: /tools/ci/opencode-relay/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - name: Record runner and install the pinned toolchain
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          mkdir -p "$EVIDENCE"
+          {
+            printf 'workflow=%s\nhead=%s\nrun=%s\nattempt=%s\nacceptance=%s\n' \
+              "$GITHUB_WORKFLOW_SHA" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$ACCEPTANCE_SHA"
+            printf 'runner=%s\nimage=%s/%s\n' "$RUNNER_ENVIRONMENT" "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+            cat /etc/os-release
+            uname -srm
+            test "$(uname -m)" = x86_64
+            lscpu
+            if ! pkg-config --exists openssl zlib || ! command -v openssl >/dev/null; then
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends pkg-config libssl-dev zlib1g-dev openssl
+            fi
+            package=zig-x86_64-linux-0.16.0
+            archive="$RUNNER_TEMP/$package.tar.xz"
+            verified=0
+            for base in https://ziglang.org/download/0.16.0 https://zig.bcr.ist; do
+              url="$base/$package.tar.xz"
+              printf 'Zig source %s\n' "$url"
+              if curl --fail --silent --show-error --location --retry 2 --retry-max-time 180 \
+                --connect-timeout 15 --max-time 120 "$url" -o "$archive" &&
+                printf '%s  %s\n' 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 \
+                  "$archive" | sha256sum --check --strict; then
+                verified=1
+                break
+              fi
+            done
+            test "$verified" = 1
+            sha256sum "$archive"
+            tar -xJf "$archive" -C "$RUNNER_TEMP"
+            test "$("$RUNNER_TEMP/$package/zig" version)" = 0.16.0
+            printf '%s\n' "$RUNNER_TEMP/$package" >> "$GITHUB_PATH"
+            rustup toolchain install 1.96.1 --profile minimal
+            rustc +1.96.1 -vV
+            cargo +1.96.1 --version
+            python3 --version
+            pkg-config --modversion openssl zlib
+            dpkg-query -W libc6 libssl3 zlib1g
+          } 2>&1 | tee "$EVIDENCE/toolchain.log"
+      - name: Verify the product tree and input sources
+        working-directory: product
+        run: |
+          {
+            git -C ../recipe show -s --format='trigger=%H tree=%T parents=%P'
+            test "$(git -C ../recipe rev-parse HEAD)" = "$GITHUB_SHA"
+            test "$(git -C ../recipe show -s --format=%P)" = "$PRODUCT_SHA"
+            git show -s --format='product=%H tree=%T parents=%P'
+            test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+            test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+            test "$(git show -s --format=%P)" = "$PRODUCT_PARENTS"
+            git -C ../native-input show -s --format='native-input=%H tree=%T'
+            test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
+            git -C ../notice-tools show -s --format='notice-tools=%H tree=%T'
+            test "$(git -C ../notice-tools rev-parse HEAD)" = "$NOTICE_TOOLS_SHA"
+            sha256sum --check --strict vendor/INPUTS.sha256 | tee "$EVIDENCE/verified-inputs.log"
+            sha256sum Cargo.lock vendor/INPUTS.sha256 ../notice-tools/tools/ci/opencode-relay/{libraries.sh,package.sh,verify-notices.py}
+            zlib=../native-input/vendor/zlib-1.3.1.tar.gz
+            sha256sum "$zlib"
+            python3 tools/prepare.py --zlib-archive "$zlib"
+            url=https://deps.files.ghostty.org/wuffs-7411f488fe2e2c205c3d3b3d28638b7356522930.tar.gz
+            archive="$RUNNER_TEMP/wuffs.tar.gz"
+            printf 'Wuffs source %s\n' "$url"
+            curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+              --connect-timeout 15 --max-time 60 "$url" -o "$archive"
+            printf '%s  %s\n' 17877d346f7988651d6c62e45b2e3b05c86809a6442c5e34612374b2a9719a1c \
+              "$archive" | sha256sum --check --strict
+            sha256sum "$archive"
+            package=$(cd vendor/libghostty-vt && zig fetch "$archive")
+            printf 'Wuffs Zig package %s\n' "$package"
+            test "$package" = 'N-V-__8AAP5JWgCGP_AD0teWpa4krRvE9VPZzvviGdbmN4jI'
+          } 2>&1 | tee "$EVIDENCE/inputs.log"
+      - name: Build and record the frozen release
+        working-directory: product
+        env:
+          WFC_BUILD_ID: ${{ env.PRODUCT_SHA }}
+        run: |
+          cargo +1.96.1 build --release --locked --bin wfc --target "$TARGET"
+          binary="target/$TARGET/release/wfc"
+          sha256sum "$binary" | tee "$EVIDENCE/binary.sha256"
+          bash ../notice-tools/tools/ci/opencode-relay/libraries.sh
+          for library in libssl.so.3 libcrypto.so.3 libz.so.1; do
+            grep -F "Shared library: [$library]" "$EVIDENCE/elf.log"
+          done
+      - name: Verify licenses and seal the checkpoint
+        id: manifest
+        working-directory: product
+        run: |
+          bash ../notice-tools/tools/ci/opencode-relay/package.sh 2>&1 | tee "$EVIDENCE/package.log"
+          archive="wfc-linux-x64-$PRODUCT_SHA.tar.gz"
+          stat --format='%n %s bytes' "$EVIDENCE/$archive" "target/$TARGET/release/wfc" | tee "$EVIDENCE/size.log"
+          cd "$EVIDENCE"
+          sha256sum -- "$archive" binary.sha256 *.log > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+          manifest=$(sha256sum SHA256SUMS | cut -d ' ' -f 1)
+          package=$(sha256sum "$archive" | cut -d ' ' -f 1)
+          read -r elf _ < binary.sha256
+          {
+            printf 'manifest_sha256=%s\n' "$manifest"
+            printf 'package_sha256=%s\n' "$package"
+            printf 'elf_sha256=%s\n' "$elf"
+          } | tee -a "$GITHUB_OUTPUT"
+      - name: Upload the Linux checkpoint
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-package-ci-${{ env.PRODUCT_SHA }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  runtime:
+    name: ${{ inputs.hosted_delegated_runtime && 'Downloaded bundled lifecycle on a delegated hosted VM' || 'Downloaded bundled lifecycle in a clean runtime' }}
+    needs: package
+    if: inputs.hosted_delegated_runtime || !inputs.clean_guest_runtime
+    runs-on: ${{ inputs.hosted_delegated_runtime && 'ubuntu-22.04' || inputs.runtime_runner }}
+    timeout-minutes: 15
+    env:
+      RUNTIME_BASE: docker.io/library/ubuntu:22.04@sha256:b682e31336cc8e0a73ed91ab32b7a95e32591c5ff09994490a20accf9b3600f9
+      MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
+      PACKAGE_SHA256: ${{ needs.package.outputs.package_sha256 }}
+      ELF_SHA256: ${{ needs.package.outputs.elf_sha256 }}
+      ARTIFACT_ID: ${{ needs.package.outputs.artifact_id }}
+      ARTIFACT_DIGEST: ${{ needs.package.outputs.artifact_digest }}
+    steps:
+      - name: Check out the Bash acceptance scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: xmxxc/agent-router
+          ref: ${{ env.ACCEPTANCE_SHA }}
+          path: ci
+          persist-credentials: false
+      - name: Download the checkpoint from the build job
+        if: env.ARTIFACT_ID != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact_id }}
+          path: checkpoint
+          merge-multiple: true
+      - name: Verify the downloaded checkpoint against the build outputs
+        run: bash ci/tools/check_linux_download.sh "$GITHUB_WORKSPACE/checkpoint"
+      - name: Exercise the downloaded binary in a delegated hosted VM
+        if: inputs.hosted_delegated_runtime
+        run: |
+          test "$(id -u)" -gt 0
+          unit="wfc-package-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sudo systemd-run --unit="$unit" --wait --pipe --collect \
+            --property=Type=exec --property="User=$(id -un)" --property=Delegate=yes \
+            --property=RuntimeMaxSec=120s --property=TimeoutStopSec=10s \
+            /usr/bin/bash "$GITHUB_WORKSPACE/ci/tools/check_linux_hosted_delegation.sh" \
+            "$(id -u)" "$unit" "$GITHUB_WORKSPACE/checkpoint" "$PRODUCT_SHA" "$TARGET" "$MANIFEST_SHA256"
+      - name: Prepare the pinned Jammy runtime with only required libraries and jq
+        if: ${{ !inputs.hosted_delegated_runtime && runner.environment == 'github-hosted' }}
+        run: |
+          printf 'runtime_base=%s\n' "$RUNTIME_BASE"
+          docker build --platform linux/amd64 --build-arg BASE_IMAGE="$RUNTIME_BASE" \
+            --tag wfc-package-runtime - <<'DOCKERFILE'
+          ARG BASE_IMAGE
+          FROM ${BASE_IMAGE}
+          RUN apt-get update \
+              && apt-get install -y --no-install-recommends libgcc-s1 libssl3 zlib1g jq \
+              && apt-get clean
+          DOCKERFILE
+      - name: Check the same downloaded binary in the clean hosted container
+        if: ${{ !inputs.hosted_delegated_runtime && runner.environment == 'github-hosted' }}
+        run: |
+          docker image inspect --format='runtime_image_id={{.Id}}' wfc-package-runtime
+          docker run --rm --init --platform linux/amd64 --user 1000:1000 \
+            --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,nosuid,nodev,exec,size=64m,mode=1777 \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/checkpoint,target=/checkpoint,readonly" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/ci/tools/check_linux_runtime.sh,target=/check_linux_runtime.sh,readonly" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/ci/tools/check_linux_bundled_package.sh,target=/check_linux_bundled_package.sh,readonly" \
+            wfc-package-runtime /bin/bash /check_linux_runtime.sh /checkpoint "$PRODUCT_SHA" "$TARGET" "$MANIFEST_SHA256"
+      - name: Exercise default dispatch in the pre-provisioned clean runtime
+        if: ${{ !inputs.hosted_delegated_runtime && runner.environment == 'self-hosted' }}
+        run: |
+          bash ci/tools/check_linux_runtime.sh "$GITHUB_WORKSPACE/checkpoint" \
+            "$PRODUCT_SHA" "$TARGET" "$MANIFEST_SHA256"
+
+  clean_guest:
+    name: Downloaded bundled lifecycle in the offline clean Jammy guest
+    needs: package
+    if: inputs.clean_guest_runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
+      PACKAGE_SHA256: ${{ needs.package.outputs.package_sha256 }}
+      ELF_SHA256: ${{ needs.package.outputs.elf_sha256 }}
+      ARTIFACT_ID: ${{ needs.package.outputs.artifact_id }}
+      ARTIFACT_DIGEST: ${{ needs.package.outputs.artifact_digest }}
+      GUEST_EVIDENCE: ${{ github.workspace }}/guest-evidence
+    steps:
+      - name: Check out the guest and Bash acceptance scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: xmxxc/agent-router
+          ref: ${{ env.ACCEPTANCE_SHA }}
+          fetch-depth: 2
+          path: ci
+          persist-credentials: false
+      - name: Download the checkpoint from the same build job
+        if: env.ARTIFACT_ID != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact_id }}
+          path: checkpoint
+          merge-multiple: true
+      - name: Verify the downloaded checkpoint against the build outputs
+        run: bash ci/tools/check_linux_download.sh "$GITHUB_WORKSPACE/checkpoint"
+      - name: Prepare the pinned offline guest and its checkpoint mount
+        run: |
+          bash ci/tools/ci/linux-guest-preflight/prepare.sh "$RUNNER_TEMP/wfc-clean-guest" "$GUEST_EVIDENCE" checkpoint
+      - name: Check the platform and the downloaded product in the guest
+        run: |
+          bash ci/tools/ci/linux-guest-preflight/boot.sh "$RUNNER_TEMP/wfc-clean-guest" "$GUEST_EVIDENCE" "$GITHUB_WORKSPACE/checkpoint"
