@@ -1,5 +1,5 @@
 //! Advance a verified rollout in bounded slices, resuming from a signed cursor.
-use super::{classify, epoch_us, parse_timestamp_us, TurnEvent};
+use super::{classify, epoch_us, parse_timestamp_us, ReadMode, TurnEvent};
 use crate::{
     bundled::RuntimeBinding,
     workflow::{codex_rollout, ensure_state_writable, write_json},
@@ -16,8 +16,11 @@ use std::{
     time::SystemTime,
 };
 
-const BUDGET: u64 = 1024 * 1024;
+const POLL_BUDGET: u64 = 1024 * 1024;
+const MAX_RECORD: u64 = 4 * 1024 * 1024;
+const STATUS_BUDGET: u64 = 8 * 1024 * 1024;
 const TRAILER: u64 = 256;
+const CURSOR_FORMAT: &str = "runtime-rollout-v2";
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub(super) struct Point {
@@ -45,6 +48,7 @@ struct Cursor {
     offset: u64,
     trailer: String,
     discarding: bool,
+    lost_anchor: bool,
     turn: Option<Turn>,
     activity: Option<Activity>,
 }
@@ -65,6 +69,7 @@ impl Slice {
         file: &mut File,
         len: u64,
         started: u64,
+        mode: ReadMode,
     ) -> Option<Self> {
         let mut cursor = load(&path, &identity, binding)
             .filter(|cursor| {
@@ -74,9 +79,26 @@ impl Slice {
             .unwrap_or_default();
         let prior = cursor.offset;
         file.seek(SeekFrom::Start(prior)).ok()?;
-        let window = (len - prior).min(BUDGET);
+        let budget = match mode {
+            ReadMode::Poll => POLL_BUDGET,
+            ReadMode::Status => STATUS_BUDGET,
+        };
+        let remaining = len - prior;
+        let mut window = remaining.min(budget);
         let mut bytes = Vec::new();
-        file.take(window).read_to_end(&mut bytes).ok()?;
+        (&mut *file).take(window).read_to_end(&mut bytes).ok()?;
+        // A poll at the start of a long record can finish that record without
+        // raising the budget for ordinary multi-record catch-up.
+        if window < remaining
+            && budget == POLL_BUDGET
+            && !cursor.discarding
+            && bytes.len() as u64 == window
+            && !bytes.contains(&b'\n')
+        {
+            let extended = remaining.min(MAX_RECORD);
+            file.take(extended - window).read_to_end(&mut bytes).ok()?;
+            window = extended;
+        }
         if bytes.len() as u64 != window {
             return None;
         }
@@ -84,10 +106,8 @@ impl Slice {
         let mut caught_up = prior + window == len;
         for line in bytes.split_inclusive(|b| *b == b'\n') {
             if !line.ends_with(b"\n") {
-                if cursor.discarding
-                    || (cursor.offset == prior && window == BUDGET && prior + window < len)
-                {
-                    cursor.invalidate();
+                if cursor.discarding || line.len() as u64 >= MAX_RECORD {
+                    cursor.discard_oversize();
                     cursor.discarding = true;
                     cursor.offset += line.len() as u64;
                 }
@@ -97,11 +117,15 @@ impl Slice {
             if std::mem::take(&mut cursor.discarding) {
                 continue;
             }
+            if line.len() as u64 > MAX_RECORD {
+                cursor.discard_oversize();
+                continue;
+            }
             cursor.observe(line, started, sampled);
         }
-        // Partial appends do not advance a valid anchor. A budget boundary
-        // or an oversized record leaves the state unknown until caught up.
-        caught_up &= !cursor.discarding;
+        // A record beyond the size limit may contain a turn boundary. Wait
+        // for a new verified start before trusting later evidence.
+        caught_up &= !cursor.lost_anchor;
         let changed = cursor.offset != prior;
         if changed {
             cursor.trailer = trailer(file, cursor.offset)?;
@@ -119,6 +143,10 @@ impl Slice {
         self.caught_up
             .then_some(self.cursor.turn.as_ref())
             .flatten()
+    }
+
+    pub fn incomplete(&self) -> bool {
+        !self.caught_up
     }
 
     pub fn activity(&self) -> Option<&Activity> {
@@ -140,7 +168,7 @@ impl Slice {
             })
         {
             ensure_state_writable(state)?;
-            let body = json!(["runtime-rollout-v1", self.identity, self.cursor]);
+            let body = json!([CURSOR_FORMAT, self.identity, self.cursor]);
             let signature = binding.sign_cursor(&serde_json::to_vec(&body)?);
             write_json(
                 &self.path,
@@ -156,6 +184,11 @@ impl Cursor {
     fn invalidate(&mut self) {
         self.turn = None;
         self.activity = None;
+    }
+
+    fn discard_oversize(&mut self) {
+        self.invalidate();
+        self.lost_anchor = true;
     }
 
     fn observe(&mut self, line: &[u8], started: u64, sampled: u64) {
@@ -216,6 +249,9 @@ impl Cursor {
                     progress: point,
                     event: TurnEvent::Active,
                 });
+                if at > started {
+                    self.lost_anchor = false;
+                }
             }
             return;
         }
@@ -308,7 +344,7 @@ fn load(path: &Path, identity: &str, binding: &RuntimeBinding) -> Option<Cursor>
     let signed: Value = serde_json::from_slice(&bytes).ok()?;
     let body = &signed["body"];
     let signature = signed["signature"].as_str()?;
-    if body[0] != "runtime-rollout-v1"
+    if body[0] != CURSOR_FORMAT
         || body[1] != identity
         || !binding.verifies_cursor(&serde_json::to_vec(body).ok()?, signature)
     {

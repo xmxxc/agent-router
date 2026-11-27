@@ -47,6 +47,12 @@ pub(super) struct Observation {
     rollout: Option<Rollout>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ReadMode {
+    Poll,
+    Status,
+}
+
 struct Rollout {
     file: File,
     stamp: FileStamp,
@@ -145,13 +151,13 @@ fn turn_evidence(session: Uuid, id: &str, point: rollout::Point) -> Value {
 }
 
 impl Observation {
-    pub fn read(state: &Path, row: &Value) -> Option<Self> {
+    pub fn read(state: &Path, row: &Value, mode: ReadMode) -> Option<Self> {
         let ticket = target(state, row)?;
         let binding = crate::bundled::runtime_binding(state, ticket).ok()??;
         let started_us = round_started(row)?;
         let sampled_us = epoch_us(SystemTime::now())?;
         let rollout = if binding.state == crate::bundled::RuntimeState::Online {
-            owned_rollout(state, row, ticket, &binding, started_us)
+            owned_rollout(state, row, ticket, &binding, started_us, mode)
         } else {
             None
         };
@@ -167,6 +173,24 @@ impl Observation {
             sampled_us,
             rollout,
         })
+    }
+
+    pub fn status(&self, input_us: Option<u64>) -> Option<Value> {
+        let (kind, message_type, fault) = match self.notice(max_turn(), stall_after(), input_us) {
+            Some(notice) => (notice.kind, notice.message_type, notice.fault),
+            None if self
+                .rollout
+                .as_ref()
+                .is_some_and(|rollout| rollout.slice.incomplete()) =>
+            {
+                ("runtime_evidence_incomplete", "unknown", Value::Null)
+            }
+            None => return None,
+        };
+        Some(
+            json!({"type":message_type,"kind":kind,"executionId":self.execution,
+            "executionGeneration":self.generation,"fault":fault}),
+        )
     }
 
     pub fn current(&self, state: &Path, row: &Value) -> bool {
@@ -382,6 +406,7 @@ fn owned_rollout(
     ticket: &Value,
     binding: &crate::bundled::RuntimeBinding,
     started_us: u64,
+    mode: ReadMode,
 ) -> Option<Rollout> {
     let pid = binding.worker["pid"].as_u64()?;
     let dispatch = row["dispatch"].as_str().filter(|id| valid_id(id))?;
@@ -487,6 +512,7 @@ fn owned_rollout(
         &mut file,
         stamp.2,
         started_us,
+        mode,
     )?;
     let rollout = Rollout {
         file,

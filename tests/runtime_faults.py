@@ -439,6 +439,96 @@ class RuntimeFaults(unittest.TestCase):
         for secret in ("fixture-command", "private-arg", "private-output"):
             self.assertNotIn(secret, json.dumps(history))
 
+    def test_read_only_status_finds_fault_after_more_than_one_poll_window(self):
+        for _ in range(240):
+            self.append("response_item", {"type": "function_call_output", "call_id": "controlled",
+                                          "output": "x" * 5000})
+        turn = self.finish("usage_limit_exceeded")
+        self.assertGreater(self.log.stat().st_size, 1024 * 1024)
+
+        def snapshot():
+            return {p.relative_to(self.state): (p.stat().st_mode, p.read_bytes())
+                    for p in self.state.rglob("*") if p.is_file()}
+
+        before = snapshot()
+        for _ in range(2):
+            row, = self.cli("status", "--dispatch", self.dispatch)["dispatches"]
+            self.assertEqual(row["runtimeObservation"]["fault"]["category"], "quota")
+            self.assertEqual(row["runtimeObservation"]["fault"]["evidence"]["turn"], turn)
+            self.assertEqual(row["messages"], [])
+            self.assertEqual(snapshot(), before)
+
+    def test_long_completed_command_recovers_and_preserves_same_turn_terminal(self):
+        stall = {"WFC_ACTIVITY_AFTER": ".06", "WFC_MAX_TURN_SECONDS": "0"}
+        quiet = {**stall, "WFC_ACTIVITY_AFTER": "10"}
+        turn = self.turn("task_started")
+        time.sleep(.08)
+        first, = self.wait(env=stall)
+        self.cli("ack", first["messageId"])
+
+        self.writer.write(json.dumps({
+            "timestamp": now(), "type": "event_msg",
+            "payload": {"type": "item_completed", "turn_id": turn, "item": {
+                "type": "CommandExecution", "id": "exec-long", "status": "completed",
+                "exit_code": 0, "command": ["true"],
+                "aggregated_output": "private-output" * (1024 * 80),
+            }},
+        }))
+        self.writer.flush()
+        self.assertEqual(self.wait(code=3, env=quiet), [])
+        self.writer.write("\n")
+        self.writer.flush()
+        recovered, = self.wait(env=quiet)
+        self.assertEqual(recovered["kind"], "runtime_recovered")
+        self.assertEqual(recovered["runtimeEvidence"]["turn"], turn)
+        self.assertNotIn("private-output", json.dumps(recovered))
+        self.assertEqual(self.wait(code=3, env=quiet), [])
+
+        self.finish("usage_limit_exceeded", turn)
+        fault, = self.wait(env=quiet)
+        self.assertEqual(fault["fault"]["category"], "quota")
+        self.assertEqual(fault["fault"]["evidence"]["turn"], turn)
+        history = self.cli("status", "--dispatch", self.dispatch)["dispatches"][0]["messages"]
+        self.assertEqual([(m["messageId"], m["state"]) for m in history],
+                         [(first["messageId"], "processed"),
+                          (recovered["messageId"], "received"), (fault["messageId"], "received")])
+
+    def test_read_limits_keep_unobserved_turn_unknown(self):
+        stall = {"WFC_ACTIVITY_AFTER": ".06", "WFC_MAX_TURN_SECONDS": "0"}
+        turn = self.turn("task_started")
+        time.sleep(.08)
+        first, = self.wait(env=stall)
+        self.cli("ack", first["messageId"])
+        self.append("event_msg", {"type": "item_completed", "turn_id": turn, "item": {
+            "type": "CommandExecution", "id": "exec-oversize", "status": "completed",
+            "exit_code": 0, "command": ["true"], "aggregated_output": "x" * (4 * 1024 * 1024),
+        }})
+        self.complete(turn)
+        for _ in range(2):
+            self.assertEqual(self.wait(code=3, env=stall), [])
+        row, = self.cli("status", "--dispatch", self.dispatch, env=stall)["dispatches"]
+        self.assertEqual(row["runtimeObservation"]["kind"], "runtime_evidence_incomplete")
+        self.assertEqual(row["runtimeObservation"]["type"], "unknown")
+        self.assertEqual([m["messageId"] for m in row["messages"]], [first["messageId"]])
+
+        # Start a provably new turn beyond the read-only catch-up limit.
+        for _ in range(18):
+            self.append("response_item", {"type": "function_call_output", "call_id": "controlled",
+                                          "output": "x" * (512 * 1024)})
+        self.finish("usage_limit_exceeded")
+        row, = self.cli("status", "--dispatch", self.dispatch, env=stall)["dispatches"]
+        self.assertEqual(row["runtimeObservation"]["kind"], "runtime_evidence_incomplete")
+        for _ in range(12):
+            code, messages = self.raw_wait(stall)
+            if code == 0:
+                fault, = messages
+                self.assertEqual(fault["fault"]["category"], "quota")
+                break
+            self.assertEqual((code, messages), (3, []))
+        else:
+            self.fail("polls did not reach the new turn")
+        self.assertEqual(self.wait(code=3, env=stall), [])
+
     def test_large_rollout_catches_up_across_fresh_wait_processes(self):
         stall = {"WFC_ACTIVITY_AFTER": ".07", "WFC_MAX_TURN_SECONDS": "0"}
         turn = self.turn("task_started")

@@ -1007,24 +1007,20 @@ fn status_with_history(
                 .cloned(),
         );
         #[cfg(target_os = "linux")]
-        if let Some(notice) = runtime_row.and_then(|before| {
+        if let Some(observation) = runtime_row.and_then(|before| {
             let dispatch = before["dispatch"].as_str()?;
             let current = assignment::public_record(&dir, dispatch).ok()??;
             if current != before {
                 return None;
             }
-            let sample = runtime_fault::Observation::read(&state, &current)?;
-            sample
-                .notice(
-                    runtime_fault::max_turn(),
-                    runtime_fault::stall_after(),
-                    runtime_fault::last_accepted_input(record, &messages),
-                )
-                .map(|notice| (sample, notice))
+            let sample = runtime_fault::Observation::read(
+                &state,
+                &current,
+                runtime_fault::ReadMode::Status,
+            )?;
+            sample.status(runtime_fault::last_accepted_input(record, &messages))
         }) {
-            let (sample, notice) = notice;
-            record["runtimeObservation"] = json!({"type":notice.message_type,"kind":notice.kind,
-                "executionId":sample.execution,"executionGeneration":sample.generation,"fault":notice.fault});
+            record["runtimeObservation"] = observation;
         }
         project_dispatch(record, &messages, id.is_some())?;
     }

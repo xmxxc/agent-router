@@ -152,7 +152,7 @@ bundled Codex 提醒或续派若明确未写出首帧、账本暂时无法结算
 
 Linux bundled Codex worker 的运行中观察使用同一收件箱。可归属的 Codex 终态错误记录为 `host_error`，明确额度耗尽的 `fault.category` 为 `quota`。普通终态 429 保留其错误码和 HTTP 状态。终态须对应本轮已验证的 Codex 回合起点。启动一次重试本身不会结束已有故障，恢复需要同一 rollout 的实质进展或成功终态。暂时读不到运行时的情况仍使用现有的未知状态。监测到已上报的故障后有新活动时，`runtime_recovered` 回执记录恢复证据。
 
-`status` 以只读方式显示当前 `runtimeObservation`，`wait` 和 `relay` 发布回执。证据只包含结构化错误类型、时间和执行标识。已发回执按逻辑轮次和物理执行去重，重启后仍可按原号查询和确认。轮次时限用 `WFC_MAX_TURN_SECONDS` 设置，默认 3600 秒。已接受的回复或 nudge 会更新时限起点。没有近期日志进展的在途 Codex 回合可按 `WFC_ACTIVITY_AFTER` 或 relay 的 `--stall-after` 报告，默认 300 秒。对应阈值设为 0 会关闭该计时。等待 `wfc ask` 的回复期间保持原有等待状态。
+`status` 以只读方式显示当前 `runtimeObservation`，`wait` 和 `relay` 发布回执。每个 worker 的只读查询从已校验的游标继续，最多查阅 8 MiB 新日志。候选证据超出读取范围或单条记录超过 4 MiB 后尚未找到可信回合起点时，查询可显示 `runtime_evidence_incomplete`。证据只包含结构化错误类型、时间和执行标识。已发回执按逻辑轮次和物理执行去重，重启后仍可按原号查询和确认。轮次时限用 `WFC_MAX_TURN_SECONDS` 设置，默认 3600 秒。已接受的回复或 nudge 会更新时限起点。没有近期日志进展的在途 Codex 回合可按 `WFC_ACTIVITY_AFTER` 或 relay 的 `--stall-after` 报告，默认 300 秒。对应阈值设为 0 会关闭该计时。等待 `wfc ask` 的回复期间保持原有等待状态。
 
 总控重启后，运行 `wfc status --dispatch ID`，从 `dispatches[0].messages` 找回原消息。历史按提交顺序排列，查询不会改变回执。处理完报告后，用消息的数字编号或稳定编号运行 `wfc ack MESSAGE`。回执变为 `processed`，版本增加一次。并发确认时只有一个调用实际推进状态，其余调用和稍后的重试返回同一版本，并标记 `duplicate: true`。
 

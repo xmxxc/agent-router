@@ -1,7 +1,7 @@
 //! Publish live observations through the ordinary Inbox transaction.
 use super::{recovery, Assignment, Inbox, Message};
 use crate::workflow::{
-    runtime_fault::{host_identity, last_accepted_input, Notice, Observation},
+    runtime_fault::{host_identity, last_accepted_input, Notice, Observation, ReadMode},
     view,
 };
 use anyhow::Result;
@@ -72,7 +72,7 @@ pub(super) fn sample(state: &Path, dir: &Path, id: &str, scope: Option<&str>) ->
     {
         return None;
     }
-    let observed = Observation::read(state, row)?;
+    let observed = Observation::read(state, row, ReadMode::Poll)?;
     Some(Sample {
         stamps: generations.stamps(),
         assignment: serde_json::from_value(row.clone()).ok()?,
