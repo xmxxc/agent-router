@@ -141,7 +141,7 @@ subprocess.run([sys.argv[1], 'ask', '选甲,乙？', '--options', '甲,乙',
         self.assertEqual((message["dispatch"], message["attempt"]), (record["dispatch"], record["attempt"]))
         confirmed = self.data("ack", message["messageId"])
         self.assertEqual((confirmed["state"], confirmed["statusVersion"]), ("processed", 4))
-        self.assertEqual(json.loads(ledger.read_bytes())[1:], [dict(row, request_key=None) for row in worker_history])
+        self.assertEqual(json.loads(ledger.read_bytes())[1:], worker_history)
 
     def test_startup_failure_uses_the_existing_scope_and_ack(self):
         self.cli("dispatch", "--task", "task", "--role", "启动验证", "--scope", "failure",
