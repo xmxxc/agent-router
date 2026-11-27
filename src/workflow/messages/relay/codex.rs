@@ -91,9 +91,10 @@ pub(super) fn controller(thread: &str) -> Result<String> {
 }
 
 pub(super) fn refusal(
-    output: &mut fs::File,
+    stdout: &mut fs::File,
+    stderr: &mut fs::File,
     thread: &OsStr,
-    exit_code: i32,
+    check_capacity: bool,
 ) -> io::Result<Option<Outcome>> {
     // Codex 0.171.0 wraps the pre-insert QueueStore capacity error in the
     // thread/queue/add JSON-RPC diagnostic. Match the complete transcript.
@@ -102,18 +103,27 @@ pub(super) fn refusal(
         "queue cannot contain more than 100 submissions (code -32600)\n",
     )
     .as_bytes();
-    if exit_code == 1 && output.metadata()?.len() == FULL.len() as u64 {
-        output.rewind()?;
+    if check_capacity
+        && stdout.metadata()?.len() == 0
+        && stderr.metadata()?.len() == FULL.len() as u64
+    {
+        stderr.rewind()?;
         let mut transcript = [0; FULL.len()];
-        output.read_exact(&mut transcript)?;
+        stderr.read_exact(&mut transcript)?;
         if transcript == FULL {
             return Ok(Some(Outcome::TargetFull));
         }
     }
-    Ok(missing_rollout(output, thread)?.then_some(Outcome::Missing))
+    let Some(stdout_refused) = missing_rollout(stdout, thread)? else {
+        return Ok(None);
+    };
+    Ok(missing_rollout(stderr, thread)?
+        .is_some_and(|stderr_refused| stdout_refused || stderr_refused)
+        .then_some(Outcome::Missing))
 }
 
-fn missing_rollout(output: &mut fs::File, thread: &OsStr) -> io::Result<bool> {
+// None means unrelated output. Some(false) means the stream is whitespace only.
+fn missing_rollout(output: &mut fs::File, thread: &OsStr) -> io::Result<Option<bool>> {
     output.rewind()?;
     let length = output.metadata()?.len();
     let mut lines = BufReader::new(output.take(length));
@@ -123,13 +133,13 @@ fn missing_rollout(output: &mut fs::File, thread: &OsStr) -> io::Result<bool> {
         prefix.clear();
         let n = lines.by_ref().take(512).read_until(b'\n', &mut prefix)?;
         if n == 0 {
-            return Ok(refused);
+            return Ok(Some(refused));
         }
         if prefix.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
         if n == 512 && prefix.last() != Some(&b'\n') {
-            return Ok(false);
+            return Ok(None);
         }
         let line = String::from_utf8_lossy(&prefix);
         let mut diagnostic = line.trim();
@@ -156,7 +166,7 @@ fn missing_rollout(output: &mut fs::File, thread: &OsStr) -> io::Result<bool> {
         }
         // A historical refusal can occur before or after evidence of submission.
         // Only a complete transcript consisting of explicit refusals is conclusive.
-        return Ok(false);
+        return Ok(None);
     }
 }
 

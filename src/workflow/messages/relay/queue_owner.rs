@@ -4,6 +4,7 @@ use super::super::private_file;
 use super::codex::{codex_home, refusal};
 use super::codex_backoff::Backoff;
 use super::Outcome;
+use crate::workflow::{ensure_state_writable, state_dir};
 use anyhow::{ensure, Context, Result};
 use std::{
     env,
@@ -71,10 +72,19 @@ fn guard_group(cmd: &mut Command) -> io::Result<io::PipeWriter> {
     Ok(writer)
 }
 
-fn launch(thread: &OsStr, message: &OsStr) -> io::Result<(Child, fs::File, io::PipeWriter)> {
+fn capture_output() -> io::Result<fs::File> {
     let path = env::temp_dir().join(format!("wfc-queue-{}", Uuid::new_v4()));
     let output = private_file().create_new(true).open(&path)?;
     fs::remove_file(path)?;
+    Ok(output)
+}
+
+fn launch(
+    thread: &OsStr,
+    message: &OsStr,
+) -> io::Result<(Child, fs::File, fs::File, io::PipeWriter)> {
+    let stdout = capture_output()?;
+    let stderr = capture_output()?;
     let mut cmd = Command::new("codex");
     cmd.arg("queue")
         .arg("--thread")
@@ -84,13 +94,13 @@ fn launch(thread: &OsStr, message: &OsStr) -> io::Result<(Child, fs::File, io::P
         .arg("--resume")
         .env("CODEX_HOME", codex_home()?)
         .stdin(Stdio::null())
-        .stdout(output.try_clone()?)
-        .stderr(output.try_clone()?);
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?);
     // A session leader cannot move itself out of the owned process group.
     crate::workflow::worker_owner::new_session(&mut cmd);
     crate::workflow::controller::strip_credentials(&mut cmd);
     let lifetime = guard_group(&mut cmd)?;
-    Ok((cmd.spawn()?, output, lifetime))
+    Ok((cmd.spawn()?, stdout, stderr, lifetime))
 }
 
 fn completed(pid: libc::pid_t) -> io::Result<bool> {
@@ -142,8 +152,9 @@ pub fn run(parent: &OsStr, limit: &OsStr, thread: &OsStr, message: &OsStr) -> Re
     let start = Instant::now();
     let relay_alive = || unsafe { libc::getppid() == parent };
     ensure!(relay_alive(), "relay exited before queue launch");
+    let state = state_dir()?;
     let backoff = Backoff::new(
-        &crate::workflow::state_dir()?,
+        &state,
         thread.to_str().context("invalid Codex queue thread")?,
     )?;
     // SAFETY: this private, single-threaded supervisor owns only one invocation.
@@ -153,7 +164,7 @@ pub fn run(parent: &OsStr, limit: &OsStr, thread: &OsStr, message: &OsStr) -> Re
         "configure queue supervisor: {}",
         io::Error::last_os_error()
     );
-    let (mut child, mut output, _lifetime) = match launch(thread, message) {
+    let (mut child, mut stdout, mut stderr, _lifetime) = match launch(thread, message) {
         Ok(started) => started,
         Err(e) if e.raw_os_error() == Some(libc::E2BIG) => {
             return Ok(ExitCode::from(Outcome::TooLong as u8))
@@ -163,35 +174,44 @@ pub fn run(parent: &OsStr, limit: &OsStr, thread: &OsStr, message: &OsStr) -> Re
             return Ok(ExitCode::from(Outcome::Failed as u8));
         }
     };
-    let finished = loop {
-        let remaining = limit.saturating_sub(start.elapsed());
-        if remaining.is_zero() {
-            break Ok(false);
-        }
+    let observed = loop {
         match completed(child.id() as _) {
-            Ok(true) => break Ok(start.elapsed() < limit),
+            Ok(true) => break Ok(Some(start.elapsed())),
             Ok(false) => (),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
             Err(e) => break Err(e),
         }
-        if !relay_alive() {
-            break Ok(false);
+        let remaining = limit.saturating_sub(start.elapsed());
+        if remaining.is_zero() || !relay_alive() {
+            break Ok(None);
         }
         std::thread::sleep(remaining.min(Duration::from_millis(10)));
     };
     let status = stop_group(&mut child)?;
-    let outcome = if !finished? {
-        Outcome::Uncertain
-    } else if status.success() {
+    let outcome = match (observed?, status.code()) {
+        (Some(_), Some(0)) => Outcome::Delivered,
+        (Some(elapsed), Some(code)) => {
+            // Completed legacy outcomes keep their original ordering. Capacity
+            // requires observing the exit within the queue deadline.
+            refusal(
+                &mut stdout,
+                &mut stderr,
+                thread,
+                code == 1 && elapsed < limit,
+            )?
+            .unwrap_or(Outcome::Uncertain)
+        }
+        _ => Outcome::Uncertain,
+    };
+    if matches!(outcome, Outcome::Delivered | Outcome::TargetFull) {
+        // The inherited target lock still covers the cooldown update.
+        ensure_state_writable(&state)?;
+    }
+    if outcome == Outcome::Delivered {
         if let Err(e) = backoff.clear() {
             eprintln!("router relay: could not clear Codex queue cooldown: {e}");
         }
-        Outcome::Delivered
-    } else if let Some(code) = status.code() {
-        refusal(&mut output, thread, code)?.unwrap_or(Outcome::Uncertain)
-    } else {
-        Outcome::Uncertain
-    };
+    }
     if outcome == Outcome::TargetFull {
         let seconds = backoff
             .record_full()

@@ -47,8 +47,11 @@ mode = os.environ.get('OUTCOME')
 if mode == 'missing':
     print(' ' * 70000, flush=True)
     print('codex queue: Error: no rollout found for thread id ' + sys.argv[3], file=sys.stderr)
+elif mode == 'missing-stdout':
+    print('Error: no rollout found for thread id ' + sys.argv[3])
 elif mode in ('full', 'full-before-success', 'full-after-success', 'full-timeout',
-              'full-truncated', 'full-wrong-code', 'full-generic'):
+              'full-truncated', 'full-wrong-code', 'full-generic', 'full-only-stdout',
+              'full-extra-stderr', 'full-whitespace-stdout', 'full-exit-two'):
     if mode == 'full-after-success':
         print('Queued message receipt for thread ' + sys.argv[3], flush=True)
     error = FULL
@@ -56,11 +59,18 @@ elif mode in ('full', 'full-before-success', 'full-after-success', 'full-timeout
         error = 'codex queue: queue is full'
     if mode == 'full-wrong-code':
         error = error.replace('-32600', '-32603')
-    print(error, file=sys.stderr, flush=True, end='' if mode == 'full-truncated' else '\\n')
+    if mode == 'full-whitespace-stdout':
+        print(' ', flush=True)
+    channel = sys.stdout if mode == 'full-only-stdout' else sys.stderr
+    print(error, file=channel, flush=True, end='' if mode == 'full-truncated' else '\\n')
+    if mode == 'full-extra-stderr':
+        print(' ', file=sys.stderr, flush=True)
     if mode == 'full-before-success':
         print('Warning: message was queued, but could not resume thread', flush=True)
     if mode == 'full-timeout':
         time.sleep(5)
+if mode == 'full-exit-two':
+    sys.exit(2)
 sys.exit(1 if mode else 0)
 """)
         self.queue.chmod(0o700)
@@ -310,7 +320,9 @@ if Path(sys.argv[3] + '.full').exists():
         args = ("relay", "--codex", "--scope", "ours", "--for", ".6")
         unknown = []
         for mode in ("full-before-success", "full-after-success", "full-timeout",
-                     "full-truncated", "full-wrong-code", "full-generic"):
+                     "full-truncated", "full-wrong-code", "full-generic",
+                     "full-extra-stderr", "full-whitespace-stdout", "full-exit-two",
+                     "full-only-stdout"):
             with self.subTest(mode=mode):
                 receipt = self.publish("ours")
                 self.cli(*args, OUTCOME=mode, WFC_QUEUE_TIMEOUT=".3")
@@ -322,6 +334,72 @@ if Path(sys.argv[3] + '.full').exists():
                 self.assertEqual([(row["messageId"], row["state"], row["statusVersion"]) for row in rows],
                                  unknown)
                 self.assertEqual(len(self.calls()), 2 * len(unknown))
+
+    def test_pending_queue_result_rechecks_legacy_fence_before_changing_cooldown(self):
+        state = Path(self.env["WFC_STATE"])
+        state.mkdir()
+        cooldown = state / f"relay-codex-{self.thread}.json"
+        old = json.dumps({"boot_id": "previous boot", "started_ms": 0, "seconds": 4})
+        expected = []
+        for mode, entry in (("full", "router.db"), ("", "router.db-journal")):
+            with self.subTest(mode=mode):
+                cooldown.write_text(old)
+                receipt = self.publish("ours")
+                expected.append((receipt["messageId"], "unknown", 2))
+                gate = self.root / "gate"
+                gate.touch()
+                proc = self.foreground(4, OUTCOME=mode)
+                self.until(lambda: len(self.calls()) == len(expected))
+                fence = state / entry
+                fence.touch()
+                gate.unlink()
+                try:
+                    output = proc.communicate(timeout=6)
+                    self.assertEqual(proc.returncode, 1, output)
+                    self.assertIn("legacy state write blocked", output[1])
+                    self.assertEqual(fence.read_bytes(), b"")
+                    actual = cooldown.read_text() if cooldown.exists() else None
+                    self.assertEqual(actual, old)
+                finally:
+                    fence.unlink()
+                self.assertEqual([(row["messageId"], row["state"], row["statusVersion"])
+                                  for row in self.data("status")["undelivered"]], expected)
+
+    def test_late_exit_observation_preserves_legacy_results_and_skips_capacity_backoff(self):
+        def children(pid):
+            return [int(child) for child in Path(f"/proc/{pid}/task/{pid}/children").read_text().split()]
+
+        for index, (mode, expected) in enumerate((("", ("received", 3)),
+                                                   ("missing", ("unsent", 3)),
+                                                   ("full", ("unknown", 2)))):
+            with self.subTest(mode=mode):
+                scope = f"paused-{index}"
+                receipt = self.publish(scope)
+                gate = self.root / "gate"
+                gate.touch()
+                launched = time.monotonic()
+                proc = self.foreground(2.6, scope=scope, WFC_QUEUE_TIMEOUT="1.2", OUTCOME=mode)
+                self.until(lambda: len(self.calls()) > index)
+                supervisor, = children(proc.pid)
+                queue = next(pid for pid in children(supervisor)
+                             if b"/codex" in Path(f"/proc/{pid}/cmdline").read_bytes())
+                os.kill(supervisor, signal.SIGSTOP)
+                try:
+                    gate.unlink()
+                    self.until(lambda: Path(f"/proc/{queue}/stat").read_text().rsplit(")", 1)[1]
+                               .split()[0] == "Z")
+                    self.assertLess(time.monotonic() - launched, .6)
+                    time.sleep(1.35)
+                finally:
+                    os.kill(supervisor, signal.SIGCONT)
+                stdout, stderr = proc.communicate(timeout=6)
+                self.assertEqual(proc.returncode, int(mode == "missing"), (stdout, stderr))
+                self.assertNotIn("pausing new submissions", stderr)
+                dispatch = next(row["dispatch"] for row in self.data("status")["dispatches"]
+                                if row["scope"] == scope)
+                [row] = self.data("status", "--dispatch", dispatch)["dispatches"][0]["messages"]
+                self.assertEqual((row["messageId"], row["state"], row["statusVersion"]),
+                                 (receipt["messageId"], *expected))
 
     def test_two_relays_and_wait_claim_once_and_resolution_wins(self):
         first, second = self.publish("ours"), self.publish("ours")
@@ -381,7 +459,7 @@ if Path(sys.argv[3] + '.full').exists():
 
     def test_queue_outcomes_and_restart(self):
         args = ["relay", "--codex-thread", self.thread.upper(), "--scope", "ours", "--for", ".8"]
-        for mode in ("missing", "error", "timeout", "absent"):
+        for mode in ("missing", "missing-stdout", "error", "timeout", "absent"):
             with self.subTest(mode=mode):
                 m = self.publish("ours")
                 prior = len(self.calls())
@@ -393,7 +471,7 @@ if Path(sys.argv[3] + '.full').exists():
                     env = {"WFC_QUEUE_TIMEOUT": ".5"}
                 else:
                     env = {"OUTCOME": mode}
-                self.cli(*args, code=int(mode == "missing"), **env)
+                self.cli(*args, code=int(mode in ("missing", "missing-stdout")), **env)
                 (self.root / "gate").unlink(missing_ok=True)
                 if mode == "absent":
                     (self.root / "disabled").rename(self.queue)
