@@ -790,7 +790,7 @@ fn conversation(old: &Value, next: &Value) -> Result<Uuid> {
     Ok(id)
 }
 
-fn rollout_id(path: &Path) -> Option<Uuid> {
+pub(super) fn rollout_id(path: &Path) -> Option<Uuid> {
     let filename = path
         .file_name()?
         .to_str()?

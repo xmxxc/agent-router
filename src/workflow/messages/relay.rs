@@ -36,6 +36,7 @@ pub struct Relay<'a> {
     target: Target<'a, Option<&'a str>>,
     detach: bool,
     lifetime: Option<Duration>,
+    stall: Option<Duration>,
     owner_token: Option<&'a str>,
 }
 
@@ -106,13 +107,11 @@ impl<'a> Relay<'a> {
             (false, None, Some(url), Some(session)) => Target::OpenCode(opencode::Target::parse(url, session)?),
             _ => bail!("give exactly one controller: --codex, --codex-thread, or --opencode-url with --opencode-session"),
         };
-        if let Some(value) = opts.get("--stall-after") {
-            seconds(value)?;
-        }
         Ok(Self {
             scope: opts.get("--scope").copied(),
             target,
             detach,
+            stall: opts.get("--stall-after").map(|v| seconds(v)).transpose()?,
             lifetime: opts
                 .get("--for")
                 .map(|v| seconds(v))
@@ -164,6 +163,9 @@ impl<'a> Relay<'a> {
             if let Some(limit) = self.lifetime {
                 cmd.args(["--for", &limit.as_secs_f64().to_string()]);
             }
+            if let Some(stall) = self.stall {
+                cmd.args(["--stall-after", &stall.as_secs_f64().to_string()]);
+            }
             if let Some(token) = &token {
                 cmd.env("WFC_CONTROLLER_TOKEN", token)
                     .env_remove("WFC_OWNER_TOKEN");
@@ -202,6 +204,13 @@ impl<'a> Relay<'a> {
             Target::OpenCode(_) => None,
         };
         let mut scan = Scan::default();
+        let mut watch = super::runtime_fault::Watch::default();
+        let (max_turn, stall) = (
+            crate::workflow::runtime_fault::max_turn(),
+            self.stall
+                .unwrap_or_else(crate::workflow::runtime_fault::stall_after),
+        );
+        let mut observations = Vec::new();
         let mut recovery = Vec::new();
         let mut first = true;
         while !remaining().is_zero() {
@@ -210,6 +219,9 @@ impl<'a> Relay<'a> {
             if !was_first {
                 if recovery.is_empty() {
                     recovery = scan.batch(&state, None, self.scope, remaining());
+                }
+                if observations.is_empty() {
+                    observations = watch.poll(&state, None, self.scope, remaining());
                 }
                 let Some(current) =
                     scope_assignments(&state, self.scope, Some(assignments), || {
@@ -237,8 +249,14 @@ impl<'a> Relay<'a> {
                             preflight()?;
                             if self.scope.is_some() || !assignments.restricted {
                                 inbox.recover_startups(&mut scan, std::mem::take(&mut recovery))?;
+                                inbox.publish_runtime(
+                                    std::mem::take(&mut observations),
+                                    max_turn,
+                                    stall,
+                                )?;
                             } else {
                                 recovery.clear();
+                                observations.clear();
                             }
                             if backoff.is_some() && target_lock.is_none() {
                                 None

@@ -93,6 +93,28 @@ pub fn merged_history(row: &Value, ledger: Vec<Value>) -> Result<Vec<Value>> {
     Ok(history)
 }
 
+pub(super) fn awaiting_answer(row: &Value, history: &[Value]) -> bool {
+    let answered: std::collections::HashSet<_> = history
+        .iter()
+        .filter(|m| {
+            m["type"] == "reply"
+                && m["round"] == row["round"]
+                && m["attempt"] == row["attempt"]
+                && m["inputResult"] == "accepted"
+        })
+        .filter_map(|m| m["questionMessageId"].as_str())
+        .collect();
+    history.iter().any(|m| {
+        m["type"] == "question"
+            && m["dispatch"] == row["dispatch"]
+            && m["round"] == row["round"]
+            && m["attempt"] == row["attempt"]
+            && m["messageId"]
+                .as_str()
+                .is_none_or(|id| !answered.contains(id))
+    })
+}
+
 pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: bool) -> Result<()> {
     let mut rounds = row
         .get("rounds")
@@ -211,28 +233,22 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
             current = round["state"].as_str().unwrap_or("unknown").to_owned();
         }
     }
-    let answered: std::collections::HashSet<_> = history
-        .iter()
-        .filter(|m| {
-            m["type"] == "reply"
-                && m["round"] == row["round"]
-                && m["attempt"] == row["attempt"]
-                && m["inputResult"] == "accepted"
-        })
-        .filter_map(|m| m["questionMessageId"].as_str())
-        .collect();
-    let awaiting_answer = history.iter().any(|m| {
-        m["type"] == "question"
-            && m["dispatch"] == row["dispatch"]
-            && m["round"] == row["round"]
-            && m["attempt"] == row["attempt"]
-            && m["messageId"]
-                .as_str()
-                .is_none_or(|id| !answered.contains(id))
-    });
+    let waiting = awaiting_answer(row, history);
     let (state, status) = match current.as_str() {
         "completed" => ("done", "completed"),
-        "running" if alive == Some(true) && awaiting_answer => ("asking", "waiting-human"),
+        "running" if alive == Some(true) && waiting => ("asking", "waiting-human"),
+        "running" if alive == Some(true) && row["runtimeObservation"]["type"] == "blocked" => {
+            ("blocked", "blocked")
+        }
+        "running"
+            if alive == Some(true)
+                && matches!(
+                    row["runtimeObservation"]["type"].as_str(),
+                    Some("unknown" | "stalled")
+                ) =>
+        {
+            ("unknown", "unknown")
+        }
         "running" if alive == Some(true) => ("working", "online"),
         "failed" if row["worker"]["state"] == "not_started" => ("not_started", "failed"),
         "failed" => ("exited", "failed"),
@@ -266,6 +282,9 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
         row["status"] = json!("reclaimed");
         row["lifecycle"] = json!("reclaimed");
     }
+    if waiting || matches!(status, "completed" | "cancelled") || row["status"] == "reclaimed" {
+        row.as_object_mut().unwrap().remove("runtimeObservation");
+    }
     row["backendAlive"] = json!(alive);
     if row["backend"] == "tmux" {
         row["tmuxAlive"] = json!(alive);
@@ -281,6 +300,29 @@ pub fn project(row: &mut Value, history: &[Value], alive: Option<bool>, named: b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_online_worker_projects_fault_until_activity_and_respects_questions() -> Result<()> {
+        let row = json!({"dispatch":"d-00000014","attempt":"a-000000000014","round":1,
+            "backend":"bundled","worker":{"state":"running"}});
+        let mut observed = row.clone();
+        observed["runtimeObservation"] = json!({"type":"blocked","fault":{"category":"quota"}});
+        project(&mut observed, &[], Some(true), true)?;
+        assert_eq!(observed["status"], "blocked");
+        assert_eq!(observed["backendAlive"], true);
+
+        let question = json!({"dispatch":row["dispatch"],"attempt":row["attempt"],
+            "round":1,"type":"question","messageId":"question"});
+        project(&mut observed, &[question], Some(true), true)?;
+        assert_eq!(observed["status"], "waiting-human");
+        assert!(observed.get("runtimeObservation").is_none());
+
+        let mut recovered = row;
+        project(&mut recovered, &[], Some(true), true)?;
+        assert_eq!(recovered["status"], "online");
+        assert!(recovered.get("runtimeObservation").is_none());
+        Ok(())
+    }
 
     #[test]
     fn delivery_fields_follow_one_version_in_either_snapshot_order() -> Result<()> {

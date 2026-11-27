@@ -163,7 +163,7 @@ impl Generations {
         }
     }
 
-    fn published(&self) -> Option<&Value> {
+    pub(super) fn published(&self) -> Option<&Value> {
         self.published
             .as_ref()
             .filter(|_| !self.damaged)
@@ -282,7 +282,7 @@ impl Scan {
     }
 }
 
-fn dispatch_filename(name: &[u8]) -> Option<&str> {
+pub(super) fn dispatch_filename(name: &[u8]) -> Option<&str> {
     std::str::from_utf8(name)
         .ok()?
         .strip_suffix(".json")

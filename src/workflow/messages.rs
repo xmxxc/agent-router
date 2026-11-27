@@ -7,6 +7,8 @@ mod recovery;
 pub mod relay;
 #[cfg(target_os = "linux")]
 mod reply;
+#[cfg(target_os = "linux")]
+mod runtime_fault;
 pub use receipt::{Confirm, ACK_USAGE, RESOLVE_USAGE};
 use receipt::{Delivery, Resolution, State};
 #[cfg(target_os = "linux")]
@@ -411,6 +413,7 @@ struct Message {
 #[serde(rename_all = "lowercase")]
 enum MessageKind {
     StartupFailure,
+    RuntimeObservation,
     Done,
     Question,
     Reply,
@@ -591,6 +594,8 @@ impl Message {
             == Some("startup_failure")
         {
             MessageKind::StartupFailure
+        } else if self.additional_fields.contains_key("runtimeEvidence") {
+            MessageKind::RuntimeObservation
         } else if let Some(input) = &self.worker_input {
             input.kind()
         } else if self.reply_payload.is_some() {
@@ -617,7 +622,10 @@ impl Message {
     fn is_controller_message(&self) -> bool {
         matches!(
             self.kind(),
-            MessageKind::Done | MessageKind::Question | MessageKind::StartupFailure
+            MessageKind::Done
+                | MessageKind::Question
+                | MessageKind::StartupFailure
+                | MessageKind::RuntimeObservation
         )
     }
 
@@ -636,6 +644,12 @@ impl Message {
                 && self.delivery.state == State::Received;
         }
         match self.kind() {
+            MessageKind::RuntimeObservation => {
+                self.question_payload.is_none()
+                    && self.reply_payload.is_none()
+                    && self.request_key.is_some()
+                    && self.additional_fields["runtimeEvidence"].is_object()
+            }
             MessageKind::StartupFailure => {
                 self.question_payload.is_none()
                     && self.reply_payload.is_none()
@@ -664,13 +678,9 @@ impl Message {
         body
     }
 
-    fn is_startup_failure(&self) -> bool {
-        self.kind() == MessageKind::StartupFailure
-    }
-
     fn message_type(&self) -> &str {
         match self.kind() {
-            MessageKind::StartupFailure => self
+            MessageKind::StartupFailure | MessageKind::RuntimeObservation => self
                 .additional_fields
                 .get("type")
                 .and_then(Value::as_str)
@@ -695,9 +705,20 @@ impl Message {
             return question.body(&self.worker);
         }
         let mut body = self.original_body();
-        if self.is_startup_failure() {
+        if matches!(
+            self.kind(),
+            MessageKind::StartupFailure | MessageKind::RuntimeObservation
+        ) {
             body.insert("scope".into(), json!(self.worker.scope()));
-            for key in ["kind", "host", "message", "fault"] {
+            for key in [
+                "kind",
+                "host",
+                "message",
+                "fault",
+                "runtimeEvidence",
+                "executionId",
+                "executionGeneration",
+            ] {
                 if let Some(value) = self.additional_fields.get(key) {
                     body.insert(key.into(), value.clone());
                 }
@@ -1836,7 +1857,10 @@ pub(super) fn history(state: &Path, dispatch: &str) -> Result<Vec<Value>> {
         .map(|m| {
             let mut view = m.view();
             match m.kind() {
-                MessageKind::Done | MessageKind::Question | MessageKind::StartupFailure => {
+                MessageKind::Done
+                | MessageKind::Question
+                | MessageKind::StartupFailure
+                | MessageKind::RuntimeObservation => {
                     view["to"] = json!("controller");
                     view["delivered"] = json!(m.delivery.delivered());
                 }
@@ -2284,6 +2308,13 @@ impl<'a> Wait<'a> {
         let start = Instant::now();
         #[cfg(target_os = "linux")]
         let (mut scan, mut pending, mut first) = (recovery::Scan::default(), None, true);
+        #[cfg(target_os = "linux")]
+        let mut watch = runtime_fault::Watch::default();
+        #[cfg(target_os = "linux")]
+        let (max_turn, stall) = (
+            super::runtime_fault::max_turn(),
+            super::runtime_fault::stall_after(),
+        );
         loop {
             let preflight = || {
                 controller::Owners::read(&state)?.preflight(self.scope, token.as_deref(), "wait")
@@ -2299,7 +2330,9 @@ impl<'a> Wait<'a> {
                     self.timeout.saturating_sub(start.elapsed())
                 };
                 first = false;
-                pending = Some(scan.poll(&state, self.dispatch, self.scope, allowance));
+                let startup = scan.poll(&state, self.dispatch, self.scope, allowance);
+                let runtime = watch.poll(&state, self.dispatch, self.scope, allowance);
+                pending = Some((startup, runtime));
             }
             let batch = match Inbox::try_open(&state)? {
                 Some(mut inbox) => {
@@ -2307,8 +2340,9 @@ impl<'a> Wait<'a> {
                     #[cfg(target_os = "linux")]
                     let mut advance = None;
                     #[cfg(target_os = "linux")]
-                    if let Some(batch) = pending.take() {
+                    if let Some((batch, observations)) = pending.take() {
                         inbox.recover_startups(&mut scan, batch.candidates)?;
+                        inbox.publish_runtime(observations, max_turn, stall)?;
                         advance = batch.advance;
                         more = batch.more;
                     }

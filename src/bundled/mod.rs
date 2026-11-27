@@ -455,6 +455,76 @@ pub(crate) fn confirm_resume_start(state: &Path, ticket: &Value, identity: &Valu
         && store.signed("ready")? == *identity)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeState {
+    Online,
+    Disconnected,
+    Exited,
+}
+
+#[derive(PartialEq, Eq)]
+pub(crate) struct RuntimeBinding {
+    pub worker: Value,
+    service: Value,
+    kernel: Value,
+    pub state: RuntimeState,
+}
+
+impl RuntimeBinding {
+    fn live_state(&self) -> Option<RuntimeState> {
+        if store::process_state(&self.worker) != "alive" {
+            return None;
+        }
+        match (store::process_state(&self.service), store::process_state(&self.kernel)) {
+            ("alive", "alive") => Some(RuntimeState::Online),
+            ("exited", _) | (_, "exited") => Some(RuntimeState::Disconnected),
+            _ => None,
+        }
+    }
+
+    pub fn current(&self) -> bool {
+        self.state == RuntimeState::Exited || self.live_state() == Some(self.state)
+    }
+}
+
+// Use the same signed ready/current records as inspect without waiting for a
+// potentially disconnected socket. Read locks here never wait on a publisher.
+pub(crate) fn runtime_binding(state: &Path, ticket: &Value) -> Result<Option<RuntimeBinding>> {
+    let (unit, guard) = unit_lock_file(state, field(ticket, "unit")?)?;
+    if guard.try_lock_shared().is_err() {
+        return Ok(None);
+    }
+    let Some((_, target)) = store::current(&unit)? else {
+        return Ok(None);
+    };
+    if ticket["version"] != 2 || target.ticket != *ticket || !store::ordered(&unit, &target)? {
+        return Ok(None);
+    }
+    let ready = target.signed("ready")?;
+    let mut binding = RuntimeBinding {
+        worker: ready["worker"].clone(),
+        service: ready["service"].clone(),
+        kernel: ready["kernel"].clone(),
+        state: RuntimeState::Exited,
+    };
+    match fs::symlink_metadata(target.run.join("cleanup.json")) {
+        Ok(_) => {
+            let proof = target.proof()?;
+            if !matches!(proof["state"].as_str(), Some("exited" | "faulted")) {
+                return Ok(None);
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let Some(live) = binding.live_state() else {
+                return Ok(None);
+            };
+            binding.state = live;
+        }
+        Err(e) => return Err(e.into()),
+    }
+    Ok(Some(binding))
+}
+
 fn operation_unit(state: &Path, name: &str, op: &str) -> Result<(PathBuf, File)> {
     if matches!(op, "close" | "input" | "resize" | "reconcile") {
         open_write_unit(state, name)

@@ -34,6 +34,8 @@ pub mod reclaim;
 #[cfg(target_os = "linux")]
 pub mod resume;
 #[cfg(target_os = "linux")]
+mod runtime_fault;
+#[cfg(target_os = "linux")]
 pub(crate) mod startup;
 mod view;
 
@@ -952,6 +954,9 @@ fn status_with_history(
     #[cfg(not(target_os = "linux"))]
     let read_only = false;
     for record in &mut dispatches {
+        #[cfg(target_os = "linux")]
+        let runtime_row =
+            (record["backend"] == "bundled" && record["host"] == "codex").then(|| record.clone());
         observe_dispatch(&state, &dir, record, read_only)?;
         record
             .as_object_mut()
@@ -999,6 +1004,26 @@ fn status_with_history(
                 })
                 .cloned(),
         );
+        #[cfg(target_os = "linux")]
+        if let Some(notice) = runtime_row.and_then(|before| {
+            let dispatch = before["dispatch"].as_str()?;
+            let current = assignment::public_record(&dir, dispatch).ok()??;
+            if current != before {
+                return None;
+            }
+            let sample = runtime_fault::Observation::read(&state, &current)?;
+            sample
+                .notice(
+                    runtime_fault::max_turn(),
+                    runtime_fault::stall_after(),
+                    runtime_fault::last_accepted_input(record, &messages),
+                )
+                .map(|notice| (sample, notice))
+        }) {
+            let (sample, notice) = notice;
+            record["runtimeObservation"] = json!({"type":notice.message_type,"kind":notice.kind,
+                "executionId":sample.execution,"executionGeneration":sample.generation,"fault":notice.fault});
+        }
         project_dispatch(record, &messages, id.is_some())?;
     }
     if active {
