@@ -396,6 +396,49 @@ class RuntimeFaults(unittest.TestCase):
         self.assertGreater(second["runtimeEvidence"]["progressOffset"],
                            first["runtimeEvidence"]["progressOffset"])
 
+    def test_only_completed_command_in_the_active_turn_recovers_stall(self):
+        stall = {"WFC_ACTIVITY_AFTER": ".06", "WFC_MAX_TURN_SECONDS": "0"}
+        turn = self.turn("task_started")
+        time.sleep(.08)
+        original, = self.wait(env=stall)
+        self.assertEqual(original["kind"], "stall_timeout")
+        self.cli("ack", original["messageId"])
+
+        item = {"type": "CommandExecution", "id": "exec-1", "status": "completed",
+                "exit_code": 7, "command": ["fixture-command", "", "private-arg"],
+                "aggregated_output": "private-output"}
+        payload = {"type": "item_completed", "turn_id": turn, "item": item}
+        self.append("event_msg", {**payload, "turn_id": str(uuid.uuid4())})
+        self.append("event_msg", {**payload, "type": "item_started"})
+        self.assertEqual(self.wait(code=3, env=stall), [])
+        for invalid in ({"id": ""}, {"status": "in_progress"}, {"status": "failed"},
+                        {"exit_code": None}, {"exit_code": "7"}, {"exit_code": 7.5},
+                        {"command": []}, {"command": [""]}, {"command": "fixture-command"},
+                        {"command": ["fixture-command", 7]}):
+            with self.subTest(invalid=invalid):
+                self.append("event_msg", {**payload, "item": {**item, **invalid}})
+                self.assertEqual(self.wait(code=3, env=stall), [])
+
+        # Even a parseable JSON object is incomplete until the line ends.
+        self.writer.write(json.dumps({"timestamp": now(), "type": "event_msg", "payload": payload}))
+        self.writer.flush()
+        self.assertEqual(self.wait(code=3, env=stall), [])
+        self.writer.write("\n")
+        self.writer.flush()
+
+        quiet = {**stall, "WFC_ACTIVITY_AFTER": "10"}
+        recovered, = self.wait(env=quiet)
+        self.assertEqual(recovered["kind"], "runtime_recovered")
+        self.assertEqual(recovered["runtimeEvidence"]["turn"], turn)
+        self.assertGreater(recovered["runtimeEvidence"]["offset"],
+                           original["runtimeEvidence"]["progressOffset"])
+        self.assertEqual(self.wait(code=3, env=quiet), [])
+        history = self.cli("status", "--dispatch", self.dispatch)["dispatches"][0]["messages"]
+        self.assertEqual([(m["messageId"], m["state"]) for m in history],
+                         [(original["messageId"], "processed"), (recovered["messageId"], "received")])
+        for secret in ("fixture-command", "private-arg", "private-output"):
+            self.assertNotIn(secret, json.dumps(history))
+
     def test_large_rollout_catches_up_across_fresh_wait_processes(self):
         stall = {"WFC_ACTIVITY_AFTER": ".07", "WFC_MAX_TURN_SECONDS": "0"}
         turn = self.turn("task_started")

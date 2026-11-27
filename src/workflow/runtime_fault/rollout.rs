@@ -261,6 +261,17 @@ fn progress_item(item: &Value) -> bool {
             Some("AgentMessage") => item["content"].is_array(),
             Some("Plan") => item["text"].is_string(),
             Some("Reasoning") => item["summary_text"].is_array() || item["raw_content"].is_array(),
+            Some("CommandExecution") => {
+                item["status"] == "completed"
+                    && item["exit_code"].as_i64().is_some()
+                    && item["command"].as_array().is_some_and(|command| {
+                        command
+                            .first()
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| !name.is_empty())
+                            && command.iter().all(Value::is_string)
+                    })
+            }
             Some("FunctionCallOutput") => {
                 item["name"].as_str().is_some_and(|name| !name.is_empty())
                     && (item["output"].is_string() || item["output"].is_array())
