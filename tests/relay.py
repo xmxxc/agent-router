@@ -17,6 +17,8 @@ import uuid
 
 WFC = str(Path(sys.argv.pop(1)).resolve())
 PREFIX = "[router] Messages for the controller: "
+QUEUE_FULL = ("Error: failed to queue session message: thread/queue/add failed: "
+              "queue cannot contain more than 100 submissions (code -32600)")
 
 
 class Relay(unittest.TestCase):
@@ -33,7 +35,7 @@ class Relay(unittest.TestCase):
         self.meta(self.thread)
         (self.root / "task").write_text("private relay test")
         self.queue = self.root / "codex"
-        self.queue.write_text(f"#!{sys.executable}\n" + """
+        self.queue.write_text(f"#!{sys.executable}\n" + f"FULL = {QUEUE_FULL!r}\n" + """
 import json, os, sys, time
 from pathlib import Path
 with open('calls', 'a') as f:
@@ -45,6 +47,20 @@ mode = os.environ.get('OUTCOME')
 if mode == 'missing':
     print(' ' * 70000, flush=True)
     print('codex queue: Error: no rollout found for thread id ' + sys.argv[3], file=sys.stderr)
+elif mode in ('full', 'full-before-success', 'full-after-success', 'full-timeout',
+              'full-truncated', 'full-wrong-code', 'full-generic'):
+    if mode == 'full-after-success':
+        print('Queued message receipt for thread ' + sys.argv[3], flush=True)
+    error = FULL
+    if mode == 'full-generic':
+        error = 'codex queue: queue is full'
+    if mode == 'full-wrong-code':
+        error = error.replace('-32600', '-32603')
+    print(error, file=sys.stderr, flush=True, end='' if mode == 'full-truncated' else '\\n')
+    if mode == 'full-before-success':
+        print('Warning: message was queued, but could not resume thread', flush=True)
+    if mode == 'full-timeout':
+        time.sleep(5)
 sys.exit(1 if mode else 0)
 """)
         self.queue.chmod(0o700)
@@ -199,6 +215,113 @@ subprocess.run([sys.argv[1], 'ask', '选甲,乙？', '--options', '甲,乙',
             by_thread.setdefault(cmd[2], []).append([m["messageId"] for m in batch])
         self.assertEqual(by_thread, {self.thread: [[m["messageId"] for m in initial], [later["messageId"]]],
                                      other_thread: [[other["messageId"]]]})
+
+    def test_queue_full_backoff_is_shared_by_thread_and_survives_relay_restart(self):
+        self.queue.write_text(f"#!{sys.executable}\n" + f"full = {QUEUE_FULL!r}\n" + r"""
+import json, sys, time
+from pathlib import Path
+with open('calls', 'a') as out:
+    out.write(json.dumps(sys.argv[1:]) + '\n')
+if Path(sys.argv[3] + '.full').exists():
+    while Path('release-refusal').exists():
+        time.sleep(.01)
+    print(full, file=sys.stderr)
+    sys.exit(1)
+""")
+        other_thread = str(uuid.uuid4())
+        self.rollout.with_name(f"rollout-time-{other_thread}.jsonl").write_text(
+            json.dumps({"type": "session_meta", "payload": {"id": other_thread}}))
+        full = self.root / (self.thread + ".full")
+        full.touch()
+        release = self.root / "release-refusal"
+        release.touch()
+        first = self.publish("ours")
+        original = self.foreground(1.25)
+        self.until(self.calls)
+        peer = self.publish("peer")
+        other = self.publish("theirs")
+        peer_relay = self.foreground(.9, scope="peer")
+        self.cli("relay", "--codex", "--scope", "theirs", "--for", ".65",
+                 CODEX_THREAD_ID=other_thread)
+        self.assertEqual([call[2] for call in self.calls()], [self.thread, other_thread])
+        release.unlink()
+        for proc in (peer_relay, original):
+            output = proc.communicate(timeout=5)
+            self.assertEqual(proc.returncode, 0, output)
+
+        later = self.publish("ours")
+        self.cli("relay", "--codex", "--scope", "ours", "--for", ".25")
+        self.assertEqual([call[2] for call in self.calls()], [self.thread, other_thread])
+        rows = self.data("status")["undelivered"]
+        self.assertEqual([(row["messageId"], row["state"], row["statusVersion"]) for row in rows],
+                         [(first["messageId"], "unknown", 2), (peer["messageId"], "unsent", 1),
+                          (later["messageId"], "unsent", 1)])
+        self.assertEqual(self.data("ack", other["messageId"])["state"], "processed")
+
+        full.unlink()
+        self.cli("relay", "--codex", "--scope", "ours", "--for", "3")
+        self.cli("relay", "--codex", "--scope", "peer", "--for", ".3")
+        calls = [json.loads(call[4][len(PREFIX):])["messages"] for call in self.calls()]
+        self.assertEqual([[row["messageId"] for row in batch] for batch in calls],
+                         [[first["messageId"]], [other["messageId"]],
+                          [later["messageId"]], [peer["messageId"]]])
+        for receipt in (later, peer):
+            self.assertEqual(self.data("ack", receipt["messageId"])["statusVersion"], 4)
+        [row] = self.data("status")["undelivered"]
+        self.assertEqual((row["messageId"], row["state"], row["statusVersion"]),
+                         (first["messageId"], "unknown", 2))
+        body = {k: row[k] for k in ("attempt", "head", "dirty", "report", "role", "round", "scope")}
+        digest = hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        self.data("resolve", first["messageId"], "--actor", "reviewer", "--reason", "observed",
+                  "--evidence", "private queue record", "--body-hash", digest)
+        self.assertEqual(self.data("ack", first["messageId"])["statusVersion"], 4)
+
+    def test_confirmed_full_delays_grow_and_success_resets_them(self):
+        def relay(seconds, **env):
+            return subprocess.run(
+                [WFC, "relay", "--codex", "--scope", "ours", "--for", str(seconds)],
+                cwd=self.root, env=dict(self.env, **env), capture_output=True, text=True,
+                timeout=10, check=True,
+            )
+
+        first = self.publish("ours")
+        rejection = relay(.5, OUTCOME="full")
+        second = self.publish("ours")
+        relay(.6, OUTCOME="full")
+        self.assertEqual(len(self.calls()), 1)
+        self.assertIn("pausing new submissions for 2s", rejection.stderr)
+        self.assertIn("pausing new submissions for 4s", relay(2, OUTCOME="full").stderr)
+        self.assertEqual(len(self.calls()), 2)
+
+        third = self.publish("ours")
+        relay(1.25)
+        self.assertEqual(len(self.calls()), 2)
+        relay(4)
+        self.assertEqual(len(self.calls()), 3)
+        self.assertEqual(self.data("ack", third["messageId"])["statusVersion"], 4)
+
+        fourth = self.publish("ours")
+        self.assertIn("pausing new submissions for 2s", relay(.7, OUTCOME="full").stderr)
+        calls = [json.loads(call[4][len(PREFIX):])["messages"] for call in self.calls()]
+        self.assertEqual([[row["messageId"] for row in batch] for batch in calls],
+                         [[r["messageId"]] for r in (first, second, third, fourth)])
+
+    def test_ambiguous_capacity_diagnostics_never_pause_new_messages(self):
+        args = ("relay", "--codex", "--scope", "ours", "--for", ".6")
+        unknown = []
+        for mode in ("full-before-success", "full-after-success", "full-timeout",
+                     "full-truncated", "full-wrong-code", "full-generic"):
+            with self.subTest(mode=mode):
+                receipt = self.publish("ours")
+                self.cli(*args, OUTCOME=mode, WFC_QUEUE_TIMEOUT=".3")
+                unknown.append((receipt["messageId"], "unknown", 2))
+                later = self.publish("ours")
+                self.cli(*args)
+                self.assertEqual(self.data("ack", later["messageId"])["statusVersion"], 4)
+                rows = self.data("status")["undelivered"]
+                self.assertEqual([(row["messageId"], row["state"], row["statusVersion"]) for row in rows],
+                                 unknown)
+                self.assertEqual(len(self.calls()), 2 * len(unknown))
 
     def test_two_relays_and_wait_claim_once_and_resolution_wins(self):
         first, second = self.publish("ours"), self.publish("ours")

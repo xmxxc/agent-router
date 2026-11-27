@@ -1,6 +1,7 @@
 //! Persist the claim before crossing the transport boundary. Only the exact
 //! still-outstanding claim can be settled when the transport returns.
 mod codex;
+mod codex_backoff;
 mod opencode;
 pub(crate) mod queue_owner;
 mod registration;
@@ -196,6 +197,10 @@ impl<'a> Relay<'a> {
             Target::OpenCode(_) => usize::MAX, // The batch is an HTTP body, not an argument.
         };
         let mut diagnosed = HashSet::new();
+        let backoff = match &target {
+            Target::Codex(thread) => Some(codex_backoff::Backoff::new(&state, thread)?),
+            Target::OpenCode(_) => None,
+        };
         let mut scan = Scan::default();
         let mut recovery = Vec::new();
         let mut first = true;
@@ -219,6 +224,10 @@ impl<'a> Relay<'a> {
                 break;
             }
             let order = transport_lock(&state, self.scope)?;
+            let target_lock = match (&backoff, &order) {
+                (Some(backoff), Some(_)) => backoff.try_ready()?,
+                _ => None,
+            };
             let batch = match &order {
                 Some(_)
                     if assignments.current_before_claim(&state, || remaining().is_zero())? =>
@@ -231,13 +240,17 @@ impl<'a> Relay<'a> {
                             } else {
                                 recovery.clear();
                             }
-                            claim_batch(
-                                &mut inbox,
-                                self.scope,
-                                &assignments,
-                                budget,
-                                &mut diagnosed,
-                            )?
+                            if backoff.is_some() && target_lock.is_none() {
+                                None
+                            } else {
+                                claim_batch(
+                                    &mut inbox,
+                                    self.scope,
+                                    &assignments,
+                                    budget,
+                                    &mut diagnosed,
+                                )?
+                            }
                         }
                         _ => None,
                     }
@@ -252,11 +265,20 @@ impl<'a> Relay<'a> {
                         let scope_lock = order
                             .as_ref()
                             .and_then(|(_, scope_lock)| scope_lock.as_ref());
-                        codex::queue(thread, &batch, &text, limit, scope_lock)?
+                        codex::queue(
+                            thread,
+                            &batch,
+                            &text,
+                            limit,
+                            scope_lock,
+                            target_lock.as_ref().expect("Codex claim holds target lock"),
+                        )?
                     }
                     Target::OpenCode(target) => target.deliver(&text, limit),
                 };
-                if outcome != Outcome::Uncertain {
+                // A full target pauses new claims. This batch already has
+                // unknown receipts and remains available for explicit resolution.
+                if !matches!(outcome, Outcome::Uncertain | Outcome::TargetFull) {
                     loop {
                         if let Some(mut inbox) = Inbox::try_open(&state)? {
                             settle(&mut inbox, &batch, outcome == Outcome::Delivered)?;
@@ -288,6 +310,7 @@ impl<'a> Relay<'a> {
                 // that reaches the retry path still waits below.
                 continue;
             }
+            drop(target_lock);
             drop(order);
             std::thread::sleep(remaining().min(Duration::from_millis(500)));
         }
@@ -361,6 +384,7 @@ pub(super) enum Outcome {
     Missing = 21,
     Uncertain = 22,
     TooLong = 23,
+    TargetFull = 24,
 }
 
 fn claim_batch(

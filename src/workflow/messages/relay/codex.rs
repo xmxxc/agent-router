@@ -90,7 +90,30 @@ pub(super) fn controller(thread: &str) -> Result<String> {
     )
 }
 
-pub(super) fn missing_rollout(output: &mut fs::File, thread: &OsStr) -> io::Result<bool> {
+pub(super) fn refusal(
+    output: &mut fs::File,
+    thread: &OsStr,
+    exit_code: i32,
+) -> io::Result<Option<Outcome>> {
+    // Codex 0.171.0 wraps the pre-insert QueueStore capacity error in the
+    // thread/queue/add JSON-RPC diagnostic. Match the complete transcript.
+    const FULL: &[u8] = concat!(
+        "Error: failed to queue session message: thread/queue/add failed: ",
+        "queue cannot contain more than 100 submissions (code -32600)\n",
+    )
+    .as_bytes();
+    if exit_code == 1 && output.metadata()?.len() == FULL.len() as u64 {
+        output.rewind()?;
+        let mut transcript = [0; FULL.len()];
+        output.read_exact(&mut transcript)?;
+        if transcript == FULL {
+            return Ok(Some(Outcome::TargetFull));
+        }
+    }
+    Ok(missing_rollout(output, thread)?.then_some(Outcome::Missing))
+}
+
+fn missing_rollout(output: &mut fs::File, thread: &OsStr) -> io::Result<bool> {
     output.rewind()?;
     let length = output.metadata()?.len();
     let mut lines = BufReader::new(output.take(length));
@@ -143,6 +166,7 @@ pub(super) fn queue(
     text: &str,
     limit: Duration,
     scope_lock: Option<&std::fs::File>,
+    target_lock: &std::fs::File,
 ) -> Result<Outcome> {
     let ids: Vec<_> = messages.iter().map(|m| m["id"].as_u64().unwrap()).collect();
     let mut supervisor = Command::new(env::current_exe()?);
@@ -153,16 +177,24 @@ pub(super) fn queue(
         .arg(limit.as_secs_f64().to_string())
         .arg(thread)
         .arg(text);
-    // The private supervisor keeps the claim's scope locked while it reaps a
-    // queue after relay death. Its external Codex child uses /dev/null.
-    let stdin = match scope_lock.map(std::fs::File::try_clone).transpose() {
-        Ok(stdin) => stdin,
+    // The supervisor holds both locks through queue cleanup and recording a
+    // cooldown, even if the relay dies. The Codex child replaces both fds.
+    let locks = scope_lock
+        .map(fs::File::try_clone)
+        .transpose()
+        .and_then(|scope| target_lock.try_clone().map(|target| (scope, target)));
+    let (scope_lock, target_lock) = match locks {
+        Ok(locks) => locks,
         Err(e) => {
-            println!("router relay: queue supervisor could not inherit scope lock for messages {ids:?}: {e}");
+            println!(
+                "router relay: queue supervisor could not inherit locks for messages {ids:?}: {e}"
+            );
             return Ok(Outcome::Failed);
         }
     };
-    supervisor.stdin(stdin.map_or_else(Stdio::null, Stdio::from));
+    supervisor
+        .stdin(scope_lock.map_or_else(Stdio::null, Stdio::from))
+        .stdout(Stdio::from(target_lock));
     crate::workflow::worker_owner::new_session(&mut supervisor);
     let mut child = match supervisor.spawn() {
         Ok(child) => child,
@@ -177,6 +209,7 @@ pub(super) fn queue(
         Some(code) if code == Outcome::Failed as i32 => Outcome::Failed,
         Some(code) if code == Outcome::TooLong as i32 => Outcome::TooLong,
         Some(code) if code == Outcome::Missing as i32 => Outcome::Missing,
+        Some(code) if code == Outcome::TargetFull as i32 => Outcome::TargetFull,
         _ => {
             println!("router relay: delivery of messages {ids:?} is uncertain");
             Outcome::Uncertain

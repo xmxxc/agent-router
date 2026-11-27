@@ -1,9 +1,10 @@
 //! A separate wfc survives loss of the relay long enough to stop this queue
 //! invocation's process group. A persistent host owns a separate group.
 use super::super::private_file;
-use super::codex::{codex_home, missing_rollout};
+use super::codex::{codex_home, refusal};
+use super::codex_backoff::Backoff;
 use super::Outcome;
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use std::{
     env,
     ffi::OsStr,
@@ -141,6 +142,10 @@ pub fn run(parent: &OsStr, limit: &OsStr, thread: &OsStr, message: &OsStr) -> Re
     let start = Instant::now();
     let relay_alive = || unsafe { libc::getppid() == parent };
     ensure!(relay_alive(), "relay exited before queue launch");
+    let backoff = Backoff::new(
+        &crate::workflow::state_dir()?,
+        thread.to_str().context("invalid Codex queue thread")?,
+    )?;
     // SAFETY: this private, single-threaded supervisor owns only one invocation.
     ensure!(
         unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) } != libc::SIG_ERR
@@ -154,18 +159,22 @@ pub fn run(parent: &OsStr, limit: &OsStr, thread: &OsStr, message: &OsStr) -> Re
             return Ok(ExitCode::from(Outcome::TooLong as u8))
         }
         Err(e) => {
-            println!("router relay: codex queue could not start: {e}");
+            eprintln!("router relay: codex queue could not start: {e}");
             return Ok(ExitCode::from(Outcome::Failed as u8));
         }
     };
     let finished = loop {
+        let remaining = limit.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            break Ok(false);
+        }
         match completed(child.id() as _) {
+            Ok(true) => break Ok(start.elapsed() < limit),
             Ok(false) => (),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
-            other => break other,
+            Err(e) => break Err(e),
         }
-        let remaining = limit.saturating_sub(start.elapsed());
-        if remaining.is_zero() || !relay_alive() {
+        if !relay_alive() {
             break Ok(false);
         }
         std::thread::sleep(remaining.min(Duration::from_millis(10)));
@@ -174,11 +183,23 @@ pub fn run(parent: &OsStr, limit: &OsStr, thread: &OsStr, message: &OsStr) -> Re
     let outcome = if !finished? {
         Outcome::Uncertain
     } else if status.success() {
+        if let Err(e) = backoff.clear() {
+            eprintln!("router relay: could not clear Codex queue cooldown: {e}");
+        }
         Outcome::Delivered
-    } else if status.code().is_some() && missing_rollout(&mut output, thread)? {
-        Outcome::Missing
+    } else if let Some(code) = status.code() {
+        refusal(&mut output, thread, code)?.unwrap_or(Outcome::Uncertain)
     } else {
         Outcome::Uncertain
     };
+    if outcome == Outcome::TargetFull {
+        let seconds = backoff
+            .record_full()
+            .context("record Codex queue cooldown")?;
+        eprintln!(
+            "router relay: Codex queue is full for thread {}; pausing new submissions for {seconds}s",
+            thread.to_string_lossy()
+        );
+    }
     Ok(ExitCode::from(outcome as u8))
 }
