@@ -14,6 +14,7 @@ env:
 
 jobs:
   windows-x64:
+    needs: linux-regression
     runs-on: windows-2022
     timeout-minutes: 45
     defaults:
@@ -23,7 +24,6 @@ jobs:
     env:
       TRIPLE: x86_64-pc-windows-msvc
       CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
-      ARTIFACT_NAME: wfc-product-windows-x64-${{ github.sha }}-attempt-${{ github.run_attempt }}
       PRODUCT_DIR: target/windows product
       PRODUCT_ZIP: wfc-windows-x64.zip
     steps:
@@ -157,8 +157,41 @@ jobs:
         if: ${{ !cancelled() && steps.verify.outcome == 'success' }}
         run: python tools/smoke.py $env:VERIFIED_EXE --kernel
       - name: Run the Windows product fixture on the extracted EXE
+        id: product-fixture
         if: ${{ !cancelled() && steps.verify.outcome == 'success' }}
-        run: python tests/windows_product.py $env:VERIFIED_EXE
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $fixtureOutput = @(python tests/windows_product.py $env:VERIFIED_EXE)
+          $fixtureExit = $LASTEXITCODE
+          $fixtureOutput
+          if ($fixtureExit -eq 0) {
+            $fixture = @{ status = 'passed' }
+            $artifactKind = 'product'
+          } elseif ($fixtureExit -eq 69 -and $env:RUNNER_ENVIRONMENT -ceq 'github-hosted') {
+            $fixture = $fixtureOutput[-1] | ConvertFrom-Json -NoEnumerate
+            if ($fixture -isnot [System.Management.Automation.PSCustomObject] -or
+                $fixture.status -isnot [string] -or $fixture.status -cne 'enclosing-windows-job') {
+              throw 'Missing enclosing Job classification'
+            }
+            $artifactKind = 'transport'
+          } else {
+            exit $fixtureExit
+          }
+
+          $download = Join-Path $env:PRODUCT_DIR 'download'
+          [ordered]@{
+            commit = $env:GITHUB_SHA
+            tree = $env:PRODUCT_TREE
+            run_id = $env:GITHUB_RUN_ID
+            run_attempt = $env:GITHUB_RUN_ATTEMPT
+            runner_environment = $env:RUNNER_ENVIRONMENT
+            fixture_exit_code = $fixtureExit
+            fixture = $fixture
+            native_desktop_verified = $false
+          } | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8 (Join-Path $download 'fixture-result.json')
+          "artifact_name=wfc-$artifactKind-windows-x64-$env:GITHUB_SHA-attempt-$env:GITHUB_RUN_ATTEMPT" >> $env:GITHUB_OUTPUT
+          "fixture_status=$($fixture.status)" >> $env:GITHUB_OUTPUT
+          exit 0
       - name: Check the packaged EXE for redistributable DLL imports
         if: ${{ !cancelled() && steps.verify.outcome == 'success' }}
         run: |
@@ -176,25 +209,34 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         id: upload
         with:
-          name: ${{ env.ARTIFACT_NAME }}
+          name: ${{ steps.product-fixture.outputs.artifact_name }}
           path: product/${{ env.PRODUCT_DIR }}/download/
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
       - name: Record the Actions download identity
         env:
+          ARTIFACT_NAME: ${{ steps.product-fixture.outputs.artifact_name }}
           ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
           ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
           ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          FIXTURE_STATUS: ${{ steps.product-fixture.outputs.fixture_status }}
         run: |
+          $manifest = Get-Content -Raw -LiteralPath (Join-Path $env:PRODUCT_DIR 'download/manifest.json') | ConvertFrom-Json
           @"
-          [Windows x64 product artifact]($env:ARTIFACT_URL)
+          [Windows x64 candidate download]($env:ARTIFACT_URL)
 
           - Name: $env:ARTIFACT_NAME
           - Artifact ID: $env:ARTIFACT_ID
           - Outer Actions ZIP SHA-256: $env:ARTIFACT_DIGEST
+          - Inner product ZIP SHA-256: $($manifest.zip.sha256)
+          - Extracted EXE SHA-256: $($manifest.exe.sha256)
           - Commit: $env:GITHUB_SHA
           - Tree: $env:PRODUCT_TREE
+          - Run: $env:GITHUB_RUN_ID, attempt $env:GITHUB_RUN_ATTEMPT
+          - Windows product fixture: $env:FIXTURE_STATUS (see fixture-result.json)
+
+          Release acceptance requires full independent review, a passing native fixture, and real Desktop verification of this EXE.
           "@ >> $env:GITHUB_STEP_SUMMARY
 
   linux-regression:

@@ -11,6 +11,12 @@ import time
 import uuid
 
 
+ENCLOSING_JOB_EXIT = 69
+ENCLOSING_JOB_STDERR = (
+    "Error: enclosing Windows Job prevents detachment\n\nCaused by:\n    permission denied\n"
+)
+
+
 class Process:
     api = ct.WinDLL("kernel32", use_last_error=True)
     api.OpenProcess.argtypes = (wt.DWORD, wt.BOOL, wt.DWORD)
@@ -182,7 +188,33 @@ def main(candidate, root, queue_only=False):
         return
 
     try:
-        relay = cli("relay", "--codex", "--scope", "original", "--detach", "--for", "18")
+        detach_args = ("relay", "--codex", "--scope", "original", "--detach", "--for", "18")
+        detach_result = cli(*detach_args, check=False)
+        if (detach_result.returncode == 1 and detach_result.stderr == ENCLOSING_JOB_STDERR
+                and detach_result.stdout == ""):
+            sys.stderr.write(detach_result.stderr)
+            # This diagnostic follows verified staging-process exit before relay activation.
+            status = cli("status")
+            if (status["waiters"] != [] or status["dispatches"] != []
+                    or queue.exists() or (state / "windows-bundled").exists()):
+                raise AssertionError("Unexpected lifecycle activity after refused relay detachment")
+            print(json.dumps({
+                "status": "enclosing-windows-job",
+                "command": ["wfc.exe", *detach_args],
+                "exit_code": detach_result.returncode,
+                "stderr": detach_result.stderr,
+                "stdout": detach_result.stdout,
+                "waiters": status["waiters"],
+                "dispatches": status["dispatches"],
+                "queue_fixture": "passed",
+                "detached_lifecycle": "not_run",
+            }))
+            return ENCLOSING_JOB_EXIT
+        if detach_result.returncode != 0:
+            raise AssertionError((
+                detach_args, detach_result.returncode, detach_result.stderr, detach_result.stdout,
+            ))
+        relay = json.loads(detach_result.stdout)
         relay_proc = pin(relay["process"], own_runtime=True)
         assert cli("status")["waiters"][0]["process"] == relay["process"]
         primary, report = dispatch("first", "original", "exit")
@@ -281,5 +313,5 @@ def main(candidate, root, queue_only=False):
 
 if __name__ == "__main__":
     args = [arg for arg in sys.argv[1:] if arg != "--queue-only"]
-    main(Path(args[0]).resolve(), Path(args[1] if len(args) > 1 else "target"),
-         queue_only="--queue-only" in sys.argv[1:])
+    sys.exit(main(Path(args[0]).resolve(), Path(args[1] if len(args) > 1 else "target"),
+                  queue_only="--queue-only" in sys.argv[1:]))
