@@ -1,0 +1,263 @@
+name: Windows product candidate
+on:
+  push:
+    branches: [rust-router/10-windows-native]
+
+permissions:
+  contents: read
+
+env:
+  WFC_BUILD_ID: ${{ github.sha }}
+  CARGO_BUILD_JOBS: '2'
+  PYTHONUTF8: '1'
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      TRIPLE: x86_64-pc-windows-msvc
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
+      ARTIFACT_NAME: wfc-product-windows-x64-${{ github.sha }}-attempt-${{ github.run_attempt }}
+      PRODUCT_DIR: target/windows product
+      PRODUCT_ZIP: wfc-windows-x64.zip
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify the candidate checkout
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $commit = git rev-parse HEAD
+          $tree = git rev-parse 'HEAD^{tree}'
+          if ($commit -cne $env:GITHUB_SHA) { throw "Unexpected checkout: $commit" }
+          "PRODUCT_TREE=$tree" >> $env:GITHUB_ENV
+          "Source commit $commit, tree $tree"
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        with:
+          version: '0.16.0'
+      - run: rustup toolchain install 1.96.1 --profile minimal
+      - run: python tools/prepare.py
+      - run: cargo +1.96.1 build --release --locked --target $env:TRIPLE --bin wfc
+      - name: Run the Windows workspace and public CLI tests
+        run: cargo +1.96.1 test --workspace --release --locked --target $env:TRIPLE --no-fail-fast
+      - name: Build the product ZIP and manifest
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $root = Join-Path $PWD $env:PRODUCT_DIR
+          $stage = New-Item -ItemType Directory (Join-Path $root 'package')
+          $download = New-Item -ItemType Directory (Join-Path $root 'download')
+          $exe = Join-Path $stage.FullName 'wfc.exe'
+          Copy-Item -LiteralPath "target/$env:TRIPLE/release/wfc.exe" -Destination $exe
+          $version = & $exe --version
+          if ($version -isnot [string] -or
+              $version -cnotmatch "^wfc \S+ \(Rust, $env:TRIPLE, release, build $env:GITHUB_SHA\)$") {
+            throw "Unexpected product version: $version"
+          }
+
+          Copy-Item -LiteralPath 'LICENSE-WFC' -Destination $stage.FullName
+          python tools/collect_notices.py $env:TRIPLE (Join-Path $stage.FullName 'bundled-notices')
+          @'
+          # WFC for Windows x64
+
+          Extract the whole ZIP into a folder of your choice. From PowerShell in that folder,
+          run `./wfc.exe --version` to identify the build and `./wfc.exe --help` for commands.
+          You can also add the folder to PATH.
+
+          The executable uses Windows system components including ConPTY. Public worker
+          dispatch requires a configured host such as Codex. For a host outside PATH, use
+          `--launch-config` with the appropriate executable paths. Python, tmux and an
+          external Herdr server are unnecessary for the bundled Windows runtime.
+
+          See `LICENSE-WFC` and `bundled-notices/` for licenses and source information.
+          The Actions download includes `manifest.json` beside this ZIP.
+          '@ | Set-Content -Encoding utf8 (Join-Path $stage.FullName 'README.md')
+
+          $zip = Join-Path $download.FullName $env:PRODUCT_ZIP
+          [IO.Compression.ZipFile]::CreateFromDirectory($stage.FullName, $zip)
+
+          function Get-FileIdentity($Path) {
+            $file = Get-Item -LiteralPath $Path
+            @{
+              name = $file.Name
+              bytes = $file.Length
+              sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+          }
+
+          [ordered]@{
+            commit = $env:GITHUB_SHA
+            tree = $env:PRODUCT_TREE
+            target = $env:TRIPLE
+            version = $version
+            run_id = $env:GITHUB_RUN_ID
+            run_attempt = $env:GITHUB_RUN_ATTEMPT
+            exe = Get-FileIdentity $exe
+            zip = Get-FileIdentity $zip
+          } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $download.FullName 'manifest.json')
+      - name: Verify the manifest and smoke-test the extracted EXE
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $root = Join-Path $PWD $env:PRODUCT_DIR
+          $download = Join-Path $root 'download'
+          $unpacked = Join-Path $root 'verified product'
+          $manifest = Get-Content -Raw -LiteralPath (Join-Path $download 'manifest.json') | ConvertFrom-Json
+          if ($manifest.commit -cne $env:GITHUB_SHA -or $manifest.tree -cne $env:PRODUCT_TREE -or
+              $manifest.target -cne $env:TRIPLE -or $manifest.run_id -cne $env:GITHUB_RUN_ID -or
+              $manifest.run_attempt -cne $env:GITHUB_RUN_ATTEMPT) {
+            throw 'Product manifest identity mismatch'
+          }
+
+          function Assert-FileIdentity($Path, $Record) {
+            $file = Get-Item -LiteralPath $Path
+            $sha = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($Record.name -cne $file.Name -or $Record.bytes -ne $file.Length -or $Record.sha256 -cne $sha) {
+              throw "Manifest mismatch for $Path"
+            }
+          }
+
+          $zip = Join-Path $download $env:PRODUCT_ZIP
+          Assert-FileIdentity $zip $manifest.zip
+          [IO.Compression.ZipFile]::ExtractToDirectory($zip, $unpacked)
+          $exe = Join-Path $unpacked 'wfc.exe'
+          Assert-FileIdentity $exe $manifest.exe
+          foreach ($required in 'README.md', 'LICENSE-WFC', 'bundled-notices/sources.json') {
+            if (!(Test-Path -LiteralPath (Join-Path $unpacked $required) -PathType Leaf)) {
+              throw "Missing product ZIP file: $required"
+            }
+          }
+          $version = & $exe --version
+          if ($version -cne $manifest.version) { throw "Packaged version mismatch: $version" }
+          $manifest | ConvertTo-Json
+          python tools/smoke.py $exe --kernel
+      - name: Check the packaged EXE for redistributable DLL imports
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $exe = Join-Path $env:PRODUCT_DIR 'verified product/wfc.exe'
+          $imports = & llvm-readobj.exe --coff-imports $exe
+          $names = $imports -match '^\s*Name:'
+          if (!$names) { throw 'No PE imports found for wfc.exe' }
+          $names
+          if ($names -match '^\s*Name: (vcruntime|msvcp|msvcr|concrt|vcomp)\d+\w*\.dll$') {
+            throw 'The product imports a Visual C++ redistributable DLL'
+          }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        id: upload
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.PRODUCT_DIR }}/download/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Record the Actions download identity
+        env:
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          @"
+          [Windows x64 product artifact]($env:ARTIFACT_URL)
+
+          - Name: $env:ARTIFACT_NAME
+          - Artifact ID: $env:ARTIFACT_ID
+          - Outer Actions ZIP SHA-256: $env:ARTIFACT_DIGEST
+          - Commit: $env:GITHUB_SHA
+          - Tree: $env:PRODUCT_TREE
+          "@ >> $env:GITHUB_STEP_SUMMARY
+
+  linux-regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+        working-directory: product
+    env:
+      NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: product
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.NATIVE_INPUT_SHA }}
+          path: native-input
+          sparse-checkout: vendor/zlib-1.3.1.tar.gz
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        with:
+          version: '0.16.0'
+      - name: Verify sources and prepare the native build
+        run: |
+          test "$(uname -m)" = x86_64
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C ../native-input rev-parse HEAD)" = "$NATIVE_INPUT_SHA"
+          git show -s --format='product=%H tree=%T'
+          sha256sum --check --strict vendor/INPUTS.sha256
+          rustup toolchain install 1.96.1 --profile minimal
+          python3 tools/prepare.py --zlib-archive ../native-input/vendor/zlib-1.3.1.tar.gz
+
+          # Cache the pinned Wuffs input as in the Linux release readiness run.
+          archive="$RUNNER_TEMP/wuffs.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+            --connect-timeout 15 --max-time 60 \
+            https://deps.files.ghostty.org/wuffs-7411f488fe2e2c205c3d3b3d28638b7356522930.tar.gz -o "$archive"
+          printf '%s  %s\n' 17877d346f7988651d6c62e45b2e3b05c86809a6442c5e34612374b2a9719a1c \
+            "$archive" | sha256sum --check --strict
+          package=$(cd vendor/libghostty-vt && zig fetch "$archive")
+          test "$package" = 'N-V-__8AAP5JWgCGP_AD0teWpa4krRvE9VPZzvviGdbmN4jI'
+      - name: Build the release CLI and verify its identity
+        id: build
+        run: |
+          cargo +1.96.1 build --release --locked --bin wfc
+          version=$(target/release/wfc --version)
+          printf '%s\n' "$version"
+          [[ "$version" == *"(Rust, x86_64-unknown-linux-gnu, release, build $GITHUB_SHA)" ]]
+      - name: Run the unfiltered Linux workspace release tests
+        run: cargo +1.96.1 test --workspace --release --locked --no-fail-fast
+      - name: Verify Linux runtime, receipts and pinned Herdr lifecycle
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          failed=0
+          run_fixture() {
+            local fixture=$1
+            shift
+            local markers='private[-_]token|private-test-token|fixture-signing-key|private\.invalid|bearer[[:space:]]'
+            local fields='token|secret|authorization|callback|api[_-]?key|signature|capabilityHash|nonce|ticket'
+            printf '\nRunning %s\n' "$fixture"
+            python3 -Bu "tests/$fixture.py" "$@" 2>&1 | sed -uE \
+              -e "/$markers|[[:alnum:]_]*($fields)[[:alnum:]_]*[^[:alnum:]_]{0,3}[:=]/Ic\\[redacted fixture diagnostic]" \
+              -e 's/\b[[:xdigit:]]{32,}\b/[redacted hex]/g' || failed=1
+          }
+
+          binary=target/release/wfc
+          for fixture in runtime_faults owner receipts relay legacy_tmux_archive; do
+            run_fixture "$fixture" "$binary"
+          done
+
+          herdr="$RUNNER_TEMP/herdr-0.9.5"
+          curl --fail --silent --show-error --location --retry 3 --max-time 120 \
+            https://github.com/herdrdev/herdr/releases/download/v0.9.5/herdr-linux-x86_64 -o "$herdr"
+          printf '%s  %s\n' 14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d \
+            "$herdr" | sha256sum --check --strict
+          chmod 700 "$herdr"
+          version=$("$herdr" --version)
+          test "$version" = 'herdr 0.9.5'
+          run_fixture herdr_public "$herdr" "$binary" -v \
+            PublicLifecycle.test_dispatch_current_execution_done_and_close \
+            PublicLifecycle.test_named_status_during_done_then_exit \
+            PublicLifecycle.test_close_after_scope_takeover_fences_stale_herdr_controls
+          exit "$failed"
