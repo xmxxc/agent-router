@@ -1,5 +1,8 @@
 //! Publish live observations through the ordinary Inbox transaction.
-use super::{recovery, Assignment, Inbox, Message};
+use super::{
+    generations::{GenerationStamps, Generations},
+    recovery, Assignment, Inbox, Message,
+};
 use crate::workflow::{
     runtime_fault::{host_identity, last_accepted_input, Notice, Observation, ReadMode},
     view,
@@ -18,7 +21,7 @@ pub(super) struct Watch {
 }
 
 pub(super) struct Sample {
-    stamps: recovery::GenerationStamps,
+    stamps: GenerationStamps,
     assignment: Assignment,
     row: Value,
     observed: Observation,
@@ -63,7 +66,7 @@ impl Watch {
 }
 
 pub(super) fn sample(state: &Path, dir: &Path, id: &str, scope: Option<&str>) -> Option<Sample> {
-    let generations = recovery::Generations::read(&dir, id);
+    let generations = Generations::read(dir, id);
     let row = generations.published()?;
     if row["dispatch"] != id
         || !row["scope"]

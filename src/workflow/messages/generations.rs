@@ -204,6 +204,14 @@ impl Generations {
     }
 
     #[cfg(target_os = "linux")]
+    pub(super) fn pending(&self) -> Option<&Value> {
+        self.pending
+            .as_ref()
+            .filter(|_| !self.damaged)
+            .map(|generation| &generation.row)
+    }
+
+    #[cfg(target_os = "linux")]
     pub(super) fn published(&self) -> Option<&Value> {
         self.published
             .as_ref()

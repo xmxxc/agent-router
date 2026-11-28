@@ -158,10 +158,9 @@ impl Inbox {
             "{}",
             assignment::UNVERIFIED_ASSIGNMENT
         );
-        let Some(pending) = &generations.pending else {
+        let Some(reserved) = generations.pending() else {
             return Ok(());
         };
-        let reserved = &pending.row;
         let create = &current["create"];
         // Launch evidence and ledger history belong to the published record.
         // Apart from those additions, require the whole original reservation.

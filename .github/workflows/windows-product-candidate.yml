@@ -8,6 +8,7 @@ permissions:
 
 env:
   WFC_BUILD_ID: ${{ github.sha }}
+  NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
   CARGO_BUILD_JOBS: '2'
   PYTHONUTF8: '1'
 
@@ -18,6 +19,7 @@ jobs:
     defaults:
       run:
         shell: pwsh
+        working-directory: product
     env:
       TRIPLE: x86_64-pc-windows-msvc
       CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
@@ -28,6 +30,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ github.sha }}
+          path: product
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.NATIVE_INPUT_SHA }}
+          path: native-input
+          sparse-checkout: vendor/zlib-1.3.1.tar.gz
+          sparse-checkout-cone-mode: false
           persist-credentials: false
       - name: Verify the candidate checkout
         run: |
@@ -35,6 +45,8 @@ jobs:
           $commit = git rev-parse HEAD
           $tree = git rev-parse 'HEAD^{tree}'
           if ($commit -cne $env:GITHUB_SHA) { throw "Unexpected checkout: $commit" }
+          $nativeCommit = git -C ../native-input rev-parse HEAD
+          if ($nativeCommit -cne $env:NATIVE_INPUT_SHA) { throw "Unexpected native input checkout: $nativeCommit" }
           "PRODUCT_TREE=$tree" >> $env:GITHUB_ENV
           "Source commit $commit, tree $tree"
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
@@ -44,7 +56,7 @@ jobs:
         with:
           version: '0.16.0'
       - run: rustup toolchain install 1.96.1 --profile minimal
-      - run: python tools/prepare.py
+      - run: python tools/prepare.py --zlib-archive ../native-input/vendor/zlib-1.3.1.tar.gz
       - name: Build the Windows release CLI
         id: build
         run: cargo +1.96.1 build --release --locked --target $env:TRIPLE --bin wfc
@@ -162,7 +174,7 @@ jobs:
         id: upload
         with:
           name: ${{ env.ARTIFACT_NAME }}
-          path: ${{ env.PRODUCT_DIR }}/download/
+          path: product/${{ env.PRODUCT_DIR }}/download/
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
@@ -189,8 +201,6 @@ jobs:
       run:
         shell: bash
         working-directory: product
-    env:
-      NATIVE_INPUT_SHA: dbae2c45e4ce46d528ec276de743f6d20dd1b51f
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
