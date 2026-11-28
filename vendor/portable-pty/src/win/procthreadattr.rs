@@ -1,5 +1,5 @@
 use crate::win::psuedocon::HPCON;
-use anyhow::{ensure, Error};
+use anyhow::{Context, Error};
 use std::io::Error as IoError;
 use std::{mem, ptr};
 use winapi::shared::minwindef::DWORD;
@@ -32,11 +32,9 @@ impl ProcThreadAttributeList {
         let res = unsafe {
             InitializeProcThreadAttributeList(attr_ptr, num_attributes, 0, &mut bytes_required)
         };
-        ensure!(
-            res != 0,
-            "InitializeProcThreadAttributeList failed: {}",
-            IoError::last_os_error()
-        );
+        if res == 0 {
+            return Err(IoError::last_os_error()).context("InitializeProcThreadAttributeList");
+        }
         Ok(Self { data })
     }
 
@@ -56,11 +54,9 @@ impl ProcThreadAttributeList {
                 ptr::null_mut(),
             )
         };
-        ensure!(
-            res != 0,
-            "UpdateProcThreadAttribute failed: {}",
-            IoError::last_os_error()
-        );
+        if res == 0 {
+            return Err(IoError::last_os_error()).context("UpdateProcThreadAttribute");
+        }
         Ok(())
     }
 }

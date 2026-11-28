@@ -1,5 +1,21 @@
 //! Local Codex substitute for the Windows public CLI integration test.
-use std::{env, fs, io::Write, path::PathBuf, process::Command, thread, time::Duration};
+use std::{
+    env,
+    ffi::c_void,
+    fs,
+    io::{self, Write},
+    path::PathBuf,
+    process::Command,
+    thread,
+    time::Duration,
+};
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetConsoleWindow() -> *mut c_void;
+    fn GetCurrentProcess() -> *mut c_void;
+    fn IsProcessInJob(process: *mut c_void, job: *mut c_void, result: &mut i32) -> i32;
+}
 
 fn setting(name: &str) -> String {
     env::var(name).unwrap()
@@ -9,6 +25,23 @@ fn main() {
     let args: Vec<_> = env::args().collect();
     match args[1].as_str() {
         "queue" => {
+            if cfg!(fixture_decoy) {
+                fs::write(setting("WFC_FIXTURE_DECOY"), "wrong executable").unwrap();
+                std::process::exit(42);
+            }
+            assert_eq!(
+                env::current_exe().unwrap().canonicalize().unwrap(),
+                fs::canonicalize(setting("WFC_FIXTURE_EXPECTED_CODEX")).unwrap()
+            );
+            let mut in_job = 0;
+            unsafe {
+                assert!(GetConsoleWindow().is_null());
+                assert_ne!(
+                    IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job),
+                    0
+                );
+            }
+            assert_ne!(in_job, 0);
             assert_eq!(&args[2..4], &["--thread", &setting("CODEX_THREAD_ID")]);
             assert_eq!(args[4], "--message");
             assert_eq!(args[6], "--resume");
@@ -18,7 +51,24 @@ fn main() {
                 .open(setting("WFC_FIXTURE_QUEUE"))
                 .unwrap();
             writeln!(queue, "{}", args[5]).unwrap();
+            match env::var("WFC_FIXTURE_QUEUE_MODE").as_deref() {
+                Ok("utf8") => {
+                    eprintln!(
+                        "Error: failed to start embedded app server: 拒绝访问。 (os error 5)"
+                    );
+                    eprintln!("fixture-private-receipt {}", args[5]);
+                    std::process::exit(1);
+                }
+                Ok("invalid") => {
+                    io::stderr()
+                        .write_all(b"fixture-private-receipt \xff\n")
+                        .unwrap();
+                    std::process::exit(1);
+                }
+                _ => (),
+            }
         }
+        "raw" => (),
         "worker" => {
             assert!(args.iter().any(|arg| arg == "--no-alt-screen"));
             assert!(!args

@@ -1,15 +1,15 @@
 use super::WinChild;
 use crate::cmdbuilder::CommandBuilder;
 use crate::win::procthreadattr::ProcThreadAttributeList;
-use anyhow::{bail, ensure, Error};
+use anyhow::{ensure, Context, Error};
 use filedescriptor::{FileDescriptor, OwnedHandle};
 use lazy_static::lazy_static;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Error as IoError, Read};
-use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
@@ -312,11 +312,15 @@ impl PsuedoCon {
                 &mut con,
             )
         };
-        ensure!(
-            result == S_OK,
-            "failed to create psuedo console: HRESULT {}",
-            result
-        );
+        if result != S_OK {
+            // HRESULT_FROM_WIN32 preserves the system error in the low word.
+            let code = if result as u32 & 0xffff_0000 == 0x8007_0000 {
+                result & 0xffff
+            } else {
+                result
+            };
+            return Err(IoError::from_raw_os_error(code)).context("CreatePseudoConsole");
+        }
         Ok(Self { con })
     }
 
@@ -353,8 +357,6 @@ impl PsuedoCon {
         let mut pi: PROCESS_INFORMATION = unsafe { mem::zeroed() };
 
         let (mut exe, mut cmdline) = cmd.cmdline()?;
-        let cmd_os = OsString::from_wide(&cmdline);
-
         let cwd = cmd.current_directory();
 
         let res = unsafe {
@@ -374,15 +376,7 @@ impl PsuedoCon {
             )
         };
         if res == 0 {
-            let err = IoError::last_os_error();
-            let msg = format!(
-                "CreateProcessW `{:?}` in cwd `{:?}` failed: {}",
-                cmd_os,
-                cwd.as_ref().map(|c| OsString::from_wide(c)),
-                err
-            );
-            log::error!("{}", msg);
-            bail!("{}", msg);
+            return Err(IoError::last_os_error()).context("CreateProcessW");
         }
 
         // Make sure we close out the thread handle so we don't leak it;

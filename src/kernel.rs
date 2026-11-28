@@ -365,6 +365,8 @@ pub(super) fn run() -> Result<()> {
             Event::Command(line) => {
                 let request = serde_json::from_str::<Value>(&line);
                 let id = request.as_ref().ok().map(|v| v["id"].clone());
+                #[cfg(windows)]
+                let spawning = request.as_ref().is_ok_and(|v| v["op"] == "spawn");
                 let result = request
                     .map_err(anyhow::Error::from)
                     .and_then(|v| handle(&v, &generation, &mut units, &tx));
@@ -372,6 +374,15 @@ pub(super) fn run() -> Result<()> {
                     Ok(None) => continue,
                     Ok(Some(result)) => {
                         json!({"id": id, "generation": generation, "ok": true, "result": result})
+                    }
+                    #[cfg(windows)]
+                    Err(error) if spawning => {
+                        use crate::windows_process as process;
+                        let system = error.downcast_ref::<io::Error>();
+                        json!({"id":id,"generation":generation,"ok":false,
+                            "errorCategory":process::launch_category(system),
+                            "osError":system.and_then(io::Error::raw_os_error),
+                            "error":process::diagnostic("start ConPTY worker", system)})
                     }
                     Err(error) => {
                         json!({"id": id, "generation": generation, "ok": false, "error": error.to_string()})

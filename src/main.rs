@@ -170,8 +170,8 @@ fn run() -> anyhow::Result<ExitCode> {
         #[cfg(windows)]
         Some("--windows-bundled") if args.is_empty() => workflow::backend::windows::runtime()?,
         #[cfg(windows)]
-        Some("--windows-relay-queue") if args.is_empty() => {
-            return workflow::messages::relay::run_windows_queue();
+        Some("--windows-relay-queue") if args.len() == 1 => {
+            return workflow::messages::relay::run_windows_queue(&args[0]);
         }
         #[cfg(windows)]
         Some("--windows-detached-relay") => workflow::messages::relay::run_detached(&args)?,

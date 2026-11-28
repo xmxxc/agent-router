@@ -55,15 +55,75 @@ def until(read, limit=10):
     raise AssertionError(f"condition did not become true in {limit}s")
 
 
-def main(candidate, root):
+def queue_outcomes(cli, root, host, task, decoy):
+    state = root / "queue state"
+    calls = root / "queue outcomes.jsonl"
+    opts = dict(WFC_STATE=str(state), WFC_FIXTURE_QUEUE=str(calls))
+
+    def publish(scope):
+        assignment = cli("dispatch", "--scope", scope, "--task", task, "--report", task, "--cwd", task.parent,
+                         "--role", "队列𐐷", "--", host / "codex.exe", "raw", changes=opts)
+        receipt = cli("done", "--attempt", assignment["attempt"], "--report", task,
+                      changes=dict(opts, WFC_DISPATCH=assignment["dispatch"]))
+        return assignment["dispatch"], receipt["messageId"]
+
+    def relay(scope, **changes):
+        result = cli("relay", "--codex", "--scope", scope, "--for", "1.2",
+                     check=False, changes=dict(opts, **changes))
+        assert result.returncode == 0, result
+        assert "fixture-private-receipt" not in result.stderr, result.stderr
+        return result.stderr
+
+    def receipt_status(dispatch, message_id, state_name):
+        row, = cli("status", "--dispatch", dispatch, changes=opts)["dispatches"]
+        receipt, = row["messages"]
+        assert (receipt["messageId"], receipt["state"]) == (message_id, state_name), receipt
+        return receipt
+
+    dispatch, message_id = publish("retry")
+    empty_path = root / "empty path"
+    empty_path.mkdir()
+    assert "os error 2" in relay("retry", PATH=str(empty_path))
+    retry = receipt_status(dispatch, message_id, "unsent")
+    assert retry["statusVersion"] > 1, retry
+    assert not calls.exists() and not decoy.exists()
+    assert not relay("retry")
+    receipt_status(dispatch, message_id, "received")
+    assert cli("ack", message_id, changes=opts)["messageId"] == message_id
+
+    expected = [message_id]
+    for mode, diagnostic in [("utf8", "os error 5"), ("invalid", "not UTF-8")]:
+        dispatch, message_id = publish(mode)
+        result = relay(mode, WFC_FIXTURE_QUEUE_MODE=mode)
+        assert "unconfirmed" in result and diagnostic in result and message_id not in result, result
+        receipt_status(dispatch, message_id, "unknown")
+        assert not relay(mode)
+        receipt_status(dispatch, message_id, "unknown")
+        assert cli("ack", message_id, check=False, changes=opts).returncode != 0
+        expected.append(message_id)
+
+    deliveries = calls.read_text(encoding="utf-8").splitlines()
+    assert len(deliveries) == len(expected)
+    for delivery, expected_id in zip(deliveries, expected):
+        assert expected_id in delivery and "队列𐐷" in delivery
+    assert not decoy.exists()
+    assert not list(state.glob("wfc-queue-*"))
+    assert not cli("status", changes=opts)["waiters"]
+    print("Windows queue fixture: PATH, Unicode, exact ACK, unsent retry, unknown without replay")
+
+
+def main(candidate, root, queue_only=False):
     root = Path(os.path.abspath(root)) / f"wfc native {uuid.uuid4().hex[:8]}"
     host = root / "host tools"
     host.mkdir(parents=True)
     binary = host / "wfc.exe"
     shutil.copyfile(candidate, binary)
-    subprocess.run(["rustc", "--edition", "2021", "--crate-name", "codex",
-                    Path(__file__).with_name("fixtures") / "windows_codex.rs",
-                    "-o", host / "codex.exe"], check=True, timeout=60)
+    path_bin = root / "path 工具"
+    path_bin.mkdir()
+    source = Path(__file__).with_name("fixtures") / "windows_codex.rs"
+    for destination, flags in [(host, ["--cfg", "fixture_decoy"]), (path_bin, [])]:
+        subprocess.run(["rustc", "--edition", "2021", "--crate-name", "codex", *flags, source,
+                        "-o", destination / "codex.exe"], check=True, timeout=60)
     thread = str(uuid.uuid4())
     home = root / "codex home"
     sessions = home / "sessions"
@@ -73,6 +133,7 @@ def main(candidate, root):
         + "\n", encoding="utf-8")
     state = root / "router state"
     queue = root / "queue.jsonl"
+    decoy = root / "wrong codex.txt"
     cwd = root / "worker space"
     cwd.mkdir()
     task = cwd / "real task.md"
@@ -80,14 +141,15 @@ def main(candidate, root):
     env = {key: value for key, value in os.environ.items()
            if not key.upper().startswith("WFC_")}
     env.update(CODEX_THREAD_ID=thread, CODEX_HOME=str(home), WFC_STATE=str(state),
-               WFC_FIXTURE_QUEUE=str(queue), PATH=os.pathsep.join(
-                   (str(host), str(Path(os.environ["SystemRoot"]) / "System32"))))
+               WFC_FIXTURE_QUEUE=str(queue), WFC_FIXTURE_DECOY=str(decoy),
+               WFC_FIXTURE_EXPECTED_CODEX=str(path_bin / "codex.exe"), PATH=os.pathsep.join(
+                   (str(path_bin), str(Path(os.environ["SystemRoot"]) / "System32"))))
     notes = []
     processes = []
     relay = None
 
-    def cli(*args, check=True):
-        output = subprocess.run([binary, *args], env=env, cwd=cwd, capture_output=True,
+    def cli(*args, check=True, changes=None):
+        output = subprocess.run([binary, *args], env=dict(env, **(changes or {})), cwd=cwd, capture_output=True,
                                 text=True, encoding="utf-8", timeout=25)
         if check:
             assert output.returncode == 0, (args, output.stderr, output.stdout)
@@ -114,6 +176,10 @@ def main(candidate, root):
         proc = Process(identity["pid"], identity["creation"], own_runtime)
         processes.append(proc)
         return proc
+
+    queue_outcomes(cli, root, host, task, decoy)
+    if queue_only:
+        return
 
     try:
         relay = cli("relay", "--codex", "--scope", "original", "--detach", "--for", "18")
@@ -173,12 +239,26 @@ def main(candidate, root):
         assert lost_kernel.exited(5000) and lost_leaf.exited(5000)
         still_unknown = row(lost["dispatch"])
         assert still_unknown["backendAlive"] is None and still_unknown["backendResult"] == "uncertain"
-        assert cli("close", lost["dispatch"])["result"] == "uncertain"
+        lost_close = cli("close", lost["dispatch"])
+        assert lost_close["result"] == "uncertain" and lost_close["closePending"] is True
+        assert all(lost_close[key] == lost[key] for key in ("dispatch", "round", "attempt"))
+        lost_status = row(lost["dispatch"])
+        assert lost_status["closePending"] is True and lost_status["backendAlive"] is None
+        assert lost_status["backendObservation"]["diagnostic"], lost_status
+        ready = state / "windows-bundled" / lost["windowsExecution"] / "ready.json"
+        ready.rename(ready.with_suffix(".removed"))
+        missing_ready = row(lost["dispatch"])
+        assert missing_ready["closePending"] is True and missing_ready["backendAlive"] is None
+        assert "missing Windows launch evidence" in missing_ready["backendObservation"]["diagnostic"]
+        missing_ready_close = cli("close", lost["dispatch"])
+        assert missing_ready_close["result"] == "uncertain" and missing_ready_close["closePending"] is True
+        assert cli("close", lost["dispatch"]) == missing_ready_close
         notes.remove(lost["dispatch"])
         bad, _ = dispatch("missing", "broken", "exit", host / "missing.exe", check=False)
-        assert bad.returncode != 0 and "definitely-not-sent" in bad.stderr, bad
+        assert bad.returncode != 0 and "definitely-not-sent" in bad.stderr and "os error 2" in bad.stderr, bad
         bad_row = next(item for item in cli("status")["dispatches"] if item["scope"] == "broken")
         assert bad_row["worker"]["state"] == "not_started" and bad_row["backendAlive"] is False
+        assert bad_row["backendObservation"]["category"] == "executable_missing", bad_row
         assert relay_proc.exited(22000)
         assert not cli("status")["waiters"]
         deliveries = queue.read_text(encoding="utf-8").splitlines()
@@ -200,4 +280,6 @@ def main(candidate, root):
 
 
 if __name__ == "__main__":
-    main(Path(sys.argv[1]).resolve(), Path(sys.argv[2] if len(sys.argv) > 2 else "target"))
+    args = [arg for arg in sys.argv[1:] if arg != "--queue-only"]
+    main(Path(args[0]).resolve(), Path(args[1] if len(args) > 1 else "target"),
+         queue_only="--queue-only" in sys.argv[1:])

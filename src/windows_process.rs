@@ -40,6 +40,26 @@ pub(crate) const OPEN_REPARSE_POINT: u32 = FILE_FLAG_OPEN_REPARSE_POINT;
 pub(crate) const NO_WINDOW: u32 = CREATE_NO_WINDOW;
 pub(crate) const TICK: Duration = Duration::from_millis(25);
 
+// Keep only a caller-provided operation and a typed system error. Error
+// chains from process libraries can contain launch arguments or paths.
+pub(crate) fn diagnostic(operation: &str, error: Option<&io::Error>) -> String {
+    match error {
+        Some(error) => match error.raw_os_error() {
+            Some(code) => format!("{operation}: {}", io::Error::from_raw_os_error(code)),
+            None => format!("{operation}: {}", error.kind()),
+        },
+        None => operation.to_owned(),
+    }
+}
+
+pub(crate) fn launch_category(error: Option<&io::Error>) -> &'static str {
+    match error.map(io::Error::kind) {
+        Some(io::ErrorKind::NotFound) => "executable_missing",
+        Some(io::ErrorKind::PermissionDenied) => "permission_denied",
+        _ => "spawn_failed",
+    }
+}
+
 pub(crate) fn background(command: &mut Command) -> anyhow::Result<Child> {
     // Both callers gate their child on stdin. Verify detachment before
     // sending authority to launch a worker or register a relay.
@@ -56,17 +76,16 @@ pub(crate) fn background(command: &mut Command) -> anyhow::Result<Child> {
     }?;
     match in_job(child.as_raw_handle(), null_mut()) {
         Ok(false) => Ok(child),
-        result => {
+        Ok(true) => {
             stop_staged(&mut child)?;
-            Err(result
-                .err()
-                .unwrap_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "enclosing Windows Job prevents detachment",
-                    )
-                })
-                .into())
+            Err(
+                anyhow::Error::new(io::Error::from(io::ErrorKind::PermissionDenied))
+                    .context("enclosing Windows Job prevents detachment"),
+            )
+        }
+        Err(error) => {
+            stop_staged(&mut child)?;
+            Err(anyhow::Error::new(error).context("verify Windows staging process Job membership"))
         }
     }
 }
@@ -210,7 +229,11 @@ pub(crate) fn open(expected: &Value) -> io::Result<Option<OwnedHandle>> {
 }
 
 pub(crate) fn exit_code(process: RawHandle) -> io::Result<Option<u32>> {
-    match unsafe { WaitForSingleObject(process.cast(), 0) } {
+    wait_for_exit(process, 0)
+}
+
+pub(crate) fn wait_for_exit(process: RawHandle, timeout_ms: u32) -> io::Result<Option<u32>> {
+    match unsafe { WaitForSingleObject(process.cast(), timeout_ms) } {
         WAIT_OBJECT_0 => {
             let mut code = 0;
             check(unsafe { GetExitCodeProcess(process.cast(), &mut code) })?;
