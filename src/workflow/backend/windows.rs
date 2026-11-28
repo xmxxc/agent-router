@@ -183,7 +183,7 @@ impl Execution {
         self.failed("spawn_failed", "closed before Windows worker launch")
     }
 
-    fn terminal(&self) -> Result<Option<Value>> {
+    fn terminal(&self, row: &Value) -> Result<Option<Value>> {
         let Some(mut value) = self.read("finished.json")? else {
             return Ok(None);
         };
@@ -197,16 +197,25 @@ impl Execution {
             "invalid Windows cleanup evidence"
         );
         if value["result"] == "completed" {
-            let ready = self
-                .read("ready.json")?
-                .context("missing Windows startup evidence")?;
-            ensure!(
-                ready["result"] == "accepted"
-                    && valid_launch_identity(&ready["identity"])
-                    && value["identity"] == ready["identity"],
-                "Windows cleanup identity mismatch"
-            );
+            // The published create receipt can corroborate a completed execution
+            // even after the startup evidence is lost.
+            if row["createPending"] == true || row["create"]["result"] != "accepted" {
+                let ready = self
+                    .launch_evidence(row)?
+                    .context("missing Windows startup evidence")?;
+                ensure!(
+                    value["identity"] == ready["identity"],
+                    "Windows cleanup identity mismatch"
+                );
+            } else {
+                ensure!(
+                    valid_launch_identity(&value["identity"]),
+                    "invalid Windows cleanup identity"
+                );
+            }
         }
+        self.verify_launch(row, &value)
+            .context("verify Windows completion identity")?;
         self.close_fields(&mut value);
         Ok(Some(value))
     }
@@ -295,11 +304,11 @@ impl Execution {
         Ok(Some(status))
     }
 
-    fn verify_launch(&self, row: &Value, ready: &Value) -> Result<()> {
+    fn verify_launch(&self, row: &Value, evidence: &Value) -> Result<()> {
         if row["create"]["result"] == "accepted" {
             ensure!(
                 row["create"]["ticket"] == self.ticket
-                    && row["create"]["identity"] == ready["identity"],
+                    && row["create"]["identity"] == evidence["identity"],
                 "Windows launch identity mismatch"
             );
         }
@@ -327,11 +336,9 @@ impl Execution {
 
     fn completion(&self, row: &Value) -> Result<Option<Value>> {
         if let Some(finished) = self
-            .terminal()
+            .terminal(row)
             .context("read Windows completion evidence")?
         {
-            self.verify_launch(row, &finished)
-                .context("verify Windows completion identity")?;
             return Ok(Some(finished));
         }
         let saved = &row["create"];
@@ -366,7 +373,7 @@ impl Execution {
     fn startup(&self, row: &Value, runtime: &Value) -> Result<Option<Value>> {
         // A fast worker can publish both ready and terminal before create
         // has observed either. Its create outcome is still accepted.
-        if let Some(finished) = self.terminal()? {
+        if let Some(finished) = self.terminal(row)? {
             if finished["result"] == "definitely-not-sent" {
                 return Ok(Some(finished));
             }
@@ -893,9 +900,11 @@ fn close_dispatch(state: &Path, id: &str, token: Option<&str>) -> Result<Value> 
     }
     let mut status = match execution.launch_evidence(&current) {
         Err(error) => execution
-            .recorded_uncertainty(&current)
+            .terminal(&current)
             .ok()
             .flatten()
+            .filter(|finished| finished["result"] == "completed")
+            .or_else(|| execution.recorded_uncertainty(&current).ok().flatten())
             .unwrap_or_else(|| {
                 execution.unknown(diagnostic(
                     "could not verify Windows launch evidence",
@@ -1004,6 +1013,111 @@ mod tests {
     }
 
     #[test]
+    fn completed_result_survives_unusable_startup_evidence() -> Result<()> {
+        let state = env::temp_dir().join(format!("wfc-finished-{}", Uuid::new_v4().simple()));
+        let records = state.join("dispatches");
+        fs::create_dir_all(&records)?;
+        let result = (|| -> Result<()> {
+            let id = "d-00000083";
+            let mut row = json!({"dispatch":id,"attempt":"a-000000000083","round":1,
+                "host":"codex","backend":"bundled","scope":"finished-readback",
+                "windowsExecution":Uuid::new_v4().simple().to_string()});
+            let execution = Execution::new(&state, &row)?;
+            let identity = json!({
+                "runtime":{"pid":101,"creation":"1001"},
+                "kernel":{"pid":102,"creation":"1002"},
+                "worker":{"pid":103,"creation":"1003"},
+            });
+            let ready = json!({"ticket":execution.ticket,"result":"accepted",
+                "identity":identity,"alive":true,"owned":true});
+            let mut accepted = ready.clone();
+            accepted["dispatch"] = row["dispatch"].clone();
+            accepted["attempt"] = row["attempt"].clone();
+            accepted["round"] = row["round"].clone();
+            row["backendHandle"] = execution.ticket.clone();
+            row["create"] = accepted.clone();
+            let published = records.join(format!("{id}.json"));
+            write_json(&published, &row, None)?;
+            execution.ensure_parent()?;
+            ensure_directory(&execution.dir)?;
+            let exited = json!({"state":"exited","exit_code":37,"signal":null});
+            let finished = json!({"ticket":execution.ticket,"result":"completed",
+                "identity":identity,"worker":exited,"alive":false,"resourceCleanup":"confirmed",
+                "jobActiveProcesses":0,"closeEffect":"already-exited"});
+            let finished_path = execution.dir.join("finished.json");
+            write_json(&finished_path, &finished, None)?;
+
+            let check = |result: &str, cleanup: &str, worker: &Value| -> Result<()> {
+                let mut record = assignment::public_record(&records, id)?.unwrap();
+                let status =
+                    crate::workflow::observe_dispatch(&state, &records, &mut record, false)?;
+                assert_eq!(record["backendResult"], result);
+                assert_eq!(record["worker"], *worker);
+                assert_eq!(status["resourceCleanup"], cleanup);
+                assert_eq!(
+                    status["closeEffect"].as_str(),
+                    (result == "completed").then_some("already-exited")
+                );
+                let close = close_dispatch(&state, id, None)?;
+                assert_eq!(close["result"], result);
+                assert_eq!(close["worker"], *worker);
+                assert_eq!(close["resourceCleanup"], cleanup);
+                assert_eq!(close["alive"], status["alive"]);
+                assert_eq!(close["closeEffect"], status["closeEffect"]);
+                assert_eq!(close["ticket"], execution.ticket);
+                assert!(execution.close_requested()?);
+                assert_eq!(close_dispatch(&state, id, None)?, close);
+                Ok(())
+            };
+
+            let ready_path = execution.dir.join("ready.json");
+            write_json(&ready_path, &ready, None)?;
+            fs::remove_file(&ready_path)?;
+            check("completed", "confirmed", &exited)?;
+            fs::create_dir(&ready_path)?;
+            check("completed", "confirmed", &exited)?;
+            fs::remove_dir(&ready_path)?;
+            fs::write(&ready_path, "{")?;
+            check("completed", "confirmed", &exited)?;
+            let mut other_ready = ready.clone();
+            other_ready["identity"]["worker"]["creation"] = json!("1004");
+            write_json(&ready_path, &other_ready, None)?;
+            check("completed", "confirmed", &exited)?;
+            fs::remove_file(&ready_path)?;
+
+            let unknown = json!({"state":"unknown"});
+            let mut other_worker = finished.clone();
+            other_worker["identity"] = other_ready["identity"].clone();
+            write_json(&finished_path, &other_worker, None)?;
+            check("uncertain", "uncertain", &unknown)?;
+            let mut old_finished = finished.clone();
+            old_finished["ticket"]["generation"] = json!(Uuid::new_v4().simple().to_string());
+            write_json(&finished_path, &old_finished, None)?;
+            check("uncertain", "uncertain", &unknown)?;
+            let mut incomplete = finished.clone();
+            incomplete["jobActiveProcesses"] = json!(1);
+            write_json(&finished_path, &incomplete, None)?;
+            check("uncertain", "uncertain", &unknown)?;
+            write_json(&finished_path, &finished, None)?;
+            row.as_object_mut().unwrap().remove("create");
+            write_json(&published, &row, None)?;
+            write_json(&ready_path, &ready, None)?;
+            check("completed", "confirmed", &exited)?;
+            fs::remove_file(&ready_path)?;
+            check("uncertain", "uncertain", &unknown)?;
+            row["create"] = accepted;
+            fs::remove_file(&published)?;
+            assignment::reserve(&records, id, &row)?;
+            check("uncertain", "uncertain", &unknown)?;
+            Ok(())
+        })();
+        let cleanup = fs::remove_dir_all(&state);
+        result?;
+        cleanup?;
+        Ok(())
+    }
+
+    #[test]
     fn unconfirmed_job_cleanup_preserves_only_an_observed_worker_exit() -> Result<()> {
         let state = env::temp_dir().join(format!("wfc-close-exit-{}", Uuid::new_v4().simple()));
         let records = state.join("dispatches");
@@ -1058,7 +1172,7 @@ mod tests {
                 assert_eq!(status["resourceCleanup"], "uncertain");
                 assert_eq!(status["runtimeResult"], "failed");
                 assert_eq!(status["jobActiveProcesses"], Value::Null);
-                assert!(execution.terminal()?.is_none());
+                assert!(execution.terminal(&row)?.is_none());
                 let close = close_dispatch(&state, id, None)?;
                 assert_eq!(close["worker"], expected);
                 assert_eq!(close["result"], "uncertain");
@@ -1170,7 +1284,7 @@ mod tests {
             let second_execution = Execution::new(&state, &request)?;
             assert_eq!(close_dispatch(&state, second, None)?["result"], "uncertain");
             run_execution(&state, &second_execution, &request)?;
-            let finished = second_execution.terminal()?.unwrap();
+            let finished = second_execution.terminal(&request)?.unwrap();
             assert_eq!(finished["worker"]["state"], "not_started");
             assert_eq!(finished["dispatch"], second);
             assert_eq!(close_dispatch(&state, id, None)?, done);
