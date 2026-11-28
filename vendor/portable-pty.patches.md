@@ -199,3 +199,14 @@ Apply `vendor/patches/portable-pty/0006-own-windows-async-wait.patch` after
 0005. The WFC kernel uses the synchronous `Child::try_wait` path. On Windows,
 `cargo test -p wfc --test cli windows_pty_async_wait_wakes_the_current_executor`
 exercises a pending wait, waker replacement and process exit notification.
+
+## 0007 retain Windows launch error codes without command arguments
+
+ConPTY initialization and process launch now preserve the underlying I/O
+error. A Win32 HRESULT is decoded to its original error code. The
+`CreateProcessW` failure omits the command line and working directory so
+the kernel can report launch failures without disclosing arguments.
+
+Apply `vendor/patches/portable-pty/0007-preserve-windows-launch-errors.patch`
+after 0006. On Windows, `python tools/smoke.py <path-to-wfc.exe> --kernel`
+checks the missing executable and permission errors and diagnostic redaction.

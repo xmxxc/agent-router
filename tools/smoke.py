@@ -50,16 +50,34 @@ def run(binary, *args):
             unit = dict(unit="native", generation=generation)
             sequence = 0
 
-            def call(operation, **fields):
+            def request(operation, **fields):
                 nonlocal sequence
                 sequence += 1
                 request = dict(unit, op=operation, id=sequence, **fields)
                 kernel.stdin.write(json.dumps(request) + "\n")
                 kernel.stdin.flush()
                 reply = json.loads(kernel.stdout.readline())
-                if reply["id"] != sequence or not reply["ok"]:
+                if reply["id"] != sequence or reply["generation"] != generation:
+                    raise RuntimeError(f"Unexpected {operation} reply: {reply}")
+                return reply
+
+            def call(operation, **fields):
+                reply = request(operation, **fields)
+                if not reply["ok"]:
                     raise RuntimeError(f"Unexpected {operation} reply: {reply}")
                 return reply["result"]
+
+            if sys.platform == "win32":
+                private_arg = "fixture-private-launch-argument"
+                for program, category, error in [
+                    (binary.parent / (uuid.uuid4().hex + ".exe"), "executable_missing", 2),
+                    (binary.parent, "permission_denied", 5),
+                ]:
+                    rejected = request("spawn", argv=[str(program), private_arg], cols=100, rows=24)
+                    assert rejected["ok"] is False and rejected["errorCategory"] == category, rejected
+                    assert f"os error {error}" in rejected["error"], rejected
+                    assert private_arg not in rejected["error"] and str(program) not in rejected["error"], rejected
+                print("ConPTY reports missing executable and permission denial with redacted diagnostics")
 
             script = "print('READY', flush=True); print(input()[::-1], flush=True); input()"
             child = call("spawn", argv=[sys.executable, "-u", "-c", script], cols=100, rows=24,
