@@ -1,9 +1,11 @@
 //! A worker can retry a keyed message. A controller claims a batch
 //! before printing it, so another waiter cannot deliver the same messages.
+#[cfg(any(target_os = "linux", windows))]
+mod generations;
 mod receipt;
 #[cfg(target_os = "linux")]
 mod recovery;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub mod relay;
 #[cfg(target_os = "linux")]
 mod reply;
@@ -207,11 +209,11 @@ pub(super) fn message_boundary(dir: &Path, dispatch: &str) -> MessageBoundary {
         // Orphan receipts can predate the public assignment ID format.
         return MessageBoundary::Open;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     {
-        recovery::Generations::read(dir, dispatch).message_boundary()
+        generations::Generations::read(dir, dispatch).message_boundary()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     match super::assignment::public_record(dir, dispatch) {
         Ok(Some(row)) => MessageBoundary::for_record(&row, row["createPending"] != true),
         Ok(None) => MessageBoundary::Open,
@@ -222,7 +224,7 @@ pub(super) fn message_boundary(dir: &Path, dispatch: &str) -> MessageBoundary {
 #[cfg(target_os = "linux")]
 pub(super) fn read_callback_record(dir: &Path, dispatch: &str) -> Result<Value> {
     ensure!(valid_id(dispatch), "invalid dispatch ID");
-    recovery::Generations::read(dir, dispatch)
+    generations::Generations::read(dir, dispatch)
         .into_assigned()?
         .with_context(|| format!("open dispatch {dispatch}: missing assignment"))
 }
@@ -868,6 +870,20 @@ impl Message {
             self.body_hash = Some(self.computed_hash());
         }
         Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn open_relay_file(options: &mut OpenOptions) -> &mut OpenOptions {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(crate::windows_process::OPEN_REPARSE_POINT)
     }
 }
 
@@ -2066,7 +2082,7 @@ impl<'a> Done<'a> {
         let snapshot = duplicate.is_none().then(|| Snapshot::read(&initial.cwd));
         // Publish after the same execution lock used for controller input.
         // The first check and Git probe hold neither lock while waiting.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         let _execution = (matches!(initial_row["backend"].as_str(), Some("tmux" | "bundled"))
             && initial_row["host"].is_string())
         .then(|| super::assignment::close_lock(&state, &initial_row))

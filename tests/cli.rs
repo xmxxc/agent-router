@@ -73,6 +73,70 @@ fn original_kernel_filename_starts_protocol_without_arguments() {
     assert_eq!(hello["protocol"], 1);
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_pty_async_wait_wakes_the_current_executor() {
+    use portable_pty::{
+        native_pty_system, win::WinChild, Child, ChildKiller, CommandBuilder, PtySize,
+    };
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{mpsc, Arc},
+        task::{Context, Poll, Wake, Waker},
+        time::Duration,
+    };
+    struct Notify(mpsc::Sender<()>);
+    impl Wake for Notify {
+        fn wake(self: Arc<Self>) {
+            let _ = self.0.send(());
+        }
+    }
+
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut terminal = pty.master.try_clone_reader().unwrap();
+    let drain = std::thread::spawn(move || std::io::copy(&mut terminal, &mut std::io::sink()));
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_wfc"));
+    command.arg("--kernel");
+    let child: Box<dyn Child> = pty.slave.spawn_command(command).unwrap();
+    drop(pty.slave);
+    let mut child = child.downcast::<WinChild>().unwrap();
+    let (old_wake, _old) = mpsc::channel();
+    let old = Waker::from(Arc::new(Notify(old_wake)));
+    assert!(Pin::new(&mut *child)
+        .poll(&mut Context::from_waker(&old))
+        .is_pending());
+
+    let (wake, notice) = mpsc::channel();
+    let current = Waker::from(Arc::new(Notify(wake)));
+    let mut cx = Context::from_waker(&current);
+    assert!(Pin::new(&mut *child).poll(&mut cx).is_pending());
+    child.clone_killer().kill().unwrap();
+    let result = loop {
+        match Pin::new(&mut *child).poll(&mut cx) {
+            Poll::Ready(v) => break v.unwrap(),
+            Poll::Pending => {
+                if notice.recv_timeout(Duration::from_secs(10)).is_err() {
+                    let status = child.try_wait();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("process did not wake the waiter, status {status:?}");
+                }
+            }
+        }
+    };
+    drop(pty.master);
+    let _ = drain.join().unwrap();
+    assert_eq!(result.exit_code(), 1);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn herdr_reconcile_help_and_missing_evidence() {

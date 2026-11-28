@@ -17,7 +17,7 @@ use uuid::Uuid;
 pub mod worker_owner;
 
 mod assignment;
-mod backend;
+pub(crate) mod backend;
 #[cfg(target_os = "linux")]
 mod codex_rollout;
 #[cfg(target_os = "linux")]
@@ -41,8 +41,12 @@ mod runtime_fault;
 pub(crate) mod startup;
 mod view;
 
+#[cfg(not(windows))]
 pub const DISPATCH_USAGE: &str =
     "wfc dispatch --host {codex,opencode,claude} --task FILE --cwd DIR --report FILE [--backend {bundled,herdr}] [--herdr-endpoint PATH] [--launch-config FILE] [--scope S] [--role R] [--model M] [--effort E] [--label L] [--git] [--network] [--owner-token TOKEN]\n    wfc dispatch --role ROLE --task FILE --cwd DIR [--report FILE] [--scope S] [--owner-token TOKEN] -- PROGRAM [ARG ...]";
+#[cfg(windows)]
+pub const DISPATCH_USAGE: &str =
+    "wfc dispatch --host codex --task FILE --cwd DIR --report FILE [--backend bundled] [--launch-config FILE] [--scope S] [--role R] [--model M] [--effort E] [--label L] [--git] [--network] [--owner-token TOKEN]\n    wfc dispatch --role ROLE --task FILE --cwd DIR [--report FILE] [--scope S] [--owner-token TOKEN] -- PROGRAM [ARG ...]";
 pub const STATUS_USAGE: &str = "wfc status [--dispatch ID | --active]";
 
 pub struct Dispatch<'a> {
@@ -252,9 +256,18 @@ impl<'a> Dispatch<'a> {
             record["git"] = json!(host.git);
             record["network"] = json!(host.network);
             ensure!(
-                cfg!(target_os = "linux"),
+                cfg!(any(target_os = "linux", windows)),
                 "public backend is unavailable on this platform"
             );
+            #[cfg(windows)]
+            {
+                ensure!(
+                    host.backend == "bundled" && host.name == "codex",
+                    "Windows managed dispatch supports --backend bundled --host codex"
+                );
+                record["windowsExecution"] = json!(Uuid::new_v4().simple().to_string());
+                record["worker"] = json!({"state":"running"});
+            }
             #[cfg(target_os = "linux")]
             if host.backend == "herdr" {
                 record["tmux"] = json!(format!("wfc-{dispatch}"));
@@ -458,9 +471,11 @@ impl<'a> Dispatch<'a> {
             return Err(err);
         }
         #[cfg(not(target_os = "linux"))]
-        fs::rename(&pending, records.join(format!("{dispatch}.json"))).with_context(|| {
-            format!("worker succeeded but publishing dispatch {dispatch} failed")
-        })?;
+        if self.host.is_none() {
+            fs::rename(&pending, records.join(format!("{dispatch}.json"))).with_context(|| {
+                format!("worker succeeded but publishing dispatch {dispatch} failed")
+            })?;
+        }
         record
             .as_object_mut()
             .unwrap()
@@ -862,6 +877,10 @@ fn observe_dispatch(
             }
             record["backendHandle"] = inspection["ticket"].clone();
             record["backendObservation"] = inspection.clone();
+            #[cfg(windows)]
+            if inspection["closePending"] == true {
+                record["closePending"] = json!(true);
+            }
         }
         record["worker"] = worker;
         record["backendResult"] = inspection["result"].clone();
@@ -1047,7 +1066,7 @@ fn status_with_history(
     undelivered.sort_by_key(|v| v["id"].as_u64());
     let mut response =
         json!({"state":state,"dispatches":dispatches,"undelivered":undelivered,"waiters":[]});
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     {
         response["waiters"] = json!(messages::relay::waiters(&state)?);
     }

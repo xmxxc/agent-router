@@ -83,6 +83,7 @@ pub(super) fn same_publication_identity(before: &Value, after: &Value) -> bool {
         "controllerOwner",
         "backend",
         "executionId",
+        "windowsExecution",
     ]
     .iter()
     .all(|&field| before[field] == after[field])

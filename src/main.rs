@@ -3,6 +3,8 @@ mod bundled;
 #[cfg(target_os = "linux")]
 mod host_launch;
 mod kernel;
+#[cfg(windows)]
+mod windows_process;
 mod workflow;
 
 use std::env;
@@ -29,7 +31,7 @@ const RESERVED_COMMANDS: &[&str] = &[
     "handoff",
     #[cfg(not(target_os = "linux"))]
     "reclaim",
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     "relay",
 ];
 
@@ -73,6 +75,8 @@ fn run() -> anyhow::Result<ExitCode> {
             println!("{}", workflow::legacy_import::USAGE);
             #[cfg(target_os = "linux")]
             println!("{}", workflow::worker_owner::CLOSE_USAGE);
+            #[cfg(windows)]
+            println!("{}", workflow::backend::windows::CLOSE_USAGE);
             #[cfg(target_os = "linux")]
             for usage in [
                 workflow::input::CONTINUE_USAGE,
@@ -91,7 +95,7 @@ fn run() -> anyhow::Result<ExitCode> {
             #[cfg(target_os = "linux")]
             println!("{REPLY_USAGE}");
             println!("{WAIT_USAGE}");
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             println!("{}", workflow::messages::relay::USAGE);
             println!("{ACK_USAGE}");
             println!("{RESOLVE_USAGE}");
@@ -163,6 +167,14 @@ fn run() -> anyhow::Result<ExitCode> {
             )?));
         }
         Some("--kernel") if args.is_empty() => kernel::run()?,
+        #[cfg(windows)]
+        Some("--windows-bundled") if args.is_empty() => workflow::backend::windows::runtime()?,
+        #[cfg(windows)]
+        Some("--windows-relay-queue") if args.is_empty() => {
+            return workflow::messages::relay::run_windows_queue();
+        }
+        #[cfg(windows)]
+        Some("--windows-detached-relay") => workflow::messages::relay::run_detached(&args)?,
         Some(name @ ("dispatch" | "status" | "done" | "ask" | "wait" | "ack" | "resolve"))
             if args == ["--help"]
                 || (matches!(name, "done" | "ask" | "wait" | "ack" | "resolve")
@@ -219,6 +231,15 @@ fn run() -> anyhow::Result<ExitCode> {
                 };
                 controller::require_controller("close")?;
                 println!("{}", close(id, token)?);
+            }
+        }
+        #[cfg(windows)]
+        Some("close") => {
+            if args == ["--help"] || args == ["-h"] {
+                println!("{}", workflow::backend::windows::CLOSE_USAGE);
+            } else {
+                controller::require_controller("close")?;
+                println!("{}", workflow::backend::windows::close_cli(&args)?);
             }
         }
         Some(name) if name == "owner" || controller::ALIASES.contains(&name) => {
@@ -400,7 +421,7 @@ fn run() -> anyhow::Result<ExitCode> {
             controller::require_controller(name)?;
             println!("{}", request.run()?);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         Some("relay") => {
             use workflow::messages::relay::{Relay, USAGE};
             if args == ["--help"] || args == ["-h"] {

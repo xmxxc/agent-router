@@ -1,6 +1,8 @@
 //! Public lifecycle clients for hosted workers.
 #[cfg(target_os = "linux")]
 mod bundled;
+#[cfg(windows)]
+pub(crate) mod windows;
 #[cfg(target_os = "linux")]
 pub(super) use bundled::{
     create_handoff as create_bundled_handoff,
@@ -10,9 +12,9 @@ pub(super) use bundled::{
     APPENDED_USER_ENTRY as BUNDLED_APPENDED_USER_ENTRY,
 };
 
-use super::{host::Launch, valid_identity};
 #[cfg(all(test, target_os = "linux"))]
 use super::write_json;
+use super::{host::Launch, valid_identity};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 #[cfg(not(target_os = "linux"))]
@@ -80,7 +82,11 @@ pub fn create(state: &Path, row: &Value, launch: Launch, _owner: Option<&str>) -
         ensure!(row["backend"] == "bundled", "bundled assignment required");
         bundled::create(state, row, launch, _owner)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        windows::create(state, row, launch, _owner)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = (state, row, launch);
         bail!("bundled dispatch requires Linux")
@@ -520,6 +526,10 @@ fn same_execution(row: &Value, event: &Value) -> bool {
 }
 
 pub(super) fn close_blocks_callback(state: &Path, row: &Value) -> Result<bool> {
+    #[cfg(windows)]
+    if row["backend"] == "bundled" && row["windowsExecution"].is_string() {
+        return windows::close_blocks_callback(state, row);
+    }
     #[cfg(target_os = "linux")]
     if row["backend"] == "bundled" {
         return bundled::close_blocks_callback(state, row);
@@ -528,6 +538,13 @@ pub(super) fn close_blocks_callback(state: &Path, row: &Value) -> Result<bool> {
 }
 
 pub(super) fn require_callback_start(_state: &Path, _row: &Value) -> Result<()> {
+    #[cfg(windows)]
+    if _row["backend"] == "bundled" && _row["windowsExecution"].is_string() {
+        ensure!(
+            windows::callback_started(_state, _row)?,
+            "Windows execution did not start"
+        );
+    }
     #[cfg(target_os = "linux")]
     if _row["backend"] == "bundled" && _row["bundledStartupCommit"] == true {
         let id = _row["dispatch"].as_str().context("missing bundled dispatch ID")?;
@@ -648,6 +665,10 @@ pub(super) fn observe_with_mode(
             row["worker"].clone(),
             json!({"result":"definitely-not-sent","alive":false}),
         ));
+    }
+    #[cfg(windows)]
+    if row["backend"] == "bundled" {
+        return windows::observe(state, row);
     }
     #[cfg(target_os = "linux")]
     if row["backend"] == "bundled" {

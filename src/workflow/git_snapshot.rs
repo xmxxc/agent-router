@@ -41,7 +41,7 @@ fn git(cwd: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut output = options.open(&path)?;
-    fs::remove_file(path)?;
+    fs::remove_file(&path)?;
     let mut cmd = Command::new("git");
     super::controller::strip_credentials(&mut cmd);
     // Local repository variables (git rev-parse --local-env-vars) can point at
@@ -74,6 +74,11 @@ fn git(cwd: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
         .stdout(output.try_clone()?);
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(
+        &mut cmd,
+        crate::windows_process::NO_WINDOW,
+    );
     let mut child = cmd.spawn()?;
     let start = Instant::now();
     loop {

@@ -8,12 +8,40 @@ import time
 import uuid
 
 
+def windows_process(identity):
+    import ctypes as ct
+    from ctypes import wintypes as wt
+
+    api = ct.WinDLL("kernel32", use_last_error=True)
+    api.OpenProcess.argtypes = wt.DWORD, wt.BOOL, wt.DWORD
+    api.OpenProcess.restype = wt.HANDLE
+    api.GetProcessTimes.argtypes = (wt.HANDLE,) + (ct.POINTER(wt.FILETIME),) * 4
+    api.WaitForSingleObject.argtypes = wt.HANDLE, wt.DWORD
+    api.WaitForSingleObject.restype = wt.DWORD
+    api.CloseHandle.argtypes = (wt.HANDLE,)
+    handle = api.OpenProcess(0x101000, False, identity["pid"])
+    if not handle:
+        raise ct.WinError(ct.get_last_error())
+    try:
+        times = [wt.FILETIME() for _ in range(4)]
+        if not api.GetProcessTimes(handle, *(ct.byref(t) for t in times)):
+            raise ct.WinError(ct.get_last_error())
+        creation = str(times[0].dwHighDateTime << 32 | times[0].dwLowDateTime)
+        if creation != identity["creation"]:
+            raise RuntimeError(f"ConPTY process identity changed for PID {identity['pid']}")
+    except BaseException:
+        api.CloseHandle(handle)
+        raise
+    return api, handle
+
+
 def run(binary, *args):
     with subprocess.Popen([str(binary), *args], cwd=binary.parent, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, encoding="utf-8") as kernel:
         # Bound a stalled hello or RPC as well as the polling loop.
         deadline = Timer(45, kernel.kill)
         deadline.start()
+        pinned = None
         try:
             hello = json.loads(kernel.stdout.readline())
             if hello["protocol"] != 1 or hello["transport"] != "private-stdio-ndjson":
@@ -34,7 +62,10 @@ def run(binary, *args):
                 return reply["result"]
 
             script = "print('READY', flush=True); print(input()[::-1], flush=True); input()"
-            child = call("spawn", argv=[sys.executable, "-u", "-c", script], cols=100, rows=24)
+            child = call("spawn", argv=[sys.executable, "-u", "-c", script], cols=100, rows=24,
+                         **({"processIdentity": True} if sys.platform == "win32" else {}))
+            if sys.platform == "win32":
+                pinned = windows_process(child["identity"])
             unit["nonce"] = child["nonce"]
 
             def observe(marker):
@@ -57,6 +88,11 @@ def run(binary, *args):
             call("input", text=marker + "\r")
             observe(marker[::-1])
             closed = call("close")
+            if pinned is not None:
+                api, handle = pinned
+                if api.WaitForSingleObject(handle, 0) != 0:
+                    raise RuntimeError(f"Close acknowledged before process exit: {child['identity']}")
+                print(f"Windows process signalled at close: {child['identity']}")
             if closed["closed"] is not True:
                 raise RuntimeError(f"Unexpected close result: {closed}")
             kernel.stdin.close()
@@ -66,6 +102,9 @@ def run(binary, *args):
             print("Native PTY create, resize, submit, observe child response, close passed")
         finally:
             deadline.cancel()
+            if pinned is not None:
+                api, handle = pinned
+                api.CloseHandle(handle)
             if kernel.poll() is None:
                 kernel.stdin.close()
                 try:

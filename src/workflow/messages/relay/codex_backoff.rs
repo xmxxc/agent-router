@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, TryLockError},
     io::{self, Read},
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
@@ -32,9 +31,7 @@ impl Backoff {
 
     pub(super) fn try_ready(&self) -> Result<Option<File>> {
         // The stable lock is independent of the atomically replaced cooldown.
-        let lock = private_file()
-            .create(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        let lock = super::super::open_relay_file(private_file().create(true))
             .open(self.0.with_extension("lock"))?;
         ensure!(
             lock.metadata()?.is_file(),
@@ -59,14 +56,11 @@ impl Backoff {
     }
 
     fn read(&self) -> Result<Option<Cooldown>> {
-        let file = match fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&self.0)
-        {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            other => other?,
-        };
+        let file =
+            match super::super::open_relay_file(fs::OpenOptions::new().read(true)).open(&self.0) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                other => other?,
+            };
         let metadata = file.metadata()?;
         ensure!(
             metadata.is_file() && metadata.len() <= 512,
@@ -106,6 +100,7 @@ impl Backoff {
 }
 
 // Unlike wall time, this clock stays monotonic across relay restarts.
+#[cfg(target_os = "linux")]
 fn boot_clock() -> io::Result<(String, u64)> {
     let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let mut now = libc::timespec {
@@ -120,4 +115,12 @@ fn boot_clock() -> io::Result<(String, u64)> {
         boot_id,
         now.tv_sec as u64 * 1000 + now.tv_nsec as u64 / 1_000_000,
     ))
+}
+
+#[cfg(windows)]
+fn boot_clock() -> io::Result<(String, u64)> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?;
+    Ok(("windows-wall-clock".into(), now.as_millis() as u64))
 }

@@ -6,8 +6,10 @@ use std::{
     ffi::OsStr,
     fs,
     io::{self, BufRead, BufReader, Read, Seek},
-    os::unix::fs::OpenOptionsExt,
     path::PathBuf,
+};
+#[cfg(target_os = "linux")]
+use std::{
     process::{Command, Stdio},
     time::Duration,
 };
@@ -59,10 +61,8 @@ pub(super) fn controller(thread: &str) -> Result<String> {
             if !kind.is_file() || !name.starts_with("rollout-") || !name.ends_with(&suffix) {
                 continue;
             }
-            let Ok(file) = fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(entry.path())
+            let Ok(file) =
+                super::super::open_relay_file(fs::OpenOptions::new().read(true)).open(entry.path())
             else {
                 continue;
             };
@@ -111,6 +111,18 @@ pub(super) fn refusal(
         let mut transcript = [0; FULL.len()];
         stderr.read_exact(&mut transcript)?;
         if transcript == FULL {
+            return Ok(Some(Outcome::TargetFull));
+        }
+    }
+    #[cfg(windows)]
+    if check_capacity
+        && stdout.metadata()?.len() == 0
+        && stderr.metadata()?.len() == FULL.len() as u64 + 1
+    {
+        stderr.rewind()?;
+        let mut transcript = vec![0; FULL.len() + 1];
+        stderr.read_exact(&mut transcript)?;
+        if transcript.ends_with(b"\r\n") && transcript[..FULL.len() - 1] == FULL[..FULL.len() - 1] {
             return Ok(Some(Outcome::TargetFull));
         }
     }
@@ -170,6 +182,7 @@ fn missing_rollout(output: &mut fs::File, thread: &OsStr) -> io::Result<Option<b
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(super) fn queue(
     thread: &str,
     messages: &[Value],
@@ -227,3 +240,6 @@ pub(super) fn queue(
     };
     Ok(outcome)
 }
+
+#[cfg(windows)]
+pub(super) use super::windows_queue::queue;

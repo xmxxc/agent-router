@@ -2,19 +2,23 @@
 //! still-outstanding claim can be settled when the transport returns.
 mod codex;
 mod codex_backoff;
+#[cfg(target_os = "linux")]
 mod opencode;
+#[cfg(target_os = "linux")]
 pub(crate) mod queue_owner;
+#[cfg(windows)]
+mod windows_queue;
+#[cfg(windows)]
+pub(crate) use windows_queue::run as run_windows_queue;
 mod registration;
 pub use registration::waiters;
 
 use super::{
-    message_boundary,
-    recovery::{GenerationStamps, Generations, Scan, Stamp},
-    spaced_json, Identity, Inbox, State,
+    generations::{GenerationStamps, Generations, Stamp},
+    message_boundary, spaced_json, Identity, Inbox, State,
 };
 use crate::workflow::{
-    assignment::MessageBoundary, controller, ensure_state_writable, worker_owner,
-    writable_state_dir,
+    assignment::MessageBoundary, controller, ensure_state_writable, writable_state_dir,
 };
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
@@ -23,27 +27,41 @@ use std::{
     env,
     ffi::OsString,
     fs::{self, File, TryLockError},
-    os::unix::fs::OpenOptionsExt,
     path::Path,
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
+#[cfg(target_os = "linux")]
+use {super::recovery::Scan, crate::workflow::worker_owner, std::os::unix::fs::OpenOptionsExt};
 
+#[cfg(target_os = "linux")]
 pub const USAGE: &str = "wfc relay (--codex | --codex-thread UUID | --opencode-url URL --opencode-session ID) [--scope NAME] [--for SECONDS] [--detach] [--stall-after SECONDS] [--owner-token TOKEN]";
+#[cfg(windows)]
+pub const USAGE: &str = "wfc relay (--codex | --codex-thread UUID) [--scope NAME] [--for SECONDS] [--detach] [--owner-token TOKEN]";
 
 pub struct Relay<'a> {
     scope: Option<&'a str>,
     target: Target<'a, Option<&'a str>>,
     detach: bool,
     lifetime: Option<Duration>,
+    #[cfg(target_os = "linux")]
     stall: Option<Duration>,
     owner_token: Option<&'a str>,
 }
 
+#[cfg(target_os = "linux")]
 enum Target<'a, Thread> {
     Codex(Thread),
     OpenCode(opencode::Target<'a>),
 }
+
+#[cfg(windows)]
+enum CodexTarget<Thread> {
+    Codex(Thread),
+}
+
+#[cfg(windows)]
+type Target<'a, Thread> = CodexTarget<Thread>;
 
 impl<'a> Target<'a, Option<&'a str>> {
     fn resolve(self) -> Result<Target<'a, String>> {
@@ -57,6 +75,7 @@ impl<'a> Target<'a, Option<&'a str>> {
                         .context("--codex needs CODEX_THREAD_ID")?,
                 )?)
             }
+            #[cfg(target_os = "linux")]
             Target::OpenCode(target) => Target::OpenCode(target),
         })
     }
@@ -87,6 +106,14 @@ impl<'a> Relay<'a> {
                 "--detach" if !detach => detach = true,
                 "--codex-thread" | "--opencode-url" | "--opencode-session" | "--scope"
                 | "--for" | "--stall-after" | "--owner-token" => {
+                    #[cfg(windows)]
+                    ensure!(
+                        !matches!(
+                            flag,
+                            "--opencode-url" | "--opencode-session" | "--stall-after"
+                        ),
+                        "unsupported Windows relay option {flag}"
+                    );
                     let v = args
                         .next()
                         .and_then(|v| v.to_str())
@@ -104,6 +131,7 @@ impl<'a> Relay<'a> {
         let session = opts.get("--opencode-session").copied();
         let target = match (codex, thread, url, session) {
             (true, None, None, None) | (false, Some(_), None, None) => Target::Codex(thread),
+            #[cfg(target_os = "linux")]
             (false, None, Some(url), Some(session)) => Target::OpenCode(opencode::Target::parse(url, session)?),
             _ => bail!("give exactly one controller: --codex, --codex-thread, or --opencode-url with --opencode-session"),
         };
@@ -111,6 +139,7 @@ impl<'a> Relay<'a> {
             scope: opts.get("--scope").copied(),
             target,
             detach,
+            #[cfg(target_os = "linux")]
             stall: opts.get("--stall-after").map(|v| seconds(v)).transpose()?,
             lifetime: opts
                 .get("--for")
@@ -139,17 +168,20 @@ impl<'a> Relay<'a> {
         if self.detach {
             fs::create_dir_all(&state)?;
             let log = state.join("relay.log");
-            let out = fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(&log)?;
+            let mut options = fs::OpenOptions::new();
+            options.append(true).create(true);
+            #[cfg(target_os = "linux")]
+            options.mode(0o600);
+            let out = super::open_relay_file(&mut options).open(&log)?;
             ensure!(out.metadata()?.is_file(), "invalid relay log");
             let mut cmd = Command::new(env::current_exe()?);
+            #[cfg(target_os = "linux")]
             cmd.arg("relay");
+            #[cfg(windows)]
+            cmd.arg("--windows-detached-relay");
             match &target {
                 Target::Codex(thread) => cmd.args(["--codex-thread", thread]),
+                #[cfg(target_os = "linux")]
                 Target::OpenCode(target) => cmd.args([
                     "--opencode-url",
                     target.url,
@@ -163,6 +195,7 @@ impl<'a> Relay<'a> {
             if let Some(limit) = self.lifetime {
                 cmd.args(["--for", &limit.as_secs_f64().to_string()]);
             }
+            #[cfg(target_os = "linux")]
             if let Some(stall) = self.stall {
                 cmd.args(["--stall-after", &stall.as_secs_f64().to_string()]);
             }
@@ -170,17 +203,49 @@ impl<'a> Relay<'a> {
                 cmd.env("WFC_CONTROLLER_TOKEN", token)
                     .env_remove("WFC_OWNER_TOKEN");
             }
-            worker_owner::new_session(&mut cmd);
-            let child = cmd
-                .stdin(Stdio::null())
+            cmd.env("WFC_STATE", &state)
                 .stdout(out.try_clone()?)
-                .stderr(out)
-                .spawn()?;
-            println!("{}", json!({"pid":child.id(),"log":log}));
+                .stderr(out);
+            #[cfg(target_os = "linux")]
+            {
+                worker_owner::new_session(&mut cmd);
+                let child = cmd.stdin(Stdio::null()).spawn()?;
+                println!("{}", json!({"pid":child.id(),"log":log}));
+            }
+            #[cfg(windows)]
+            {
+                use crate::windows_process as process;
+                use std::io::Write;
+                use std::os::windows::io::AsRawHandle;
+                let mut child = process::background(cmd.stdin(Stdio::piped()))?;
+                let identity = process::identity(child.id(), child.as_raw_handle())?;
+                child
+                    .stdin
+                    .take()
+                    .context("missing relay startup pipe")?
+                    .write_all(b"1")?;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if registration::waiters(&state)?
+                        .iter()
+                        .any(|entry| entry["process"] == identity)
+                    {
+                        break;
+                    }
+                    ensure!(
+                        child.try_wait()?.is_none() && Instant::now() < deadline,
+                        "could not confirm detached relay registration; inspect {}",
+                        log.display()
+                    );
+                    std::thread::sleep(process::TICK);
+                }
+                println!("{}", json!({"pid":child.id(),"process":identity,"log":log}));
+            }
             return Ok(());
         }
         let destination = match &target {
             Target::Codex(thread) => ("thread", thread.as_str()),
+            #[cfg(target_os = "linux")]
             Target::OpenCode(target) => ("session", target.session),
         };
         let _entry = registration::Registration::create(&state, self.scope, destination)?;
@@ -190,36 +255,46 @@ impl<'a> Relay<'a> {
                 .map_or(Duration::MAX, |d| d.saturating_sub(start.elapsed()))
         };
         let mut budget = match &target {
+            #[cfg(target_os = "linux")]
             Target::Codex(_) => {
                 let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
                 ensure!(page_size > 0, "cannot determine queue argument limit");
                 // Linux MAX_ARG_STRLEN counts the terminating NUL.
                 page_size as usize * 32
             }
+            #[cfg(windows)]
+            Target::Codex(_) => 32_000,
+            #[cfg(target_os = "linux")]
             Target::OpenCode(_) => usize::MAX, // The batch is an HTTP body, not an argument.
         };
         let mut diagnosed = HashSet::new();
         let backoff = match &target {
             Target::Codex(thread) => Some(codex_backoff::Backoff::new(&state, thread)?),
+            #[cfg(target_os = "linux")]
             Target::OpenCode(_) => None,
         };
+        #[cfg(target_os = "linux")]
         let mut scan = Scan::default();
+        #[cfg(target_os = "linux")]
         let mut watch = super::runtime_fault::Watch::default();
+        #[cfg(target_os = "linux")]
         let (max_turn, stall) = (
             crate::workflow::runtime_fault::max_turn(),
             self.stall
                 .unwrap_or_else(crate::workflow::runtime_fault::stall_after),
         );
-        let mut observations = Vec::new();
-        let mut recovery = Vec::new();
+        #[cfg(target_os = "linux")]
+        let (mut observations, mut recovery) = (Vec::new(), Vec::new());
         let mut first = true;
         while !remaining().is_zero() {
             preflight()?;
             let was_first = std::mem::replace(&mut first, false);
             if !was_first {
+                #[cfg(target_os = "linux")]
                 if recovery.is_empty() {
                     recovery = scan.batch(&state, None, self.scope, remaining());
                 }
+                #[cfg(target_os = "linux")]
                 if observations.is_empty() {
                     observations = watch.poll(&state, None, self.scope, remaining());
                 }
@@ -247,6 +322,7 @@ impl<'a> Relay<'a> {
                     match Inbox::try_open(&state)? {
                         Some(mut inbox) if assignments.namespace_current(&state)? => {
                             preflight()?;
+                            #[cfg(target_os = "linux")]
                             if self.scope.is_some() || !assignments.restricted {
                                 inbox.recover_startups(&mut scan, std::mem::take(&mut recovery))?;
                                 inbox.publish_runtime(
@@ -292,6 +368,7 @@ impl<'a> Relay<'a> {
                             target_lock.as_ref().expect("Codex claim holds target lock"),
                         )?
                     }
+                    #[cfg(target_os = "linux")]
                     Target::OpenCode(target) => target.deliver(&text, limit),
                 };
                 // A full target pauses new claims. This batch already has
@@ -309,7 +386,11 @@ impl<'a> Relay<'a> {
                         std::thread::sleep(remaining().min(Duration::from_millis(10)));
                     }
                 }
-                if let Target::Codex(thread) = &target {
+                if let Some(thread) = match &target {
+                    Target::Codex(thread) => Some(thread),
+                    #[cfg(target_os = "linux")]
+                    Target::OpenCode(_) => None,
+                } {
                     ensure!(
                         outcome != Outcome::Missing,
                         "no rollout found for thread {thread}; messages stay waiting"
@@ -318,12 +399,21 @@ impl<'a> Relay<'a> {
                 if outcome == Outcome::TooLong {
                     // exec rejected this exact argument before submission. Its byte
                     // length excludes the NUL, so the next claim must be smaller.
-                    budget = text.len();
+                    budget = argument_size(&text);
                 }
                 if matches!(outcome, Outcome::Delivered | Outcome::TooLong) {
                     continue;
                 }
-            } else if was_first || (recovery.is_empty() && scan.in_progress()) {
+            } else if was_first || {
+                #[cfg(target_os = "linux")]
+                {
+                    recovery.is_empty() && scan.in_progress()
+                }
+                #[cfg(windows)]
+                {
+                    false
+                }
+            } {
                 // Advance an idle recovery scan promptly. A transport attempt
                 // that reaches the retry path still waits below.
                 continue;
@@ -336,13 +426,32 @@ impl<'a> Relay<'a> {
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn run_detached(args: &[OsString]) -> Result<()> {
+    use std::io::Read;
+    let mut grant = [0];
+    std::io::stdin().read_exact(&mut grant)?;
+    ensure!(grant == *b"1", "invalid relay startup grant");
+    controller::require_controller("relay")?;
+    let relay = Relay::parse(args)?;
+    ensure!(!relay.detach, "detached relay cannot detach again");
+    relay.run()
+}
+
 // Serialize queue submissions that can overlap, without holding the inbox lock
 // across an external call. Scoped senders still progress on independent scopes.
 fn transport_lock(state: &Path, scope: Option<&str>) -> Result<Option<(File, Option<File>)>> {
-    let transport = super::private_file()
-        .create(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(state.join("relay-transport.lock"))?;
+    let mut options = super::private_file();
+    options.create(true);
+    #[cfg(target_os = "linux")]
+    options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    super::open_relay_file(&mut options);
+    let transport = options.open(state.join("relay-transport.lock"))?;
+    ensure!(
+        transport.metadata()?.is_file(),
+        "invalid relay transport lock"
+    );
     match if scope.is_some() {
         transport.try_lock_shared()
     } else {
@@ -416,9 +525,7 @@ fn claim_batch(
     let mut text = String::from(PREFIX);
     let dispatches = inbox.dir.join("dispatches");
     for m in &mut inbox.messages {
-        if !m.claimable()
-            || scope.is_some_and(|s| s != m.worker.scope())
-        {
+        if !m.claimable() || scope.is_some_and(|s| s != m.worker.scope()) {
             continue;
         }
         if !assignments.permits(&dispatches, &m.worker) {
@@ -426,7 +533,7 @@ fn claim_batch(
         }
         let view = m.view_at(State::Unknown, m.delivery.next_version()?);
         let envelope = envelope(&view);
-        let size = PREFIX.len() + envelope.len() + SUFFIX.len() + 1;
+        let size = argument_size(PREFIX) + argument_size(&envelope) + argument_size(SUFFIX) + 1;
         if size > budget {
             if diagnosed.insert(m.id) {
                 println!("router relay: message {} ({}) needs {size} queue argument bytes, limit {budget}; available to wait", m.id, m.message_id);
@@ -434,7 +541,9 @@ fn claim_batch(
             continue;
         }
         if !messages.is_empty() {
-            if text.len() + 2 + envelope.len() + SUFFIX.len() + 1 > budget {
+            if argument_size(&text) + 2 + argument_size(&envelope) + argument_size(SUFFIX) + 1
+                > budget
+            {
                 break;
             }
             text.push_str(", ");
@@ -453,6 +562,18 @@ fn claim_batch(
     Ok(Some((messages, text)))
 }
 
+#[cfg(target_os = "linux")]
+fn argument_size(text: &str) -> usize {
+    text.len()
+}
+
+#[cfg(windows)]
+fn argument_size(text: &str) -> usize {
+    // The complete CreateProcess command line is limited to 32767 UTF-16
+    // units. Count quotes and backslashes with their worst-case expansion.
+    text.encode_utf16().count() + text.bytes().filter(|b| matches!(b, b'"' | b'\\')).count()
+}
+
 struct AssignmentProof {
     stamps: Option<GenerationStamps>,
     identity: Option<(String, u64)>,
@@ -468,7 +589,17 @@ struct ScopeAssignments {
 
 impl ScopeAssignments {
     fn namespace_current(&self, state: &Path) -> Result<bool> {
-        Ok(Stamp::at(&state.join("dispatches"))? == self.directory)
+        let dir = state.join("dispatches");
+        #[cfg(windows)]
+        if !crate::workflow::assignment::ids(&dir)?.iter().eq(self
+            .proofs
+            .keys()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter())
+        {
+            return Ok(false);
+        }
+        Ok(Stamp::at(&dir)? == self.directory)
     }
 
     // Called after taking transport and scope locks and before taking the
@@ -522,7 +653,7 @@ fn scope_assignments(
     });
     // The directory stamp only tracks the namespace. Recheck each pair's
     // stamps before reusing its parsed metadata, including damaged entries.
-    let ids = if old.directory == directory {
+    let ids = if cfg!(target_os = "linux") && old.directory == directory {
         old.proofs.keys().cloned().collect()
     } else {
         crate::workflow::assignment::ids(&dir)?
@@ -561,7 +692,9 @@ fn scope_assignments(
                         );
                     }
                 }
-                let unchanged = stamps.is_some_and(|stamps| stamps.current(&dir, &id));
+                let unchanged = stamps.is_some_and(|stamps| {
+                    stamps == generations.stamps() && stamps.current(&dir, &id)
+                });
                 let identity = generations.assigned().and_then(|row| {
                     let assigned = if row["scope"].is_null() {
                         Some(id.as_str())

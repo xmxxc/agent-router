@@ -29,14 +29,28 @@ cargo +1.96.1-x86_64-pc-windows-msvc build --release --locked --target x86_64-pc
 cargo +1.96.1-x86_64-pc-windows-msvc test --workspace --release --locked --target x86_64-pc-windows-msvc
 ./target/x86_64-pc-windows-msvc/release/wfc.exe --version
 python tools/smoke.py target/x86_64-pc-windows-msvc/release/wfc.exe --kernel
+python tests/windows_product.py target/x86_64-pc-windows-msvc/release/wfc.exe
 python tools/collect_notices.py x86_64-pc-windows-msvc target/bundled-notices
 ```
 
 prepare 校验并解出仓内的 Ghostty 源码包，校验 zlib 下载字节和 Zig 包哈希。已有原始 zlib 源包时可传入 `--zlib-archive <文件>`。其他 Zig 依赖按 Ghostty 的 .zon 清单校验内容，Rust 依赖按 Cargo.lock 校验。许可证输出目录须为新目录。
 
+Windows 上的 Codex 派发默认使用 bundled。由原聊天中的 PowerShell 为本次派发的 scope 注册 relay。relay 从 PATH 启动原生 `codex.exe`，派发用 `--launch-config` 选择 worker 的 Codex 程序和进程级配置。
+
+```powershell
+$env:WFC_STATE = "$env:LOCALAPPDATA\agent-router\native state"
+wfc relay --codex --scope demo --detach --for 600
+$run = wfc dispatch --host codex --scope demo --launch-config "host config.json" --task "task brief.md" --cwd . --report "worker report.md" | ConvertFrom-Json
+wfc status --dispatch $run.dispatch
+wfc ack $messageId
+wfc close $run.dispatch
+```
+
+收到回报后，将其中的 `messageId` 交给 `ack`。关闭按派发号定位此次 Job Object，已确认的回执包含 `jobActiveProcesses: 0`。启动结果不明时，`status` 保留派发证据并显示 `backendResult: uncertain`。
+
 ## 运行和接入 WFC
 
-直接运行 `wfc` 或 `wfc --help` 会列出熟悉的工作流命令名。当前版本支持派发和状态查询，Linux 还支持后台运行与按编号关闭，预留命令返回退出码 2。`wfc --version` 显示 Rust 标识、包版本、目标平台、构建类型和编译时的 `WFC_BUILD_ID`（未设置、为空或仅含空白时，使用本地构建时间的 Unix 纳秒数）。
+直接运行 `wfc` 或 `wfc --help` 会列出工作流命令。Linux 和 Windows 支持后台派发、状态查询与按编号关闭，预留命令返回退出码 2。`wfc --version` 显示 Rust 标识、包版本、目标平台、构建类型和编译时的 `WFC_BUILD_ID`（未设置、为空或仅含空白时，使用本地构建时间的 Unix 纳秒数）。
 
 Linux 公开入口按宿主和后端派发，例如：
 

@@ -49,6 +49,11 @@ pub fn clean(value: &str) -> String {
 
 fn git_dir(cwd: &Path, flag: &str) -> Result<PathBuf> {
     let mut command = Command::new("git");
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(
+        &mut command,
+        crate::windows_process::NO_WINDOW,
+    );
     super::controller::strip_credentials(&mut command);
     let out = command
         .args(["rev-parse", flag])
@@ -88,6 +93,8 @@ fn append_env(to: &mut Map<String, Value>, from: Option<&Value>) -> Result<()> {
                 "invalid env"
             );
             if !super::controller::is_credential(k) {
+                #[cfg(windows)]
+                let k = &k.to_ascii_uppercase();
                 to.insert(k.clone(), v.clone());
             }
         }
@@ -223,8 +230,12 @@ pub(super) fn worker_brief(record: &Value, opening: &str) -> Result<String> {
     } else {
         "If you need a decision, run \"$WFC_BIN\" ask \"<question>\" [--options a,b] --attempt \"$WFC_ATTEMPT\" and end your turn. The answer arrives as your next message."
     };
+    #[cfg(windows)]
+    let completion = "In PowerShell run & $env:WFC_BIN done --report $env:WFC_REPORT --attempt $env:WFC_ATTEMPT.";
+    #[cfg(not(windows))]
+    let completion = "Run \"$WFC_BIN\" done --report \"$WFC_REPORT\" --attempt \"$WFC_ATTEMPT\".";
     Ok(format!(
-        "{opening} (dispatch {dispatch}). Read and do the task in {task}. Stop any server or background process you started before reporting. Write the report to {report}. Run \"$WFC_BIN\" done --report \"$WFC_REPORT\" --attempt \"$WFC_ATTEMPT\". {decision}"
+        "{opening} (dispatch {dispatch}). Read and do the task in {task}. Stop any server or background process you started before reporting. Write the report to {report}. {completion} {decision}"
     ))
 }
 
@@ -522,7 +533,7 @@ impl Options<'_> {
         if let Some(path) = selected_config {
             record["launchConfig"] = json!(path);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         if self.name == "codex" && matches!(self.backend, "tmux" | "herdr" | "bundled") {
             match codex_home(&cwd, &launch.env) {
                 Ok(home) => {
@@ -557,6 +568,22 @@ fn writable_paths(state: &Path, record: &Value) -> Result<Vec<PathBuf>> {
 }
 
 fn bind_environment(state: &Path, record: &Value, launch: &mut Launch) -> Result<()> {
+    #[cfg(windows)]
+    launch.env.retain(|key, _| {
+        ![
+            "WFC_DISPATCH",
+            "WFC_SCOPE",
+            "WFC_ROLE",
+            "WFC_ATTEMPT",
+            "WFC_TASK",
+            "WFC_REPORT",
+            "WFC_ROUND",
+            "WFC_STATE",
+            "WFC_BIN",
+        ]
+        .iter()
+        .any(|reserved| key.eq_ignore_ascii_case(reserved))
+    });
     for key in ["dispatch", "scope", "role", "attempt", "task", "report"] {
         launch.env.insert(
             format!("WFC_{}", key.to_ascii_uppercase()),
@@ -577,7 +604,7 @@ fn bind_environment(state: &Path, record: &Value, launch: &mut Launch) -> Result
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn codex_home(cwd: &Path, settings: &Map<String, Value>) -> Result<PathBuf> {
     let effective = |key| {
         settings
@@ -642,6 +669,9 @@ mod tests {
             json!({"task":"task","report":"report","dispatch":"d-1234abcd","backend":"bundled"});
         let brief = worker_brief(&row, FIRST_BRIEF)?;
         assert!(brief.contains("describe the blocker in your report"));
+        #[cfg(windows)]
+        assert!(brief.contains("& $env:WFC_BIN done --report"));
+        #[cfg(not(windows))]
         assert!(brief.contains("\"$WFC_BIN\" done --report"));
         assert!(!brief.contains("\"$WFC_BIN\" ask"));
         assert!(!brief.contains("next message"));

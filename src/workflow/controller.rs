@@ -260,7 +260,7 @@ fn scope_lock_file(state: &Path, scope: &str) -> Result<File> {
     Ok(lock)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub(super) fn try_scope_lock(state: &Path, scope: &str) -> Result<Option<File>> {
     ensure_state_writable(state)?;
     let lock = scope_lock_file(state, scope)?;

@@ -1,14 +1,14 @@
 use crate::{Child, ChildKiller, ExitStatus};
 use anyhow::Context as _;
 use std::io::{Error as IoError, Result as IoResult};
-use std::os::windows::io::{AsRawHandle, RawHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::pin::Pin;
-use std::sync::Mutex;
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use winapi::shared::minwindef::DWORD;
 use winapi::shared::winerror::WAIT_TIMEOUT;
 use winapi::um::processthreadsapi::*;
-use winapi::um::synchapi::WaitForSingleObject;
+use winapi::um::synchapi::{CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject};
 use winapi::um::winbase::{INFINITE, WAIT_OBJECT_0};
 
 pub mod conpty;
@@ -20,9 +20,17 @@ use filedescriptor::OwnedHandle;
 #[derive(Debug)]
 pub struct WinChild {
     proc: Mutex<OwnedHandle>,
+    waiter: Option<ExitWaiter>,
 }
 
 impl WinChild {
+    fn new(proc: OwnedHandle) -> Self {
+        Self {
+            proc: Mutex::new(proc),
+            waiter: None,
+        }
+    }
+
     fn wait_for_exit(&self, timeout: DWORD) -> IoResult<Option<ExitStatus>> {
         let proc = self.proc.lock().unwrap();
         let handle = proc.as_raw_handle() as _;
@@ -38,6 +46,60 @@ impl WinChild {
             WAIT_TIMEOUT => Ok(None),
             _ => Err(IoError::last_os_error()),
         }
+    }
+}
+
+#[derive(Debug)]
+struct ExitWaiter {
+    cancel: OwnedHandle,
+    state: Arc<Mutex<WaitState>>,
+}
+
+#[derive(Debug)]
+struct WaitState {
+    waker: Waker,
+    failure: Option<IoError>,
+}
+
+impl ExitWaiter {
+    fn start(proc: OwnedHandle, waker: Waker) -> anyhow::Result<Self> {
+        let event = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return Err(IoError::last_os_error().into());
+        }
+        let cancel = unsafe { OwnedHandle::from_raw_handle(event as _) };
+        let thread_cancel = cancel.try_clone()?;
+        let state = Arc::new(Mutex::new(WaitState {
+            waker,
+            failure: None,
+        }));
+        let thread_state = state.clone();
+        std::thread::Builder::new().spawn(move || {
+            // Both handles remain owned by this thread throughout the wait.
+            let handles = [
+                proc.as_raw_handle() as _,
+                thread_cancel.as_raw_handle() as _,
+            ];
+            let result = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+            if result == WAIT_OBJECT_0 + 1 {
+                return;
+            }
+            let waker = {
+                let mut state = thread_state.lock().unwrap();
+                if result != WAIT_OBJECT_0 {
+                    state.failure = Some(IoError::last_os_error());
+                }
+                state.waker.clone()
+            };
+            waker.wake();
+        })?;
+        Ok(Self { cancel, state })
+    }
+}
+
+impl Drop for ExitWaiter {
+    fn drop(&mut self) {
+        unsafe { SetEvent(self.cancel.as_raw_handle() as _) };
     }
 }
 
@@ -110,24 +172,27 @@ impl Child for WinChild {
 impl std::future::Future for WinChild {
     type Output = anyhow::Result<ExitStatus>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<anyhow::Result<ExitStatus>> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<anyhow::Result<ExitStatus>> {
         match self.wait_for_exit(0) {
             Ok(Some(status)) => Poll::Ready(Ok(status)),
             Err(err) => Poll::Ready(Err(err).context("Failed to retrieve process exit status")),
             Ok(None) => {
-                struct PassRawHandleToWaiterThread(pub RawHandle);
-                unsafe impl Send for PassRawHandleToWaiterThread {}
-
-                let proc = self.proc.lock().unwrap().try_clone()?;
-                let handle = PassRawHandleToWaiterThread(proc.as_raw_handle());
-
-                let waker = cx.waker().clone();
-                std::thread::spawn(move || {
-                    unsafe {
-                        WaitForSingleObject(handle.0 as _, INFINITE);
+                if let Some(waiter) = &self.waiter {
+                    let mut state = waiter.state.lock().unwrap();
+                    if let Some(error) = state.failure.take() {
+                        return Poll::Ready(Err(error).context("Failed to wait for process exit"));
                     }
-                    waker.wake();
-                });
+                    state.waker.clone_from(cx.waker());
+                    drop(state);
+                    // The waiter may already have woken a previous executor.
+                    return match self.wait_for_exit(0) {
+                        Ok(None) => Poll::Pending,
+                        Ok(Some(status)) => Poll::Ready(Ok(status)),
+                        Err(error) => Poll::Ready(Err(error.into())),
+                    };
+                }
+                let proc = self.proc.lock().unwrap().try_clone()?;
+                self.waiter = Some(ExitWaiter::start(proc, cx.waker().clone())?);
                 Poll::Pending
             }
         }

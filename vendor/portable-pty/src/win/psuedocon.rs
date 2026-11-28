@@ -13,7 +13,6 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::{mem, ptr};
 use winapi::shared::minwindef::{DWORD, HMODULE};
 use winapi::shared::winerror::{HRESULT, S_OK};
@@ -391,8 +390,6 @@ impl PsuedoCon {
         let _main_thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread as _) };
         let proc = unsafe { OwnedHandle::from_raw_handle(pi.hProcess as _) };
 
-        Ok(WinChild {
-            proc: Mutex::new(proc),
-        })
+        Ok(WinChild::new(proc))
     }
 }

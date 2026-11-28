@@ -186,3 +186,16 @@ Both the child and its cloned killer use the same termination check.
 Apply `vendor/patches/portable-pty/0005-wait-for-windows-child-exit.patch`
 after the four Herdr patches. Verify on Windows with
 `python tools/smoke.py <path-to-wfc.exe> --kernel`.
+
+## 0006 retain the Windows process handle for asynchronous waits
+
+`WinChild::poll` now installs one waiter per child while it is pending.
+The waiter owns a duplicate process handle for the whole wait. A later poll
+replaces the waker, or observes exit directly if a notification already ran.
+Dropping the child signals the private cancellation event and releases the
+waiter's process handle even when the process continues running.
+
+Apply `vendor/patches/portable-pty/0006-own-windows-async-wait.patch` after
+0005. The WFC kernel uses the synchronous `Child::try_wait` path. On Windows,
+`cargo test -p wfc --test cli windows_pty_async_wait_wakes_the_current_executor`
+exercises a pending wait, waker replacement and process exit notification.

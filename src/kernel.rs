@@ -244,6 +244,18 @@ fn handle(
         ensure!(!units.contains_key(name), "unit_exists");
         let unit = spawn(v, tx.clone())?;
         let result = json!({"nonce": unit.nonce, "pid": unit.child.process_id()});
+        #[cfg(windows)]
+        let result = if v["processIdentity"] == true {
+            // Read creation time on the original ConPTY process handle.
+            let identity = unit
+                .child
+                .process_id()
+                .zip(unit.child.as_raw_handle())
+                .and_then(|(pid, handle)| crate::windows_process::identity(pid, handle).ok());
+            json!({"nonce": unit.nonce, "pid": unit.child.process_id(), "identity": identity})
+        } else {
+            result
+        };
         units.insert(name.to_string(), unit);
         return Ok(Some(result));
     }

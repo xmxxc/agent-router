@@ -872,6 +872,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "uuid",
+ "winapi",
  "wfc-herdr",
  "wfc-legacy-state",
 ]
