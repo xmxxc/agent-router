@@ -45,9 +45,9 @@ jobs:
           version: '0.16.0'
       - run: rustup toolchain install 1.96.1 --profile minimal
       - run: python tools/prepare.py
-      - run: cargo +1.96.1 build --release --locked --target $env:TRIPLE --bin wfc
-      - name: Run the Windows workspace and public CLI tests
-        run: cargo +1.96.1 test --workspace --release --locked --target $env:TRIPLE --no-fail-fast
+      - name: Build the Windows release CLI
+        id: build
+        run: cargo +1.96.1 build --release --locked --target $env:TRIPLE --bin wfc
       - name: Build the product ZIP and manifest
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
@@ -102,7 +102,8 @@ jobs:
             exe = Get-FileIdentity $exe
             zip = Get-FileIdentity $zip
           } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $download.FullName 'manifest.json')
-      - name: Verify the manifest and smoke-test the extracted EXE
+      - name: Verify the manifest and extracted EXE
+        id: verify
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           $root = Join-Path $PWD $env:PRODUCT_DIR
@@ -136,18 +137,27 @@ jobs:
           $version = & $exe --version
           if ($version -cne $manifest.version) { throw "Packaged version mismatch: $version" }
           $manifest | ConvertTo-Json
-          python tools/smoke.py $exe --kernel
+          "VERIFIED_EXE=$exe" >> $env:GITHUB_ENV
+      - name: Smoke-test the extracted EXE kernel
+        if: ${{ !cancelled() && steps.verify.outcome == 'success' }}
+        run: python tools/smoke.py $env:VERIFIED_EXE --kernel
+      - name: Run the Windows product fixture on the extracted EXE
+        if: ${{ !cancelled() && steps.verify.outcome == 'success' }}
+        run: python tests/windows_product.py $env:VERIFIED_EXE
       - name: Check the packaged EXE for redistributable DLL imports
+        if: ${{ !cancelled() && steps.verify.outcome == 'success' }}
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
-          $exe = Join-Path $env:PRODUCT_DIR 'verified product/wfc.exe'
-          $imports = & llvm-readobj.exe --coff-imports $exe
+          $imports = & llvm-readobj.exe --coff-imports $env:VERIFIED_EXE
           $names = $imports -match '^\s*Name:'
           if (!$names) { throw 'No PE imports found for wfc.exe' }
           $names
           if ($names -match '^\s*Name: (vcruntime|msvcp|msvcr|concrt|vcomp)\d+\w*\.dll$') {
             throw 'The product imports a Visual C++ redistributable DLL'
           }
+      - name: Run the unfiltered Windows workspace release tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: cargo +1.96.1 test --workspace --release --locked --target $env:TRIPLE --no-fail-fast
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         id: upload
         with:
