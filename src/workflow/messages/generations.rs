@@ -5,7 +5,7 @@ use serde_json::Value;
 #[cfg(target_os = "linux")]
 use std::{fs, os::unix::fs::MetadataExt};
 use std::{
-    fs::{File, Metadata, OpenOptions},
+    fs::{File, OpenOptions},
     io,
     path::Path,
 };
@@ -22,7 +22,7 @@ pub(super) struct Stamp {
 
 #[cfg(windows)]
 impl Stamp {
-    fn from_file(file: &File, metadata: &Metadata) -> io::Result<Self> {
+    fn from_file(file: &File) -> io::Result<Self> {
         use std::os::windows::io::AsRawHandle;
         use winapi::um::fileapi::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -37,15 +37,16 @@ impl Stamp {
                 info.ftLastWriteTime.dwHighDateTime,
                 info.ftLastWriteTime.dwLowDateTime,
             ),
-            len: metadata.len(),
+            len: (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
         })
     }
 
     pub(super) fn at(path: &Path) -> io::Result<Option<Self>> {
+        // Query the object even if a content handle denies shared reads.
         use std::os::windows::fs::OpenOptionsExt;
         use winapi::um::winbase::FILE_FLAG_BACKUP_SEMANTICS;
         let file = match OpenOptions::new()
-            .read(true)
+            .access_mode(0)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | crate::windows_process::OPEN_REPARSE_POINT)
             .open(path)
         {
@@ -53,7 +54,7 @@ impl Stamp {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        Ok(Some(Self::from_file(&file, &file.metadata()?)?))
+        Self::from_file(&file).map(Some)
     }
 }
 
@@ -69,7 +70,7 @@ pub(super) struct Stamp {
 
 #[cfg(target_os = "linux")]
 impl Stamp {
-    fn new(metadata: &Metadata) -> Self {
+    fn new(metadata: &fs::Metadata) -> Self {
         Self {
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -77,10 +78,6 @@ impl Stamp {
             changed: (metadata.ctime(), metadata.ctime_nsec()),
             len: metadata.len(),
         }
-    }
-
-    fn from_file(_file: &File, metadata: &Metadata) -> io::Result<Self> {
-        Ok(Self::new(metadata))
     }
 
     pub(super) fn at(path: &Path) -> io::Result<Option<Self>> {
@@ -92,44 +89,97 @@ impl Stamp {
     }
 }
 
+fn open_content(path: &Path) -> io::Result<(File, Stamp)> {
+    let file = super::open_relay_file(OpenOptions::new().read(true)).open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid dispatch generation",
+        ));
+    }
+    #[cfg(windows)]
+    let stamp = {
+        use std::os::windows::fs::MetadataExt;
+        use winapi::um::winnt::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid dispatch generation reparse point",
+            ));
+        }
+        Stamp::from_file(&file)?
+    };
+    #[cfg(target_os = "linux")]
+    let stamp = Stamp::new(&metadata);
+    Ok((file, stamp))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GenerationStamp {
+    object: Stamp,
+    // Sharing can change without an object stamp changing.
+    #[cfg(windows)]
+    readable: bool,
+}
+
+impl GenerationStamp {
+    fn at(path: &Path) -> io::Result<Option<Self>> {
+        let Some(object) = Stamp::at(path)? else {
+            return Ok(None);
+        };
+        #[cfg(windows)]
+        let readable = match open_content(path) {
+            Ok((_, stamp)) if stamp == object => true,
+            Ok(_) => return Err(io::Error::other("dispatch generation changed")),
+            Err(_) => false,
+        };
+        Ok(Some(Self {
+            object,
+            #[cfg(windows)]
+            readable,
+        }))
+    }
+}
+
 struct Generation {
     row: Option<Value>,
-    stamp: Stamp,
+    stamp: GenerationStamp,
 }
 
 impl Generation {
-    fn read_pending(path: &Path) -> Result<Option<Self>> {
+    fn read(path: &Path) -> Result<Option<Self>> {
         let before = Stamp::at(path)?;
-        let read = Self::read(path);
+        let read = Self::read_content(path);
         if !matches!(&read, Ok(Some(_))) {
-            if let Some(stamp) = before {
-                anyhow::ensure!(Stamp::at(path)? == before, "dispatch reservation changed");
+            if let Some(object) = before {
+                anyhow::ensure!(Stamp::at(path)? == before, "dispatch generation changed");
                 // A stable path can fence the namespace without authorizing a row.
-                return Ok(Some(Self { row: None, stamp }));
+                return Ok(Some(Self {
+                    row: None,
+                    stamp: GenerationStamp {
+                        object,
+                        #[cfg(windows)]
+                        readable: false,
+                    },
+                }));
             }
         }
         read
     }
 
-    fn read(path: &Path) -> Result<Option<Self>> {
-        let file = match super::open_relay_file(OpenOptions::new().read(true)).open(path) {
-            Ok(file) => file,
+    fn read_content(path: &Path) -> Result<Option<Self>> {
+        let (file, object) = match open_content(path) {
+            Ok(content) => content,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let metadata = file.metadata()?;
-        anyhow::ensure!(metadata.is_file(), "invalid dispatch generation");
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            use winapi::um::winnt::FILE_ATTRIBUTE_REPARSE_POINT;
-            anyhow::ensure!(
-                metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
-                "invalid dispatch generation reparse point"
-            );
-        }
         Ok(Some(Self {
-            stamp: Stamp::from_file(&file, &metadata)?,
+            stamp: GenerationStamp {
+                object,
+                #[cfg(windows)]
+                readable: true,
+            },
             // The relay needs the file identity even if the record fails to decode.
             row: decode_record(file, path).ok(),
         }))
@@ -138,15 +188,15 @@ impl Generation {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct GenerationStamps {
-    pending: Option<Stamp>,
-    published: Option<Stamp>,
+    pending: Option<GenerationStamp>,
+    published: Option<GenerationStamp>,
 }
 
 impl GenerationStamps {
     pub(super) fn at(dir: &Path, id: &str) -> io::Result<Self> {
         Ok(Self {
-            pending: Stamp::at(&dir.join(format!("{id}.pending")))?,
-            published: Stamp::at(&dir.join(format!("{id}.json")))?,
+            pending: GenerationStamp::at(&dir.join(format!("{id}.pending")))?,
+            published: GenerationStamp::at(&dir.join(format!("{id}.json")))?,
         })
     }
 
@@ -164,7 +214,7 @@ pub(super) struct Generations {
 impl Generations {
     pub(super) fn read(dir: &Path, id: &str) -> Self {
         // Read the reservation first to cover a concurrent promotion.
-        let pending = Generation::read_pending(&dir.join(format!("{id}.pending")));
+        let pending = Generation::read(&dir.join(format!("{id}.pending")));
         let published = Generation::read(&dir.join(format!("{id}.json")));
         let mut damaged = pending.is_err() || published.is_err();
         let pending = pending.ok().flatten();

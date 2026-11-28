@@ -1,4 +1,5 @@
 """Windows public CLI lifecycle with a controlled substitute for Codex."""
+from contextlib import contextmanager, ExitStack, nullcontext
 import ctypes as ct
 from ctypes import wintypes as wt
 import json
@@ -15,6 +16,7 @@ ENCLOSING_JOB_EXIT = 69
 ENCLOSING_JOB_STDERR = (
     "Error: enclosing Windows Job prevents detachment\n\nCaused by:\n    permission denied\n"
 )
+BAD_RELAY = b'{"kind":'
 
 
 class Process:
@@ -62,17 +64,58 @@ def until(read, limit=10):
     raise AssertionError(f"condition did not become true in {limit}s")
 
 
+@contextmanager
+def exclusive_file(path):
+    create = Process.api.CreateFileW
+    create.argtypes = (wt.LPCWSTR, wt.DWORD, wt.DWORD, ct.c_void_p, wt.DWORD, wt.DWORD, wt.HANDLE)
+    create.restype = wt.HANDLE
+    invalid = ct.c_void_p(-1).value
+    handle = create(str(path), 0x80000000, 0, None, 3, 0, None)  # GENERIC_READ, OPEN_EXISTING
+    if handle == invalid:
+        raise ct.WinError(ct.get_last_error())
+    try:
+        metadata = create(str(path), 0, 7, None, 3, 0, None)
+        if metadata == invalid:
+            raise ct.WinError(ct.get_last_error())
+        Process.api.CloseHandle(metadata)
+        contents = create(str(path), 0x80000000, 7, None, 3, 0, None)
+        if contents != invalid:
+            Process.api.CloseHandle(contents)
+            raise AssertionError("exclusive handle still allows content reads")
+        assert ct.get_last_error() == 32  # ERROR_SHARING_VIOLATION
+        yield
+    finally:
+        Process.api.CloseHandle(handle)
+
+
+def publish_done(cli, cwd, task, host, scope, opts):
+    assignment = cli("dispatch", "--scope", scope, "--task", task, "--report", task, "--cwd", cwd,
+                     "--role", "队列𐐷", "--", host / "codex.exe", "raw", changes=opts)
+    receipt = cli("done", "--attempt", assignment["attempt"], "--report", task,
+                  changes=dict(opts, WFC_DISPATCH=assignment["dispatch"]))
+    return assignment["dispatch"], receipt["messageId"]
+
+
+@contextmanager
+def foreground_relay(binary, cwd, env, scope):
+    args = ("relay", "--codex", "--scope", scope, "--for", "6")
+    with subprocess.Popen([binary, *args], cwd=cwd, env=env,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+        try:
+            yield child
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate(timeout=5)
+
+
 def queue_outcomes(cli, root, host, task, decoy):
     state = root / "queue state"
     calls = root / "queue outcomes.jsonl"
     opts = dict(WFC_STATE=str(state), WFC_FIXTURE_QUEUE=str(calls))
 
     def publish(scope):
-        assignment = cli("dispatch", "--scope", scope, "--task", task, "--report", task, "--cwd", task.parent,
-                         "--role", "队列𐐷", "--", host / "codex.exe", "raw", changes=opts)
-        receipt = cli("done", "--attempt", assignment["attempt"], "--report", task,
-                      changes=dict(opts, WFC_DISPATCH=assignment["dispatch"]))
-        return assignment["dispatch"], receipt["messageId"]
+        return publish_done(cli, task.parent, task, host, scope, opts)
 
     def relay(scope, **changes):
         result = cli("relay", "--codex", "--scope", scope, "--for", "1.2",
@@ -119,11 +162,140 @@ def queue_outcomes(cli, root, host, task, decoy):
     print("Windows queue fixture: PATH, Unicode, exact ACK, unsent retry, unknown without replay")
 
 
+def generation_neighbor(cli, root, task, host, suffix, kind):
+    state = root / f"generation {kind} {suffix}"
+    queue = root / f"generation {kind} {suffix}.jsonl"
+    opts = dict(WFC_STATE=str(state), WFC_FIXTURE_QUEUE=str(queue))
+    bad_dispatch, bad_id = publish_done(cli, task.parent, task, host, "ready", opts)
+    good_dispatch, good_id = publish_done(cli, task.parent, task, host, "ready", opts)
+    published = state / "dispatches" / f"{bad_dispatch}.json"
+    bad = published.with_suffix(suffix)
+    published.rename(root / f"{bad_dispatch}-{kind}{suffix}")
+    fragment = b'{"dispatch":'
+    if kind == "directory":
+        bad.mkdir()
+    else:
+        bad.write_bytes(fragment)
+    with exclusive_file(bad) if kind == "exclusive" else nullcontext():
+        relay = cli("relay", "--codex", "--scope", "ready", "--for", "1.2", check=False, changes=opts)
+        assert relay.returncode == 0, relay
+        refused = cli("ack", bad_id, check=False, changes=opts)
+        assert refused.returncode == 1 and "cannot verify assignment publication identity" in refused.stderr, refused
+        row, = cli("status", "--dispatch", good_dispatch, changes=opts)["dispatches"]
+        good, = row["messages"]
+        assert (good["messageId"], good["state"]) == (good_id, "received"), (kind, suffix, good)
+        ack = cli("ack", good_id, changes=opts)
+        assert (ack["messageId"], ack["state"], ack["statusVersion"]) == (good_id, "processed", 4), ack
+    assert bad.is_dir() if kind == "directory" else bad.read_bytes() == fragment
+    bad_row = next(row for row in json.loads((state / "messages.json").read_bytes()) if row["messageId"] == bad_id)
+    assert (bad_row["state"], bad_row["statusVersion"]) == ("unsent", 1), bad_row
+    delivery, = queue.read_text(encoding="utf-8").splitlines()
+    assert good_id in delivery and bad_id not in delivery, delivery
+    print(f"Windows generation fixture: {kind} {suffix}, single delivery and ACK {good_id}, fenced {bad_id}")
+
+
+def generation_access_changes(cli, binary, cwd, env, root, task, host):
+    state = root / "generation sharing changes"
+    queue = root / "generation sharing queue.jsonl"
+    opts = dict(WFC_STATE=str(state), WFC_FIXTURE_QUEUE=str(queue))
+    dispatches = state / "dispatches"
+    scope = "sharing"
+    owner, owner_id = publish_done(cli, cwd, task, host, scope, opts)
+    stale, stale_id = publish_done(cli, cwd, task, host, scope, opts)
+    good, good_id = publish_done(cli, cwd, task, host, scope, opts)
+    owned_path = dispatches / f"{owner}.json"
+    record = json.loads(owned_path.read_bytes())
+    record["controllerOwner"] = {"owner": "fixture", "generation": 1}
+    owned_path.write_text(json.dumps(record), encoding="utf-8")
+    stale_path = dispatches / f"{stale}.json"
+    record = json.loads(stale_path.read_bytes())
+    record["attempt"] = "a-000000000000"
+    stale_path.write_text(json.dumps(record), encoding="utf-8")
+    before = owned_path.stat()
+
+    with ExitStack() as relay:
+        with exclusive_file(owned_path):
+            child = relay.enter_context(foreground_relay(binary, cwd, dict(env, **opts), scope))
+            def received():
+                receipts = cli("status", "--dispatch", good, changes=opts)["dispatches"][0]["messages"]
+                return receipts[0]["state"] == "received"
+
+            until(received)
+            refused = cli("ack", owner_id, check=False, changes=opts)
+            assert refused.returncode == 1 and "cannot verify assignment publication identity" in refused.stderr, refused
+            ack = cli("ack", good_id, changes=opts)
+            assert (ack["messageId"], ack["state"]) == (good_id, "processed"), ack
+        _, error = child.communicate(timeout=8)
+        assert child.returncode == 1 and b"controller owner authorization required for relay" in error, error
+    after = owned_path.stat()
+    assert (before.st_ino, before.st_mtime_ns, before.st_size) == (after.st_ino, after.st_mtime_ns, after.st_size)
+    ledger = {row["messageId"]: row for row in json.loads((state / "messages.json").read_bytes())}
+    assert all((ledger[msg]["state"], ledger[msg]["statusVersion"]) == ("unsent", 1) for msg in (owner_id, stale_id))
+    delivery, = queue.read_text(encoding="utf-8").splitlines()
+    assert good_id in delivery and owner_id not in delivery and stale_id not in delivery
+    print(f"Windows generation fixture: unchanged sharing neighbor, ACK {good_id}, restored owner and fenced stale attempt")
+
+
+def status_neighbor(cli, binary, cwd, env, root, task, host):
+    state = root / "status state"
+    queue = root / "status queue.jsonl"
+    opts = dict(WFC_STATE=str(state), WFC_FIXTURE_QUEUE=str(queue))
+    dispatch, message_id = publish_done(cli, cwd, task, host, "observed", opts)
+    rows = state / "relays"
+    rows.mkdir(exist_ok=True)
+    bad = rows / f"{uuid.uuid4()}.json"
+    bad.write_bytes(BAD_RELAY)
+
+    def status():
+        result = cli("status", "--dispatch", dispatch, changes=opts)
+        row, = result["dispatches"]
+        assert row["dispatch"] == dispatch, row
+        return result["waiters"], row["messages"][0]
+
+    assert status()[0] == []
+    directory = rows / f"{uuid.uuid4()}.json"
+    directory.mkdir()
+    with foreground_relay(binary, cwd, dict(env, **opts), "observed") as child:
+        process = Process(child.pid)
+        try:
+            waiters, = until(lambda: status()[0])
+            identity = {"pid": child.pid, "creation": process.creation}
+            assert (waiters["process"], waiters["scope"], waiters["thread"]) == (
+                identity, "observed", env["CODEX_THREAD_ID"]), waiters
+            registration, = set(rows.glob("*.json")) - {bad, directory}
+            wrong_pid = rows / f"{uuid.uuid4()}.json"
+            wrong_pid.write_text(json.dumps(dict(waiters, pid=0)), encoding="utf-8")
+            wrong_creation = rows / f"{uuid.uuid4()}.json"
+            wrong_creation.write_text(json.dumps(dict(waiters, process=dict(identity, creation="0"))),
+                                      encoding="utf-8")
+            incomplete = rows / f"{uuid.uuid4()}.json"
+            incomplete.write_text(json.dumps(dict(waiters, thread=None)), encoding="utf-8")
+            locked = rows / f"{uuid.uuid4()}.json"
+            locked.write_text(json.dumps(waiters), encoding="utf-8")
+            with exclusive_file(locked):
+                assert status()[0] == [waiters]
+                until(lambda: status()[1]["state"] == "received")
+                ack = cli("ack", message_id, changes=opts)
+                assert (ack["messageId"], ack["state"]) == (message_id, "processed"), ack
+                output = child.communicate(timeout=12)
+                assert child.returncode == 0 and process.exited(), output
+        finally:
+            process.close()
+    waiters, message = status()
+    assert waiters == [] and (message["messageId"], message["state"]) == (message_id, "processed")
+    assert bad.read_bytes() == BAD_RELAY and directory.is_dir() and locked.is_file()
+    assert wrong_pid.is_file() and wrong_creation.is_file() and incomplete.is_file()
+    assert not registration.exists()
+    delivery, = queue.read_text(encoding="utf-8").splitlines()
+    assert message_id in delivery, delivery
+    print(f"Windows status fixture: {dispatch}, live relay and deregistration beside corrupt entries, ACK {message_id}")
+
+
 def relay_startup_gate(binary, cwd, env, state):
     """Exercise the real child startup pipe even inside a hosted runner Job."""
     rows = state / "relays"
     rows.mkdir(parents=True)
-    (rows / f"{uuid.uuid4()}.json").write_text('{"kind":', encoding="utf-8")
+    (rows / f"{uuid.uuid4()}.json").write_bytes(BAD_RELAY)
     args = ("--windows-detached-relay", "--codex", "--scope", "gated")
     with subprocess.Popen([binary, *args], cwd=cwd, env=dict(env, WFC_STATE=str(state)),
                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
@@ -161,7 +333,7 @@ def detached_startup(cli, binary, cwd, env, root, task, host):
                      "--role", "fixture", "--", host / "codex.exe", "raw", changes=opts)
     receipt = cli("done", "--attempt", assignment["attempt"], "--report", task,
                   changes=dict(opts, WFC_DISPATCH=assignment["dispatch"]))
-    args = ("relay", "--codex", "--scope", "startup", "--detach", "--for", "3")
+    args = ("relay", "--codex", "--scope", "startup", "--detach", "--for", "6")
     with subprocess.Popen([binary, *args], env=dict(env, **opts), cwd=cwd,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE) as parent:
         parent.stdout.close()
@@ -179,25 +351,27 @@ def detached_startup(cli, binary, cwd, env, root, task, host):
 
     bad = state / "relays" / f"{uuid.uuid4()}.json"
     bad.parent.mkdir(exist_ok=True)
-    bad.write_text('{"kind":', encoding="utf-8")
-    try:
-        relay = cli(*args, changes=opts)
-    finally:
-        bad.unlink()
+    bad.write_bytes(BAD_RELAY)
+    relay = cli(*args, changes=opts)
     process = Process(relay["pid"], relay["process"]["creation"], own_runtime=True)
     try:
+        waiter, = cli("status", "--dispatch", assignment["dispatch"], changes=opts)["waiters"]
+        assert waiter["process"] == relay["process"], waiter
         until(queue.exists)
         until(lambda: cli("status", "--dispatch", assignment["dispatch"], changes=opts)["dispatches"]
               [0]["messages"][0]["state"] == "received")
         ack = cli("ack", receipt["messageId"], changes=opts)
         assert (ack["messageId"], ack["state"]) == (receipt["messageId"], "processed")
-        assert process.exited(5000)
+        assert process.exited(10000)
     finally:
         if not process.exited():
             process.api.TerminateProcess(process.handle, 1)
             assert process.exited(5000)
         process.close()
 
+    assert not cli("status", "--dispatch", assignment["dispatch"], changes=opts)["waiters"]
+    assert list(bad.parent.glob("*.json")) == [bad]
+    assert bad.read_bytes() == BAD_RELAY
     short = cli(*args[:-1], ".000000001", changes=opts)
     assert short["pid"] == short["process"]["pid"] and int(short["process"]["creation"]) > 0
     until(lambda: not cli("status", changes=opts)["waiters"])
@@ -271,8 +445,13 @@ def main(candidate, root, queue_only=False):
         return proc
 
     queue_outcomes(cli, root, host, task, decoy)
+    for suffix in (".pending", ".json"):
+        for kind in ("directory", "exclusive"):
+            generation_neighbor(cli, root, task, host, suffix, kind)
+    generation_access_changes(cli, binary, cwd, env, root, task, host)
     if queue_only:
         return
+    status_neighbor(cli, binary, cwd, env, root, task, host)
     relay_startup_gate(binary, cwd, env, root / "staging state")
 
     try:

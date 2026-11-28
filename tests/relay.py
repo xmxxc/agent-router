@@ -78,11 +78,11 @@ sys.exit(1 if mode else 0)
     def meta(self, ident, source="cli"):
         self.rollout.write_text(json.dumps({"type": "session_meta", "payload": {"id": ident, "source": source}}) + "\n")
 
-    def cli(self, *args, code=0, **env):
+    def cli(self, *args, code=0, stderr=False, **env):
         p = subprocess.run([WFC, *args], cwd=self.root, env=dict(self.env, **env),
                            capture_output=True, text=True, timeout=10)
         self.assertEqual(p.returncode, code, (args, p.stderr, p.stdout))
-        return p.stdout
+        return p.stderr if stderr else p.stdout
 
     def data(self, *args, **env):
         return json.loads(self.cli(*args, **env))
@@ -739,7 +739,7 @@ while not Path('release').exists():
         row, = json.loads(call[4][len(PREFIX):])["messages"]
         self.assertEqual(row["messageId"], ready["messageId"])
 
-    def check_scoped_delivery_beside_nonfile_reservation(self, kind):
+    def check_scoped_delivery_beside_nonfile_generation(self, suffix, kind):
         damaged = self.publish("ready")
         good = self.publish("ready")
         state = Path(self.env["WFC_STATE"])
@@ -747,13 +747,14 @@ while not Path('release').exists():
         dispatch = next(row["dispatch"] for row in json.loads(ledger.read_bytes())
                         if row["messageId"] == damaged["messageId"])
         published = state / "dispatches" / (dispatch + ".json")
-        pending = published.with_suffix(".pending")
-        saved = self.root / "valid-reservation.json"
+        generation = published.with_suffix(suffix)
+        saved = self.root / published.name
+        original = published.read_bytes()
         published.rename(saved)
         if kind == "directory":
-            pending.mkdir()
+            generation.mkdir()
         else:
-            pending.symlink_to(saved)
+            generation.symlink_to(saved)
 
         self.cli("relay", "--codex", "--scope", "ready", "--for", "1.5")
         rows = {row["messageId"]: row for row in json.loads(ledger.read_bytes())}
@@ -761,17 +762,27 @@ while not Path('release').exists():
         ack = self.data("ack", good["messageId"])
         self.assertEqual((ack["messageId"], ack["state"], ack["statusVersion"]),
                          (good["messageId"], "processed", 4))
-        self.cli("ack", damaged["messageId"], code=1)
-        self.assertEqual(rows[damaged["messageId"]]["state"], "unsent")
+        refused = self.cli("ack", damaged["messageId"], code=1, stderr=True)
+        self.assertIn("cannot verify assignment publication identity", refused)
+        self.assertEqual((rows[damaged["messageId"]]["state"], rows[damaged["messageId"]]["statusVersion"]),
+                         ("unsent", 1))
+        self.assertTrue(generation.is_dir() if kind == "directory" else generation.is_symlink())
+        self.assertEqual(saved.read_bytes(), original)
         call, = self.calls()
         message, = json.loads(call[4][len(PREFIX):])["messages"]
         self.assertEqual(message["messageId"], good["messageId"])
 
     def test_scoped_delivery_beside_directory_reservation(self):
-        self.check_scoped_delivery_beside_nonfile_reservation("directory")
+        self.check_scoped_delivery_beside_nonfile_generation(".pending", "directory")
 
     def test_scoped_delivery_beside_symlink_reservation(self):
-        self.check_scoped_delivery_beside_nonfile_reservation("symlink")
+        self.check_scoped_delivery_beside_nonfile_generation(".pending", "symlink")
+
+    def test_scoped_delivery_beside_directory_publication(self):
+        self.check_scoped_delivery_beside_nonfile_generation(".json", "directory")
+
+    def test_scoped_delivery_beside_symlink_publication(self):
+        self.check_scoped_delivery_beside_nonfile_generation(".json", "symlink")
 
     def test_running_relay_refreshes_repaired_and_legacy_owner_records(self):
         state = Path(self.env["WFC_STATE"])
