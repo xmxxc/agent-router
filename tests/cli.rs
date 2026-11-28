@@ -75,6 +75,129 @@ fn original_kernel_filename_starts_protocol_without_arguments() {
 
 #[cfg(windows)]
 #[test]
+fn windows_runtime_uses_the_explicit_conpty_program() -> anyhow::Result<()> {
+    use anyhow::{ensure, Context};
+    use serde_json::{json, Value};
+    use std::{
+        io::{self, Write},
+        os::windows::io::{FromRawHandle, OwnedHandle},
+        process::Stdio,
+        thread,
+        time::{Duration, Instant},
+    };
+    use winapi::um::{
+        processthreadsapi::OpenProcess, synchapi::WaitForSingleObject, winnt::SYNCHRONIZE,
+    };
+
+    let dir = env::temp_dir().join(format!("wfc-exact-{}", uuid::Uuid::new_v4().simple()));
+    fs::create_dir(&dir)?;
+    let result = (|| -> anyhow::Result<()> {
+        let binary = env!("CARGO_BIN_EXE_wfc");
+        let selected = dir.join("选定 程序.fixture");
+        fs::copy(binary, &selected)?;
+        fs::create_dir(dir.join("windows-bundled"))?;
+
+        for (program, present) in [(&selected, true), (&dir.join("缺少 程序.fixture"), false)] {
+            let generation = uuid::Uuid::new_v4().simple().to_string();
+            let execution = dir.join("windows-bundled").join(&generation);
+            fs::create_dir(&execution)?;
+            // Exercise the real bundled runtime and ConPTY without requiring detachment.
+            let request = json!({"state":dir,"dispatch":"d-00000081","attempt":"a-000000000081",
+                "round":1,"windowsExecution":generation,"cwd":dir,"env":{},
+                "argv":[program,"--kernel","extra"],"exactProgram":true});
+            let mut runtime = Command::new(binary)
+                .arg("--windows-bundled")
+                .stdin(Stdio::piped())
+                .spawn()?;
+            let run = (|| -> anyhow::Result<()> {
+                writeln!(
+                    runtime.stdin.take().context("missing runtime input")?,
+                    "{request}"
+                )?;
+                let deadline = Instant::now() + Duration::from_secs(15);
+                if present {
+                    let ready = loop {
+                        match fs::File::open(execution.join("ready.json")) {
+                            Ok(file) => break serde_json::from_reader::<_, Value>(file)?,
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                            Err(e) => return Err(e.into()),
+                        }
+                        anyhow::ensure!(
+                            runtime.try_wait()?.is_none() && Instant::now() < deadline,
+                            "bundled runtime did not confirm the explicit launch"
+                        );
+                        thread::sleep(Duration::from_millis(20));
+                    };
+                    let pid = u32::try_from(
+                        ready["identity"]["worker"]["pid"]
+                            .as_u64()
+                            .context("missing fixture PID")?,
+                    )?;
+                    let worker = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+                    if worker.is_null() {
+                        // ERROR_INVALID_PARAMETER means the short-lived fixture is already gone.
+                        let error = io::Error::last_os_error();
+                        ensure!(
+                            error.raw_os_error() == Some(87),
+                            "open fixture process: {error}"
+                        );
+                    } else {
+                        let _worker = unsafe { OwnedHandle::from_raw_handle(worker.cast()) };
+                        ensure!(
+                            unsafe { WaitForSingleObject(worker, 5000) } == 0,
+                            "fixture process did not exit"
+                        );
+                    }
+                    let close = json!({"ticket":ready["ticket"],"operation":"close"});
+                    let staging = execution.join("close.tmp");
+                    fs::write(&staging, serde_json::to_vec(&close)?)?;
+                    fs::rename(staging, execution.join("close.json"))?;
+                }
+                loop {
+                    if let Some(status) = runtime.try_wait()? {
+                        ensure!(status.success(), "bundled runtime exited with {status}");
+                        return Ok(());
+                    }
+                    anyhow::ensure!(Instant::now() < deadline, "bundled runtime did not exit");
+                    thread::sleep(Duration::from_millis(20));
+                }
+            })();
+            if run.is_err() {
+                let _ = runtime.kill();
+                let _ = runtime.wait();
+            }
+            run?;
+            let finished = serde_json::from_reader::<_, Value>(fs::File::open(
+                execution.join("finished.json"),
+            )?)?;
+            assert_eq!(finished["resourceCleanup"], "confirmed", "{finished}");
+            if present {
+                assert_eq!(finished["result"], "completed", "{finished}");
+                assert_eq!(finished["worker"]["state"], "exited", "{finished}");
+                assert_eq!(finished["worker"]["exit_code"], 2, "{finished}");
+            } else {
+                assert_eq!(finished["result"], "definitely-not-sent", "{finished}");
+                assert_eq!(finished["category"], "executable_missing", "{finished}");
+                assert_eq!(finished["worker"]["state"], "not_started", "{finished}");
+                let diagnostic = finished["diagnostic"].as_str().unwrap();
+                assert!(diagnostic.contains("os error 2"), "{finished}");
+                assert!(
+                    !diagnostic.contains("程序") && !diagnostic.contains("extra"),
+                    "{finished}"
+                );
+                assert!(!execution.join("ready.json").exists());
+            }
+        }
+        Ok(())
+    })();
+    let cleanup = fs::remove_dir_all(&dir);
+    result?;
+    cleanup?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
 fn windows_pty_async_wait_wakes_the_current_executor() {
     use portable_pty::{
         native_pty_system, win::WinChild, Child, ChildKiller, CommandBuilder, PtySize,

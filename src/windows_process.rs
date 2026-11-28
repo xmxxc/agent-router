@@ -453,7 +453,7 @@ fn check(result: i32) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::{
         io::{BufRead, BufReader, Read, Write},
@@ -464,7 +464,7 @@ mod tests {
 
     const FIXTURE: &str = "WFC_TEST_PRIVATE_JOB_MEMBER";
 
-    fn fixture(kind: &str) -> io::Result<Child> {
+    pub(crate) fn fixture(kind: &str) -> io::Result<Child> {
         Command::new(std::env::current_exe()?)
             .args(["--exact", "windows_process::tests::job_member_fixture", "--nocapture"])
             .env(FIXTURE, kind)
@@ -502,6 +502,10 @@ mod tests {
             Ok("leaf") => {
                 // The inherited pipe stays open and the leaf blocks in a read.
                 let _ = io::stdin().read_exact(&mut [0]);
+            }
+            Ok("exit") => {
+                let _ = io::stdin().read_exact(&mut [0]);
+                std::process::exit(37);
             }
             _ => (),
         }

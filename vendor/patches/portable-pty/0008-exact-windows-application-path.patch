@@ -1,0 +1,114 @@
+diff --git a/vendor/portable-pty/src/cmdbuilder.rs b/vendor/portable-pty/src/cmdbuilder.rs
+index 81ebd72378cee817be95e3b482989f4580bef4d9..8a090db1af2d37cd5be53cb9064c1fcabb07ead4 100644
+--- a/vendor/portable-pty/src/cmdbuilder.rs
++++ b/vendor/portable-pty/src/cmdbuilder.rs
+@@ -239,6 +239,9 @@ pub struct CommandBuilder {
+     args: Vec<OsString>,
+     #[cfg(windows)]
+     raw_args: Vec<OsString>,
++    #[cfg(windows)]
++    #[cfg_attr(feature = "serde_support", serde(default))]
++    exact_program: bool,
+     envs: BTreeMap<OsString, EnvEntry>,
+     cwd: Option<OsString>,
+     #[cfg(unix)]
+@@ -254,6 +257,8 @@ impl CommandBuilder {
+             args: vec![program.as_ref().to_owned()],
+             #[cfg(windows)]
+             raw_args: Vec::new(),
++            #[cfg(windows)]
++            exact_program: false,
+             envs: get_base_env(),
+             cwd: None,
+             #[cfg(unix)]
+@@ -268,6 +273,8 @@ impl CommandBuilder {
+             args,
+             #[cfg(windows)]
+             raw_args: Vec::new(),
++            #[cfg(windows)]
++            exact_program: false,
+             envs: get_base_env(),
+             cwd: None,
+             #[cfg(unix)]
+@@ -297,6 +304,8 @@ impl CommandBuilder {
+             args: vec![],
+             #[cfg(windows)]
+             raw_args: Vec::new(),
++            #[cfg(windows)]
++            exact_program: false,
+             envs: get_base_env(),
+             cwd: None,
+             #[cfg(unix)]
+@@ -630,6 +639,11 @@ impl CommandBuilder {
+
+ #[cfg(windows)]
+ impl CommandBuilder {
++    /// Use the given absolute program path as the Windows application name.
++    pub fn require_exact_program(&mut self) {
++        self.exact_program = true;
++    }
++
+     fn search_path(&self, exe: &OsStr) -> OsString {
+         if let Some(path) = self.get_env("PATH") {
+             let extensions = self.get_env("PATHEXT").unwrap_or(OsStr::new(".EXE"));
+@@ -732,7 +746,18 @@ impl CommandBuilder {
+     pub(crate) fn cmdline(&self) -> anyhow::Result<(Vec<u16>, Vec<u16>)> {
+         let mut cmdline = Vec::<u16>::new();
+
+-        let exe: OsString = if self.is_default_prog() {
++        let exe: OsString = if self.exact_program {
++            let program = self
++                .args
++                .first()
++                .filter(|arg| Path::new(arg).is_absolute() && !arg.encode_wide().any(|c| c == 0));
++            program.cloned().ok_or_else(|| {
++                std::io::Error::new(
++                    std::io::ErrorKind::InvalidInput,
++                    "expected an absolute program path",
++                )
++            })?
++        } else if self.is_default_prog() {
+             self.get_env("ComSpec")
+                 .unwrap_or(OsStr::new("cmd.exe"))
+                 .into()
+@@ -831,6 +856,40 @@ fn is_cwd_relative_path<P: AsRef<Path>>(p: P) -> bool {
+ mod tests {
+     use super::*;
+
++    #[cfg(windows)]
++    #[test]
++    fn windows_exact_program_keeps_the_supplied_application_name() -> anyhow::Result<()> {
++        let root = std::env::temp_dir().join(format!("portable-pty-exact-{}", std::process::id()));
++        std::fs::create_dir(&root)?;
++        let result = (|| -> anyhow::Result<_> {
++            let selected = root.join("选定 程序.fixture");
++            // These are ordinary files used to check path construction without spawning.
++            let relative = root.join("选定 程序.exe");
++            std::fs::write(&relative, b"test fixture")?;
++            let mut exact = CommandBuilder::new(&selected);
++            exact.env("PATH", &root);
++            exact.env("PATHEXT", ".EXE");
++            exact.require_exact_program();
++            let (program, _) = exact.cmdline()?;
++            assert!(program
++                .into_iter()
++                .eq(selected.as_os_str().encode_wide().chain([0])));
++
++            let mut searched = CommandBuilder::new("选定 程序");
++            searched.env("PATH", &root);
++            searched.env("PATHEXT", ".exe");
++            let (program, _) = searched.cmdline()?;
++            assert!(program
++                .into_iter()
++                .eq(relative.as_os_str().encode_wide().chain([0])));
++            Ok(())
++        })();
++        let cleanup = std::fs::remove_dir_all(&root);
++        result?;
++        cleanup?;
++        Ok(())
++    }
++
+     #[cfg(windows)]
+     #[test]
+     fn windows_search_path_skips_directories() {

@@ -138,6 +138,10 @@ fn spawn(v: &Value, tx: mpsc::SyncSender<Event>) -> Result<Unit> {
         args.push(arg.as_str().context("argv must contain strings")?);
     }
     let mut cmd = CommandBuilder::new(args[0]);
+    #[cfg(windows)]
+    if v["exactProgram"] == true {
+        cmd.require_exact_program();
+    }
     cmd.args(&args[1..]);
     cmd.env("TERM", ghostty_vt::TERM);
     if let Some(cwd) = v["cwd"].as_str() {

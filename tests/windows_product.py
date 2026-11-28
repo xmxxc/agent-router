@@ -423,11 +423,12 @@ def main(candidate, root, queue_only=False):
             return json.loads(output.stdout)
         return output
 
-    def dispatch(name, scope, mode, program=None, check=True):
+    def dispatch(name, scope, mode, program=None, check=True, runtime=False):
         report = cwd / f"{name} report.md"
         cfg = cwd / f"{name} launch.json"
-        cfg.write_text(json.dumps({"hosts": {"codex": {"command": [
-            str(program or host / "codex.exe"), "worker", mode]}}}), encoding="utf-8")
+        argv = [str(program or host / "codex.exe"), "worker", mode]
+        host_config = {"runtime": argv, "command": [str(task)]} if runtime else {"command": argv}
+        cfg.write_text(json.dumps({"hosts": {"codex": host_config}}), encoding="utf-8")
         output = cli("dispatch", "--host", "codex", "--scope", scope,
                      "--cwd", cwd, "--task", task, "--report", report,
                      "--launch-config", cfg, check=check)
@@ -559,6 +560,21 @@ def main(candidate, root, queue_only=False):
         bad_row = next(item for item in cli("status")["dispatches"] if item["scope"] == "broken")
         assert bad_row["worker"]["state"] == "not_started" and bad_row["backendAlive"] is False
         assert bad_row["backendObservation"]["category"] == "executable_missing", bad_row
+        selected_program = host / "选定 worker.fixture"
+        shutil.copyfile(path_bin / "codex.exe", selected_program)
+        for kind in ("command", "runtime"):
+            use_runtime = kind == "runtime"
+            selected, selected_report = dispatch(kind, kind, "selected", selected_program, runtime=use_runtime)
+            until(lambda: selected_report.exists())
+            assert Path(selected_report.read_text(encoding="utf-8")).samefile(selected_program)
+            selected_id = selected["dispatch"]
+            selected_exit = until(lambda: worker if (worker := row(selected_id)["worker"])["state"] == "exited" else None)
+            assert selected_exit["exit_code"] == 0, selected_exit
+            assert cli("close", selected_id)["resourceCleanup"] == "confirmed"
+        missing_runtime, _ = dispatch("missing runtime", "missing-runtime", "selected",
+                                      host / "missing-runtime.fixture", check=False, runtime=True)
+        assert missing_runtime.returncode != 0 and "definitely-not-sent" in missing_runtime.stderr, missing_runtime
+        assert "os error 2" in missing_runtime.stderr and "missing-runtime.fixture" not in missing_runtime.stderr
         assert relay_proc.exited(22000)
         assert not cli("status")["waiters"]
         deliveries = queue.read_text(encoding="utf-8").splitlines()

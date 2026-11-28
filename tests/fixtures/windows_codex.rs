@@ -78,6 +78,13 @@ fn main() {
                 std::process::exit(259);
             }
             let report = PathBuf::from(setting("WFC_REPORT"));
+            if args[2] == "selected" {
+                let exe = env::current_exe().unwrap();
+                let staging = report.with_extension("tmp");
+                fs::write(&staging, exe.to_str().unwrap()).unwrap();
+                fs::rename(staging, &report).unwrap();
+                return;
+            }
             let mut child = Command::new(env::current_exe().unwrap())
                 .arg("leaf")
                 .spawn()

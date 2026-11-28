@@ -210,3 +210,18 @@ the kernel can report launch failures without disclosing arguments.
 Apply `vendor/patches/portable-pty/0007-preserve-windows-launch-errors.patch`
 after 0006. On Windows, `python tools/smoke.py <path-to-wfc.exe> --kernel`
 checks the missing executable and permission errors and diagnostic redaction.
+
+## 0008 use an exact Windows application path when requested
+
+This agent-router patch adds an opt-in to pass the supplied absolute path
+directly as the `CreateProcessW` application name. The managed Windows worker
+opts in when its launch config selects an absolute executable. This preserves
+the path and the existing argv quoting. The default builder still resolves
+programs with `PATH` and `PATHEXT`.
+
+Apply `vendor/patches/portable-pty/0008-exact-windows-application-path.patch`
+after 0007, starting from `cmdbuilder.rs` blob
+`81ebd72378cee817be95e3b482989f4580bef4d9`. On Windows, run
+`cargo test -p wfc --test cli windows_runtime_uses_the_explicit_conpty_program`.
+The public Windows product fixture also checks the executable selected by
+both `command` and `runtime` in the launch config.
