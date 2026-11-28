@@ -93,7 +93,7 @@ impl Stamp {
 }
 
 struct Generation {
-    row: Value,
+    row: Option<Value>,
     stamp: Stamp,
 }
 
@@ -108,7 +108,8 @@ impl Generation {
         anyhow::ensure!(metadata.is_file(), "invalid dispatch generation");
         Ok(Some(Self {
             stamp: Stamp::from_file(&file, &metadata)?,
-            row: decode_record(file, path)?,
+            // The relay needs the file identity even if the record fails to decode.
+            row: decode_record(file, path).ok(),
         }))
     }
 }
@@ -146,11 +147,17 @@ impl Generations {
         let mut damaged = pending.is_err() || published.is_err();
         let pending = pending.ok().flatten();
         let published = published.ok().flatten();
-        damaged |= pending
-            .as_ref()
-            .is_some_and(|generation| !assignment::valid_reservation(&generation.row));
-        if let (Some(a), Some(b)) = (&pending, &published) {
-            damaged |= !assignment::same_publication_identity(&a.row, &b.row);
+        damaged |= pending.as_ref().is_some_and(|g| {
+            g.row
+                .as_ref()
+                .is_none_or(|row| !assignment::valid_reservation(row))
+        });
+        damaged |= published.as_ref().is_some_and(|g| g.row.is_none());
+        if let (Some(a), Some(b)) = (
+            pending.as_ref().and_then(|g| g.row.as_ref()),
+            published.as_ref().and_then(|g| g.row.as_ref()),
+        ) {
+            damaged |= !assignment::same_publication_identity(a, b);
         }
         Self {
             pending,
@@ -161,7 +168,10 @@ impl Generations {
 
     #[cfg(any(target_os = "linux", windows))]
     pub(super) fn rows(&self) -> impl Iterator<Item = &Value> {
-        self.pending.iter().chain(&self.published).map(|g| &g.row)
+        self.pending
+            .iter()
+            .chain(&self.published)
+            .filter_map(|g| g.row.as_ref())
     }
 
     pub(super) fn assigned(&self) -> Option<&Value> {
@@ -171,17 +181,16 @@ impl Generations {
         self.published
             .as_ref()
             .or(self.pending.as_ref())
-            .map(|g| &g.row)
+            .and_then(|g| g.row.as_ref())
     }
 
     #[cfg(target_os = "linux")]
     pub(super) fn into_assigned(self) -> Result<Option<Value>> {
         anyhow::ensure!(!self.damaged, "{}", assignment::UNVERIFIED_ASSIGNMENT);
         if let Some(published) = self.published {
-            return Ok(Some(published.row));
+            return Ok(published.row);
         }
-        Ok(self.pending.map(|generation| {
-            let mut row = generation.row;
+        Ok(self.pending.and_then(|g| g.row).map(|mut row| {
             row["createPending"] = Value::Bool(true);
             row
         }))
@@ -208,7 +217,7 @@ impl Generations {
         self.pending
             .as_ref()
             .filter(|_| !self.damaged)
-            .map(|generation| &generation.row)
+            .and_then(|g| g.row.as_ref())
     }
 
     #[cfg(target_os = "linux")]
@@ -216,6 +225,6 @@ impl Generations {
         self.published
             .as_ref()
             .filter(|_| !self.damaged)
-            .map(|generation| &generation.row)
+            .and_then(|g| g.row.as_ref())
     }
 }
