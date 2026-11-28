@@ -15,7 +15,7 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     os::windows::{
         fs::{MetadataExt, OpenOptionsExt},
-        io::AsRawHandle,
+        io::{AsHandle, AsRawHandle},
         process::CommandExt,
     },
     path::{Path, PathBuf},
@@ -442,7 +442,7 @@ fn run_execution(state: &Path, execution: &Execution, request: &Value) -> Result
     {
         return execution.write("finished.json", execution.cancelled());
     }
-    let job = match Job::new() {
+    let job = match Job::new_tracked() {
         Ok(job) => job,
         Err(e) => {
             let error = anyhow::Error::from(e).context("create Windows runtime Job");
@@ -452,7 +452,7 @@ fn run_execution(state: &Path, execution: &Execution, request: &Value) -> Result
     let (kernel, receiver, hello) = match start_kernel(&job, request) {
         Ok(started) => started,
         Err(error) => {
-            job.stop().context("confirm Windows kernel Job cleanup")?;
+            job.stop_and_verify().context("confirm Windows kernel Job cleanup")?;
             if error.is::<process::UnverifiedStageExit>() {
                 return Err(error).context("Windows kernel staging process exit is unconfirmed");
             }
@@ -581,6 +581,7 @@ fn supervise(
             || job.contains(worker.as_raw_handle())?,
         "Windows worker is outside the assigned Job"
     );
+    job.track(worker.as_handle())?;
     let identity = json!({"runtime":process::current_identity()?,
         "kernel":process::identity(kernel.id(), kernel.as_raw_handle())?,"worker":root});
     execution.write(
@@ -596,7 +597,7 @@ fn supervise(
         let kernel_exited = kernel.try_wait()?.is_some();
         if close || kernel_exited || (exit.is_some() && job.active()? <= 1) {
             stop_kernel(&job, &kernel)?;
-            // Job accounting can reach zero before process handles signal.
+            // A worker that exited before the Job snapshot has its own handle.
             let code = process::wait_for_exit(worker.as_raw_handle(), 5000)?
                 .context("Windows worker did not signal after Job cleanup")?;
             let (worker, effect) = match (exit, close, kernel_exited) {
@@ -626,7 +627,7 @@ fn supervise(
 }
 
 fn stop_kernel(job: &Job, kernel: &Child) -> Result<()> {
-    job.stop().context("confirm Windows kernel Job cleanup")?;
+    job.stop_and_verify().context("confirm Windows kernel Job cleanup")?;
     process::wait_for_exit(kernel.as_raw_handle(), 5000)
         .context("wait for original Windows kernel process")?
         .context("Windows kernel did not signal after Job cleanup")?;

@@ -151,6 +151,13 @@ impl<'a> Relay<'a> {
     }
 
     pub fn run(self) -> Result<()> {
+        self.run_inner(
+            #[cfg(windows)]
+            false,
+        )
+    }
+
+    fn run_inner(self, #[cfg(windows)] detached: bool) -> Result<()> {
         let state = writable_state_dir()?;
         let token = controller::token(self.owner_token);
         let preflight = || {
@@ -159,6 +166,11 @@ impl<'a> Relay<'a> {
         };
         preflight()?;
         let target = self.target.resolve()?;
+        let destination = match &target {
+            Target::Codex(thread) => ("thread", thread.as_str()),
+            #[cfg(target_os = "linux")]
+            Target::OpenCode(target) => ("session", target.session),
+        };
         let timeout = seconds(&env::var("WFC_QUEUE_TIMEOUT").unwrap_or_else(|_| "60".into()))?;
         // Legacy authorization is scope-wide. Complete it outside all
         // transport locks before starting the delivery window.
@@ -213,42 +225,22 @@ impl<'a> Relay<'a> {
                 println!("{}", json!({"pid":child.id(),"log":log}));
             }
             #[cfg(windows)]
-            {
-                use crate::windows_process as process;
-                use std::io::Write;
-                use std::os::windows::io::AsRawHandle;
-                let mut child = process::background(cmd.stdin(Stdio::piped()))?;
-                let identity = process::identity(child.id(), child.as_raw_handle())?;
-                child
-                    .stdin
-                    .take()
-                    .context("missing relay startup pipe")?
-                    .write_all(b"1")?;
-                let deadline = Instant::now() + Duration::from_secs(5);
-                loop {
-                    if registration::waiters(&state)?
-                        .iter()
-                        .any(|entry| entry["process"] == identity)
-                    {
-                        break;
-                    }
-                    ensure!(
-                        child.try_wait()?.is_none() && Instant::now() < deadline,
-                        "could not confirm detached relay registration; inspect {}",
-                        log.display()
-                    );
-                    std::thread::sleep(process::TICK);
-                }
-                println!("{}", json!({"pid":child.id(),"process":identity,"log":log}));
-            }
+            start_detached(&mut cmd, &state, &log, self.scope, destination)?;
             return Ok(());
         }
-        let destination = match &target {
-            Target::Codex(thread) => ("thread", thread.as_str()),
-            #[cfg(target_os = "linux")]
-            Target::OpenCode(target) => ("session", target.session),
-        };
+        #[cfg(target_os = "linux")]
         let _entry = registration::Registration::create(&state, self.scope, destination)?;
+        #[cfg(windows)]
+        let _entry = {
+            let entry = registration::Registration::create(&state, self.scope, destination, detached)?;
+            if detached {
+                use std::io::Read;
+                let mut grant = [0];
+                std::io::stdin().read_exact(&mut grant).context("read detached relay startup grant")?;
+                ensure!(grant == *b"1", "invalid relay startup grant");
+            }
+            entry
+        };
         let start = Instant::now();
         let remaining = || {
             self.lifetime
@@ -429,13 +421,55 @@ impl<'a> Relay<'a> {
 #[cfg(windows)]
 pub(crate) fn run_detached(args: &[OsString]) -> Result<()> {
     use std::io::Read;
-    let mut grant = [0];
-    std::io::stdin().read_exact(&mut grant)?;
-    ensure!(grant == *b"1", "invalid relay startup grant");
+    let mut stage = [0];
+    std::io::stdin().read_exact(&mut stage).context("read detached relay staging grant")?;
+    ensure!(stage == *b"0", "invalid detached relay staging grant");
     controller::require_controller("relay")?;
     let relay = Relay::parse(args)?;
     ensure!(!relay.detach, "detached relay cannot detach again");
-    relay.run()
+    relay.run_inner(true)
+}
+
+#[cfg(windows)]
+fn start_detached(
+    command: &mut Command,
+    state: &Path,
+    log: &Path,
+    scope: Option<&str>,
+    destination: (&str, &str),
+) -> Result<()> {
+    use crate::windows_process as process;
+    use std::{io::Write, os::windows::io::AsRawHandle};
+
+    let mut child = process::background(command.stdin(Stdio::piped()))?;
+    let result = (|| {
+        let identity = process::identity(child.id(), child.as_raw_handle())?;
+        let mut grant = child.stdin.take().context("missing relay startup pipe")?;
+        // The child can register only after its detachment has been verified.
+        grant.write_all(b"0").context("stage detached relay registration")?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            ensure!(child.try_wait()?.is_none() && Instant::now() < deadline,
+                "could not confirm detached relay registration; inspect {}", log.display());
+            if registration::staged(state, &identity, scope, destination)? {
+                break;
+            }
+            std::thread::sleep(process::TICK);
+        }
+        let receipt = json!({"pid":child.id(),"process":identity,"log":log});
+        let mut output = std::io::stdout().lock();
+        writeln!(output, "{receipt}").context("write detached relay receipt")?;
+        output.flush().context("flush detached relay receipt")?;
+        // The child starts its delivery window only after the parent's last fallible step.
+        grant.write_all(b"1").context("grant detached relay delivery")
+    })();
+    if result.is_err() {
+        drop(child.stdin.take());
+        if !matches!(process::wait_for_exit(child.as_raw_handle(), 250), Ok(Some(_))) {
+            process::stop_staged(&mut child)?;
+        }
+    }
+    result
 }
 
 // Serialize queue submissions that can overlap, without holding the inbox lock
@@ -610,7 +644,7 @@ impl ScopeAssignments {
             return Ok(false);
         }
         for (id, proof) in &self.proofs {
-            if expired() || GenerationStamps::at(&dir, id).ok() != proof.stamps {
+            if expired() || !proof.stamps.is_some_and(|stamps| stamps.current(&dir, id)) {
                 return Ok(false);
             }
         }

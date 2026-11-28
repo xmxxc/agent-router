@@ -739,6 +739,40 @@ while not Path('release').exists():
         row, = json.loads(call[4][len(PREFIX):])["messages"]
         self.assertEqual(row["messageId"], ready["messageId"])
 
+    def check_scoped_delivery_beside_nonfile_reservation(self, kind):
+        damaged = self.publish("ready")
+        good = self.publish("ready")
+        state = Path(self.env["WFC_STATE"])
+        ledger = state / "messages.json"
+        dispatch = next(row["dispatch"] for row in json.loads(ledger.read_bytes())
+                        if row["messageId"] == damaged["messageId"])
+        published = state / "dispatches" / (dispatch + ".json")
+        pending = published.with_suffix(".pending")
+        saved = self.root / "valid-reservation.json"
+        published.rename(saved)
+        if kind == "directory":
+            pending.mkdir()
+        else:
+            pending.symlink_to(saved)
+
+        self.cli("relay", "--codex", "--scope", "ready", "--for", "1.5")
+        rows = {row["messageId"]: row for row in json.loads(ledger.read_bytes())}
+        self.assertEqual(rows[good["messageId"]]["state"], "received")
+        ack = self.data("ack", good["messageId"])
+        self.assertEqual((ack["messageId"], ack["state"], ack["statusVersion"]),
+                         (good["messageId"], "processed", 4))
+        self.cli("ack", damaged["messageId"], code=1)
+        self.assertEqual(rows[damaged["messageId"]]["state"], "unsent")
+        call, = self.calls()
+        message, = json.loads(call[4][len(PREFIX):])["messages"]
+        self.assertEqual(message["messageId"], good["messageId"])
+
+    def test_scoped_delivery_beside_directory_reservation(self):
+        self.check_scoped_delivery_beside_nonfile_reservation("directory")
+
+    def test_scoped_delivery_beside_symlink_reservation(self):
+        self.check_scoped_delivery_beside_nonfile_reservation("symlink")
+
     def test_running_relay_refreshes_repaired_and_legacy_owner_records(self):
         state = Path(self.env["WFC_STATE"])
         directory = state / "dispatches"

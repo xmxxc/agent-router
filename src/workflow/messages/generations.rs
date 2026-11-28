@@ -98,6 +98,19 @@ struct Generation {
 }
 
 impl Generation {
+    fn read_pending(path: &Path) -> Result<Option<Self>> {
+        let before = Stamp::at(path)?;
+        let read = Self::read(path);
+        if !matches!(&read, Ok(Some(_))) {
+            if let Some(stamp) = before {
+                anyhow::ensure!(Stamp::at(path)? == before, "dispatch reservation changed");
+                // A stable path can fence the namespace without authorizing a row.
+                return Ok(Some(Self { row: None, stamp }));
+            }
+        }
+        read
+    }
+
     fn read(path: &Path) -> Result<Option<Self>> {
         let file = match super::open_relay_file(OpenOptions::new().read(true)).open(path) {
             Ok(file) => file,
@@ -106,6 +119,15 @@ impl Generation {
         };
         let metadata = file.metadata()?;
         anyhow::ensure!(metadata.is_file(), "invalid dispatch generation");
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            use winapi::um::winnt::FILE_ATTRIBUTE_REPARSE_POINT;
+            anyhow::ensure!(
+                metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+                "invalid dispatch generation reparse point"
+            );
+        }
         Ok(Some(Self {
             stamp: Stamp::from_file(&file, &metadata)?,
             // The relay needs the file identity even if the record fails to decode.
@@ -142,7 +164,7 @@ pub(super) struct Generations {
 impl Generations {
     pub(super) fn read(dir: &Path, id: &str) -> Self {
         // Read the reservation first to cover a concurrent promotion.
-        let pending = Generation::read(&dir.join(format!("{id}.pending")));
+        let pending = Generation::read_pending(&dir.join(format!("{id}.pending")));
         let published = Generation::read(&dir.join(format!("{id}.json")));
         let mut damaged = pending.is_err() || published.is_err();
         let pending = pending.ok().flatten();

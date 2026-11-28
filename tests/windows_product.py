@@ -37,6 +37,7 @@ class Process:
                 raise ct.WinError(ct.get_last_error())
             actual = str((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime)
             assert creation is None or creation == actual, (pid, creation, actual)
+            self.creation = actual
         except BaseException:
             self.close()
             raise
@@ -118,6 +119,92 @@ def queue_outcomes(cli, root, host, task, decoy):
     print("Windows queue fixture: PATH, Unicode, exact ACK, unsent retry, unknown without replay")
 
 
+def relay_startup_gate(binary, cwd, env, state):
+    """Exercise the real child startup pipe even inside a hosted runner Job."""
+    rows = state / "relays"
+    rows.mkdir(parents=True)
+    (rows / f"{uuid.uuid4()}.json").write_text('{"kind":', encoding="utf-8")
+    args = ("--windows-detached-relay", "--codex", "--scope", "gated")
+    with subprocess.Popen([binary, *args], cwd=cwd, env=dict(env, WFC_STATE=str(state)),
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+        try:
+            process = Process(child.pid)
+            try:
+                ready = rows / f"detached-{child.pid}-{process.creation}.json"
+                assert not ready.exists()
+                child.stdin.write(b"0")
+                child.stdin.flush()
+                until(ready.is_file, limit=5)
+                entry = json.loads(ready.read_bytes())
+                assert (entry["pid"], entry["scope"], entry["thread"]) == (child.pid, "gated", env["CODEX_THREAD_ID"])
+                assert entry["process"] == {"pid": child.pid, "creation": process.creation}
+                assert not process.exited()
+                assert not (state / "relay-transport.lock").exists()
+                # Simulate a parent disappearing before it grants delivery.
+                child.communicate(input=b"", timeout=5)
+                assert child.returncode != 0 and process.exited()
+            finally:
+                process.close()
+            assert not ready.exists() and not (state / "relay-transport.lock").exists()
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate(timeout=5)
+    print("Windows relay startup fixture: exact registration, no grant, original child exited")
+
+
+def detached_startup(cli, binary, cwd, env, root, task, host):
+    state = root / "detach state"
+    queue = root / "detach queue.jsonl"
+    opts = dict(WFC_STATE=str(state), WFC_FIXTURE_QUEUE=str(queue))
+    assignment = cli("dispatch", "--scope", "startup", "--task", task, "--report", task, "--cwd", cwd,
+                     "--role", "fixture", "--", host / "codex.exe", "raw", changes=opts)
+    receipt = cli("done", "--attempt", assignment["attempt"], "--report", task,
+                  changes=dict(opts, WFC_DISPATCH=assignment["dispatch"]))
+    args = ("relay", "--codex", "--scope", "startup", "--detach", "--for", "3")
+    with subprocess.Popen([binary, *args], env=dict(env, **opts), cwd=cwd,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as parent:
+        parent.stdout.close()
+        parent.stdout = None
+        try:
+            _, error = parent.communicate(timeout=15)
+            assert parent.returncode != 0 and b"write detached relay receipt" in error, error
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+                parent.communicate(timeout=5)
+    assert not cli("status", changes=opts)["waiters"] and not queue.exists()
+    row, = cli("status", "--dispatch", assignment["dispatch"], changes=opts)["dispatches"]
+    assert row["messages"][0]["state"] == "unsent"
+
+    bad = state / "relays" / f"{uuid.uuid4()}.json"
+    bad.parent.mkdir(exist_ok=True)
+    bad.write_text('{"kind":', encoding="utf-8")
+    try:
+        relay = cli(*args, changes=opts)
+    finally:
+        bad.unlink()
+    process = Process(relay["pid"], relay["process"]["creation"], own_runtime=True)
+    try:
+        until(queue.exists)
+        until(lambda: cli("status", "--dispatch", assignment["dispatch"], changes=opts)["dispatches"]
+              [0]["messages"][0]["state"] == "received")
+        ack = cli("ack", receipt["messageId"], changes=opts)
+        assert (ack["messageId"], ack["state"]) == (receipt["messageId"], "processed")
+        assert process.exited(5000)
+    finally:
+        if not process.exited():
+            process.api.TerminateProcess(process.handle, 1)
+            assert process.exited(5000)
+        process.close()
+
+    short = cli(*args[:-1], ".000000001", changes=opts)
+    assert short["pid"] == short["process"]["pid"] and int(short["process"]["creation"]) > 0
+    until(lambda: not cli("status", changes=opts)["waiters"])
+    assert len(queue.read_text(encoding="utf-8").splitlines()) == 1
+    print("Windows detached relay fixture: failed parent output, corrupt neighbor, short lifetime, exact ACK")
+
+
 def main(candidate, root, queue_only=False):
     root = Path(os.path.abspath(root)) / f"wfc native {uuid.uuid4().hex[:8]}"
     host = root / "host tools"
@@ -186,6 +273,7 @@ def main(candidate, root, queue_only=False):
     queue_outcomes(cli, root, host, task, decoy)
     if queue_only:
         return
+    relay_startup_gate(binary, cwd, env, root / "staging state")
 
     try:
         detach_args = ("relay", "--codex", "--scope", "original", "--detach", "--for", "18")
@@ -196,6 +284,7 @@ def main(candidate, root, queue_only=False):
             # This diagnostic follows verified staging-process exit before relay activation.
             status = cli("status")
             if (status["waiters"] != [] or status["dispatches"] != []
+                    or list((state / "relays").glob("*.json"))
                     or queue.exists() or (state / "windows-bundled").exists()):
                 raise AssertionError("Unexpected lifecycle activity after refused relay detachment")
             print(json.dumps({
@@ -296,6 +385,7 @@ def main(candidate, root, queue_only=False):
         deliveries = queue.read_text(encoding="utf-8").splitlines()
         assert len(deliveries) == 1 and msg in deliveries[0], deliveries
         print(f"Windows dispatch {primary['dispatch']}, exact identities {identity}, message {msg}, Job zero")
+        detached_startup(cli, binary, cwd, env, root, task, host)
     finally:
         for note in notes:
             cli("close", note, check=False)

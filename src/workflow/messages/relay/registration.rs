@@ -19,24 +19,42 @@ pub(super) struct Registration {
     _lock: File,
 }
 
+#[cfg(windows)]
+fn staged_path(dir: &Path, identity: &Value) -> PathBuf {
+    let creation = identity["creation"].as_str().expect("process creation time");
+    dir.join(format!("detached-{}-{creation}.json", identity["pid"]))
+}
+
 impl Registration {
-    pub fn create(state: &Path, scope: Option<&str>, (field, id): (&str, &str)) -> Result<Self> {
+
+    pub(super) fn create(
+        state: &Path,
+        scope: Option<&str>,
+        (field, id): (&str, &str),
+        #[cfg(windows)] detached: bool,
+    ) -> Result<Self> {
         let dir = state.join("relays");
         fs::create_dir_all(&dir)?;
-        let path = dir.join(Uuid::new_v4().to_string()).with_extension("json");
         #[cfg(windows)]
         {
+            let process = crate::windows_process::current_identity()?;
+            let path = if detached {
+                staged_path(&dir, &process)
+            } else {
+                dir.join(format!("{}.json", Uuid::new_v4()))
+            };
             crate::workflow::write_json(
                 &path,
                 &json!({"kind":"relay","pid":std::process::id(),
                 "since":receipt::timestamp(),"scope":scope,(field):id,
-                "process":crate::windows_process::current_identity()?}),
+                "process":process}),
                 None,
             )?;
             Ok(Self { path })
         }
         #[cfg(target_os = "linux")]
         {
+            let path = dir.join(format!("{}.json", Uuid::new_v4()));
             let temp = path.with_extension("tmp");
             let file = private_file().create_new(true).open(&temp)?;
             let mut entry = Self {
@@ -54,6 +72,36 @@ impl Registration {
             Ok(entry)
         }
     }
+}
+
+#[cfg(windows)]
+pub(super) fn staged(
+    state: &Path,
+    identity: &Value,
+    scope: Option<&str>,
+    (field, id): (&str, &str),
+) -> Result<bool> {
+    let path = staged_path(&state.join("relays"), identity);
+    let file = match super::super::open_relay_file(fs::OpenOptions::new().read(true)).open(path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+        other => other?,
+    };
+    use std::os::windows::fs::MetadataExt;
+    use winapi::um::winnt::FILE_ATTRIBUTE_REPARSE_POINT;
+    let meta = file.metadata()?;
+    anyhow::ensure!(
+        meta.is_file() && meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+        "invalid detached relay registration file"
+    );
+    let entry: Value = serde_json::from_reader(file).map_err(|_| {
+        anyhow::anyhow!("invalid detached relay registration record")
+    })?;
+    anyhow::ensure!(
+        entry["kind"] == "relay" && entry["pid"] == identity["pid"]
+            && entry["process"] == *identity && entry["scope"] == json!(scope) && entry[field] == id,
+        "detached relay registration identity mismatch"
+    );
+    Ok(true)
 }
 
 impl Drop for Registration {
