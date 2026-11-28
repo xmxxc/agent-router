@@ -9,6 +9,7 @@ use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
     env,
+    ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{self, BufRead, Read, Seek, Write},
     os::windows::{fs::OpenOptionsExt, process::CommandExt},
@@ -183,11 +184,15 @@ fn queue_in_state(state: &Path, thread: &str, text: &str, limit: Duration) -> Re
 fn prepare(state: &Path) -> Result<(File, File, Job, Child)> {
     let stdout = capture(state).context("open Windows queue stdout capture")?;
     let stderr = capture(state).context("open Windows queue stderr capture")?;
+    // Resolve before starting the supervisor so even a short queue deadline
+    // cannot turn a missing executable into an unconfirmed submission.
+    let program = codex_program().context("resolve native Codex from Windows PATH")?;
     let job = Job::new().context("create Windows queue Job")?;
     let mut command = Command::new(env::current_exe().context("resolve Windows queue supervisor")?);
     controller::strip_credentials(&mut command);
     command
         .arg("--windows-relay-queue")
+        .arg(program)
         .creation_flags(process::NO_WINDOW)
         .stdin(Stdio::piped())
         .stdout(
@@ -284,7 +289,11 @@ fn codex_program() -> io::Result<PathBuf> {
     Err(io::Error::from_raw_os_error(ERROR_FILE_NOT_FOUND as i32))
 }
 
-fn codex_command() -> Result<Command> {
+fn codex_command(program: &OsStr) -> Result<Command> {
+    ensure!(
+        Path::new(program).is_absolute(),
+        "missing absolute Codex executable"
+    );
     let mut request = Vec::new();
     io::stdin()
         .lock()
@@ -296,7 +305,7 @@ fn codex_command() -> Result<Command> {
     let message = request["message"]
         .as_str()
         .context("missing queue message")?;
-    let mut command = Command::new(codex_program()?);
+    let mut command = Command::new(program);
     controller::strip_credentials(&mut command);
     command
         .args([
@@ -324,8 +333,8 @@ fn start_failed(error: Option<&io::Error>) -> ExitCode {
     ExitCode::from(Outcome::Failed as u8)
 }
 
-pub(crate) fn run() -> Result<ExitCode> {
-    let mut command = match codex_command() {
+pub(crate) fn run(program: &OsStr) -> Result<ExitCode> {
+    let mut command = match codex_command(program) {
         Ok(command) => command,
         Err(e) => return Ok(start_failed(e.downcast_ref())),
     };
